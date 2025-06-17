@@ -43,9 +43,10 @@ void syscall_init(void) {
     write_msr(MSR_FMASK, 0x200); // Clear IF bit (bit 9)
 }
 
-// The C-level dispatcher
-uint64_t syscall_dispatcher(register_state_t *frame) {
-    // The syscall number is passed in RAX
+// The C-level dispatcher.
+// --- FIX: Changed parameter type to the standard interrupt_frame ---
+uint64_t syscall_dispatcher(struct interrupt_frame *frame) {
+    // The syscall number is passed in RAX.
     uint64_t syscall_num = frame->rax;
     uint64_t result = 0;
 
@@ -61,5 +62,6 @@ uint64_t syscall_dispatcher(register_state_t *frame) {
             break;
     }
 
+    // The return value will be placed in the frame's RAX by the assembly stub.
     return result;
 }

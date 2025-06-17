@@ -5,17 +5,18 @@ global syscall_entry
 extern syscall_dispatcher
 
 syscall_entry:
-    ; We are in kernel mode, but we need to save the user-space state.
-    ; The `syscall` instruction saves RIP -> RCX and RFLAGS -> R11.
-    ; It does NOT save RSP. We must do that manually.
-    ; We will use the kernel stack of the current task. For now, this is fine.
+    ; This is the entry point for the `syscall` instruction.
+    ; The CPU saves RIP into RCX and RFLAGS into R11.
+    ; We must save all other registers to create a valid interrupt_frame.
 
-    ; Save registers to build the interrupt_frame on the stack
+    ; We are already on the kernel stack (for now).
+
+    ; Save general purpose registers in the order defined by interrupt_frame.
     push r15
     push r14
     push r13
     push r12
-    push r11  ; User RFLAGS
+    push r11        ; User RFLAGS (saved by CPU)
     push r10
     push r9
     push r8
@@ -23,39 +24,42 @@ syscall_entry:
     push rdi
     push rsi
     push rdx
-    push rcx  ; User RIP
+    push rcx        ; User RIP (saved by CPU)
     push rbx
-    ; RAX is not pushed yet, it holds the syscall number.
+    push rax        ; Contains syscall number
 
-    ; Now, create the rest of the interrupt_frame structure.
-    ; We need to push a dummy error code and the interrupt number (which is not applicable for syscalls).
-    ; Then we push the registers that the CPU would have pushed.
-    mov rax, [rsp + 14*8] ; Get user RAX (syscall number) from the stack
+    ; Now, construct the part of the frame that the CPU would push for interrupts.
+    ; We need to simulate what hardware interrupt would have pushed:
+    push 0x10       ; SS (Kernel Data Segment)
+    push rsp        ; RSP (current stack pointer)
+    add qword [rsp], 17*8  ; Adjust RSP to point to user stack before we pushed registers
+    push r11        ; RFLAGS (from the CPU)
+    push 0x08       ; CS (Kernel Code Segment)
+    push rcx        ; RIP (from the CPU)
 
-    ; Create the full interrupt_frame on the stack
-    push 0 ; dummy ss
-    push 0 ; dummy rsp
-    push r11 ; RFLAGS
-    push 0x08 ; CS (Kernel Code Segment)
-    push rcx ; RIP
-    push 0 ; dummy error code
-    push rax ; syscall number as "int_no"
+    ; Syscalls don't have an error code. Push a dummy one.
+    push 0          ; Error Code
 
-    ; Now we have a structure on the stack that looks like interrupt_frame
-    ; but the top half is our saved registers. Let's fix that.
-    ; The stack pointer (RSP) now points to our interrupt_frame structure.
-    ; We pass this as the first argument (in RDI) to our C handler.
+    ; The syscall number is in the original RAX. Push it as the int_no.
+    mov rax, [rsp + 21*8]   ; Get original RAX from the stack
+    push rax        ; Interrupt Number (syscall number)
+
+    ; Now the stack is a perfect `interrupt_frame`.
+    ; Pass a pointer to it (current RSP) to the C dispatcher.
     mov rdi, rsp
     call syscall_dispatcher
 
-    ; The return value from C is in RAX. We will leave it there.
+    ; The return value is in RAX. We need to place it in the saved RAX
+    ; on the stack so it gets restored correctly.
+    mov [rsp + 15*8], rax   ; Update frame->rax with return value
 
-    ; Restore all registers from the stack frame.
-    ; We skip the "CPU-pushed" part of the frame.
-    add rsp, 7*8 ; Skip int_no, err_code, rip, cs, rflags, rsp, ss
+    ; Clean up the interrupt frame header
+    add rsp, 7*8    ; Skip int_no, err_code, rip, cs, rflags, rsp, ss
 
+    ; Restore the registers in reverse order
+    pop rax         ; Return value is now in RAX
     pop rbx
-    pop rcx ; This is the user RIP, we need it for sysretq
+    pop rcx         ; User RIP for sysretq
     pop rdx
     pop rsi
     pop rdi
@@ -63,11 +67,12 @@ syscall_entry:
     pop r8
     pop r9
     pop r10
-    pop r11 ; This is the user RFLAGS, we need it for sysretq
+    pop r11         ; User RFLAGS for sysretq
     pop r12
     pop r13
     pop r14
     pop r15
 
-    ; Return to the caller. `sysretq` restores RIP from RCX and RFLAGS from R11.
+    ; Return to the caller using sysretq
+    ; RCX contains the return RIP, R11 contains the return RFLAGS
     sysretq

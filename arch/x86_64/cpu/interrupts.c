@@ -1,23 +1,83 @@
 #include "interrupts.h"
+#include "ports.h"
+#include "sched/sched.h" // For calling the scheduler
 #include "../../../drivers/video/framebuffer.h"
 
-// Simple interrupt handler for demonstration
-void interrupt_handler(struct interrupt_frame *frame) {
-    // Create a message showing the interrupt number in hex
-    char msg[] = "Interrupt: 0x00";
-    char hex[] = "0123456789ABCDEF";
+// PIC (Programmable Interrupt Controller) ports
+#define PIC1_COMMAND 0x20
+#define PIC1_DATA    0x21
+#define PIC2_COMMAND 0xA0
+#define PIC2_DATA    0xA1
 
-    // Convert interrupt number to hex string
-    msg[13] = hex[(frame->int_no >> 4) & 0xF];
-    msg[14] = hex[frame->int_no & 0xF];
+// End-of-Interrupt command
+#define PIC_EOI      0x20
 
-    // Display the interrupt message
-    framebuffer_draw_string(msg, 10, 200, COLOR_RED, 0x00101828);
+// Remaps the PIC interrupts to avoid conflicts with CPU exceptions.
+// By default, IRQs 0-7 map to interrupts 8-15, which conflicts with #DF, #TS, etc.
+// We will remap them to interrupts 32-47.
+static void pic_remap(void) {
+    // Save masks
+    uint8_t a1 = inb(PIC1_DATA);
+    uint8_t a2 = inb(PIC2_DATA);
 
-    // For now, halt the system after displaying the interrupt
-    // In a real OS, you would handle the interrupt appropriately
-    asm volatile ("cli");
+    // Start initialization sequence (in cascade mode)
+    outb(PIC1_COMMAND, 0x11);
+    outb(PIC2_COMMAND, 0x11);
+
+    // Set vector offsets (PIC1 starts at 32, PIC2 at 40)
+    outb(PIC1_DATA, 32);
+    outb(PIC2_DATA, 40);
+
+    // Tell PICs about their cascade relationship
+    outb(PIC1_DATA, 4); // Tell Master PIC there is a slave PIC at IRQ2 (0100)
+    outb(PIC2_DATA, 2); // Tell Slave PIC its cascade identity (0010)
+
+    // Set 8086/88 (MCS-80/85) mode
+    outb(PIC1_DATA, 0x01);
+    outb(PIC2_DATA, 0x01);
+
+    // Restore saved masks
+    outb(PIC1_DATA, a1);
+    outb(PIC2_DATA, a2);
+}
+
+// Called from idt_init()
+void irq_init(void) {
+    pic_remap();
+    // Enable only the timer (IRQ0) and keyboard (IRQ1) for now
+    outb(PIC1_DATA, 0b11111100); // Unmask IRQ0 and IRQ1
+    outb(PIC2_DATA, 0b11111111); // Mask all slave PIC IRQs
+    asm volatile ("sti"); // Enable interrupts
+}
+
+// Simple hcf function
+static void hcf(void) {
+    asm ("cli");  // Disable interrupts first
     for (;;) {
-        asm volatile ("hlt");
+        asm ("hlt");
+    }
+}
+
+// The main C-level interrupt handler, now modified to handle IRQs.
+void interrupt_handler(struct interrupt_frame *frame) {
+    if (frame->int_no < 32) {
+        // Is a CPU exception
+        char msg[] = "CPU Exception: 00";
+        char hex[] = "0123456789ABCDEF";
+        msg[15] = hex[(frame->int_no >> 4) & 0xF];
+        msg[16] = hex[frame->int_no & 0xF];
+        framebuffer_draw_string(msg, 10, 10, COLOR_RED, COLOR_BLACK);
+        hcf(); // Halt on any exception
+    } else if (frame->int_no >= 32 && frame->int_no < 48) {
+        // Is a hardware IRQ
+        if (frame->int_no == 32) { // IRQ0: Timer
+            schedule(frame); // Call the scheduler
+        }
+
+        // Send EOI to the PICs.
+        if (frame->int_no >= 40) {
+            outb(PIC2_COMMAND, PIC_EOI); // EOI to slave
+        }
+        outb(PIC1_COMMAND, PIC_EOI); // EOI to master
     }
 }

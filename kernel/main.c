@@ -7,8 +7,10 @@
 #include "../arch/x86_64/cpu/idt.h"
 #include "../arch/x86_64/mm/pmm.h"
 #include "../arch/x86_64/mm/vmm.h"
-#include "../arch/x86_64/cpu/sched/sched.h"     // New include
-#include "../arch/x86_64/cpu/syscall/syscall.h" // New include
+#include "../arch/x86_64/cpu/sched/sched.h"
+#include "../arch/x86_64/cpu/syscall/syscall.h"
+#include "../arch/x86_64/drivers/timer/pit.h" // New include
+#include "../arch/x86_64/cpu/interrupts.h" // For irq_init
 
 // --- Centralized Limine Requests ---
 // This is the SINGLE source of truth for all requests.
@@ -174,6 +176,22 @@ static void hcf(void) {
     }
 }
 
+// A simple second task that will run concurrently.
+void other_task_main(void) {
+    uint32_t color = COLOR_YELLOW;
+    while (1) {
+        // --- FIX: Use the correct 4-argument function call ---
+        // First, draw a black space to clear the old character.
+        framebuffer_draw_char(' ', 750, 10, COLOR_BLACK);
+        // Then, draw the new character.
+        framebuffer_draw_char('@', 750, 10, color);
+
+        // Simple delay loop
+        for (volatile int i = 0; i < 10000000; i++);
+        color = (color == COLOR_YELLOW) ? COLOR_CYAN : COLOR_YELLOW;
+    }
+}
+
 void kmain(void) {
     // Check if the bootloader supports our base revision
     if (LIMINE_BASE_REVISION_SUPPORTED == false) {
@@ -196,14 +214,14 @@ void kmain(void) {
     // Clear the screen to a dark blue-gray
     framebuffer_clear(0x00101828);
 
-    // Draw a welcome banner - Updated for Phase 4a
+    // Draw a welcome banner - Updated for Phase 4b
     framebuffer_draw_rect(50, 50, 600, 140, COLOR_GRAHA_BLUE);
     framebuffer_draw_rect(52, 52, 596, 136, 0x00004488); // Inner darker blue
     framebuffer_draw_rect(54, 54, 592, 132, 0x000066AA); // Lighter inner
 
-    // Draw the main title - Updated for Phase 4a
-    framebuffer_draw_string("GrahaOS - Phase 4a", 70, 70, COLOR_WHITE, 0x000066AA);
-    framebuffer_draw_string("System Calls & Task Structures", 70, 90, COLOR_LIGHT_GRAY, 0x000066AA);
+    // Draw the main title - Updated for Phase 4b
+    framebuffer_draw_string("GrahaOS - Phase 4b", 70, 70, COLOR_WHITE, 0x000066AA);
+    framebuffer_draw_string("Multitasking & First Context Switch", 70, 90, COLOR_LIGHT_GRAY, 0x000066AA);
 
     // Draw decorative elements
     framebuffer_draw_rect_outline(40, 40, 620, 160, COLOR_WHITE);
@@ -290,66 +308,50 @@ void kmain(void) {
     framebuffer_draw_string("VMM Initialized. Paging is now active!", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
-    // --- NEW: Initialize Phase 4a components ---
+    // --- NEW: Initialize Phase 4b components ---
 
     // Initialize the scheduler
     sched_init();
     framebuffer_draw_string("Scheduler Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
+    // Create our second task.
+    if (sched_create_task(other_task_main) != -1) {
+        framebuffer_draw_string("Second task created.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    } else {
+        framebuffer_draw_string("Failed to create second task.", 50, y_pos, COLOR_RED, 0x00101828);
+    }
+    y_pos += 20;
+
     // Initialize the syscall interface
     syscall_init();
     framebuffer_draw_string("Syscall Interface Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    y_pos += 40;
-
-    framebuffer_draw_string("Kernel running in virtual mode", 50, y_pos, COLOR_CYAN, 0x00101828);
     y_pos += 20;
 
-    // Show post-VMM memory statistics
-    uint64_t free_after_vmm_mb = pmm_get_free_memory() / (1024 * 1024);
-    char free_after_str[32];
-    uint_to_string(free_after_vmm_mb, free_after_str);
-
-    framebuffer_draw_string("Free Memory (post-VMM): ", 50, y_pos, COLOR_CYAN, 0x00101828);
-    framebuffer_draw_string(free_after_str, 220, y_pos, COLOR_CYAN, 0x00101828);
-    framebuffer_draw_string(" MB", 300, y_pos, COLOR_CYAN, 0x00101828);
-    y_pos += 40;
-
-    // Test the interrupt system again, this time while paging is active.
-    framebuffer_draw_string("Triggering interrupt 0x20 (with paging)...", 50, y_pos, COLOR_YELLOW, 0x00101828);
+    // --- NEW: Initialize Timer and IRQs ---
+    pit_init(100); // Initialize PIT to 100 Hz
+    framebuffer_draw_string("PIT Initialized to 100 Hz.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
-    // Enable interrupts and trigger a test interrupt
-    asm volatile ("sti");           // Enable interrupts
-    asm volatile ("int $0x20");     // Trigger interrupt 32 (0x20)
-
-    // The interrupt handler should print its message, and execution will continue here.
-    // If we reach this point, the interrupt system is working correctly with paging.
-    framebuffer_draw_string("Interrupt system working with paging!", 50, y_pos, COLOR_GREEN, 0x00101828);
+    irq_init(); // Remap PIC and enable interrupts
+    // Add a small delay to ensure PIT is working
+    for (volatile int i = 0; i < 1000000; i++);
+    framebuffer_draw_string("IRQs Initialized and Enabled.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 40;
 
-    // --- NEW: Test the syscall system ---
-    framebuffer_draw_string("Testing syscall 0 (SYS_TEST)...", 50, y_pos, COLOR_YELLOW, 0x00101828);
-    y_pos += 20;
+    framebuffer_draw_string("Phase 4b Complete: Multitasking Active!", 50, y_pos, COLOR_WHITE, 0x00101828);
+    framebuffer_draw_string("Watch for blinking characters!", 50, y_pos + 20, COLOR_LIGHT_GRAY, 0x00101828);
 
-    uint64_t syscall_ret = do_syscall(SYS_TEST);
+    // The main kernel task now just prints a character in a loop.
+    uint32_t color = COLOR_WHITE;
+    while (1) {
+        // --- FIX: Use the correct 4-argument function call ---
+        // First, draw a black space to clear the old character.
+        framebuffer_draw_char(' ', 10, 10, COLOR_BLACK);
+        // Then, draw the new character.
+        framebuffer_draw_char('#', 10, 10, color);
 
-    // This message will appear if the syscall returns correctly
-    // The handler itself will also print a message
-    framebuffer_draw_string("Syscall returned successfully.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    y_pos += 20;
-
-    // Print the return value
-    char ret_str[32];
-    uint_to_string(syscall_ret, ret_str);
-    framebuffer_draw_string("Return value: ", 50, y_pos, COLOR_CYAN, 0x00101828);
-    framebuffer_draw_string(ret_str, 170, y_pos, COLOR_CYAN, 0x00101828);
-    y_pos += 40;
-
-    // Final success message
-    framebuffer_draw_string("Phase 4a Complete: Syscalls Active!", 50, y_pos, COLOR_WHITE, 0x00101828);
-    framebuffer_draw_string("Task structures and syscall interface ready.", 50, y_pos + 20, COLOR_LIGHT_GRAY, 0x00101828);
-
-    // We're done, just hang...
-    hcf();
+        for (volatile int i = 0; i < 10000000; i++);
+        color = (color == COLOR_WHITE) ? COLOR_LIGHT_GRAY : COLOR_WHITE;
+    }
 }

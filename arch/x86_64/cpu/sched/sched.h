@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "../interrupts.h"
 
 #define MAX_TASKS 128
 #define KERNEL_STACK_SIZE 8192 // 8 KiB kernel stack per task
@@ -11,26 +12,31 @@ typedef enum {
     TASK_STATE_ZOMBIE
 } task_state_t;
 
-// Simple register state structure for syscalls
+// Use the interrupt_frame structure from interrupts.h for register state
 typedef struct {
-    uint64_t r15, r14, r13, r12;
-    uint64_t r11, r10, r9, r8;
-    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
-    uint64_t rip, cs, rflags, rsp, ss;
-} __attribute__((packed)) register_state_t;
-
-// Represents a single task (or process/thread) in the system.
-typedef struct {
-    register_state_t regs;       // Saved registers when not running
-    uint64_t kernel_stack;       // Virtual address of kernel stack top
-    task_state_t state;          // Current state of the task
-    int id;                      // Unique task ID
+    struct interrupt_frame regs;
+    uint64_t kernel_stack_top;
+    task_state_t state;
+    int id;
 } task_t;
 
 /**
  * @brief Initializes the scheduler and creates the initial kernel task.
  */
 void sched_init(void);
+
+/**
+ * @brief Creates a new kernel thread.
+ * @param entry_point The function pointer where the new thread will start execution.
+ * @return The ID of the new task, or -1 on failure.
+ */
+int sched_create_task(void (*entry_point)(void));
+
+/**
+ * @brief The main scheduler function, called by the timer interrupt.
+ * @param frame The register state of the interrupted task.
+ */
+void schedule(struct interrupt_frame *frame);
 
 /**
  * @brief Get the currently running task.
