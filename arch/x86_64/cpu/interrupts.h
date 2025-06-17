@@ -1,0 +1,23 @@
+#pragma once
+#include <stdint.h>
+
+// Structure representing the CPU state when an interrupt occurs
+// This matches the order of registers pushed by our assembly stubs
+struct interrupt_frame {
+    // Registers pushed by our stub
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+
+    // Interrupt number and error code (pushed by stub)
+    uint64_t int_no, err_code;
+
+    // Pushed automatically by CPU on interrupt
+    uint64_t rip, cs, rflags, rsp, ss;
+};
+
+/**
+ * @brief Main C interrupt handler
+ * Called by assembly stubs for all interrupts
+ * @param frame Pointer to the interrupt stack frame
+ */
+void interrupt_handler(struct interrupt_frame *frame);

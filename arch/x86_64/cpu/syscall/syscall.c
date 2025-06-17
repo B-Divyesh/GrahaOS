@@ -1,0 +1,65 @@
+#include "syscall.h"
+#include "../../../../drivers/video/framebuffer.h"
+
+// MSR (Model-Specific Register) addresses
+#define MSR_EFER 0xC0000080        // Extended Feature Enable Register
+#define MSR_STAR 0xC0000081        // System Call Target Address Register
+#define MSR_LSTAR 0xC0000082       // Long Mode System Call Target Address
+#define MSR_FMASK 0xC0000084       // System Call Flag Mask
+
+// External assembly function that will be the entry point for syscalls
+extern void syscall_entry(void);
+
+// Helper functions to read and write MSRs
+static void write_msr(uint32_t msr, uint64_t value) {
+    uint32_t low = value & 0xFFFFFFFF;
+    uint32_t high = value >> 32;
+    asm volatile ("wrmsr" : : "c"(msr), "a"(low), "d"(high));
+}
+
+static uint64_t read_msr(uint32_t msr) {
+    uint32_t low, high;
+    asm volatile ("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
+    return ((uint64_t)high << 32) | low;
+}
+
+void syscall_init(void) {
+    // 1. Enable the SCE (System Call Extensions) bit in the EFER MSR
+    uint64_t efer = read_msr(MSR_EFER);
+    efer |= 1; // Set SCE bit (bit 0)
+    write_msr(MSR_EFER, efer);
+
+    // 2. Set the kernel segment selectors in the STAR MSR
+    // Bits 47:32 are Kernel CS (0x08), Bits 63:48 would be User CS (future)
+    // For now, we only set the kernel segments
+    uint64_t star = ((uint64_t)0x08 << 32) | ((uint64_t)0x10 << 48);
+    write_msr(MSR_STAR, star);
+
+    // 3. Set the syscall entry point address in the LSTAR MSR
+    write_msr(MSR_LSTAR, (uint64_t)syscall_entry);
+
+    // 4. Set the RFLAGS mask for syscalls in the FMASK MSR
+    // We want to clear the Interrupt Flag (IF) to disable interrupts during syscalls
+    write_msr(MSR_FMASK, 0x200); // Clear IF bit (bit 9)
+}
+
+// The C-level dispatcher
+uint64_t syscall_dispatcher(register_state_t *frame) {
+    // The syscall number is passed in RAX
+    uint64_t syscall_num = frame->rax;
+    uint64_t result = 0;
+
+    switch (syscall_num) {
+        case SYS_TEST:
+            framebuffer_draw_string("Syscall 0 (SYS_TEST) called successfully!", 10, 500, COLOR_MAGENTA, 0x00101828);
+            result = 42; // Return a test value
+            break;
+
+        default:
+            framebuffer_draw_string("Unknown syscall number.", 10, 520, COLOR_RED, 0x00101828);
+            result = (uint64_t)-1; // Return an error
+            break;
+    }
+
+    return result;
+}
