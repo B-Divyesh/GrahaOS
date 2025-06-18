@@ -1,0 +1,74 @@
+; Original location: ./arch/x86_64/cpu/syscall/syscall.S
+; Original extension: S
+
+bits 64
+section .text
+
+global syscall_entry
+extern syscall_dispatcher
+
+syscall_entry:
+    ; We have just entered from user-mode via the `syscall` instruction.
+    ; The CPU has saved:
+    ;   - Return RIP -> RCX
+    ;   - Return RFLAGS -> R11
+    ; It has NOT saved the user stack (RSP) or any other registers.
+    ; We are now on the kernel stack (RSP0) specified in the TSS.
+
+    ; We must save all registers to construct a valid `interrupt_frame`.
+    ; The order MUST match the struct definition in interrupts.h.
+
+    ; 1. Save GPRs that are NOT part of the CPU-saved state for iretq.
+    push r15
+    push r14
+    push r13
+    push r12
+    push r10
+    push r9
+    push r8
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rbx
+    
+    ; 2. Now, save the registers that `syscall` modified, preserving their
+    ;    original user-mode values for the C handler and for `sysretq`.
+    push r11  ; User RFLAGS
+    push rcx  ; User RIP
+    
+    ; 3. Finally, save RAX, which contains the syscall number.
+    push rax
+
+    ; At this point, the top of the stack contains the general-purpose registers.
+    ; The C handler `syscall_dispatcher` expects a pointer to a full
+    ; `interrupt_frame`. The current RSP is NOT a valid pointer to this struct yet.
+    ; We will pass the current RSP as the frame pointer. The C code will
+    ; correctly access members like `rax`, `rbx`, etc.
+    
+    mov rdi, rsp  ; Pass pointer to the saved registers to the C handler.
+    call syscall_dispatcher
+
+    ; The C handler returns the result in RAX. `sysretq` expects the return
+    ; value to be in RAX, so we don't need to do anything with it.
+
+    ; 4. Restore all registers in the exact reverse order.
+    pop rax   ; This is the original user RAX, now overwritten with the return value.
+    pop rcx   ; This is the user RIP, needed by `sysretq`.
+    pop r11   ; This is the user RFLAGS, needed by `sysretq`.
+    pop rbx
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rbp
+    pop r8
+    pop r9
+    pop r10
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+
+    ; 5. Return to user mode.
+    ; `sysretq` will restore RIP from RCX and RFLAGS from R11.
+    sysretq

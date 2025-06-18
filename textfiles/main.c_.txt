@@ -1,3 +1,6 @@
+// Original location: ./kernel/main.c
+// Original extension: c
+
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -204,10 +207,44 @@ void kmain(void) {
 
     int y_pos = 220;
 
-    // --- CORRECTED INITIALIZATION SEQUENCE ---
+    // --- GDT, IDT, PMM, VMM Initialization ---
     // This sequence is now critical as it sets up the entire memory and CPU environment.
-    
-    // 1. Get critical memory information from Limine FIRST.
+    gdt_init();
+    framebuffer_draw_string("GDT & TSS Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    idt_init();
+    framebuffer_draw_string("IDT Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    pmm_init(memmap_request.response);
+    framebuffer_draw_string("PMM Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    // Display memory statistics (before VMM initialization)
+    uint64_t total_mb = pmm_get_total_memory() / (1024 * 1024);
+    uint64_t free_mb = pmm_get_free_memory() / (1024 * 1024);
+
+    char total_str[32];
+    char free_str[32];
+    uint_to_string(total_mb, total_str);
+    uint_to_string(free_mb, free_str);
+
+    framebuffer_draw_string("Total Memory: ", 50, y_pos, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string(total_str, 170, y_pos, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string(" MB", 250, y_pos, COLOR_CYAN, 0x00101828);
+    y_pos += 20;
+
+    framebuffer_draw_string("Free Memory:  ", 50, y_pos, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string(free_str, 170, y_pos, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string(" MB", 250, y_pos, COLOR_CYAN, 0x00101828);
+    y_pos += 40;
+
+    // --- Initialize Virtual Memory Manager ---
+    framebuffer_draw_string("VMM: Initializing and enabling paging...", 50, y_pos, COLOR_YELLOW, 0x00101828);
+    y_pos += 20;
+
+    // Get kernel addresses using the proper Limine requests
     uint64_t kernel_phys_base = executable_address_request.response->physical_base;
     uint64_t kernel_virt_base = executable_address_request.response->virtual_base;
     uint64_t hhdm_offset = hhdm_request.response->offset;
@@ -228,54 +265,16 @@ void kmain(void) {
 
     framebuffer_draw_string("Higher-half direct map: 0x", 50, y_pos, COLOR_CYAN, 0x00101828);
     framebuffer_draw_string(hhdm_str, 250, y_pos, COLOR_CYAN, 0x00101828);
-    y_pos += 40;
+    y_pos += 60;
 
-    // 2. Initialize Physical Memory Manager (PMM).
-    //    It needs the memory map from Limine.
-    pmm_init(memmap_request.response);
-    framebuffer_draw_string("PMM Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    y_pos += 20;
-
-    // Display memory statistics (after PMM initialization)
-    uint64_t total_mb = pmm_get_total_memory() / (1024 * 1024);
-    uint64_t free_mb = pmm_get_free_memory() / (1024 * 1024);
-
-    char total_str[32];
-    char free_str[32];
-    uint_to_string(total_mb, total_str);
-    uint_to_string(free_mb, free_str);
-
-    framebuffer_draw_string("Total Memory: ", 50, y_pos, COLOR_CYAN, 0x00101828);
-    framebuffer_draw_string(total_str, 170, y_pos, COLOR_CYAN, 0x00101828);
-    framebuffer_draw_string(" MB", 250, y_pos, COLOR_CYAN, 0x00101828);
-    y_pos += 20;
-
-    framebuffer_draw_string("Free Memory:  ", 50, y_pos, COLOR_CYAN, 0x00101828);
-    framebuffer_draw_string(free_str, 170, y_pos, COLOR_CYAN, 0x00101828);
-    framebuffer_draw_string(" MB", 250, y_pos, COLOR_CYAN, 0x00101828);
-    y_pos += 40;
-
-    // 3. Initialize Virtual Memory Manager (VMM).
-    //    This will create a new kernel address space and enable paging.
-    framebuffer_draw_string("VMM: Initializing and enabling paging...", 50, y_pos, COLOR_YELLOW, 0x00101828);
-    y_pos += 20;
-
+    // --- Initialize Virtual Memory Manager ---
     vmm_init(memmap_request.response, framebuffer_request.response, kernel_phys_base, kernel_virt_base, hhdm_offset);
     framebuffer_init(&framebuffer_request); // Re-init with virtual addresses
     framebuffer_draw_string("VMM Initialized. Paging is now active!", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 40;
 
-    // 4. Initialize GDT and TSS.
-    //    This MUST be done after VMM/PMM are ready, as it allocates memory.
-    gdt_init();
-    framebuffer_draw_string("GDT & TSS Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    y_pos += 20;
-
-    // 5. Initialize IDT, Syscalls, and Scheduler.
-    idt_init();
-    framebuffer_draw_string("IDT Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    y_pos += 20;
-
+    // --- Phase 4 & 5a Initialization ---
+    
     sched_init();
     framebuffer_draw_string("Scheduler Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
@@ -291,32 +290,10 @@ void kmain(void) {
     // 1. Get the virtual address of our user code, provided by the linker.
     uint64_t user_code_virt_addr = (uint64_t)&_start_user;
     
-    // Debug the virtual address
-    framebuffer_draw_string("User code virtual address: ", 50, y_pos - 40, COLOR_WHITE, 0x00101828);
-    char vaddr_str[32];
-    for (int i = 0; i < 32; i++) vaddr_str[i] = 0;
-    for (int i = 0; i < 16; i++) {
-        int digit = (user_code_virt_addr >> ((15-i) * 4)) & 0xF;
-        vaddr_str[i] = digit < 10 ? '0' + digit : 'A' + (digit - 10);
-    }
-    framebuffer_draw_string(vaddr_str, 250, y_pos - 40, COLOR_WHITE, 0x00101828);
-    
     // 2. Calculate its physical address. Since it's part of the kernel ELF,
     //    we can find its physical location by subtracting the kernel's virtual base
     //    and adding its physical base.
     uint64_t user_code_phys_addr = user_code_virt_addr - kernel_virt_base + kernel_phys_base;
-
-    // Debug the physical address
-    framebuffer_draw_string("User code physical address: ", 50, y_pos - 20, COLOR_WHITE, 0x00101828);
-    char addr_str[32];
-    for (int i = 0; i < 32; i++) addr_str[i] = 0;
-    // Simple hex conversion
-    uint64_t addr = (uint64_t)user_code_phys_addr;
-    for (int i = 0; i < 16; i++) {
-        int digit = (addr >> ((15-i) * 4)) & 0xF;
-        addr_str[i] = digit < 10 ? '0' + digit : 'A' + (digit - 10);
-    }
-    framebuffer_draw_string(addr_str, 250, y_pos - 20, COLOR_WHITE, 0x00101828);
 
     // 3. Call the new scheduler function to create the process.
     //    It will set up a new address space and map the physical page containing

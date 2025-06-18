@@ -1,3 +1,6 @@
+// Original location: ./arch/x86_64/cpu/interrupts.c
+// Original extension: c
+
 #include "interrupts.h"
 #include "ports.h"
 #include "sched/sched.h" // For calling the scheduler
@@ -58,31 +61,8 @@ static void hcf(void) {
     }
 }
 
-// Helper to print a hex value, useful for debugging registers
-static void print_hex(uint64_t value) {
-    char buffer[17] = {0};
-    const char *hex_chars = "0123456789ABCDEF";
-    for (int i = 15; i >= 0; i--) {
-        buffer[i] = hex_chars[value & 0xF];
-        value >>= 4;
-    }
-    framebuffer_draw_string(buffer, framebuffer_get_width() - 16*8 - 10, 10, COLOR_WHITE, COLOR_RED);
-}
-
-// The main C-level interrupt handler, renamed to match expected function name
+// The main C-level interrupt handler, now modified to handle IRQs.
 void interrupt_handler(struct interrupt_frame *frame) {
-    if (frame->int_no == 14) { // Page Fault
-        uint64_t fault_addr;
-        asm volatile("mov %%cr2, %0" : "=r"(fault_addr)); // Get faulting address from CR2
-
-        framebuffer_draw_string("CPU Exception: 0E (Page Fault)", 10, 10, COLOR_RED, COLOR_BLACK);
-        framebuffer_draw_string("Faulting Address:", 10, 30, COLOR_RED, COLOR_BLACK);
-        print_hex(fault_addr); // Print the address that caused the fault
-        framebuffer_draw_string("Instruction Ptr:", 10, 50, COLOR_RED, COLOR_BLACK);
-        print_hex(frame->rip); // Print the instruction that caused the fault
-        hcf();
-    }
-
     if (frame->int_no < 32) {
         // Is a CPU exception
         char msg[] = "CPU Exception: 00";

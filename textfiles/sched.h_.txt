@@ -1,3 +1,6 @@
+// Original location: ./arch/x86_64/cpu/sched/sched.h
+// Original extension: h
+
 #pragma once
 #include <stdint.h>
 #include <stddef.h>

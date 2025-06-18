@@ -1,3 +1,6 @@
+; Original location: ./arch/x86_64/cpu/interrupts.S
+; Original extension: S
+
 bits 64
 
 extern interrupt_handler

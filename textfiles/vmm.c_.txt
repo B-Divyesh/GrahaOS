@@ -1,3 +1,6 @@
+// Original location: ./arch/x86_64/mm/vmm.c
+// Original extension: c
+
 #include "vmm.h"
 #include "pmm.h"
 #include "../../../drivers/video/framebuffer.h"
@@ -39,32 +42,11 @@ void vmm_switch_address_space(vmm_address_space_t *addr_space) {
     asm volatile ("mov %0, %%cr3" : : "r" (pml4_phys) : "memory");
 }
 
-// Simple function to convert a hex value to a string
-static void vmm_hex_to_string(uint64_t value, char *buffer) {
-    const char hex_chars[] = "0123456789ABCDEF";
-    char temp[17]; // 16 hex digits + null terminator
-    int i = 0;
-
-    if (value == 0) {
-        buffer[0] = '0';
-        buffer[1] = '\0';
-        return;
-    }
-
-    while (value > 0 && i < 16) {
-        temp[i++] = hex_chars[value & 0xF];
-        value >>= 4;
-    }
-
-    // Reverse the string
-    int j;
-    for (j = 0; j < i; j++) {
-        buffer[j] = temp[i - 1 - j];
-    }
-    buffer[j] = '\0';
-}
-
 bool vmm_map_page(vmm_address_space_t *addr_space, uint64_t virt, uint64_t phys, uint64_t flags) {
+    // Ensure addresses are page-aligned
+    if ((virt & (PAGE_SIZE - 1)) || (phys & (PAGE_SIZE - 1))) {
+        return false;
+    }
 
     // Calculate indices for each page table level.
     uint64_t pml4_index = (virt >> 39) & 0x1FF;

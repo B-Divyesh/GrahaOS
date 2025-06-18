@@ -1,0 +1,11 @@
+; Original location: ./arch/x86_64/cpu/idt.S
+; Original extension: S
+
+bits 64
+
+global idt_load
+
+idt_load:
+    ; Load IDT pointer from first argument (RDI)
+    lidt [rdi]
+    ret
