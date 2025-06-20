@@ -21,10 +21,8 @@ typedef struct {
     task_state_t state;
     uint64_t kernel_stack_top;
     struct interrupt_frame regs; // CPU register state from interrupt/syscall
-    
     // --- FIX: Store the address space (CR3) separately ---
     uint64_t cr3; // Physical address of the task's PML4 table
-    
 } task_t;
 
 /**
@@ -41,10 +39,11 @@ int sched_create_task(void (*entry_point)(void));
 
 /**
  * @brief Create a new user-mode process
- * @param elf_data Physical address of the user code to execute
+ * @param rip Entry point address for the process
+ * @param cr3 Physical address of the process's PML4 table
  * @return Task ID on success, -1 on failure
  */
-int sched_create_user_process(void *elf_data);
+int sched_create_user_process(uint64_t rip, uint64_t cr3);
 
 /**
  * @brief Schedule the next task to run

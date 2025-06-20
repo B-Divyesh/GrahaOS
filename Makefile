@@ -1,4 +1,4 @@
-# Makefile for GrahaOS (Phase 2 - Core Kernel Infrastructure)
+# Makefile for GrahaOS (Phase 5b-i - ELF Validation)
 
 # --- Configuration ---
 PREFIX   := /home/atman/GrahaOS/toolchain
@@ -9,6 +9,7 @@ CC       := $(PREFIX)/bin/$(TARGET)-gcc
 LD       := $(PREFIX)/bin/$(TARGET)-ld
 AS       := $(PREFIX)/bin/$(TARGET)-as
 NASM     := nasm
+TAR      := tar
 LIMINE_DIR := limine
 
 # --- Flags ---
@@ -46,38 +47,60 @@ OBJECTS     := $(C_OBJECTS) $(ASM_OBJECTS)
 DEPS := $(C_OBJECTS:.o=.d)
 
 # --- Build Targets ---
-.PHONY: all clean run help debug info
+.PHONY: all clean run help debug info userland
 
-# Default target
+# Default target - now depends on initrd
 all: grahaos.iso
 
-# Create the bootable ISO image
-grahaos.iso: kernel/kernel.elf limine.conf
+# Create the bootable ISO image (FIXED for Phase 5b-i)
+grahaos.iso: kernel/kernel.elf initrd.tar limine.conf
 	@echo "Creating ISO image..."
+	@echo "Checking prerequisites..."
+	@ls -la kernel/kernel.elf
+	@ls -la initrd.tar
+	@ls -la limine.conf
 	@rm -rf iso_root
-	@mkdir -p iso_root/boot/limine
+	@mkdir -p iso_root/boot
 	@cp kernel/kernel.elf iso_root/boot/
-	@cp limine.conf iso_root/boot/limine/
-	@cp $(LIMINE_DIR)/limine-bios.sys iso_root/boot/limine/
-	@cp $(LIMINE_DIR)/limine-bios-cd.bin iso_root/boot/limine/
-	@cp $(LIMINE_DIR)/limine-uefi-cd.bin iso_root/boot/limine/
+	@cp initrd.tar iso_root/boot/
+	@cp limine.conf iso_root/
+	@echo "ISO structure created:"
+	@find iso_root -type f
+	@cp $(LIMINE_DIR)/limine-bios.sys iso_root/
+	@cp $(LIMINE_DIR)/limine-bios-cd.bin iso_root/
+	@cp $(LIMINE_DIR)/limine-uefi-cd.bin iso_root/
 	@mkdir -p iso_root/EFI/BOOT
 	@cp $(LIMINE_DIR)/BOOTX64.EFI iso_root/EFI/BOOT/
 	@cp $(LIMINE_DIR)/BOOTIA32.EFI iso_root/EFI/BOOT/
-	@xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
+	@echo "Final ISO structure before xorriso:"
+	@find iso_root -type f
+	@xorriso -as mkisofs -R -r -J -b limine-bios-cd.bin \
         -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
-        -apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin \
+        -apm-block-size 2048 --efi-boot limine-uefi-cd.bin \
         -efi-boot-part --efi-boot-image --protective-msdos-label \
         iso_root -o grahaos.iso
 	@$(LIMINE_DIR)/limine bios-install grahaos.iso
 	@rm -rf iso_root
 	@echo "Build complete: grahaos.iso"
 
+# Create the initrd containing user programs
+initrd.tar: userland
+	@echo "Creating initrd..."
+	@mkdir -p initrd_root/bin
+	@cp user/grahai initrd_root/bin/
+	@$(TAR) -cf initrd.tar -C initrd_root bin
+	@rm -rf initrd_root
+	@echo "initrd.tar created successfully"
+
+# Build user-space programs
+userland:
+	@echo "Building user programs..."
+	@$(MAKE) -C user PREFIX=$(PREFIX) TARGET=$(TARGET)
+
 # Link the kernel using LD directly (as requested)
 kernel/kernel.elf: $(OBJECTS) linker.ld
 	@echo "Linking kernel with LD..."
 	@echo "Objects to link: $(words $(OBJECTS)) files"
-	@echo "Linking with objects: $(OBJECTS)"
 	@$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
 
 # Compile C source files
@@ -105,10 +128,11 @@ debug: grahaos.iso
 	@echo "Starting QEMU with GDB support..."
 	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -s -S
 
-# Clean up build artifacts
+# Clean up build artifacts (updated to include user programs and initrd)
 clean:
 	@echo "Cleaning up..."
-	@rm -rf $(C_OBJECTS) $(ASM_OBJECTS) $(DEPS) kernel/kernel.elf grahaos.iso iso_root
+	@rm -rf $(C_OBJECTS) $(ASM_OBJECTS) $(DEPS) kernel/kernel.elf grahaos.iso iso_root initrd.tar initrd_root
+	@$(MAKE) -C user clean
 
 # Show detailed build information
 info:
@@ -133,7 +157,8 @@ info:
 # Help target
 help:
 	@echo "Available targets:"
-	@echo "  all      - Build the OS ISO (default)"
+	@echo "  all      - Build the OS ISO with initrd (default)"
+	@echo "  userland - Build user-space programs"
 	@echo "  run      - Build and run in QEMU"
 	@echo "  debug    - Build and run in QEMU with GDB support"
 	@echo "  clean    - Clean build artifacts"

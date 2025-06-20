@@ -20,7 +20,10 @@
 
 static struct gdt_entry gdt[GDT_ENTRIES];
 static struct gdt_ptr gdt_pointer;
-static struct tss kernel_tss;
+
+// --- THE FIX ---
+// The TSS must be a global, non-static variable so the scheduler can access it.
+struct tss kernel_tss;
 
 // External assembly functions
 extern void gdt_load(struct gdt_ptr *gdt_ptr);

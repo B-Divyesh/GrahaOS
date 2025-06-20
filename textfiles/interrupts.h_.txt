@@ -4,16 +4,46 @@
 #pragma once
 #include <stdint.h>
 
-// Structure representing the CPU state when an interrupt occurs
-// This matches the order of registers pushed by our assembly stubs
+// This structure represents the CPU state saved on the stack by an interrupt or syscall.
+// The order of fields MUST EXACTLY match the order of `push` operations in the
+// corresponding assembly handlers.
+//
+// Stack layout from low address to high address:
+// [r15, r14, ..., rax, int_no, err_code, rip, cs, rflags, rsp, ss]
+//
+// Assembly Push Order: push err_code, THEN push int_no.
+// This means int_no is at a lower memory address than err_code.
 struct interrupt_frame {
-    // Registers pushed by our stub
-    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
-    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
-    // Interrupt number and error code (pushed by stub)
-    uint64_t int_no, err_code;
-    // Pushed automatically by CPU on interrupt
-    uint64_t rip, cs, rflags, rsp, ss;
+    // General purpose registers pushed by our assembly stubs.
+    // This order is the REVERSE of the push order (push rax...push r15).
+    uint64_t r15;
+    uint64_t r14;
+    uint64_t r13;
+    uint64_t r12;
+    uint64_t r11;
+    uint64_t r10;
+    uint64_t r9;
+    uint64_t r8;
+    uint64_t rbp;
+    uint64_t rdi;
+    uint64_t rsi;
+    uint64_t rdx;
+    uint64_t rcx;
+    uint64_t rbx;
+    uint64_t rax;
+
+    // --- THE DEFINITIVE FIX ---
+    // The assembly pushes `int_no` LAST, so it is at the lowest address.
+    // Therefore, it must come FIRST in the C struct definition.
+    uint64_t int_no;
+    uint64_t err_code;
+
+    // Pushed automatically by the CPU on interrupt/exception
+    uint64_t rip;
+    uint64_t cs;
+    uint64_t rflags;
+    uint64_t rsp;
+    uint64_t ss;
 };
 
 /**

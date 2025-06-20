@@ -4,7 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include "limine.h"
+#include "initrd.h"  // Include initrd support
+#include "elf.h"     // Include ELF validation and loading
 #include "../drivers/video/framebuffer.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
@@ -62,10 +65,13 @@ static volatile struct limine_hhdm_request hhdm_request = {
     .response = NULL
 };
 
-// --- NEW: External reference to the user code ---
-// The `_start_user` symbol is defined in `arch/x86_64/user/user.S`.
-// The linker will provide its virtual address within the kernel's ELF file.
-extern void _start_user(void);
+// Limine module request for the initrd
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_module_request module_request = {
+    .id = LIMINE_MODULE_REQUEST,
+    .revision = 0,
+    .response = NULL
+};
 
 // GCC and Clang reserve the right to generate calls to the following
 // 4 functions even if they are not directly called.
@@ -180,7 +186,8 @@ void kmain(void) {
     if (framebuffer_request.response == NULL ||
         memmap_request.response == NULL ||
         executable_address_request.response == NULL ||
-        hhdm_request.response == NULL) {
+        hhdm_request.response == NULL ||
+        module_request.response == NULL) {
         hcf();
     }
 
@@ -192,14 +199,14 @@ void kmain(void) {
     // Clear the screen to a dark blue-gray
     framebuffer_clear(0x00101828);
 
-    // Draw a welcome banner - Updated for Phase 5a
+    // UPDATED: Banner for Phase 5b-ii
     framebuffer_draw_rect(50, 50, 600, 140, COLOR_GRAHA_BLUE);
     framebuffer_draw_rect(52, 52, 596, 136, 0x00004488); // Inner darker blue
     framebuffer_draw_rect(54, 54, 592, 132, 0x000066AA); // Lighter inner
 
-    // Draw the main title - Updated for Phase 5a
-    framebuffer_draw_string("GrahaOS - Phase 5a: User Mode", 70, 70, COLOR_WHITE, 0x000066AA);
-    framebuffer_draw_string("Entering Ring 3", 70, 90, COLOR_LIGHT_GRAY, 0x000066AA);
+    // Draw the main title - Updated for Phase 5b-ii
+    framebuffer_draw_string("GrahaOS - Phase 5b-ii: ELF Execution", 70, 70, COLOR_WHITE, 0x000066AA);
+    framebuffer_draw_string("Loading and Running User Programs", 70, 90, COLOR_LIGHT_GRAY, 0x000066AA);
 
     // Draw decorative elements
     framebuffer_draw_rect_outline(40, 40, 620, 160, COLOR_WHITE);
@@ -207,44 +214,9 @@ void kmain(void) {
 
     int y_pos = 220;
 
-    // --- GDT, IDT, PMM, VMM Initialization ---
-    // This sequence is now critical as it sets up the entire memory and CPU environment.
-    gdt_init();
-    framebuffer_draw_string("GDT & TSS Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    y_pos += 20;
-
-    idt_init();
-    framebuffer_draw_string("IDT Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    y_pos += 20;
-
-    pmm_init(memmap_request.response);
-    framebuffer_draw_string("PMM Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    y_pos += 20;
-
-    // Display memory statistics (before VMM initialization)
-    uint64_t total_mb = pmm_get_total_memory() / (1024 * 1024);
-    uint64_t free_mb = pmm_get_free_memory() / (1024 * 1024);
-
-    char total_str[32];
-    char free_str[32];
-    uint_to_string(total_mb, total_str);
-    uint_to_string(free_mb, free_str);
-
-    framebuffer_draw_string("Total Memory: ", 50, y_pos, COLOR_CYAN, 0x00101828);
-    framebuffer_draw_string(total_str, 170, y_pos, COLOR_CYAN, 0x00101828);
-    framebuffer_draw_string(" MB", 250, y_pos, COLOR_CYAN, 0x00101828);
-    y_pos += 20;
-
-    framebuffer_draw_string("Free Memory:  ", 50, y_pos, COLOR_CYAN, 0x00101828);
-    framebuffer_draw_string(free_str, 170, y_pos, COLOR_CYAN, 0x00101828);
-    framebuffer_draw_string(" MB", 250, y_pos, COLOR_CYAN, 0x00101828);
-    y_pos += 40;
-
-    // --- Initialize Virtual Memory Manager ---
-    framebuffer_draw_string("VMM: Initializing and enabling paging...", 50, y_pos, COLOR_YELLOW, 0x00101828);
-    y_pos += 20;
-
-    // Get kernel addresses using the proper Limine requests
+    // --- INITIALIZATION SEQUENCE ---
+    
+    // 1. Get critical memory information from Limine FIRST.
     uint64_t kernel_phys_base = executable_address_request.response->physical_base;
     uint64_t kernel_virt_base = executable_address_request.response->virtual_base;
     uint64_t hhdm_offset = hhdm_request.response->offset;
@@ -265,66 +237,147 @@ void kmain(void) {
 
     framebuffer_draw_string("Higher-half direct map: 0x", 50, y_pos, COLOR_CYAN, 0x00101828);
     framebuffer_draw_string(hhdm_str, 250, y_pos, COLOR_CYAN, 0x00101828);
-    y_pos += 60;
+    y_pos += 40;
 
-    // --- Initialize Virtual Memory Manager ---
+    // 2. Initialize Physical Memory Manager (PMM).
+    pmm_init(memmap_request.response);
+    framebuffer_draw_string("PMM Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    // Display memory statistics (after PMM initialization)
+    uint64_t total_mb = pmm_get_total_memory() / (1024 * 1024);
+    uint64_t free_mb = pmm_get_free_memory() / (1024 * 1024);
+
+    char total_str[32];
+    char free_str[32];
+    uint_to_string(total_mb, total_str);
+    uint_to_string(free_mb, free_str);
+
+    framebuffer_draw_string("Total Memory: ", 50, y_pos, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string(total_str, 170, y_pos, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string(" MB", 250, y_pos, COLOR_CYAN, 0x00101828);
+    y_pos += 20;
+
+    framebuffer_draw_string("Free Memory:  ", 50, y_pos, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string(free_str, 170, y_pos, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string(" MB", 250, y_pos, COLOR_CYAN, 0x00101828);
+    y_pos += 40;
+
+    // 3. Initialize Virtual Memory Manager (VMM).
+    framebuffer_draw_string("VMM: Initializing and enabling paging...", 50, y_pos, COLOR_YELLOW, 0x00101828);
+    y_pos += 20;
+
     vmm_init(memmap_request.response, framebuffer_request.response, kernel_phys_base, kernel_virt_base, hhdm_offset);
     framebuffer_init(&framebuffer_request); // Re-init with virtual addresses
     framebuffer_draw_string("VMM Initialized. Paging is now active!", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 40;
 
-    // --- Phase 4 & 5a Initialization ---
-    
+    // 4. Initialize GDT and TSS.
+    gdt_init();
+    framebuffer_draw_string("GDT & TSS Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    // 5. Initialize IDT, Syscalls, and Scheduler.
+    idt_init();
+    framebuffer_draw_string("IDT Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
     sched_init();
     framebuffer_draw_string("Scheduler Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
     syscall_init();
     framebuffer_draw_string("Syscall Interface Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    y_pos += 20;
-
-    // --- Create the First User-Mode Process ---
-    // This is the core of Phase 5a.
-    framebuffer_draw_string("Creating first user process...", 50, y_pos, COLOR_YELLOW, 0x00101828);
-    
-    // 1. Get the virtual address of our user code, provided by the linker.
-    uint64_t user_code_virt_addr = (uint64_t)&_start_user;
-    
-    // 2. Calculate its physical address. Since it's part of the kernel ELF,
-    //    we can find its physical location by subtracting the kernel's virtual base
-    //    and adding its physical base.
-    uint64_t user_code_phys_addr = user_code_virt_addr - kernel_virt_base + kernel_phys_base;
-
-    // 3. Call the new scheduler function to create the process.
-    //    It will set up a new address space and map the physical page containing
-    //    our user code to a virtual address (0x400000) inside that new space.
-    if (sched_create_user_process((void*)user_code_phys_addr) != -1) {
-        framebuffer_draw_string("User process created successfully.", 50, y_pos + 20, COLOR_GREEN, 0x00101828);
-    } else {
-        framebuffer_draw_string("Failed to create user process.", 50, y_pos + 20, COLOR_RED, 0x00101828);
-        hcf();
-    }
     y_pos += 40;
 
-    // --- Start Multitasking ---
-    // Initialize the PIT and enable interrupts. This will fire the first timer
-    // interrupt, which will call the scheduler and start the context switching.
-    pit_init(100); // 100 Hz
+    // --- PHASE 5b-ii: ELF Loading and Execution ---
+    framebuffer_draw_string("=== Phase 5b-ii: ELF Execution ===", 50, y_pos, COLOR_WHITE, 0x00101828);
+    y_pos += 30;
+
+    // Initialize the initrd subsystem
+    initrd_init(&module_request);
+    framebuffer_draw_string("Initrd initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    // Look for the grahai executable in the initrd
+    size_t grahai_size;
+    void *grahai_data = initrd_lookup("bin/grahai", &grahai_size);
+    if (!grahai_data) {
+        framebuffer_draw_string("FATAL: Could not find bin/grahai in initrd!", 50, y_pos, COLOR_RED, 0x00101828);
+        hcf();
+    }
+    framebuffer_draw_string("Found bin/grahai in initrd.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    // Display file size
+    char size_str[32];
+    uint_to_string(grahai_size, size_str);
+    framebuffer_draw_string("File size: ", 50, y_pos, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string(size_str, 130, y_pos, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string(" bytes", 200, y_pos, COLOR_CYAN, 0x00101828);
+    y_pos += 20;
+
+    // NEW: Load the ELF file into memory and get entry point + CR3
+    uint64_t entry_point, cr3;
+    if (!elf_load(grahai_data, &entry_point, &cr3)) {
+        framebuffer_draw_string("FATAL: Failed to load ELF file!", 50, y_pos, COLOR_RED, 0x00101828);
+        hcf();
+    }
+    
+    framebuffer_draw_string("ELF loaded successfully into memory.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+    
+    // Display the loaded ELF entry point and CR3
+    char entry_str[17], cr3_str[17];
+    hex_to_string(entry_point, entry_str);
+    hex_to_string(cr3, cr3_str);
+    framebuffer_draw_string("Entry Point: 0x", 50, y_pos, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string(entry_str, 170, y_pos, COLOR_CYAN, 0x00101828);
+    y_pos += 20;
+
+    framebuffer_draw_string("Process CR3: 0x", 50, y_pos, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string(cr3_str, 170, y_pos, COLOR_CYAN, 0x00101828);
+    y_pos += 30;
+
+    // NEW: Create a user process with the loaded ELF
+    int process_id = sched_create_user_process(entry_point, cr3);
+    if (process_id == -1) {
+        framebuffer_draw_string("FATAL: Failed to create user process!", 50, y_pos, COLOR_RED, 0x00101828);
+        hcf();
+    }
+
+    char pid_str[16];
+    uint_to_string(process_id, pid_str);
+    framebuffer_draw_string("User process created with ID: ", 50, y_pos, COLOR_GREEN, 0x00101828);
+    framebuffer_draw_string(pid_str, 280, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 30;
+
+    framebuffer_draw_string("=== Starting Process Execution ===", 50, y_pos, COLOR_WHITE, 0x00101828);
+    y_pos += 20;
+
+    // NEW: Start the timer and scheduler to begin execution
+    pit_init(100); // 100 Hz timer
     framebuffer_draw_string("PIT Initialized to 100 Hz.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
     
-    irq_init(); // Remap PIC and call `sti`
-    // Add a small delay to ensure PIT is working
-    for (volatile int i = 0; i < 1000000; i++);
+    irq_init(); // Remap PIC and enable interrupts
     framebuffer_draw_string("IRQs Initialized and Enabled.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    y_pos += 40;
+    
+    // --- CRITICAL ADDITION ---
+    // Add a visual separator in the right half to indicate where user output appears.
+    framebuffer_draw_rect(400, 220, 2, framebuffer_get_height() - 240, COLOR_GRAHA_BLUE);
+    framebuffer_draw_string("User Output ->", 400, 240, COLOR_YELLOW, 0x00101828);
 
-    framebuffer_draw_string("Phase 5a Complete: User Mode Active!", 50, y_pos, COLOR_WHITE, 0x00101828);
-    framebuffer_draw_string("Watch for magenta syscall message...", 50, y_pos + 20, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string("Phase 5b-ii: Transferring control to scheduler...", 400, 200, COLOR_YELLOW, 0x00101828);
+    framebuffer_draw_string("User program should start executing now!", 400, 180, COLOR_WHITE, 0x00101828);
 
-    // The kernel's main task no longer does anything useful. It just yields
-    // to the scheduler by halting. The timer interrupt will wake it up, and
-    // the scheduler will switch to other tasks.
+    // NEW: The kernel's main task is now complete. It yields to the scheduler.
+    // The user program (grahai) should start running and using syscalls.
+    
+    framebuffer_draw_string("Kernel initialization complete.", 400, 260, COLOR_GREEN, 0x00101828);
+    framebuffer_draw_string("Waiting for timer interrupts to start scheduling...", 400, 280, COLOR_YELLOW, 0x00101828);
+    
+    // Simple approach: Just wait for timer interrupts to trigger the scheduler
     while (1) {
         asm ("hlt");
     }

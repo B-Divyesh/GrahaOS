@@ -54,6 +54,10 @@ struct tss {
     uint16_t iopb_offset;
 } __attribute__((packed));
 
+// --- THE FIX ---
+// Expose the kernel_tss so the scheduler can modify its rsp0 field.
+extern struct tss kernel_tss;
+
 /**
  * @brief Initialize the Global Descriptor Table
  * Sets up kernel code and data segments for x86_64 long mode

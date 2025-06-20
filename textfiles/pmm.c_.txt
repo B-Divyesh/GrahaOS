@@ -3,6 +3,7 @@
 
 #include "pmm.h"
 #include <stdbool.h>
+#include <stddef.h> // For NULL
 
 // Simple bitmap-based physical memory manager
 static uint8_t *bitmap = NULL;
@@ -30,7 +31,10 @@ static bool bitmap_test_bit(uint64_t page) {
     return (bitmap[byte] & (1 << bit)) != 0;
 }
 
-void pmm_init(struct limine_memmap_response *memmap_response) {
+// FIXED: Accept volatile pointer but use non-volatile local variable
+void pmm_init(volatile struct limine_memmap_response *memmap_response) {
+    // FIX: The local variable `entries` should not be volatile.
+    // We are reading a value from a volatile location into a stable local variable.
     struct limine_memmap_entry **entries = memmap_response->entries;
     uint64_t entry_count = memmap_response->entry_count;
     uint64_t highest_addr = 0;
@@ -123,6 +127,32 @@ void *pmm_alloc_page(void) {
     }
 
     return NULL; // Out of memory
+}
+
+// Function to allocate multiple contiguous pages
+void *pmm_alloc_pages(size_t num_pages) {
+    if (num_pages == 0) return NULL;
+    if (num_pages == 1) return pmm_alloc_page();
+
+    uint64_t consecutive_pages = 0;
+    for (uint64_t i = 0; i < total_pages; i++) {
+        if (!bitmap_test_bit(i)) {
+            consecutive_pages++;
+        } else {
+            consecutive_pages = 0;
+        }
+
+        if (consecutive_pages == num_pages) {
+            uint64_t start_page = i - num_pages + 1;
+            for (uint64_t j = 0; j < num_pages; j++) {
+                bitmap_set_bit(start_page + j);
+                used_pages++;
+            }
+            return (void *)(start_page * PAGE_SIZE);
+        }
+    }
+
+    return NULL; // Not enough contiguous pages
 }
 
 void pmm_free_page(void *page) {

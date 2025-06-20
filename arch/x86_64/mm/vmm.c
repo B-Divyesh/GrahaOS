@@ -12,6 +12,10 @@ uint64_t g_hhdm_offset = 0;
 // The kernel's address space.
 static vmm_address_space_t kernel_space;
 
+// --- MODIFICATION: Make the pool non-static so sched.c can access it ---
+vmm_address_space_t address_space_pool[MAX_ADDRESS_SPACES];
+static int next_address_space_idx = 0;
+
 // Internal helper functions
 static void vmm_memset(void *s, int c, size_t n) {
     uint8_t *p = (uint8_t *)s;
@@ -22,6 +26,7 @@ static void vmm_memset(void *s, int c, size_t n) {
 
 // Helper function to get the physical address of the PML4 table.
 static uint64_t get_pml4_phys(vmm_address_space_t *addr_space) {
+    if (!addr_space || !addr_space->top_level) return 0;
     return (uint64_t)addr_space->top_level - g_hhdm_offset;
 }
 
@@ -65,6 +70,7 @@ static void vmm_hex_to_string(uint64_t value, char *buffer) {
 }
 
 bool vmm_map_page(vmm_address_space_t *addr_space, uint64_t virt, uint64_t phys, uint64_t flags) {
+    if (!addr_space || !addr_space->top_level) return false;
 
     // Calculate indices for each page table level.
     uint64_t pml4_index = (virt >> 39) & 0x1FF;
@@ -75,28 +81,31 @@ bool vmm_map_page(vmm_address_space_t *addr_space, uint64_t virt, uint64_t phys,
     // Level 1: Page Map Level 4 (PML4)
     uint64_t *pml4 = addr_space->top_level;
     if (!(pml4[pml4_index] & PTE_PRESENT)) {
-        uint64_t *pdpt = pmm_alloc_page();
-        if (!pdpt) return false;
-        vmm_memset((void*)((uint64_t)pdpt + g_hhdm_offset), 0, PAGE_SIZE);
-        pml4[pml4_index] = (uint64_t)pdpt | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+        void *pdpt_phys = pmm_alloc_page();
+        if (!pdpt_phys) return false;
+        uint64_t *pdpt_virt = (uint64_t*)((uint64_t)pdpt_phys + g_hhdm_offset);
+        vmm_memset(pdpt_virt, 0, PAGE_SIZE);
+        pml4[pml4_index] = (uint64_t)pdpt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
     }
 
     // Level 2: Page Directory Pointer Table (PDPT)
     uint64_t *pdpt = (uint64_t*)((pml4[pml4_index] & PAGE_MASK) + g_hhdm_offset);
     if (!(pdpt[pdpt_index] & PTE_PRESENT)) {
-        uint64_t *pd = pmm_alloc_page();
-        if (!pd) return false;
-        vmm_memset((void*)((uint64_t)pd + g_hhdm_offset), 0, PAGE_SIZE);
-        pdpt[pdpt_index] = (uint64_t)pd | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+        void *pd_phys = pmm_alloc_page();
+        if (!pd_phys) return false;
+        uint64_t *pd_virt = (uint64_t*)((uint64_t)pd_phys + g_hhdm_offset);
+        vmm_memset(pd_virt, 0, PAGE_SIZE);
+        pdpt[pdpt_index] = (uint64_t)pd_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
     }
 
     // Level 3: Page Directory (PD)
     uint64_t *pd = (uint64_t*)((pdpt[pdpt_index] & PAGE_MASK) + g_hhdm_offset);
     if (!(pd[pd_index] & PTE_PRESENT)) {
-        uint64_t *pt = pmm_alloc_page();
-        if (!pt) return false;
-        vmm_memset((void*)((uint64_t)pt + g_hhdm_offset), 0, PAGE_SIZE);
-        pd[pd_index] = (uint64_t)pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+        void *pt_phys = pmm_alloc_page();
+        if (!pt_phys) return false;
+        uint64_t* pt_virt = (uint64_t*)((uint64_t)pt_phys + g_hhdm_offset);
+        vmm_memset(pt_virt, 0, PAGE_SIZE);
+        pd[pd_index] = (uint64_t)pt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
     }
 
     // Level 4: Page Table (PT)
@@ -139,7 +148,7 @@ void vmm_init(
     g_hhdm_offset = hhdm_offset;
 
     // 1. Create a new, blank address space for the kernel.
-    uint64_t *pml4_phys = pmm_alloc_page();
+    void *pml4_phys = pmm_alloc_page();
     if (!pml4_phys) {
         asm volatile ("cli; hlt");
     }
@@ -173,12 +182,8 @@ void vmm_init(
     vmm_switch_address_space(&kernel_space);
 }
 
-// Static array to hold address spaces (simplified for Phase 5a)
-static vmm_address_space_t address_spaces[MAX_ADDRESS_SPACES];
-static int next_address_space = 0;
-
 uint64_t vmm_get_pml4_phys(vmm_address_space_t *addr_space) {
-    return (uint64_t)addr_space->top_level - g_hhdm_offset;
+    return get_pml4_phys(addr_space);
 }
 
 void vmm_switch_address_space_phys(uint64_t pml4_phys) {
@@ -187,14 +192,14 @@ void vmm_switch_address_space_phys(uint64_t pml4_phys) {
 
 vmm_address_space_t* vmm_create_address_space(void) {
     // Check if we have space for another address space
-    if (next_address_space >= MAX_ADDRESS_SPACES) {
+    if (next_address_space_idx >= MAX_ADDRESS_SPACES) {
         return NULL;
     }
 
-    vmm_address_space_t *space = &address_spaces[next_address_space++];
+    vmm_address_space_t *space = &address_space_pool[next_address_space_idx++];
     
     // Allocate a new PML4 table
-    uint64_t *pml4_phys = pmm_alloc_page();
+    void *pml4_phys = pmm_alloc_page();
     if (!pml4_phys) {
         return NULL;
     }
@@ -206,9 +211,9 @@ vmm_address_space_t* vmm_create_address_space(void) {
     // Every address space needs the kernel and HHDM mapped.
     // We can copy the kernel mappings from the initial kernel_space.
     // The top half of the PML4 (entries 256-511) are for the kernel.
-    vmm_address_space_t *kernel_space = vmm_get_kernel_space();
+    vmm_address_space_t *k_space = vmm_get_kernel_space();
     for (int i = 256; i < 512; i++) {
-        space->top_level[i] = kernel_space->top_level[i];
+        space->top_level[i] = k_space->top_level[i];
     }
 
     return space;

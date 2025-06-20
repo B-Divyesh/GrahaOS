@@ -58,39 +58,86 @@ static void hcf(void) {
     }
 }
 
-// Helper to print a hex value, useful for debugging registers
-static void print_hex(uint64_t value) {
+// Helper to print a hex value at a specific screen location
+static void print_hex_at(uint64_t value, int x, int y) {
     char buffer[17] = {0};
     const char *hex_chars = "0123456789ABCDEF";
-    for (int i = 15; i >= 0; i--) {
+    buffer[0] = '0';
+    buffer[1] = 'x';
+    for (int i = 15; i >= 2; i--) {
         buffer[i] = hex_chars[value & 0xF];
         value >>= 4;
     }
-    framebuffer_draw_string(buffer, framebuffer_get_width() - 16*8 - 10, 10, COLOR_WHITE, COLOR_RED);
+    framebuffer_draw_string(buffer, x, y, COLOR_WHITE, COLOR_RED);
 }
 
-// The main C-level interrupt handler, renamed to match expected function name
+// The main C-level interrupt handler, with corrected page fault diagnostics
 void interrupt_handler(struct interrupt_frame *frame) {
     if (frame->int_no == 14) { // Page Fault
         uint64_t fault_addr;
         asm volatile("mov %%cr2, %0" : "=r"(fault_addr)); // Get faulting address from CR2
 
-        framebuffer_draw_string("CPU Exception: 0E (Page Fault)", 10, 10, COLOR_RED, COLOR_BLACK);
-        framebuffer_draw_string("Faulting Address:", 10, 30, COLOR_RED, COLOR_BLACK);
-        print_hex(fault_addr); // Print the address that caused the fault
-        framebuffer_draw_string("Instruction Ptr:", 10, 50, COLOR_RED, COLOR_BLACK);
-        print_hex(frame->rip); // Print the instruction that caused the fault
+        // Create a red banner for the error message
+        framebuffer_draw_rect(0, 0, framebuffer_get_width(), 120, COLOR_RED);
+        framebuffer_draw_string("CPU Exception: 0E (Page Fault)", 10, 10, COLOR_WHITE, COLOR_RED);
+        
+        // Print faulting address and instruction pointer on separate lines
+        framebuffer_draw_string("Faulting Address:", 10, 30, COLOR_WHITE, COLOR_RED);
+        print_hex_at(fault_addr, 180, 30);
+
+        framebuffer_draw_string("Instruction Ptr:", 10, 50, COLOR_WHITE, COLOR_RED);
+        print_hex_at(frame->rip, 180, 50);
+
+        framebuffer_draw_string("Error Code:", 10, 70, COLOR_WHITE, COLOR_RED);
+        print_hex_at(frame->err_code, 180, 70);
+        
+        // Decode error code
+        if (frame->err_code & 4) {
+            framebuffer_draw_string("USER MODE fault", 10, 90, COLOR_WHITE, COLOR_RED);
+        } else {
+            framebuffer_draw_string("KERNEL MODE fault", 10, 90, COLOR_WHITE, COLOR_RED);
+        }
+
         hcf();
     }
 
     if (frame->int_no < 32) {
         // Is a CPU exception
-        char msg[] = "CPU Exception: 00";
+        char msg[] = "CPU Exception: 00 at RIP=0x00000000";
         char hex[] = "0123456789ABCDEF";
         msg[15] = hex[(frame->int_no >> 4) & 0xF];
         msg[16] = hex[frame->int_no & 0xF];
-        framebuffer_draw_string(msg, 10, 10, COLOR_RED, COLOR_BLACK);
-        hcf(); // Halt on any exception
+        
+        // Add RIP to the error message
+        uint64_t rip = frame->rip;
+        for (int i = 0; i < 8; i++) {
+            uint8_t nibble = (rip >> (28 - i * 4)) & 0xF;
+            msg[26 + i] = (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
+        }
+        
+        framebuffer_draw_rect(0, 0, framebuffer_get_width(), 90, COLOR_RED);
+        framebuffer_draw_string(msg, 10, 10, COLOR_WHITE, COLOR_RED);
+        
+        // Show what type of exception this is
+        if (frame->int_no == 6) {
+            framebuffer_draw_string("Invalid Opcode (#UD) - syscall not supported?", 10, 30, COLOR_WHITE, COLOR_RED);
+        } else if (frame->int_no == 13) {
+            framebuffer_draw_string("General Protection Fault (#GP)", 10, 30, COLOR_WHITE, COLOR_RED);
+        } else {
+            framebuffer_draw_string("User process crashed!", 10, 30, COLOR_WHITE, COLOR_RED);
+        }
+        
+        // Show if it's user or kernel mode
+        if (frame->cs & 3) {
+            framebuffer_draw_string("USER MODE exception", 10, 50, COLOR_WHITE, COLOR_RED);
+        } else {
+            framebuffer_draw_string("KERNEL MODE exception", 10, 50, COLOR_WHITE, COLOR_RED);
+        }
+        
+        framebuffer_draw_string("Error code:", 10, 70, COLOR_WHITE, COLOR_RED);
+        print_hex_at(frame->err_code, 120, 70);
+        
+        hcf(); // Halt on any other exception
     } else if (frame->int_no >= 32 && frame->int_no < 48) {
         // Is a hardware IRQ
         if (frame->int_no == 32) { // IRQ0: Timer

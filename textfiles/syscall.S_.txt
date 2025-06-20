@@ -1,74 +1,97 @@
 ; Original location: ./arch/x86_64/cpu/syscall/syscall.S
 ; Original extension: S
 
+; arch/x86_64/cpu/syscall/syscall.S
 bits 64
 section .text
 
 global syscall_entry
 extern syscall_dispatcher
 
+; Debug variables are defined in syscall.c - we just need to reference them
+extern syscall_entry_reached
+extern syscall_about_to_return
+extern syscall_frame_created
+extern syscall_pre_dispatch
+
+section .text
+
 syscall_entry:
-    ; We have just entered from user-mode via the `syscall` instruction.
-    ; The CPU has saved:
-    ;   - Return RIP -> RCX
-    ;   - Return RFLAGS -> R11
-    ; It has NOT saved the user stack (RSP) or any other registers.
-    ; We are now on the kernel stack (RSP0) specified in the TSS.
-
-    ; We must save all registers to construct a valid `interrupt_frame`.
-    ; The order MUST match the struct definition in interrupts.h.
-
-    ; 1. Save GPRs that are NOT part of the CPU-saved state for iretq.
-    push r15
-    push r14
-    push r13
-    push r12
-    push r10
-    push r9
-    push r8
-    push rbp
-    push rdi
-    push rsi
-    push rdx
-    push rbx
+    ; Debug: Mark that we've reached the syscall entry point
+    mov qword [syscall_entry_reached], 1
     
-    ; 2. Now, save the registers that `syscall` modified, preserving their
-    ;    original user-mode values for the C handler and for `sysretq`.
-    push r11  ; User RFLAGS
-    push rcx  ; User RIP
+    ; We have entered from user mode via the `syscall` instruction.
+    ; The CPU has saved user RIP -> RCX and user RFLAGS -> R11.
+    ; We are on the kernel stack provided by the TSS.
     
-    ; 3. Finally, save RAX, which contains the syscall number.
+    ; --- THE DEFINITIVE FIX ---
+    ; To ensure full compatibility with the scheduler and interrupt frame,
+    ; we must create a stack frame that is IDENTICAL to an interrupt_frame.
+    ; We push two dummy values for the error code and interrupt number.
+    ; The syscall number (in RAX) can be used as the "interrupt number".
+    push 0          ; Dummy Error Code (err_code field)
+    push rax        ; Push the syscall number as the "interrupt number" (int_no field)
+    
+    ; Now, save all general-purpose registers in the standard, consistent order
+    ; This MUST match the exact order expected by struct interrupt_frame
     push rax
+    push rbx
+    push rcx    ; User RIP (saved by CPU during syscall instruction)
+    push rdx
+    push rsi    ; Second syscall argument
+    push rdi    ; First syscall argument
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11    ; User RFLAGS (saved by CPU during syscall instruction)
+    push r12
+    push r13
+    push r14
+    push r15
 
-    ; At this point, the top of the stack contains the general-purpose registers.
-    ; The C handler `syscall_dispatcher` expects a pointer to a full
-    ; `interrupt_frame`. The current RSP is NOT a valid pointer to this struct yet.
-    ; We will pass the current RSP as the frame pointer. The C code will
-    ; correctly access members like `rax`, `rbx`, etc.
+    ; Debug: Mark that we've created the interrupt_frame compatible stack
+    mov qword [syscall_frame_created], 1
     
-    mov rdi, rsp  ; Pass pointer to the saved registers to the C handler.
+    ; The stack now perfectly matches the layout of `struct interrupt_frame`.
+    ; This is critical for scheduler compatibility - prevents stack corruption.
+    
+    ; Debug: Mark that we're about to dispatch
+    mov qword [syscall_pre_dispatch], 1
+    
+    ; Pass a pointer to the interrupt_frame (current RSP) to our C handler
+    mov rdi, rsp
     call syscall_dispatcher
 
-    ; The C handler returns the result in RAX. `sysretq` expects the return
-    ; value to be in RAX, so we don't need to do anything with it.
+    ; Debug: Mark that we're about to return from syscall
+    mov qword [syscall_about_to_return], 1
 
-    ; 4. Restore all registers in the exact reverse order.
-    pop rax   ; This is the original user RAX, now overwritten with the return value.
-    pop rcx   ; This is the user RIP, needed by `sysretq`.
-    pop r11   ; This is the user RFLAGS, needed by `sysretq`.
-    pop rbx
-    pop rdx
-    pop rsi
-    pop rdi
-    pop rbp
-    pop r8
-    pop r9
-    pop r10
-    pop r12
-    pop r13
-    pop r14
+    ; Restore all registers from the potentially modified frame
+    ; Pop in exact reverse order to maintain stack integrity
     pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11     ; This restores user RFLAGS to R11 for sysretq
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi     ; Restore first syscall argument
+    pop rsi     ; Restore second syscall argument  
+    pop rdx
+    pop rcx     ; This restores user RIP to RCX for sysretq
+    pop rbx
+    pop rax     ; This contains the syscall return value
 
-    ; 5. Return to user mode.
-    ; `sysretq` will restore RIP from RCX and RFLAGS from R11.
+    ; Pop the dummy error code and interrupt number we pushed earlier
+    ; This is CRITICAL - we must clean up the stack frame completely
+    add rsp, 16
+
+    ; Return to user mode using sysretq
+    ; sysretq will:
+    ; - Restore RIP from RCX (return address)
+    ; - Restore RFLAGS from R11 (processor flags)
+    ; - Switch CS to user code segment and SS to user data segment
+    ; - Switch from Ring 0 back to Ring 3
     sysretq

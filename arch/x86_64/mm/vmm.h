@@ -22,7 +22,7 @@ extern uint64_t g_hhdm_offset;
 // --- Virtual Memory Constants ---
 #define PAGE_SIZE 4096
 #define PAGE_MASK 0xFFFFFFFFFFFFF000ULL
-
+#define MAX_ADDRESS_SPACES 32
 // Virtual address space layout
 #define KERNEL_VIRTUAL_BASE 0xFFFFFFFF80000000ULL
 
@@ -30,6 +30,8 @@ extern uint64_t g_hhdm_offset;
 typedef struct {
     uint64_t *top_level;
 } vmm_address_space_t;
+
+extern vmm_address_space_t address_space_pool[MAX_ADDRESS_SPACES];
 
 /**
  * @brief Initializes the Virtual Memory Manager.

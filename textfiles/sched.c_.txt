@@ -1,14 +1,16 @@
 // Original location: ./arch/x86_64/cpu/sched/sched.c
 // Original extension: c
 
+//arch/x86_64/cpu/sched/sched.c
 #include "sched.h"
 #include "../../mm/pmm.h"
 #include "../../mm/vmm.h"
+#include "../gdt.h" // Include GDT header to access the TSS
 #include "../../../../drivers/video/framebuffer.h"
 
 static task_t tasks[MAX_TASKS];
 static int next_task_id = 0;
-static int current_task_index = 0;
+static int current_task_index = 0; // Start with task 0 (kernel task)
 
 // Simple memset implementation
 static void *memset(void *s, int c, size_t n) {
@@ -22,29 +24,32 @@ static void *memset(void *s, int c, size_t n) {
 void sched_init(void) {
     memset(tasks, 0, sizeof(tasks));
 
-    // Task 0 is the kernel task (current execution context)
+    // Task 0 is the kernel's idle task.
+    // We get its kernel stack from gdt_init.
     tasks[0].id = next_task_id++;
-    tasks[0].state = TASK_STATE_RUNNING;
-    // Capture current stack pointer for task 0
-    asm volatile ("mov %%rsp, %0" : "=r"(tasks[0].kernel_stack_top));
-    
-    // --- FIX: Store CR3 in the correct member ---
+    tasks[0].state = TASK_STATE_RUNNING; // The kernel starts as the running task
     tasks[0].cr3 = vmm_get_pml4_phys(vmm_get_kernel_space());
+    tasks[0].kernel_stack_top = kernel_tss.rsp0; // Use the stack created in gdt_init
     
     current_task_index = 0;
 }
 
 int sched_create_task(void (*entry_point)(void)) {
-    if (next_task_id >= MAX_TASKS) return -1; // No more tasks available
+    if (next_task_id >= MAX_TASKS) return -1;
 
     int id = next_task_id++;
     tasks[id].id = id;
     tasks[id].state = TASK_STATE_READY;
 
-    // Allocate a kernel stack for the new task.
-    uint64_t stack_phys = (uint64_t)pmm_alloc_page();
-    if (!stack_phys) return -1;
-    tasks[id].kernel_stack_top = stack_phys + g_hhdm_offset + KERNEL_STACK_SIZE;
+    // Allocate a DEDICATED kernel stack for this new task.
+    void* kstack_phys = pmm_alloc_page();
+    if (!kstack_phys) return -1;
+    tasks[id].kernel_stack_top = (uint64_t)kstack_phys + g_hhdm_offset + KERNEL_STACK_SIZE;
+
+    // --- THE DEFINITIVE FIX ---
+    // Map the newly allocated physical page for the kernel stack into the kernel's virtual address space
+    uint64_t kstack_base = tasks[id].kernel_stack_top - KERNEL_STACK_SIZE;
+    vmm_map_page(vmm_get_kernel_space(), kstack_base, (uint64_t)kstack_phys, PTE_PRESENT | PTE_WRITABLE);
 
     // Set up the initial register state for the new task.
     memset(&tasks[id].regs, 0, sizeof(struct interrupt_frame));
@@ -54,91 +59,207 @@ int sched_create_task(void (*entry_point)(void)) {
     tasks[id].regs.rsp = (tasks[id].kernel_stack_top - 16) & ~0xF;
     tasks[id].regs.ss = 0x10; // Kernel data segment
     
-    // --- FIX: Store CR3 in the correct member ---
     tasks[id].cr3 = vmm_get_pml4_phys(vmm_get_kernel_space()); // Kernel address space
 
     return id;
 }
 
-// --- NEW: Function to create a user-mode process ---
-int sched_create_user_process(void *elf_data) {
+// Simple function to convert a hex value to a string (kept for useful debugging)
+static void sched_hex_to_string(uint64_t value, char *buffer) {
+    const char hex_chars[] = "0123456789ABCDEF";
+    char temp[17]; // 16 hex digits + null terminator
+    int i = 0;
+
+    if (value == 0) {
+        buffer[0] = '0';
+        buffer[1] = '\0';
+        return;
+    }
+
+    while (value > 0 && i < 16) {
+        temp[i++] = hex_chars[value & 0xF];
+        value >>= 4;
+    }
+
+    // Reverse the string
+    int j;
+    for (j = 0; j < i; j++) {
+        buffer[j] = temp[i - 1 - j];
+    }
+    buffer[j] = '\0';
+}
+
+// CRITICAL FIX: Now allocates and maps the user-space stack
+int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     if (next_task_id >= MAX_TASKS) return -1;
 
     int id = next_task_id++;
     tasks[id].id = id;
-    tasks[id].state = TASK_STATE_READY;
+    tasks[id].state = TASK_STATE_READY; // The new process is ready to run
+    tasks[id].cr3 = cr3;
 
-    // Allocate a kernel stack for this process (for syscalls/interrupts)
-    uint64_t kstack_phys = (uint64_t)pmm_alloc_page();
+    // Allocate a DEDICATED kernel stack for this new process.
+    void* kstack_phys = pmm_alloc_page();
     if (!kstack_phys) return -1;
-    tasks[id].kernel_stack_top = kstack_phys + g_hhdm_offset + KERNEL_STACK_SIZE;
+    tasks[id].kernel_stack_top = (uint64_t)kstack_phys + g_hhdm_offset + KERNEL_STACK_SIZE;
 
-    // Create a new address space for the process
-    vmm_address_space_t *proc_space = vmm_create_address_space();
-    if (!proc_space) return -1;
+    // --- THE DEFINITIVE FIX ---
+    // Map the newly allocated physical page for the kernel stack into the kernel's virtual address space
+    uint64_t kstack_base = tasks[id].kernel_stack_top - KERNEL_STACK_SIZE;
+    vmm_map_page(vmm_get_kernel_space(), kstack_base, (uint64_t)kstack_phys, PTE_PRESENT | PTE_WRITABLE);
 
-    // Map the user code into the process's address space
-    // Let's map it at virtual address 0x400000
-    uint64_t user_code_phys = (uint64_t)elf_data;
-    if (!vmm_map_page(proc_space, 0x400000, user_code_phys, PTE_PRESENT | PTE_USER)) {
+    // --- THE CRITICAL FIX ---
+    // We must allocate and map the user-space stack.
+    uint64_t user_stack_addr = 0x7FFFFFFFF000;
+    void* user_stack_phys = pmm_alloc_page();
+    if (!user_stack_phys) {
+        // Clean up previously allocated kernel stack
+        pmm_free_page(kstack_phys);
         return -1;
     }
 
-    // Allocate and map a stack for the user process
-    uint64_t ustack_phys = (uint64_t)pmm_alloc_page();
-    if (!ustack_phys) return -1;
-    if (!vmm_map_page(proc_space, 0x700000, ustack_phys, PTE_PRESENT | PTE_USER | PTE_WRITABLE)) {
+    // We need a pointer to the process's address space to map the new page.
+    // Since we don't have a direct reverse lookup, we'll find it by iterating
+    // through the address space pool.
+    vmm_address_space_t* proc_space = NULL;
+    for(int i = 0; i < MAX_ADDRESS_SPACES; i++) {
+        if (vmm_get_pml4_phys(&address_space_pool[i]) == cr3) {
+            proc_space = &address_space_pool[i];
+            break;
+        }
+    }
+
+    if (proc_space == NULL) {
+        // This should never happen if elf_load was successful
+        pmm_free_page(kstack_phys);
+        pmm_free_page(user_stack_phys);
         return -1;
     }
 
-    // --- FIX: Store CR3 in the correct member ---
-    tasks[id].cr3 = vmm_get_pml4_phys(proc_space);
+    // Map the physical stack page to the virtual user stack address.
+    // The virtual address for mapping is the base of the page.
+    uint64_t user_stack_page_base = user_stack_addr - PAGE_SIZE;
+    uint64_t flags = PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    if (!vmm_map_page(proc_space, user_stack_page_base, (uint64_t)user_stack_phys, flags)) {
+        // Clean up allocated pages
+        pmm_free_page(kstack_phys);
+        pmm_free_page(user_stack_phys);
+        return -1;
+    }
+    
+    // Debug: Show user stack mapping
+    char stack_msg[64] = "User stack mapped: 0x";
+    uint64_t stack_base = user_stack_page_base;
+    for (int i = 0; i < 8; i++) {
+        uint8_t nibble = (stack_base >> (28 - i * 4)) & 0xF;
+        stack_msg[22 + i] = (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
+    }
+    stack_msg[30] = '\0';
+    framebuffer_draw_string(stack_msg, 10, 480, COLOR_CYAN, 0x00101828);
 
+    // Debug output for the provided parameters (kept - useful and not performance-critical)
+    char rip_str[32], cr3_str[32];
+    sched_hex_to_string(rip, rip_str);
+    sched_hex_to_string(cr3, cr3_str);
+    framebuffer_draw_string("Creating user process - RIP: 0x", 10, 420, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string(rip_str, 240, 420, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string("CR3: 0x", 10, 440, COLOR_CYAN, 0x00101828);
+    framebuffer_draw_string(cr3_str, 70, 440, COLOR_CYAN, 0x00101828);
+    
     // Set up the initial register state to enter user mode
     memset(&tasks[id].regs, 0, sizeof(struct interrupt_frame));
-    tasks[id].regs.rip = 0x400000; // Entry point of user code
-    tasks[id].regs.cs = 0x1B;      // User Code Segment (0x18 with DPL=3 -> 0x1B)
+    tasks[id].regs.rip = rip;
     tasks[id].regs.rflags = 0x202; // Interrupts enabled
-    tasks[id].regs.rsp = 0x700000 + PAGE_SIZE; // Top of user stack
-    tasks[id].regs.ss = 0x23;      // User Data Segment (0x20 with DPL=3 -> 0x23)
+    tasks[id].regs.rsp = user_stack_addr; // Set RSP to the top of the mapped page
+    tasks[id].regs.cs = 0x20 | 3; // User Code Selector (0x20) + RPL 3
+    tasks[id].regs.ss = 0x18 | 3; // User Data Selector (0x18) + RPL 3
+
+    // Debug output for successful process creation (kept - useful and not performance-critical)
+    framebuffer_draw_string("User process created successfully!", 10, 460, COLOR_GREEN, 0x00101828);
 
     return id;
 }
 
-// The core scheduler and context switcher.
+// External variable from syscall.c
+extern volatile uint64_t syscall_entry_reached;
+extern volatile uint64_t syscall_about_to_return;
+
 void schedule(struct interrupt_frame *frame) {
-    // 1. Save the state of the current task.
+    // Debug: Check if syscall entry and return were reached
+    static int check_count = 0;
+    check_count++;
+    if (check_count == 10) {  // Check after a few timer ticks
+        if (syscall_entry_reached) {
+            framebuffer_draw_string("SYSCALL ENTRY WAS REACHED!", 400, 500, COLOR_RED, 0x00101828);
+        }
+        if (syscall_about_to_return) {
+            framebuffer_draw_string("SYSCALL RETURN WAS REACHED!", 400, 520, COLOR_GREEN, 0x00101828);
+        }
+    }
+    
+    // Save state of the current task
     tasks[current_task_index].regs = *frame;
     if (tasks[current_task_index].state == TASK_STATE_RUNNING) {
         tasks[current_task_index].state = TASK_STATE_READY;
     }
 
-    // 2. Find the next ready task to run (round-robin).
-    int next_task_index = (current_task_index + 1) % next_task_id;
-    int attempts = 0;
-    while (tasks[next_task_index].state != TASK_STATE_READY && attempts < next_task_id) {
-        next_task_index = (next_task_index + 1) % next_task_id;
-        attempts++;
-    }
+    // --- THE DEFINITIVE FIX ---
+    // This loop correctly finds the next available ready task.
+    int original_task = current_task_index;
+    do {
+        current_task_index = (current_task_index + 1) % next_task_id;
+        // If we've looped all the way around and found nothing, just stay on the original task.
+        if (current_task_index == original_task) {
+            break;
+        }
+    } while (tasks[current_task_index].state != TASK_STATE_READY);
 
-    // If no ready tasks found, stay with current task
-    if (attempts >= next_task_id) {
-        tasks[current_task_index].state = TASK_STATE_RUNNING;
-        return; // Don't switch
-    }
-
-    // 3. Update the current task index.
-    current_task_index = next_task_index;
+    // Mark the chosen task as running
     tasks[current_task_index].state = TASK_STATE_RUNNING;
 
-    // --- FIX: Switch address space if necessary, using the correct member ---
+    // Debug output for task switching (retained)
+    char switch_msg[64];
+    switch_msg[0] = 'S'; switch_msg[1] = 'w'; switch_msg[2] = 'i'; switch_msg[3] = 't';
+    switch_msg[4] = 'c'; switch_msg[5] = 'h'; switch_msg[6] = ' '; switch_msg[7] = 't';
+    switch_msg[8] = 'o'; switch_msg[9] = ' '; switch_msg[10] = 't'; switch_msg[11] = 'a';
+    switch_msg[12] = 's'; switch_msg[13] = 'k'; switch_msg[14] = ' ';
+    switch_msg[15] = '0' + current_task_index; 
+    switch_msg[16] = ' '; switch_msg[17] = 'R'; switch_msg[18] = 'I'; switch_msg[19] = 'P';
+    switch_msg[20] = '='; switch_msg[21] = '0'; switch_msg[22] = 'x';
+    // Add hex representation of RIP
+    uint64_t rip = tasks[current_task_index].regs.rip;
+    for (int i = 0; i < 8; i++) {
+        uint8_t nibble = (rip >> (28 - i * 4)) & 0xF;
+        switch_msg[23 + i] = (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
+    }
+    switch_msg[31] = '\0';
+    framebuffer_draw_string(switch_msg, 400, 300 + (current_task_index * 20), COLOR_GREEN, 0x00101828);
+    
+    // --- THE DEFINITIVE FIX ---
+    // Update the TSS's rsp0 to point to the new task's kernel stack.
+    // The CPU will use this for all subsequent Ring 3 -> Ring 0 transitions.
+    kernel_tss.rsp0 = tasks[current_task_index].kernel_stack_top;
+    
+    // Debug: Show TSS RSP0 value (retained)
+    if (current_task_index == 1) {  // Only for user task
+        char tss_msg[32] = "TSS RSP0: 0x";
+        uint64_t rsp0 = kernel_tss.rsp0;
+        for (int i = 0; i < 8; i++) {
+            uint8_t nibble = (rsp0 >> (28 - i * 4)) & 0xF;
+            tss_msg[13 + i] = (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
+        }
+        tss_msg[21] = '\0';
+        framebuffer_draw_string(tss_msg, 400, 340, COLOR_MAGENTA, 0x00101828);
+    }
+
+    // Switch address space if necessary
     uint64_t current_cr3;
     asm volatile ("mov %%cr3, %0" : "=r"(current_cr3));
     if (current_cr3 != tasks[current_task_index].cr3) {
         vmm_switch_address_space_phys(tasks[current_task_index].cr3);
     }
 
-    // 4. Load the state of the new task.
+    // Load state of the new task into the interrupt frame
     *frame = tasks[current_task_index].regs;
 }
 
@@ -147,10 +268,7 @@ task_t* sched_get_current_task(void) {
 }
 
 task_t* sched_get_task(int id) {
-    if (id < 0 || id >= MAX_TASKS) {
-        return NULL;
-    }
-    if (tasks[id].state == TASK_STATE_ZOMBIE) {
+    if (id < 0 || id >= next_task_id || tasks[id].state == TASK_STATE_ZOMBIE) {
         return NULL;
     }
     return &tasks[id];

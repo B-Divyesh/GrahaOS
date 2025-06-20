@@ -1,16 +1,10 @@
 #pragma once
 #include <stdint.h>
+#include "../interrupts.h" // Keep for the struct definitions
 
-// Define our system call numbers
+// Define system call numbers
 #define SYS_TEST 0
-
-// This struct defines the register state passed to the C syscall handler.
-// It contains all the general-purpose registers that the user program
-// might use to pass arguments to the kernel.
-typedef struct {
-    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
-    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
-} syscall_frame_t;
+#define SYS_PUTC 1001
 
 /**
  * @brief Initializes the system call interface.
@@ -20,5 +14,6 @@ void syscall_init(void);
 /**
  * @brief The main C-level system call dispatcher.
  * @param frame The register state from the calling task.
+ *          THIS MUST USE syscall_frame, NOT interrupt_frame.
  */
-void syscall_dispatcher(syscall_frame_t *frame);
+void syscall_dispatcher(struct syscall_frame *frame); // <-- CORRECTED TYPE

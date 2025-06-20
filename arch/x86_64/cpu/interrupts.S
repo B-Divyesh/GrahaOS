@@ -13,36 +13,40 @@ isrstub%1:
     jmp isr_common      ; Jump to common handler
 %endmacro
 
-; CORRECTED common interrupt handler
+; FIXED common interrupt handler - now matches updated struct layout
+; Stack grows downward, so push order creates this memory layout:
+; [int_no][err_code][rax][rbx]...[r15][rip][cs][rflags][rsp][ss]
 isr_common:
     ; The stack currently contains:
-    ; [rsp+0]  -> int_no
-    ; [rsp+8]  -> err_code
-    ; [rsp+16] -> rip
-    ; [rsp+24] -> cs
-    ; [rsp+32] -> rflags
-    ; [rsp+40] -> rsp
-    ; [rsp+48] -> ss
+    ; [rsp+0]  -> int_no      (pushed by stub)
+    ; [rsp+8]  -> err_code    (pushed by stub or CPU)
+    ; [rsp+16] -> rip         (pushed by CPU)
+    ; [rsp+24] -> cs          (pushed by CPU)
+    ; [rsp+32] -> rflags      (pushed by CPU)
+    ; [rsp+40] -> rsp         (pushed by CPU)
+    ; [rsp+48] -> ss          (pushed by CPU)
     
-    ; Now, push the general-purpose registers in the correct order
-    ; to match the top of the `interrupt_frame` struct.
-    push r15
-    push r14
-    push r13
-    push r12
-    push r11
-    push r10
-    push r9
-    push r8
-    push rbp
-    push rdi
-    push rsi
-    push rdx
-    push rcx
-    push rbx
+    ; CRITICAL FIX: Push registers in order that matches struct interrupt_frame
+    ; The struct expects: rax, rbx, rcx, rdx, rsi, rdi, rbp, r8...r15
+    ; So we push in that exact order to create the right memory layout
     push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
 
-    ; The stack pointer (RSP) now points to a perfect `interrupt_frame`.
+    ; DEBUG: The stack pointer (RSP) now points to a perfect `interrupt_frame`.
+    ; Memory layout matches struct exactly: [int_no][err_code][rax][rbx]...[r15][rip][cs][rflags][rsp][ss]
     ; Pass this as the first argument (in RDI) to our C handler.
     mov rdi, rsp
     call interrupt_handler
@@ -50,22 +54,23 @@ isr_common:
     ; The C handler (and scheduler) may have modified the frame on the stack
     ; to switch tasks. We now restore the state from this potentially new frame.
 
-    ; Restore all general-purpose registers.
-    pop rax
-    pop rbx
-    pop rcx
-    pop rdx
-    pop rsi
-    pop rdi
-    pop rbp
-    pop r8
-    pop r9
-    pop r10
-    pop r11
-    pop r12
-    pop r13
-    pop r14
+    ; CRITICAL: Restore all general-purpose registers in perfect reverse order
+    ; This must be exact reverse of the push sequence above
     pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
 
     ; Pop the interrupt number and error code that we pushed.
     add rsp, 16

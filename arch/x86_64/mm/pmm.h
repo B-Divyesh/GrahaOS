@@ -1,3 +1,4 @@
+// arch/x86_64/mm/pmm.h
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
@@ -9,13 +10,20 @@
  * @brief Initialize the Physical Memory Manager
  * @param memmap_response Pointer to Limine memory map response
  */
-void pmm_init(struct limine_memmap_response *memmap_response);
+void pmm_init(volatile struct limine_memmap_response *memmap_response);
 
 /**
  * @brief Allocate a single physical page
  * @return Physical address of allocated page, or NULL if out of memory
  */
 void *pmm_alloc_page(void);
+
+/**
+ * @brief Allocate multiple contiguous physical pages
+ * @param num_pages Number of pages to allocate
+ * @return Physical address of first allocated page, or NULL if out of memory
+ */
+void *pmm_alloc_pages(size_t num_pages);
 
 /**
  * @brief Free a previously allocated physical page
