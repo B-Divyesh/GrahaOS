@@ -139,7 +139,10 @@ void syscall_dispatcher(struct syscall_frame *frame) { // <-- CORRECTED TYPE
         }
         int_err[20] = '\0';
         framebuffer_draw_string(int_err, 700, 600 + frame_debug_count * 16, COLOR_CYAN, 0x00101828);
+        // Should show actual user RSP value
         
+        framebuffer_draw_hex(frame->user_rsp, 100, 100, COLOR_WHITE, COLOR_BLUE);
+        framebuffer_draw_hex(frame->rcx, 100, 120, COLOR_YELLOW, COLOR_RED);
         // Debug: Show corrected frame structure verification
         framebuffer_draw_string("FIXED: Using syscall_frame struct", 700, 750, COLOR_GREEN, 0x00101828);
     }

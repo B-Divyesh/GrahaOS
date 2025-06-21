@@ -1,128 +1,98 @@
+; arch/x86_64/cpu/interrupts.S
 bits 64
-
+section .text
 extern interrupt_handler
 
-; Macro to create interrupt stubs
-; %1 = interrupt number, %2 = 1 if CPU pushes error code, 0 if not
+; Macro to create interrupt stubs that the IDT will point to.
+; %1 = interrupt number, %2 = 1 if CPU pushes error code, 0 if not.
 %macro isr_stub 2
 isrstub%1:
     %if %2 == 0
-        push 0          ; Push dummy error code
+        push 0          ; Push a dummy error code if the CPU doesn't.
     %endif
-    push %1             ; Push interrupt number
-    jmp isr_common      ; Jump to common handler
+    push %1             ; Push the interrupt number.
+    jmp isr_common      ; Jump to the common handler.
 %endmacro
 
-; FIXED common interrupt handler - now matches updated struct layout
-; Stack grows downward, so push order creates this memory layout:
-; [int_no][err_code][rax][rbx]...[r15][rip][cs][rflags][rsp][ss]
+; Common handler for all interrupts.
 isr_common:
-    ; The stack currently contains:
-    ; [rsp+0]  -> int_no      (pushed by stub)
-    ; [rsp+8]  -> err_code    (pushed by stub or CPU)
-    ; [rsp+16] -> rip         (pushed by CPU)
-    ; [rsp+24] -> cs          (pushed by CPU)
-    ; [rsp+32] -> rflags      (pushed by CPU)
-    ; [rsp+40] -> rsp         (pushed by CPU)
-    ; [rsp+48] -> ss          (pushed by CPU)
-    
-    ; CRITICAL FIX: Push registers in order that matches struct interrupt_frame
-    ; The struct expects: rax, rbx, rcx, rdx, rsi, rdi, rbp, r8...r15
-    ; So we push in that exact order to create the right memory layout
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
+    ; --- CRITICAL FIX: CORRECT PUSH ORDER ---
+    ; Push GPRs in r15..rax order to match the C struct memory layout.
     push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rbx
+    push rax
 
-    ; DEBUG: The stack pointer (RSP) now points to a perfect `interrupt_frame`.
-    ; Memory layout matches struct exactly: [int_no][err_code][rax][rbx]...[r15][rip][cs][rflags][rsp][ss]
-    ; Pass this as the first argument (in RDI) to our C handler.
+    ; Pass a pointer to the now-correct interrupt_frame to the C handler.
     mov rdi, rsp
     call interrupt_handler
 
-    ; The C handler (and scheduler) may have modified the frame on the stack
-    ; to switch tasks. We now restore the state from this potentially new frame.
-
-    ; CRITICAL: Restore all general-purpose registers in perfect reverse order
-    ; This must be exact reverse of the push sequence above
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
+    ; Restore all GPRs in the exact reverse order.
     pop rax
+    pop rbx
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rbp
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
 
-    ; Pop the interrupt number and error code that we pushed.
+    ; Pop the interrupt number and error code.
     add rsp, 16
 
-    ; Return from interrupt. `iretq` will pop rip, cs, rflags, rsp, ss.
+    ; Return from the interrupt.
     iretq
 
-; Generate interrupt stubs for all 256 interrupts
-; CPU exceptions that push error codes: 8, 10, 11, 12, 13, 14, 17, 21
-isr_stub 0, 0    ; Divide by Zero
-isr_stub 1, 0    ; Debug
-isr_stub 2, 0    ; NMI
-isr_stub 3, 0    ; Breakpoint
-isr_stub 4, 0    ; Overflow
-isr_stub 5, 0    ; Bound Range Exceeded
-isr_stub 6, 0    ; Invalid Opcode
-isr_stub 7, 0    ; Device Not Available
-isr_stub 8, 1    ; Double Fault (has error code)
-isr_stub 9, 0    ; Coprocessor Segment Overrun
-isr_stub 10, 1   ; Invalid TSS (has error code)
-isr_stub 11, 1   ; Segment Not Present (has error code)
-isr_stub 12, 1   ; Stack-Segment Fault (has error code)
-isr_stub 13, 1   ; General Protection Fault (has error code)
-isr_stub 14, 1   ; Page Fault (has error code)
-isr_stub 15, 0   ; Reserved
-isr_stub 16, 0   ; x87 Floating-Point Exception
-isr_stub 17, 1   ; Alignment Check (has error code)
-isr_stub 18, 0   ; Machine Check
-isr_stub 19, 0   ; SIMD Floating-Point Exception
-isr_stub 20, 0   ; Virtualization Exception
-isr_stub 21, 1   ; Control Protection Exception (has error code)
-
-; Generate stubs 22-31 individually first
-isr_stub 22, 0
-isr_stub 23, 0
-isr_stub 24, 0
-isr_stub 25, 0
-isr_stub 26, 0
-isr_stub 27, 0
-isr_stub 28, 0
-isr_stub 29, 0
-isr_stub 30, 0
-isr_stub 31, 0
-
-; Generate remaining stubs (32-255) - these don't have error codes
-%assign i 32
-%rep (256-32)
+; Generate stubs for all 256 interrupts with correct error code flags
+isr_stub 0, 0   ; Divide by Zero
+isr_stub 1, 0   ; Debug
+isr_stub 2, 0   ; Non-maskable Interrupt
+isr_stub 3, 0   ; Breakpoint
+isr_stub 4, 0   ; Overflow
+isr_stub 5, 0   ; Bound Range Exceeded
+isr_stub 6, 0   ; Invalid Opcode
+isr_stub 7, 0   ; Device Not Available
+isr_stub 8, 1   ; Double Fault (has error code)
+isr_stub 9, 0   ; Coprocessor Segment Overrun
+isr_stub 10, 1  ; Invalid TSS (has error code)
+isr_stub 11, 1  ; Segment Not Present (has error code)
+isr_stub 12, 1  ; Stack-Segment Fault (has error code)
+isr_stub 13, 1  ; General Protection Fault (has error code)
+isr_stub 14, 1  ; Page Fault (has error code)
+isr_stub 15, 0  ; Reserved
+isr_stub 16, 0  ; x87 Floating-Point Exception
+isr_stub 17, 1  ; Alignment Check (has error code)
+isr_stub 18, 0  ; Machine Check
+isr_stub 19, 0  ; SIMD Floating-Point Exception
+isr_stub 20, 0  ; Virtualization Exception
+isr_stub 21, 1  ; Control Protection Exception (has error code)
+; Generate remaining stubs (22-255) - these don't have error codes
+%assign i 22
+%rep (256-22)
     isr_stub i, 0
     %assign i i+1
 %endrep
 
-; Create a table of pointers to all interrupt stubs
+; --- CRITICAL FIX: CREATE THE MISSING ISR_STUB_TABLE ---
+; This table is required by idt.c to initialize the IDT.
 section .data
 global isr_stub_table
 isr_stub_table:

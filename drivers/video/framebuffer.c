@@ -247,3 +247,29 @@ void framebuffer_draw_string(const char *str, uint32_t x, uint32_t y, uint32_t f
         framebuffer_draw_char(str[i], x + (i * 8), y, fg_color);
     }
 }
+
+void framebuffer_draw_hex(uint64_t value, int x, int y, uint32_t fg_color, uint32_t bg_color) {
+    char buffer[19];  // "0x" + 16 hex digits + null terminator
+    const char *hex_chars = "0123456789ABCDEF";
+    
+    // Format as "0xFFFFFFFFFFFFFFFF"
+    buffer[0] = '0';
+    buffer[1] = 'x';
+    
+    // Convert 64-bit value to hex string
+    for (int i = 0; i < 16; i++) {
+        // Extract nibble (4 bits) from the value
+        uint8_t nibble = (value >> (60 - i * 4)) & 0xF;
+        buffer[2 + i] = hex_chars[nibble];
+    }
+    buffer[18] = '\0';  // Null-terminate
+    
+    // Draw the formatted hex string
+    framebuffer_draw_string(buffer, x, y, fg_color, bg_color);
+}
+
+void framebuffer_draw_rsp_error(uint64_t code) {
+    framebuffer_draw_rect(300, 300, 400, 100, COLOR_RED);
+    framebuffer_draw_string("ZERO RSP DETECTED!", 320, 320, COLOR_WHITE, COLOR_RED);
+    framebuffer_draw_hex(code, 320, 340, COLOR_WHITE, COLOR_RED);
+}

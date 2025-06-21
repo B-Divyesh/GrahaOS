@@ -177,15 +177,8 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     tasks[id].regs.cs = 0x20 | 3; // User Code Selector (0x20) + RPL 3
     tasks[id].regs.ss = 0x18 | 3; // User Data Selector (0x18) + RPL 3
 
-    // --- CRITICAL FOR SWAPGS MECHANISM ---
-    // Initialize RCX and R11 for proper sysretq handling
-    // RCX will hold the user RIP, R11 will hold user RFLAGS
-    tasks[id].regs.rcx = rip;       // User return address
-    tasks[id].regs.r11 = 0x202;    // User RFLAGS
-
     // Debug output for successful process creation (moved to right side)
     framebuffer_draw_string("User process created successfully!", 700, 120, COLOR_GREEN, 0x00101828);
-    framebuffer_draw_string("SWAPGS registers initialized", 700, 140, COLOR_GREEN, 0x00101828);
 
     return id;
 }
@@ -211,28 +204,9 @@ void schedule(struct interrupt_frame *frame) {
         }
     }
     
-    // --- CRITICAL SWAPGS FIX ---
-    // Save the complete interrupt frame state to the current task
-    // This is essential for the SWAPGS mechanism to work correctly
+    // --- THE DEFINITIVE FIX ---
+    // Save the COMPLETE state of the interrupted task.
     tasks[current_task_index].regs = *frame;
-    
-    // For user processes, we need to ensure RCX and R11 are properly maintained
-    // since they're critical for sysretq after SWAPGS
-    if (current_task_index > 0) { // User process
-        // Debug: Show critical register preservation
-        static int reg_debug_count = 0;
-        reg_debug_count++;
-        if (reg_debug_count <= 3) {
-            char rcx_msg[32] = "Saved RCX: 0x";
-            uint64_t rcx_val = frame->rcx;
-            for (int i = 0; i < 8; i++) {
-                uint8_t nibble = (rcx_val >> (28 - i * 4)) & 0xF;
-                rcx_msg[14 + i] = (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
-            }
-            rcx_msg[22] = '\0';
-            framebuffer_draw_string(rcx_msg, 700, 220 + reg_debug_count * 16, COLOR_YELLOW, 0x00101828);
-        }
-    }
     
     if (tasks[current_task_index].state == TASK_STATE_RUNNING) {
         tasks[current_task_index].state = TASK_STATE_READY;
@@ -306,28 +280,9 @@ void schedule(struct interrupt_frame *frame) {
         framebuffer_draw_string("Address space switched", 700, 400, COLOR_CYAN, 0x00101828);
     }
 
-    // --- CRITICAL FOR SWAPGS MECHANISM ---
-    // Load the complete state of the new task into the interrupt frame
-    // This ensures that RCX and R11 are properly restored for user processes
+    // --- THE DEFINITIVE FIX ---
+    // Restore the COMPLETE state of the next task to be run.
     *frame = tasks[current_task_index].regs;
-    
-    // Debug: Verify frame restoration for user processes
-    if (current_task_index > 0) { // User process
-        static int frame_debug_count = 0;
-        frame_debug_count++;
-        if (frame_debug_count <= 3) {
-            char frame_msg[32] = "Restored RCX: 0x";
-            uint64_t restored_rcx = frame->rcx;
-            for (int i = 0; i < 8; i++) {
-                uint8_t nibble = (restored_rcx >> (28 - i * 4)) & 0xF;
-                frame_msg[16 + i] = (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
-            }
-            frame_msg[24] = '\0';
-            framebuffer_draw_string(frame_msg, 700, 400 + frame_debug_count * 16, COLOR_GREEN, 0x00101828);
-            
-            framebuffer_draw_string("Frame restored for SWAPGS", 700, 420 + frame_debug_count * 16, COLOR_GREEN, 0x00101828);
-        }
-    }
 }
 
 task_t* sched_get_current_task(void) {

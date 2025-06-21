@@ -89,8 +89,13 @@ void framebuffer_draw_rect_outline(uint32_t x, uint32_t y, uint32_t width, uint3
  */
 void framebuffer_draw_string(const char *str, uint32_t x, uint32_t y, uint32_t fg_color, uint32_t bg_color);
 
+
+// Add this function declaration
+void framebuffer_draw_hex(uint64_t value, int x, int y, uint32_t fg_color, uint32_t bg_color);
+
 /**
  * @brief Clears the entire screen
  * @param color Fill color
  */
 void framebuffer_clear(uint32_t color);
+
