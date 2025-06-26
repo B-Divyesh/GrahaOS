@@ -71,6 +71,21 @@ static void print_hex_at(uint64_t value, int x, int y) {
     framebuffer_draw_string(buffer, x, y, COLOR_WHITE, COLOR_RED);
 }
 
+static void print_hex_value(const char *label, uint64_t value, int x, int y) {
+    framebuffer_draw_string(label, x, y, COLOR_WHITE, COLOR_RED);
+    
+    // Simple hex conversion
+    char hex[17] = "0x";
+    const char *digits = "0123456789ABCDEF";
+    for (int i = 15; i >= 0; i--) {
+        hex[17 - i] = digits[(value >> (i * 4)) & 0xF];
+    }
+    hex[16] = '\0';
+    
+    framebuffer_draw_string(hex, x + 80, y, COLOR_YELLOW, COLOR_RED);
+}
+
+
 // The main C-level interrupt handler, with corrected page fault diagnostics
 void interrupt_handler(struct interrupt_frame *frame) {
     if (frame->int_no == 14) { // Page Fault
@@ -96,6 +111,18 @@ void interrupt_handler(struct interrupt_frame *frame) {
             framebuffer_draw_string("USER MODE fault", 10, 90, COLOR_WHITE, COLOR_RED);
         } else {
             framebuffer_draw_string("KERNEL MODE fault", 10, 90, COLOR_WHITE, COLOR_RED);
+        }
+        if (frame->cs & 3) {  // User mode exception
+            framebuffer_draw_string("=== USER CRASH DUMP ===", 500, 300, COLOR_YELLOW, COLOR_RED);
+            print_hex_value("RAX:", frame->rax, 500, 320);
+            print_hex_value("RCX:", frame->rcx, 500, 340);
+            print_hex_value("RDX:", frame->rdx, 500, 360);
+            print_hex_value("RSI:", frame->rsi, 500, 380);
+            print_hex_value("RDI:", frame->rdi, 500, 400);
+            print_hex_value("RBP:", frame->rbp, 500, 420);
+            print_hex_value("RSP:", frame->rsp, 500, 440);
+            print_hex_value("RIP:", frame->rip, 500, 460);
+            print_hex_value("R11:", frame->r11, 500, 480);
         }
 
         hcf();
@@ -136,6 +163,19 @@ void interrupt_handler(struct interrupt_frame *frame) {
         
         framebuffer_draw_string("Error code:", 10, 70, COLOR_WHITE, COLOR_RED);
         print_hex_at(frame->err_code, 120, 70);
+
+        if (frame->cs & 3) {  // User mode exception
+            framebuffer_draw_string("=== USER CRASH DUMP ===", 500, 300, COLOR_YELLOW, COLOR_RED);
+            print_hex_value("RAX:", frame->rax, 500, 320);
+            print_hex_value("RCX:", frame->rcx, 500, 340);
+            print_hex_value("RDX:", frame->rdx, 500, 360);
+            print_hex_value("RSI:", frame->rsi, 500, 380);
+            print_hex_value("RDI:", frame->rdi, 500, 400);
+            print_hex_value("RBP:", frame->rbp, 500, 420);
+            print_hex_value("RSP:", frame->rsp, 500, 440);
+            print_hex_value("RIP:", frame->rip, 500, 460);
+            print_hex_value("R11:", frame->r11, 500, 480);
+        }
         
         hcf(); // Halt on any other exception
     } else if (frame->int_no >= 32 && frame->int_no < 48) {

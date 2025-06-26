@@ -5,7 +5,7 @@
 #include "../../mm/vmm.h" // For vmm_address_space_t
 
 #define MAX_TASKS 32
-#define KERNEL_STACK_SIZE 4096
+#define KERNEL_STACK_SIZE 16384
 
 // Task states
 typedef enum {

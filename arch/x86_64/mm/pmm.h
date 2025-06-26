@@ -32,6 +32,13 @@ void *pmm_alloc_pages(size_t num_pages);
 void pmm_free_page(void *page);
 
 /**
+ * @brief Free multiple contiguous physical pages
+ * @param pages Physical address of first page
+ * @param num_pages Number of pages to free
+ */
+void pmm_free_pages(void *pages, size_t num_pages);
+
+/**
  * @brief Get total amount of usable memory in bytes
  * @return Total usable memory
  */

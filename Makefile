@@ -16,8 +16,8 @@ LIMINE_DIR := limine
 # Compiler flags for kernel development
 CFLAGS   := -Ikernel -Idrivers -Iarch -ffreestanding -fno-stack-protector -fno-pie \
             -mno-red-zone -mcmodel=kernel -g -Wall -Wextra \
-            -std=gnu11 -fno-stack-check -fno-PIC -m64 \
-            -march=x86-64 -mno-80387 -mno-mmx -mno-sse -mno-sse2
+            -std=gnu11 -fno-stack-check -fno-PIC -m64  \
+            -march=x86-64 -mno-80387 -mno-mmx -mno-sse -mno-sse2  \
 
 # Preprocessor flags
 CPPFLAGS := -DLIMINE_API_REVISION=3 -MMD -MP

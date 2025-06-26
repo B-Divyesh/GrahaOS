@@ -1,6 +1,7 @@
 #include "gdt.h"
 #include "../mm/pmm.h"
 #include "../mm/vmm.h" // For g_hhdm_offset
+#include "./sched/sched.h"  // For KERNEL_STACK_SIZE
 
 // --- GDT is now larger and reordered for sysretq ---
 // 0: NULL
@@ -82,19 +83,23 @@ void gdt_init(void) {
     // --- TSS setup ---
     // Allocate and map a stack for the TSS RSP0 field.
     // This code now runs AFTER PMM and VMM are initialized.
-    void *tss_stack_phys = pmm_alloc_page();
+    // FIXED: Allocate multiple pages for TSS RSP0 stack
+    size_t num_pages = KERNEL_STACK_SIZE / PAGE_SIZE;  // This requires including sched.h
+    void *tss_stack_phys = pmm_alloc_pages(num_pages);
     if (!tss_stack_phys) {
-        // This should not happen, but good to have a check.
         asm volatile ("cli; hlt");
     }
-    // The stack pointer must be a VIRTUAL address. We use the HHDM.
-    uint64_t tss_stack_virt_top = (uint64_t)tss_stack_phys + g_hhdm_offset + PAGE_SIZE;
     
-    // **THE CRUCIAL FIX:** We must explicitly map this physical page to its
-    // virtual address in the kernel's page tables. Without this, the CPU
-    // will page fault when trying to switch to this stack during a syscall.
-    vmm_map_page(vmm_get_kernel_space(), tss_stack_virt_top - PAGE_SIZE, (uint64_t)tss_stack_phys, PTE_PRESENT | PTE_WRITABLE);
+    // The stack pointer must be a VIRTUAL address pointing to the TOP of the stack
+    uint64_t tss_stack_virt_base = (uint64_t)tss_stack_phys + g_hhdm_offset;
+    uint64_t tss_stack_virt_top = tss_stack_virt_base + KERNEL_STACK_SIZE;
     
+    // CRITICAL: Map ALL pages of the kernel stack
+    for (size_t i = 0; i < num_pages; i++) {
+        uint64_t page_virt = tss_stack_virt_base + (i * PAGE_SIZE);
+        uint64_t page_phys = (uint64_t)tss_stack_phys + (i * PAGE_SIZE);
+        vmm_map_page(vmm_get_kernel_space(), page_virt, page_phys, PTE_PRESENT | PTE_WRITABLE);
+    }
     // Initialize TSS structure, setting only the kernel stack pointer.
     kernel_tss.rsp0 = tss_stack_virt_top;
     

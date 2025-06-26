@@ -1,55 +1,43 @@
-// user/grahai.c
+// user/grahai.c - ORIGINAL WORKING VERSION
 #include <stdint.h>
 
-// Syscall numbers
 #define SYS_PUTC 1001
 
-// Simple syscall wrapper.
-// With the kernel properly saving/restoring registers, we only need to
-// declare the registers clobbered by the `syscall` instruction itself
-// (rcx, r11) and memory.
-static inline long syscall(long n, long arg1) {
+long syscall_putc(char c) {
     long ret;
-    
-    asm volatile (
+    register long rdi_reg asm("rdi") = (long)c;
+    register long rax_reg asm("rax") = SYS_PUTC;
+
+    asm volatile(
         "syscall"
-        : "=a" (ret)    // Output: return value in RAX.
-        : "a" (n),      // Input 0: syscall number 'n' in RAX.
-          "D" (arg1)    // Input 1: argument 'arg1' in RDI.
-        : "rcx", "r11", "memory" // Clobber list.
+        : "=a" (ret)
+        : "r" (rdi_reg), "r" (rax_reg)
+        : "rcx", "r11", "memory"
     );
     return ret;
 }
 
-// Simple print function using the new syscall.
-// The 'volatile' keyword is still good practice to ensure the compiler
-// doesn't make assumptions about the pointer 'p' across the syscall.
-void print(const char *str) {
-    for (volatile const char *p = str; *p; p++) {
-        syscall(SYS_PUTC, (long)*p);
-    }
-}
-
-// Entry point for the user program
 void _start(void) {
-    // Now we know the user program executes, let's make syscalls
+    syscall_putc('[');
+    syscall_putc('O');
+    syscall_putc('K');
+    syscall_putc(']');
+    syscall_putc(' ');
+    syscall_putc('H');
+    syscall_putc('e');
+    syscall_putc('l');
+    syscall_putc('l');
+    syscall_putc('o');
+    syscall_putc(' ');
+    syscall_putc('w');
+    syscall_putc('o');
+    syscall_putc('r');
+    syscall_putc('l');
+    syscall_putc('d');
+    syscall_putc('!');
+    syscall_putc('\n');
 
-
-    syscall(SYS_PUTC, (long)'H');
-    syscall(SYS_PUTC, (long)'e');
-    syscall(SYS_PUTC, (long)'l');
-    syscall(SYS_PUTC, (long)'l');
-    syscall(SYS_PUTC, (long)'o');
-    syscall(SYS_PUTC, (long)' ');
-    syscall(SYS_PUTC, (long)'w');
-    syscall(SYS_PUTC, (long)'o');
-    syscall(SYS_PUTC, (long)'r');
-    syscall(SYS_PUTC, (long)'l');
-    syscall(SYS_PUTC, (long)'d');
-    syscall(SYS_PUTC, (long)'!');
-    
-    // Loop forever
-    for (;;) {
-        asm("hlt");
+    while (1) {
+        asm volatile("hlt");
     }
 }

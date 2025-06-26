@@ -1,34 +1,27 @@
 # user/Makefile
-# Builds user-space programs for GrahaOS
-
-# These variables are passed from the main Makefile
 PREFIX := $(or $(PREFIX),/home/atman/GrahaOS/toolchain)
 TARGET := $(or $(TARGET),x86_64-elf)
 CC     := $(PREFIX)/bin/$(TARGET)-gcc
 LD     := $(PREFIX)/bin/$(TARGET)-ld
 
-# User-space compilation flags
-# Ensure -fomit-frame-pointer is present and works with the volatile fix.
+# CRITICAL: Use flags that prevent problematic optimizations
 CFLAGS := -ffreestanding -fno-stack-protector -fno-pie -g -Wall -Wextra \
           -std=gnu11 -fno-stack-check -fno-PIC -m64 -march=x86-64 \
-          -mno-red-zone -fno-builtin -fomit-frame-pointer
+          -mno-red-zone -fno-builtin -fomit-frame-pointer \
+          -O0  # CRITICAL: No optimization to ensure predictable code
 
-# Linker flags for user programs
 LDFLAGS := -nostdlib -static -T linker.ld
 
-# Default target
 .PHONY: all clean
 
 all: grahai
 
-# Build the grahai executable
 grahai: grahai.c linker.ld
 	@echo "  CC      user/grahai.c"
 	@$(CC) $(CFLAGS) -c grahai.c -o grahai.o
 	@echo "  LD      grahai"
 	@$(LD) $(LDFLAGS) -o grahai grahai.o
 
-# Clean up build artifacts
 clean:
 	@echo "  CLEAN   user/"
 	@rm -f grahai grahai.o

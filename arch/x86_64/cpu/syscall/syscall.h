@@ -5,6 +5,7 @@
 // Define system call numbers
 #define SYS_TEST 0
 #define SYS_PUTC 1001
+#define SYS_DEBUG 9999
 
 /**
  * @brief Initializes the system call interface.

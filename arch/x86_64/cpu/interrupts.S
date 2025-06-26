@@ -14,31 +14,37 @@ isrstub%1:
     jmp isr_common      ; Jump to the common handler.
 %endmacro
 
-; Common handler for all interrupts.
-isr_common:
-    ; --- CRITICAL FIX: CORRECT PUSH ORDER ---
-    ; Push GPRs in r15..rax order to match the C struct memory layout.
-    push r15
-    push r14
-    push r13
-    push r12
-    push r11
-    push r10
-    push r9
-    push r8
-    push rbp
-    push rdi
-    push rsi
-    push rdx
-    push rcx
-    push rbx
-    push rax
+; Common handler section from interrupts.S
+; This shows the correct push order for interrupt handling
 
-    ; Pass a pointer to the now-correct interrupt_frame to the C handler.
+isr_common:
+    ; At this point, the CPU has already pushed (for interrupts):
+    ; SS, RSP, RFLAGS, CS, RIP (and error code if applicable)
+    ; The stub has pushed: error code (if needed) and interrupt number
+    
+    ; Push GPRs in SAME order as syscall.S for consistency
+    ; r15 first (highest address), rax last (lowest address)
+    push r15            ; offset 112 from final RSP
+    push r14            ; offset 104
+    push r13            ; offset 96
+    push r12            ; offset 88
+    push r11            ; offset 80
+    push r10            ; offset 72
+    push r9             ; offset 64
+    push r8             ; offset 56
+    push rbp            ; offset 48
+    push rdi            ; offset 40
+    push rsi            ; offset 32
+    push rdx            ; offset 24
+    push rcx            ; offset 16
+    push rbx            ; offset 8
+    push rax            ; offset 0 - RSP points here
+    
+    ; Call C handler with pointer to frame
     mov rdi, rsp
     call interrupt_handler
-
-    ; Restore all GPRs in the exact reverse order.
+    
+    ; Pop GPRs in reverse order
     pop rax
     pop rbx
     pop rcx
@@ -54,11 +60,11 @@ isr_common:
     pop r13
     pop r14
     pop r15
-
-    ; Pop the interrupt number and error code.
+    
+    ; Remove interrupt number and error code
     add rsp, 16
-
-    ; Return from the interrupt.
+    
+    ; Return from interrupt (pops RIP, CS, RFLAGS, RSP, SS)
     iretq
 
 ; Generate stubs for all 256 interrupts with correct error code flags

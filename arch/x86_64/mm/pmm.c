@@ -166,6 +166,23 @@ void pmm_free_page(void *page) {
     }
 }
 
+void pmm_free_pages(void *pages, size_t num_pages) {
+    uint64_t start_page_index = (uint64_t)pages / PAGE_SIZE;
+    
+    for (size_t i = 0; i < num_pages; i++) {
+        uint64_t page_index = start_page_index + i;
+        if (page_index < total_pages && bitmap_test_bit(page_index)) {
+            bitmap_clear_bit(page_index);
+            used_pages--;
+        }
+    }
+    
+    // Update last_used_index for faster allocation
+    if (start_page_index < last_used_index) {
+        last_used_index = start_page_index;
+    }
+}
+
 uint64_t pmm_get_total_memory(void) {
     return usable_memory;
 }
