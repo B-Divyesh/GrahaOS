@@ -17,7 +17,14 @@ long syscall_putc(char c) {
     return ret;
 }
 
+void print(const char *str) {
+    while (*str) {
+        syscall_putc(*str++);
+    }
+}
+
 void _start(void) {
+    print("Hello World!\n");
     syscall_putc('[');
     syscall_putc('O');
     syscall_putc('K');
@@ -38,6 +45,6 @@ void _start(void) {
     syscall_putc('\n');
 
     while (1) {
-        asm volatile("hlt");
+        //asm volatile("hlt");
     }
 }
