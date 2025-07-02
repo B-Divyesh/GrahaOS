@@ -5,6 +5,12 @@
 // Define system call numbers
 #define SYS_TEST 0
 #define SYS_PUTC 1001
+
+// NEW Filesystem Syscalls for Phase 6a
+#define SYS_OPEN  1002
+#define SYS_READ  1003
+#define SYS_CLOSE 1004
+
 #define SYS_DEBUG 9999
 
 /**

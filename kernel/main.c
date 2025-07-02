@@ -3,8 +3,9 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include "limine.h"
-#include "initrd.h"  // Include initrd support
-#include "elf.h"     // Include ELF validation and loading
+#include "initrd.h"
+#include "elf.h"
+#include "fs/vfs.h"  // <-- ADDED
 #include "../drivers/video/framebuffer.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
@@ -196,14 +197,14 @@ void kmain(void) {
     // Clear the screen to a dark blue-gray
     framebuffer_clear(0x00101828);
 
-    // UPDATED: Banner for Phase 5b-ii
+    // UPDATED: Banner for Phase 6a
     framebuffer_draw_rect(50, 50, 600, 140, COLOR_GRAHA_BLUE);
     framebuffer_draw_rect(52, 52, 596, 136, 0x00004488); // Inner darker blue
     framebuffer_draw_rect(54, 54, 592, 132, 0x000066AA); // Lighter inner
 
-    // Draw the main title - Updated for Phase 5b-ii
-    framebuffer_draw_string("GrahaOS - Phase 5b-ii: ELF Execution", 70, 70, COLOR_WHITE, 0x000066AA);
-    framebuffer_draw_string("Loading and Running User Programs", 70, 90, COLOR_LIGHT_GRAY, 0x000066AA);
+    // Draw the main title - Updated for Phase 6a
+    framebuffer_draw_string("GrahaOS - Phase 6a: Filesystem Syscalls", 70, 70, COLOR_WHITE, 0x000066AA);
+    framebuffer_draw_string("Exposing initrd to user-space programs", 70, 90, COLOR_LIGHT_GRAY, 0x000066AA);
 
     // Draw decorative elements
     framebuffer_draw_rect_outline(40, 40, 620, 160, COLOR_WHITE);
@@ -285,10 +286,15 @@ void kmain(void) {
 
     syscall_init();
     framebuffer_draw_string("Syscall Interface Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    // --- NEW: Initialize VFS ---
+    vfs_init();
+    framebuffer_draw_string("VFS Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 40;
 
-    // --- PHASE 5b-ii: ELF Loading and Execution ---
-    framebuffer_draw_string("=== Phase 5b-ii: ELF Execution ===", 50, y_pos, COLOR_WHITE, 0x00101828);
+    // --- PHASE 6a: ELF Loading and Execution ---
+    framebuffer_draw_string("=== Phase 6a: Loading Test Program ===", 50, y_pos, COLOR_WHITE, 0x00101828);
     y_pos += 30;
 
     // Initialize the initrd subsystem
@@ -314,7 +320,7 @@ void kmain(void) {
     framebuffer_draw_string(" bytes", 200, y_pos, COLOR_CYAN, 0x00101828);
     y_pos += 20;
 
-    // NEW: Load the ELF file into memory and get entry point + CR3
+    // Load the ELF file into memory and get entry point + CR3
     uint64_t entry_point, cr3;
     if (!elf_load(grahai_data, &entry_point, &cr3)) {
         framebuffer_draw_string("FATAL: Failed to load ELF file!", 50, y_pos, COLOR_RED, 0x00101828);
@@ -336,7 +342,7 @@ void kmain(void) {
     framebuffer_draw_string(cr3_str, 170, y_pos, COLOR_CYAN, 0x00101828);
     y_pos += 30;
 
-    // NEW: Create a user process with the loaded ELF
+    // Create a user process with the loaded ELF
     int process_id = sched_create_user_process(entry_point, cr3);
     if (process_id == -1) {
         framebuffer_draw_string("FATAL: Failed to create user process!", 50, y_pos, COLOR_RED, 0x00101828);
@@ -352,7 +358,7 @@ void kmain(void) {
     framebuffer_draw_string("=== Starting Process Execution ===", 50, y_pos, COLOR_WHITE, 0x00101828);
     y_pos += 20;
 
-    // NEW: Start the timer and scheduler to begin execution
+    // Start the timer and scheduler to begin execution
     pit_init(100); // 100 Hz timer
     framebuffer_draw_string("PIT Initialized to 100 Hz.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
@@ -360,19 +366,15 @@ void kmain(void) {
     irq_init(); // Remap PIC and enable interrupts
     framebuffer_draw_string("IRQs Initialized and Enabled.", 50, y_pos, COLOR_GREEN, 0x00101828);
     
-    // --- CRITICAL ADDITION ---
     // Add a visual separator in the right half to indicate where user output appears.
     framebuffer_draw_rect(400, 220, 2, framebuffer_get_height() - 240, COLOR_GRAHA_BLUE);
-    framebuffer_draw_string("User Output ->", 400, 240, COLOR_YELLOW, 0x00101828);
+    framebuffer_draw_string("User Output ->", 410, 220, COLOR_YELLOW, 0x00101828);
 
-    framebuffer_draw_string("Phase 5b-ii: Transferring control to scheduler...", 400, 200, COLOR_YELLOW, 0x00101828);
-    framebuffer_draw_string("User program should start executing now!", 400, 180, COLOR_WHITE, 0x00101828);
+    framebuffer_draw_string("Phase 6a: Filesystem syscalls ready!", 410, 200, COLOR_YELLOW, 0x00101828);
+    framebuffer_draw_string("User program will test file I/O...", 410, 180, COLOR_WHITE, 0x00101828);
 
-    // NEW: The kernel's main task is now complete. It yields to the scheduler.
-    // The user program (grahai) should start running and using syscalls.
-    
-    framebuffer_draw_string("Kernel initialization complete.", 400, 260, COLOR_GREEN, 0x00101828);
-    framebuffer_draw_string("Waiting for timer interrupts to start scheduling...", 400, 280, COLOR_YELLOW, 0x00101828);
+    framebuffer_draw_string("Kernel initialization complete.", 410, 260, COLOR_GREEN, 0x00101828);
+    framebuffer_draw_string("Waiting for timer interrupts to start scheduling...", 410, 280, COLOR_YELLOW, 0x00101828);
     
     // Simple approach: Just wait for timer interrupts to trigger the scheduler
     while (1) {

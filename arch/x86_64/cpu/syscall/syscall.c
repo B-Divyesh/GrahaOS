@@ -2,6 +2,7 @@
 #include "syscall.h"
 #include "../../../../drivers/video/framebuffer.h"
 #include "../gdt.h" // Include GDT header to access the TSS
+#include "../../../../kernel/fs/vfs.h" // <-- ADDED
 
 // Add this at file scope to reduce stack usage
 static char debug_buffer[256];
@@ -23,8 +24,6 @@ static char debug_buffer[256];
 
 // External assembly function for syscall entry
 extern void syscall_entry(void);
-
-
 
 // Helper functions to read and write MSRs
 static void write_msr(uint32_t msr, uint64_t value) {
@@ -108,8 +107,25 @@ static void format_hex64(char *buffer, uint64_t value, int digits) {
     buffer[digits] = '\0';
 }
 
-// Add this function to syscall.c after the format_hex64 function
+// Helper to safely copy string from user-space
+// Returns number of bytes copied (including null), or -1 on error.
+static int copy_string_from_user(const char *user_src, char *k_dest, size_t max_len) {
+    // Basic validation for now
+    if (user_src == NULL || k_dest == NULL) return -1;
+    // A more robust check would validate the entire user memory range.
+    
+    size_t i = 0;
+    for (i = 0; i < max_len - 1; ++i) {
+        k_dest[i] = user_src[i];
+        if (user_src[i] == '\0') {
+            return i + 1;
+        }
+    }
+    k_dest[max_len - 1] = '\0';
+    return max_len;
+}
 
+// Add this function to syscall.c after the format_hex64 function
 static void debug_memory_layout(struct syscall_frame *frame, int call_num) {
     if (call_num > 1) return; // Only debug first syscall
     
@@ -179,9 +195,6 @@ static void debug_memory_layout(struct syscall_frame *frame, int call_num) {
     *p = '\0';
     framebuffer_draw_string(msg, 50, 720, COLOR_WHITE, 0x00101828);
 }
-
-// Then in syscall_dispatcher, add this right after incrementing call_count:
-// debug_memory_layout(frame, call_count);
 
 // Organized frame debugging function
 // Optimized debug function
@@ -324,7 +337,6 @@ void syscall_dispatcher(struct syscall_frame *frame) {
     }
 
     switch (syscall_num) {
-        // In syscall_dispatcher, add:
         case SYS_DEBUG: {
             uint64_t marker = frame->rdi;
             char msg[32] = "DEBUG MARKER: 0x";
@@ -333,6 +345,7 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             frame->rax = 0;
             break;
         }
+        
         case SYS_TEST:
             // Set return value in the frame's rax
             frame->rax = 42;
@@ -349,7 +362,7 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             char c = (char)frame->rdi;
             
             // Debug character info in organized area
-            if (call_count <= 5) {
+            if (call_count <= 20) {
                 char char_debug[32] = "PUTC: '";
                 char_debug[7] = (c >= 32 && c <= 126) ? c : '?';
                 char_debug[8] = '\'';
@@ -360,9 +373,9 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 format_hex64(char_debug + 13, (uint8_t)c, 2);
                 char_debug[15] = ')';
                 char_debug[16] = '\0';
-                framebuffer_draw_string(char_debug, DEBUG_X_MID + 70, 
-                                       DEBUG_Y_START + (call_count - 1) * 80 + DEBUG_LINE_HEIGHT, 
-                                       COLOR_WHITE, 0x00101828);
+                // Wrap debug output to avoid clutter
+                int debug_y = DEBUG_Y_START + ((call_count - 1) % 5) * 80 + DEBUG_LINE_HEIGHT;
+                framebuffer_draw_string(char_debug, DEBUG_X_MID + 70, debug_y, COLOR_WHITE, 0x00101828);
             }
             
             // Draw the character to the user output area
@@ -392,6 +405,33 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             
             // Set success return value
             frame->rax = 0;
+            break;
+        }
+
+        // --- NEW: Filesystem Syscall Handlers ---
+        case SYS_OPEN: {
+            const char *pathname_user = (const char *)frame->rdi;
+            char pathname_kernel[256]; // Max path length
+
+            if (copy_string_from_user(pathname_user, pathname_kernel, sizeof(pathname_kernel)) > 0) {
+                frame->rax = vfs_open(pathname_kernel);
+            } else {
+                frame->rax = -1; // Error copying path
+            }
+            break;
+        }
+
+        case SYS_READ: {
+            int fd = (int)frame->rdi;
+            void *buffer_user = (void *)frame->rsi;
+            size_t count = (size_t)frame->rdx;
+            frame->rax = vfs_read(fd, buffer_user, count);
+            break;
+        }
+
+        case SYS_CLOSE: {
+            int fd = (int)frame->rdi;
+            frame->rax = vfs_close(fd);
             break;
         }
 

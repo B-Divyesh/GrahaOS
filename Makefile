@@ -1,4 +1,4 @@
-# Makefile for GrahaOS (Phase 5b-i - ELF Validation)
+# Makefile for GrahaOS (Phase 6a - Filesystem Syscalls)
 
 # --- Configuration ---
 PREFIX   := /home/atman/GrahaOS/toolchain
@@ -14,10 +14,10 @@ LIMINE_DIR := limine
 
 # --- Flags ---
 # Compiler flags for kernel development
-CFLAGS   := -Ikernel -Idrivers -Iarch -ffreestanding -fno-stack-protector -fno-pie \
+CFLAGS   := -I. -ffreestanding -fno-stack-protector -fno-pie \
             -mno-red-zone -mcmodel=kernel -g -Wall -Wextra \
-            -std=gnu11 -fno-stack-check -fno-PIC -m64  \
-            -march=x86-64 -mno-80387 -mno-mmx -mno-sse -mno-sse2  \
+            -std=gnu11 -fno-stack-check -fno-PIC -m64 \
+            -march=x86-64 -mno-80387 -mno-mmx -mno-sse -mno-sse2
 
 # Preprocessor flags
 CPPFLAGS := -DLIMINE_API_REVISION=3 -MMD -MP
@@ -30,7 +30,7 @@ LDFLAGS  := -T linker.ld -nostdlib -static -z max-page-size=0x1000 \
             --build-id=none
 
 # --- Source Files ---
-# Find all C sources in kernel, drivers, and arch directories
+# MODIFIED: Added kernel/fs to the search path
 C_SOURCES := $(shell find kernel drivers arch -name "*.c" -type f | sort -u)
 
 # Find all assembly sources in arch directory (.S files for NASM)
@@ -52,28 +52,20 @@ DEPS := $(C_OBJECTS:.o=.d)
 # Default target - now depends on initrd
 all: grahaos.iso
 
-# Create the bootable ISO image (FIXED for Phase 5b-i)
+# Create the bootable ISO image
 grahaos.iso: kernel/kernel.elf initrd.tar limine.conf
 	@echo "Creating ISO image..."
-	@echo "Checking prerequisites..."
-	@ls -la kernel/kernel.elf
-	@ls -la initrd.tar
-	@ls -la limine.conf
 	@rm -rf iso_root
 	@mkdir -p iso_root/boot
 	@cp kernel/kernel.elf iso_root/boot/
 	@cp initrd.tar iso_root/boot/
 	@cp limine.conf iso_root/
-	@echo "ISO structure created:"
-	@find iso_root -type f
 	@cp $(LIMINE_DIR)/limine-bios.sys iso_root/
 	@cp $(LIMINE_DIR)/limine-bios-cd.bin iso_root/
 	@cp $(LIMINE_DIR)/limine-uefi-cd.bin iso_root/
 	@mkdir -p iso_root/EFI/BOOT
 	@cp $(LIMINE_DIR)/BOOTX64.EFI iso_root/EFI/BOOT/
 	@cp $(LIMINE_DIR)/BOOTIA32.EFI iso_root/EFI/BOOT/
-	@echo "Final ISO structure before xorriso:"
-	@find iso_root -type f
 	@xorriso -as mkisofs -R -r -J -b limine-bios-cd.bin \
         -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
         -apm-block-size 2048 --efi-boot limine-uefi-cd.bin \
@@ -83,12 +75,15 @@ grahaos.iso: kernel/kernel.elf initrd.tar limine.conf
 	@rm -rf iso_root
 	@echo "Build complete: grahaos.iso"
 
-# Create the initrd containing user programs
-initrd.tar: userland
+# MODIFIED: Recipe to create the initrd with the new structure
+initrd.tar: userland etc/motd.txt
 	@echo "Creating initrd..."
+	@rm -rf initrd_root
 	@mkdir -p initrd_root/bin
+	@mkdir -p initrd_root/etc
 	@cp user/grahai initrd_root/bin/
-	@$(TAR) -cf initrd.tar -C initrd_root bin
+	@cp etc/motd.txt initrd_root/etc/
+	@$(TAR) -cf initrd.tar -C initrd_root bin etc
 	@rm -rf initrd_root
 	@echo "initrd.tar created successfully"
 
@@ -152,7 +147,7 @@ info:
 	@echo ""
 	@echo "=== File Check ==="
 	@echo "Directory structure:"
-	@find arch -type f 2>/dev/null || echo "arch directory not found"
+	@find arch kernel drivers -type f 2>/dev/null || echo "core directories not found"
 
 # Help target
 help:

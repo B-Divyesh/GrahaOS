@@ -1,0 +1,3 @@
+Welcome to GrahaOS!
+The filesystem syscall API is now live.
+User programs can now read files from the initrd.
