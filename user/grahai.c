@@ -1,105 +1,268 @@
-// user/grahai.c - Phase 6a Test Program
+// user/grahai.c - Phase 6b GCP Interpreter (DEBUG VERSION)
 #include <stdint.h>
-#include <stddef.h> // For size_t
-#include "../kernel/fs/vfs.h" // For ssize_t
+#include <stddef.h>
+#include "json.h"
+#include "../kernel/gcp.h"
 
-// Syscall numbers from kernel's syscall.h
-#define SYS_PUTC  1001
-#define SYS_OPEN  1002
-#define SYS_READ  1003
-#define SYS_CLOSE 1004
+typedef long ssize_t;
 
-// Syscall wrapper for putc
+// --- Syscall Definitions ---
+#define SYS_PUTC        1001
+#define SYS_OPEN        1002
+#define SYS_READ        1003
+#define SYS_CLOSE       1004
+#define SYS_GCP_EXECUTE 1005
+
+// --- Syscall Wrappers ---
 void syscall_putc(char c) {
-    asm volatile(
-        "syscall"
-        :
-        : "a"(SYS_PUTC), "D"(c)
-        : "rcx", "r11", "memory"
-    );
+    asm volatile("syscall" : : "a"(SYS_PUTC), "D"(c) : "rcx", "r11", "memory");
 }
-
-// Syscall wrapper for open
 int syscall_open(const char *pathname) {
     long ret;
-    asm volatile(
-        "syscall"
-        : "=a"(ret)
-        : "a"(SYS_OPEN), "D"(pathname)
-        : "rcx", "r11", "memory"
-    );
+    asm volatile("syscall" : "=a"(ret) : "a"(SYS_OPEN), "D"(pathname) : "rcx", "r11", "memory");
     return (int)ret;
 }
-
-// Syscall wrapper for read
 ssize_t syscall_read(int fd, void *buf, size_t count) {
     long ret;
-    asm volatile(
-        "syscall"
-        : "=a"(ret)
-        : "a"(SYS_READ), "D"(fd), "S"(buf), "d"(count)
-        : "rcx", "r11", "memory"
-    );
+    asm volatile("syscall" : "=a"(ret) : "a"(SYS_READ), "D"(fd), "S"(buf), "d"(count) : "rcx", "r11", "memory");
     return (ssize_t)ret;
 }
-
-// Syscall wrapper for close
 int syscall_close(int fd) {
     long ret;
-    asm volatile(
-        "syscall"
-        : "=a"(ret)
-        : "a"(SYS_CLOSE), "D"(fd)
-        : "rcx", "r11", "memory"
-    );
+    asm volatile("syscall" : "=a"(ret) : "a"(SYS_CLOSE), "D"(fd) : "rcx", "r11", "memory");
+    return (int)ret;
+}
+int syscall_gcp_execute(gcp_command_t *cmd) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret) : "a"(SYS_GCP_EXECUTE), "D"(cmd) : "rcx", "r11", "memory");
     return (int)ret;
 }
 
-// Helper to print a null-terminated string
+// --- String and Print Helpers ---
 void print(const char *str) {
     while (*str) {
         syscall_putc(*str++);
     }
 }
 
+// Simple int to string for debugging
+void print_int(int value) {
+    char buffer[20];
+    int i = 0;
+    int is_negative = 0;
+    
+    if (value < 0) {
+        is_negative = 1;
+        value = -value;
+    }
+    
+    if (value == 0) {
+        syscall_putc('0');
+        return;
+    }
+    
+    while (value > 0) {
+        buffer[i++] = '0' + (value % 10);
+        value /= 10;
+    }
+    
+    if (is_negative) {
+        syscall_putc('-');
+    }
+    
+    while (i > 0) {
+        syscall_putc(buffer[--i]);
+    }
+}
+
+int strncmp(const char *s1, const char *s2, size_t n) {
+    while (n && *s1 && (*s1 == *s2)) {
+        s1++;
+        s2++;
+        n--;
+    }
+    if (n == 0) return 0;
+    return *(unsigned char *)s1 - *(unsigned char *)s2;
+}
+size_t strlen(const char *s) {
+    size_t i = 0;
+    while (s[i]) i++;
+    return i;
+}
+
+// --- JSON Parsing Helpers ---
+static int jsoneq(const char *json, jsmntok_t *tok, const char *s) {
+    if (tok->type == JSMN_STRING && (int)strlen(s) == tok->end - tok->start &&
+        strncmp(json + tok->start, s, tok->end - tok->start) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+static long long string_to_long(const char* s) {
+    long long res = 0;
+    int sign = 1;
+    if (*s == '-') {
+        sign = -1;
+        s++;
+    }
+    while (*s >= '0' && *s <= '9') {
+        res = res * 10 + (*s - '0');
+        s++;
+    }
+    return res * sign;
+}
+
+// --- Main Program Logic ---
 void _start(void) {
-    print("grahai: Starting filesystem test...\n");
+    print("grahai: Starting GCP interpreter...\n");
 
-    const char *filepath = "etc/motd.txt";
+    const char *filepath = "etc/plan.json";
     int fd = syscall_open(filepath);
-
     if (fd < 0) {
-        print("grahai: FAILED to open /etc/motd.txt\n");
-    } else {
-        print("grahai: Successfully opened /etc/motd.txt (fd=");
-        // Simple int to char for debugging fd
-        if (fd >= 0 && fd <= 9) {
-            syscall_putc('0' + fd);
-        } else {
-            syscall_putc('?');
+        print("grahai: FAILED to open plan file.\n");
+        while(1);
+    }
+
+    char file_buffer[900];
+    ssize_t bytes_read = syscall_read(fd, file_buffer, sizeof(file_buffer) - 1);
+    syscall_close(fd);
+
+    if (bytes_read <= 0) {
+        print("grahai: FAILED to read plan file.\n");
+        while(1);
+    }
+    file_buffer[bytes_read] = '\0';
+
+    // Parse the JSON file
+    jsmn_parser p;
+    jsmntok_t tokens[100];
+    jsmn_init(&p);
+    
+    int r = jsmn_parse(&p, file_buffer, bytes_read, tokens, 100);
+    
+    if (r < 0) {
+        print("grahai: FAILED to parse JSON.\n");
+        while(1);
+    }
+
+    // Find the "commands" array
+    int commands_array_idx = -1;
+    for (int i = 1; i < r; i++) {
+        if (jsoneq(file_buffer, &tokens[i], "commands") == 0) {
+            commands_array_idx = i + 1;
+            break;
         }
-        print(")\n");
-        print("---\n");
+    }
 
-        char buffer[128];
-        ssize_t bytes_read;
+    if (commands_array_idx == -1 || tokens[commands_array_idx].type != JSMN_ARRAY) {
+        print("grahai: Could not find 'commands' array in plan.\n");
+        while(1);
+    }
 
-        while ((bytes_read = syscall_read(fd, buffer, sizeof(buffer) - 1)) > 0) {
-            // Null-terminate the buffer to print it safely
-            buffer[bytes_read] = '\0';
-            print(buffer);
+    int num_commands = tokens[commands_array_idx].size;
+    int current_token = commands_array_idx + 1;
+
+    // Loop through each command object in the array
+    for (int i = 0; i < num_commands; i++) {
+        gcp_command_t cmd_to_exec = {0};
+        int command_obj_token = current_token;
+        int tokens_to_skip = 1; // Start with the command object itself
+        
+        current_token++; // Move to first key in command object
+
+        // Find command type and params object
+        char command_name[32] = {0};
+        int params_obj_idx = -1;
+        int params_obj_size = 0;
+
+        // First pass: find command and params
+        int temp_token = current_token;
+        int num_obj_props = tokens[command_obj_token].size;
+        
+        for (int j = 0; j < num_obj_props; j++) {
+            if (jsoneq(file_buffer, &tokens[temp_token], "command") == 0) {
+                jsmntok_t *t = &tokens[temp_token + 1];
+                int len = t->end - t->start;
+                if (len < 31) {
+                    for(int k=0; k<len; k++) command_name[k] = file_buffer[t->start + k];
+                    command_name[len] = '\0';
+                }
+            } else if (jsoneq(file_buffer, &tokens[temp_token], "params") == 0) {
+                params_obj_idx = temp_token + 1;
+                params_obj_size = tokens[params_obj_idx].size;
+            }
+            temp_token += 2;
+            tokens_to_skip += 2;
         }
         
-        print("\n---\n");
-        print("grahai: Finished reading file.\n");
+        if (strlen(command_name) == 0 || params_obj_idx == -1) {
+            current_token = command_obj_token + tokens_to_skip + (params_obj_size * 2);
+            continue;
+        }
 
-        syscall_close(fd);
+        // Add tokens for all parameters in the params object
+        tokens_to_skip += params_obj_size * 2;
+
+        // Parse parameters based on command name
+        current_token = params_obj_idx + 1;
+
+        if (strncmp(command_name, "draw_rect", 9) == 0) {
+            cmd_to_exec.command_id = GCP_CMD_DRAW_RECT;
+            for (int j = 0; j < params_obj_size; j++) {
+                jsmntok_t *key = &tokens[current_token];
+                jsmntok_t *val = &tokens[current_token + 1];
+                char val_str[32] = {0};
+                int len = val->end - val->start;
+                if (len < 31) {
+                    for(int k=0; k<len; k++) val_str[k] = file_buffer[val->start + k];
+                    val_str[len] = '\0';
+                }
+                
+                if (jsoneq(file_buffer, key, "x") == 0) cmd_to_exec.params.draw_rect.x = string_to_long(val_str);
+                if (jsoneq(file_buffer, key, "y") == 0) cmd_to_exec.params.draw_rect.y = string_to_long(val_str);
+                if (jsoneq(file_buffer, key, "width") == 0) cmd_to_exec.params.draw_rect.width = string_to_long(val_str);
+                if (jsoneq(file_buffer, key, "height") == 0) cmd_to_exec.params.draw_rect.height = string_to_long(val_str);
+                if (jsoneq(file_buffer, key, "color") == 0) cmd_to_exec.params.draw_rect.color = string_to_long(val_str);
+                current_token += 2;
+            }
+            syscall_gcp_execute(&cmd_to_exec);
+        } else if (strncmp(command_name, "draw_string", 11) == 0) {
+            cmd_to_exec.command_id = GCP_CMD_DRAW_STRING;
+            for (int j = 0; j < params_obj_size; j++) {
+                jsmntok_t *key = &tokens[current_token];
+                jsmntok_t *val = &tokens[current_token + 1];
+                
+                if (jsoneq(file_buffer, key, "text") == 0) {
+                    int len = val->end - val->start;
+                    if (len < GCP_MAX_STRING_LEN - 1) {
+                        for(int k=0; k<len; k++) {
+                            cmd_to_exec.params.draw_string.text[k] = file_buffer[val->start + k];
+                        }
+                        cmd_to_exec.params.draw_string.text[len] = '\0';
+                    }
+                } else {
+                    char val_str[32] = {0};
+                    int len = val->end - val->start;
+                    if (len < 31) {
+                        for(int k=0; k<len; k++) val_str[k] = file_buffer[val->start + k];
+                        val_str[len] = '\0';
+                    }
+                    
+                    if (jsoneq(file_buffer, key, "x") == 0) cmd_to_exec.params.draw_string.x = string_to_long(val_str);
+                    if (jsoneq(file_buffer, key, "y") == 0) cmd_to_exec.params.draw_string.y = string_to_long(val_str);
+                    if (jsoneq(file_buffer, key, "fg_color") == 0) cmd_to_exec.params.draw_string.fg_color = string_to_long(val_str);
+                    if (jsoneq(file_buffer, key, "bg_color") == 0) cmd_to_exec.params.draw_string.bg_color = string_to_long(val_str);
+                }
+                current_token += 2;
+            }
+            syscall_gcp_execute(&cmd_to_exec);
+        }
+        
+        // Move to next command - use our calculated tokens_to_skip
+        current_token = command_obj_token + tokens_to_skip;
     }
 
-    print("grahai: Test complete. Halting.\n");
-
-    // Infinite loop to stop the process
-    while (1) {
-        //asm volatile("hlt");
-    }
+    print("grahai: Plan execution complete. Halting.\n");
+    while (1);
 }

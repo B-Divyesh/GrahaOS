@@ -1,0 +1,25 @@
+{
+  "plan_description": "Draw a test window using local GCP plan.",
+  "commands": [
+    {
+      "command": "draw_rect",
+      "params": { "x": 750, "y": 550, "width": 500, "height": 300, "color": 4473924 }
+    },
+    {
+      "command": "draw_rect",
+      "params": { "x": 750, "y": 550, "width": 500, "height": 30, "color": 65535 }
+    },
+    {
+      "command": "draw_string",
+      "params": { "text": "GCP: AI-Generated Window (Local Plan)", "x": 760, "y": 557, "fg_color": 0, "bg_color": 65535 }
+    },
+    {
+      "command": "draw_string",
+      "params": { "text": "This window was rendered by the 'grahai'", "x": 760, "y": 500, "fg_color": 16777215, "bg_color": 4473924 }
+    },
+    {
+      "command": "draw_string",
+      "params": { "text": "interpreter executing a JSON plan file.", "x": 760, "y": 516, "fg_color": 16777215, "bg_color": 4473924 }
+    }
+  ]
+}

@@ -1,27 +1,39 @@
-# user/Makefile
-PREFIX := $(or $(PREFIX),/home/atman/GrahaOS/toolchain)
-TARGET := $(or $(TARGET),x86_64-elf)
-CC     := $(PREFIX)/bin/$(TARGET)-gcc
-LD     := $(PREFIX)/bin/$(TARGET)-ld
+# Makefile for GrahaOS Userland Programs (Phase 6b)
 
-# CRITICAL: Use flags that prevent problematic optimizations
-CFLAGS := -ffreestanding -fno-stack-protector -fno-pie -g -Wall -Wextra \
-          -std=gnu11 -fno-stack-check -fno-PIC -m64 -march=x86-64 \
-          -mno-red-zone -fno-builtin -fomit-frame-pointer \
-          -O0  # CRITICAL: No optimization to ensure predictable code
+# Inherit from parent Makefile
+PREFIX ?= /home/atman/GrahaOS/toolchain
+TARGET ?= x86_64-elf
 
-LDFLAGS := -nostdlib -static -T linker.ld
+# Tools
+CC := $(PREFIX)/bin/$(TARGET)-gcc
+LD := $(PREFIX)/bin/$(TARGET)-ld
+
+# Flags
+# NOTE: We are building for user-space, so we don't need kernel-specific flags.
+# -I../ is added to find kernel headers like gcp.h
+CFLAGS := -I. -I../ -ffreestanding -fno-stack-protector -fpie -g \
+          -Wall -Wextra -std=gnu11 -fno-stack-check -m64 \
+          -march=x86-64 -mno-red-zone -fno-builtin -fomit-frame-pointer \
+          -O0
+
+LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
+
+# MODIFIED: Add json.c to the sources
+SOURCES := grahai.c json.c
+OBJECTS := $(SOURCES:.c=.o)
 
 .PHONY: all clean
 
 all: grahai
 
-grahai: grahai.c linker.ld
-	@echo "  CC      user/grahai.c"
-	@$(CC) $(CFLAGS) -c grahai.c -o grahai.o
-	@echo "  LD      grahai"
-	@$(LD) $(LDFLAGS) -o grahai grahai.o
+grahai: $(OBJECTS) linker.ld
+	@echo "Linking user program: $@"
+	@$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
+
+%.o: %.c
+	@echo "Compiling user C: $<"
+	@$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	@echo "  CLEAN   user/"
-	@rm -f grahai grahai.o
+	@echo "Cleaning user programs..."
+	@rm -f $(OBJECTS) grahai
