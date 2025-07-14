@@ -2,6 +2,8 @@
 
 ---
 
+[![GrahaOS Control Protocol overview](https://img.youtube.com/vi/uivT1Bw1-l0/0.jpg)](https://www.youtube.com/watch?v=uivT1Bw1-l0 "GrahaOS Control Protocol overview")
+
 **GrahaOS – An AI-Integrated Operating System from Scratch**
 *Introducing the GrahaOS Control Protocol (GCP)*
 
