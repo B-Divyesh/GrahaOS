@@ -1,1 +1,6 @@
-{}
+{
+    "files.associations": {
+        "stddef.h": "c",
+        "framebuffer.h": "c"
+    }
+}

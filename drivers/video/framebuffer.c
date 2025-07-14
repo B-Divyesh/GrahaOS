@@ -234,18 +234,20 @@ void framebuffer_draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color) {
  *       background rectangle for the whole string, then draws each character
  *       on top without a background.
  */
-void framebuffer_draw_string(const char *str, uint32_t x, uint32_t y, uint32_t fg_color, uint32_t bg_color) {
+void framebuffer_draw_string(const char *str, uint32_t x, uint32_t y, 
+                             uint32_t fg_color, uint32_t bg_color) {
     size_t len = strlen(str);
-
-    // 1. Draw the background for the entire string area in one go.
-    //    The width is length * 8 pixels, height is 16 pixels.
+    
+    // Draw background
     framebuffer_draw_rect(x, y, len * 8, 16, bg_color);
-
-    // 2. Draw each character "transparently" on top of the background.
+    
+    // Draw characters
     for (size_t i = 0; i < len; i++) {
-        // We now call the modified draw_char which only needs the foreground color.
         framebuffer_draw_char(str[i], x + (i * 8), y, fg_color);
     }
+    
+    // CRITICAL: Force memory write
+    asm volatile("mfence" ::: "memory");
 }
 
 void framebuffer_draw_hex(uint64_t value, int x, int y, uint32_t fg_color, uint32_t bg_color) {

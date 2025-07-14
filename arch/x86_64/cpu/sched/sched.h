@@ -20,9 +20,12 @@ typedef struct {
     int id;
     task_state_t state;
     uint64_t kernel_stack_top;
-    struct interrupt_frame regs; // CPU register state from interrupt/syscall
-    // --- FIX: Store the address space (CR3) separately ---
-    uint64_t cr3; // Physical address of the task's PML4 table
+    struct interrupt_frame regs;
+    uint64_t cr3;
+    int parent_id;
+    int exit_status;
+    // Track what child we're waiting for (-1 = any child)
+    int waiting_for_child;
 } task_t;
 
 /**
@@ -63,3 +66,29 @@ task_t* sched_get_current_task(void);
  * @return Pointer to the task, or NULL if not found
  */
 task_t* sched_get_task(int id);
+
+/**
+ * @brief Check if a process has exited children to reap
+ * @param parent_id Parent task ID
+ * @param status Pointer to store exit status (can be NULL)
+ * @return Child PID if zombie child found, -1 otherwise
+ */
+int sched_check_children(int parent_id, int *status);
+
+/**
+ * @brief Mark children as orphans when parent dies
+ * @param parent_id Parent task ID
+ */
+void sched_orphan_children(int parent_id);
+
+/**
+ * @brief Reap a zombie task and free its resources
+ * @param task_id Task ID to reap
+ */
+void sched_reap_zombie(int task_id);
+
+/**
+ * @brief Wake up parent waiting for a child
+ * @param child_id Child task ID that exited
+ */
+void wake_waiting_parent(int child_id);

@@ -6,7 +6,7 @@
 #include "initrd.h"
 #include "elf.h"
 #include "fs/vfs.h"
-#include "gcp.h" // <-- ADDED
+#include "gcp.h"
 #include "../drivers/video/framebuffer.h"
 #include "../arch/x86_64/cpu/gdt.h"
 #include "../arch/x86_64/cpu/idt.h"
@@ -61,23 +61,6 @@ int memcmp(const void *s1, const void *s2, size_t n) {
     return 0;
 }
 
-static void uint_to_string(uint64_t value, char *buffer) {
-    if (value == 0) { buffer[0] = '0'; buffer[1] = '\0'; return; }
-    char temp[21]; int i = 0;
-    while (value > 0) { temp[i++] = '0' + (value % 10); value /= 10; }
-    int j; for (j = 0; j < i; j++) buffer[j] = temp[i - 1 - j];
-    buffer[j] = '\0';
-}
-
-static void hex_to_string(uint64_t value, char *buffer) {
-    const char hex_chars[] = "0123456789ABCDEF";
-    char temp[17]; int i = 0;
-    if (value == 0) { buffer[0] = '0'; buffer[1] = '\0'; return; }
-    while (value > 0) { temp[i++] = hex_chars[value & 0xF]; value >>= 4; }
-    int j; for (j = 0; j < i; j++) buffer[j] = temp[i - 1 - j];
-    buffer[j] = '\0';
-}
-
 static void hcf(void) { asm ("cli"); for (;;) { asm ("hlt"); } }
 
 void kmain(void) {
@@ -90,12 +73,12 @@ void kmain(void) {
 
     framebuffer_clear(0x00101828);
 
-    // UPDATED: Banner for Phase 6b
+    // UPDATED: Banner for Phase 6c
     framebuffer_draw_rect(50, 50, 600, 140, COLOR_GRAHA_BLUE);
     framebuffer_draw_rect(52, 52, 596, 136, 0x00004488);
     framebuffer_draw_rect(54, 54, 592, 132, 0x000066AA);
-    framebuffer_draw_string("GrahaOS - Phase 6b: Local GCP Interpreter", 70, 70, COLOR_WHITE, 0x000066AA);
-    framebuffer_draw_string("Executing multi-step plan from /etc/plan.json", 70, 90, COLOR_LIGHT_GRAY, 0x000066AA);
+    framebuffer_draw_string("GrahaOS - Phase 6c: Interactive Shell", 70, 70, COLOR_WHITE, 0x000066AA);
+    framebuffer_draw_string("Welcome to the birth of gash!", 70, 90, COLOR_LIGHT_GRAY, 0x000066AA);
     framebuffer_draw_rect_outline(40, 40, 620, 160, COLOR_WHITE);
     framebuffer_draw_rect_outline(42, 42, 616, 156, COLOR_LIGHT_GRAY);
 
@@ -122,40 +105,44 @@ void kmain(void) {
     vfs_init();
     framebuffer_draw_string("VFS Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828); y_pos += 40;
 
-    // --- PHASE 6b: ELF Loading and Execution ---
-    framebuffer_draw_string("=== Phase 6b: Loading GCP Interpreter ===", 50, y_pos, COLOR_WHITE, 0x00101828); y_pos += 30;
+    // --- PHASE 6c: Loading the Shell ---
+    framebuffer_draw_string("=== Phase 6c: Loading Shell ===", 50, y_pos, COLOR_WHITE, 0x00101828); y_pos += 30;
 
     initrd_init(&module_request);
     framebuffer_draw_string("Initrd initialized.", 50, y_pos, COLOR_GREEN, 0x00101828); y_pos += 20;
 
-    size_t grahai_size;
-    void *grahai_data = initrd_lookup("bin/grahai", &grahai_size);
-    if (!grahai_data) {
-        framebuffer_draw_string("FATAL: Could not find bin/grahai in initrd!", 50, y_pos, COLOR_RED, 0x00101828);
+    // MODIFIED: Load gash instead of grahai
+    size_t gash_size;
+    void *gash_data = initrd_lookup("bin/gash", &gash_size);
+    if (!gash_data) {
+        framebuffer_draw_string("FATAL: Could not find bin/gash in initrd!", 50, y_pos, COLOR_RED, 0x00101828);
         hcf();
     }
-    framebuffer_draw_string("Found bin/grahai in initrd.", 50, y_pos, COLOR_GREEN, 0x00101828); y_pos += 20;
+    framebuffer_draw_string("Found bin/gash in initrd.", 50, y_pos, COLOR_GREEN, 0x00101828); y_pos += 20;
 
     uint64_t entry_point, cr3;
-    if (!elf_load(grahai_data, &entry_point, &cr3)) {
-        framebuffer_draw_string("FATAL: Failed to load ELF file!", 50, y_pos, COLOR_RED, 0x00101828);
+    if (!elf_load(gash_data, &entry_point, &cr3)) {
+        framebuffer_draw_string("FATAL: Failed to load shell ELF file!", 50, y_pos, COLOR_RED, 0x00101828);
         hcf();
     }
-    framebuffer_draw_string("ELF loaded successfully into memory.", 50, y_pos, COLOR_GREEN, 0x00101828); y_pos += 20;
+    framebuffer_draw_string("Shell loaded successfully into memory.", 50, y_pos, COLOR_GREEN, 0x00101828); y_pos += 20;
 
     int process_id = sched_create_user_process(entry_point, cr3);
     if (process_id == -1) {
-        framebuffer_draw_string("FATAL: Failed to create user process!", 50, y_pos, COLOR_RED, 0x00101828);
+        framebuffer_draw_string("FATAL: Failed to create shell process!", 50, y_pos, COLOR_RED, 0x00101828);
         hcf();
     }
-    framebuffer_draw_string("User process created.", 50, y_pos, COLOR_GREEN, 0x00101828); y_pos += 30;
+    framebuffer_draw_string("Shell process created.", 50, y_pos, COLOR_GREEN, 0x00101828); y_pos += 30;
 
-    framebuffer_draw_string("=== Starting Process Execution ===", 50, y_pos, COLOR_WHITE, 0x00101828); y_pos += 20;
+    framebuffer_draw_string("=== Starting Interactive Shell ===", 50, y_pos, COLOR_WHITE, 0x00101828); y_pos += 20;
 
-    framebuffer_draw_string("User program will now execute the plan...", 50, y_pos, COLOR_YELLOW, 0x00101828);
+    framebuffer_draw_string("Type 'help' for available commands...", 50, y_pos, COLOR_YELLOW, 0x00101828);
 
     pit_init(100);
     irq_init();
+    
+    // Clear screen before shell starts
+    framebuffer_clear(0x00101828);
     
     while (1) {
         asm ("hlt");

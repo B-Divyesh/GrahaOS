@@ -2,6 +2,7 @@
 #include "ports.h"
 #include "sched/sched.h" // For calling the scheduler
 #include "../../../drivers/video/framebuffer.h"
+#include "../../drivers/keyboard/keyboard.h" // ADDED
 
 // PIC (Programmable Interrupt Controller) ports
 #define PIC1_COMMAND 0x20
@@ -13,8 +14,6 @@
 #define PIC_EOI      0x20
 
 // Remaps the PIC interrupts to avoid conflicts with CPU exceptions.
-// By default, IRQs 0-7 map to interrupts 8-15, which conflicts with #DF, #TS, etc.
-// We will remap them to interrupts 32-47.
 static void pic_remap(void) {
     // Save masks
     uint8_t a1 = inb(PIC1_DATA);
@@ -44,6 +43,7 @@ static void pic_remap(void) {
 // Called from idt_init()
 void irq_init(void) {
     pic_remap();
+    keyboard_init(); // ADDED: Initialize keyboard driver
     // Enable only the timer (IRQ0) and keyboard (IRQ1) for now
     outb(PIC1_DATA, 0b11111100); // Unmask IRQ0 and IRQ1
     outb(PIC2_DATA, 0b11111111); // Mask all slave PIC IRQs
@@ -85,9 +85,26 @@ static void print_hex_value(const char *label, uint64_t value, int x, int y) {
     framebuffer_draw_string(hex, x + 80, y, COLOR_YELLOW, COLOR_RED);
 }
 
-
 // The main C-level interrupt handler, with corrected page fault diagnostics
 void interrupt_handler(struct interrupt_frame *frame) {
+    // CRITICAL: Validate frame pointer
+    if (!frame) {
+        // This should NEVER happen - indicates severe corruption
+        asm volatile(
+            "cli\n"
+            "mov $0xDEADBEEF, %%rax\n"  // Magic value for debugging
+            "hlt\n"
+            ::: "rax"
+        );
+    }
+    
+    // Validate frame address is in reasonable range
+    uint64_t frame_addr = (uint64_t)frame;
+    if (frame_addr < 0xFFFF800000000000) {
+        // Frame is not in kernel space - corruption!
+        asm volatile("cli; hlt");
+    }
+    
     if (frame->int_no == 14) { // Page Fault
         uint64_t fault_addr;
         asm volatile("mov %%cr2, %0" : "=r"(fault_addr)); // Get faulting address from CR2
@@ -129,59 +146,64 @@ void interrupt_handler(struct interrupt_frame *frame) {
     }
 
     if (frame->int_no < 32) {
-        // Is a CPU exception
-        char msg[] = "CPU Exception: 00 at RIP=0x00000000";
-        char hex[] = "0123456789ABCDEF";
-        msg[15] = hex[(frame->int_no >> 4) & 0xF];
-        msg[16] = hex[frame->int_no & 0xF];
+        // CPU exception - show detailed info
+        framebuffer_draw_rect(0, 0, framebuffer_get_width(), 200, COLOR_RED);
         
-        // Add RIP to the error message
-        uint64_t rip = frame->rip;
-        for (int i = 0; i < 8; i++) {
-            uint8_t nibble = (rip >> (28 - i * 4)) & 0xF;
-            msg[26 + i] = (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
+        char msg[64] = "CPU Exception #";
+        char num[3];
+        int n = frame->int_no;
+        int i = 0;
+        do {
+            num[i++] = '0' + (n % 10);
+            n /= 10;
+        } while (n > 0);
+        while (i > 0) {
+            msg[15 + (2-i)] = num[--i];
         }
-        
-        framebuffer_draw_rect(0, 0, framebuffer_get_width(), 90, COLOR_RED);
+        msg[17] = '\0';
         framebuffer_draw_string(msg, 10, 10, COLOR_WHITE, COLOR_RED);
         
-        // Show what type of exception this is
-        if (frame->int_no == 6) {
-            framebuffer_draw_string("Invalid Opcode (#UD) - syscall not supported?", 10, 30, COLOR_WHITE, COLOR_RED);
-        } else if (frame->int_no == 13) {
-            framebuffer_draw_string("General Protection Fault (#GP)", 10, 30, COLOR_WHITE, COLOR_RED);
-        } else {
-            framebuffer_draw_string("User process crashed!", 10, 30, COLOR_WHITE, COLOR_RED);
+        // Show exception name during hte exception
+        const char *exception_names[] = {
+            "Divide by Zero", "Debug", "NMI", "Breakpoint",
+            "Overflow", "Bound Range", "Invalid Opcode", "Device Not Available",
+            "Double Fault", "Coprocessor Segment", "Invalid TSS", "Segment Not Present",
+            "Stack Fault", "General Protection", "Page Fault", "Reserved",
+            "x87 FP", "Alignment Check", "Machine Check", "SIMD FP"
+        };
+        
+        if (frame->int_no < 20) {
+            framebuffer_draw_string(exception_names[frame->int_no], 10, 30, COLOR_YELLOW, COLOR_RED);
         }
+        
+        // Show RIP where it crashed
+        char rip_msg[32] = "RIP: 0x";
+        const char *hex = "0123456789ABCDEF";
+        uint64_t rip = frame->rip;
+        for (int j = 0; j < 16; j++) {
+            rip_msg[7 + j] = hex[(rip >> (60 - j * 4)) & 0xF];
+        }
+        rip_msg[23] = '\0';
+        framebuffer_draw_string(rip_msg, 10, 50, COLOR_WHITE, COLOR_RED);
         
         // Show if it's user or kernel mode
         if (frame->cs & 3) {
-            framebuffer_draw_string("USER MODE exception", 10, 50, COLOR_WHITE, COLOR_RED);
+            framebuffer_draw_string("USER MODE crash", 10, 70, COLOR_YELLOW, COLOR_RED);
+            framebuffer_draw_string("Process was: grahai", 10, 90, COLOR_WHITE, COLOR_RED);
         } else {
-            framebuffer_draw_string("KERNEL MODE exception", 10, 50, COLOR_WHITE, COLOR_RED);
+            framebuffer_draw_string("KERNEL MODE crash", 10, 70, COLOR_YELLOW, COLOR_RED);
         }
         
-        framebuffer_draw_string("Error code:", 10, 70, COLOR_WHITE, COLOR_RED);
-        print_hex_at(frame->err_code, 120, 70);
-
-        if (frame->cs & 3) {  // User mode exception
-            framebuffer_draw_string("=== USER CRASH DUMP ===", 500, 300, COLOR_YELLOW, COLOR_RED);
-            print_hex_value("RAX:", frame->rax, 500, 320);
-            print_hex_value("RCX:", frame->rcx, 500, 340);
-            print_hex_value("RDX:", frame->rdx, 500, 360);
-            print_hex_value("RSI:", frame->rsi, 500, 380);
-            print_hex_value("RDI:", frame->rdi, 500, 400);
-            print_hex_value("RBP:", frame->rbp, 500, 420);
-            print_hex_value("RSP:", frame->rsp, 500, 440);
-            print_hex_value("RIP:", frame->rip, 500, 460);
-            print_hex_value("R11:", frame->r11, 500, 480);
-        }
-        
-        hcf(); // Halt on any other exception
+        hcf();
     } else if (frame->int_no >= 32 && frame->int_no < 48) {
         // Is a hardware IRQ
-        if (frame->int_no == 32) { // IRQ0: Timer
-            schedule(frame); // Call the scheduler
+        switch (frame->int_no) {
+            case 32: // IRQ0: Timer
+                schedule(frame);
+                break;
+            case 33: // IRQ1: Keyboard - ADDED
+                keyboard_irq_handler();
+                break;
         }
 
         // Send EOI to the PICs.

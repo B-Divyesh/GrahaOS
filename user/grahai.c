@@ -1,77 +1,11 @@
-// user/grahai.c - Phase 6b GCP Interpreter (DEBUG VERSION)
-#include <stdint.h>
-#include <stddef.h>
+// user/grahai.c - Phase 6c GCP Interpreter (Modified)
+#include "syscalls.h"
 #include "json.h"
-#include "../kernel/gcp.h"
-
-typedef long ssize_t;
-
-// --- Syscall Definitions ---
-#define SYS_PUTC        1001
-#define SYS_OPEN        1002
-#define SYS_READ        1003
-#define SYS_CLOSE       1004
-#define SYS_GCP_EXECUTE 1005
-
-// --- Syscall Wrappers ---
-void syscall_putc(char c) {
-    asm volatile("syscall" : : "a"(SYS_PUTC), "D"(c) : "rcx", "r11", "memory");
-}
-int syscall_open(const char *pathname) {
-    long ret;
-    asm volatile("syscall" : "=a"(ret) : "a"(SYS_OPEN), "D"(pathname) : "rcx", "r11", "memory");
-    return (int)ret;
-}
-ssize_t syscall_read(int fd, void *buf, size_t count) {
-    long ret;
-    asm volatile("syscall" : "=a"(ret) : "a"(SYS_READ), "D"(fd), "S"(buf), "d"(count) : "rcx", "r11", "memory");
-    return (ssize_t)ret;
-}
-int syscall_close(int fd) {
-    long ret;
-    asm volatile("syscall" : "=a"(ret) : "a"(SYS_CLOSE), "D"(fd) : "rcx", "r11", "memory");
-    return (int)ret;
-}
-int syscall_gcp_execute(gcp_command_t *cmd) {
-    long ret;
-    asm volatile("syscall" : "=a"(ret) : "a"(SYS_GCP_EXECUTE), "D"(cmd) : "rcx", "r11", "memory");
-    return (int)ret;
-}
 
 // --- String and Print Helpers ---
 void print(const char *str) {
     while (*str) {
         syscall_putc(*str++);
-    }
-}
-
-// Simple int to string for debugging
-void print_int(int value) {
-    char buffer[20];
-    int i = 0;
-    int is_negative = 0;
-    
-    if (value < 0) {
-        is_negative = 1;
-        value = -value;
-    }
-    
-    if (value == 0) {
-        syscall_putc('0');
-        return;
-    }
-    
-    while (value > 0) {
-        buffer[i++] = '0' + (value % 10);
-        value /= 10;
-    }
-    
-    if (is_negative) {
-        syscall_putc('-');
-    }
-    
-    while (i > 0) {
-        syscall_putc(buffer[--i]);
     }
 }
 
@@ -84,19 +18,11 @@ int strncmp(const char *s1, const char *s2, size_t n) {
     if (n == 0) return 0;
     return *(unsigned char *)s1 - *(unsigned char *)s2;
 }
+
 size_t strlen(const char *s) {
     size_t i = 0;
     while (s[i]) i++;
     return i;
-}
-
-// --- JSON Parsing Helpers ---
-static int jsoneq(const char *json, jsmntok_t *tok, const char *s) {
-    if (tok->type == JSMN_STRING && (int)strlen(s) == tok->end - tok->start &&
-        strncmp(json + tok->start, s, tok->end - tok->start) == 0) {
-        return 0;
-    }
-    return -1;
 }
 
 static long long string_to_long(const char* s) {
@@ -111,6 +37,15 @@ static long long string_to_long(const char* s) {
         s++;
     }
     return res * sign;
+}
+
+// --- JSON Parsing Helpers ---
+static int jsoneq(const char *json, jsmntok_t *tok, const char *s) {
+    if (tok->type == JSMN_STRING && (int)strlen(s) == tok->end - tok->start &&
+        strncmp(json + tok->start, s, tok->end - tok->start) == 0) {
+        return 0;
+    }
+    return -1;
 }
 
 // --- Main Program Logic ---
@@ -208,6 +143,7 @@ void _start(void) {
         current_token = params_obj_idx + 1;
 
         if (strncmp(command_name, "draw_rect", 9) == 0) {
+            print("grahai: Executing draw_rect\n");
             cmd_to_exec.command_id = GCP_CMD_DRAW_RECT;
             for (int j = 0; j < params_obj_size; j++) {
                 jsmntok_t *key = &tokens[current_token];
@@ -227,6 +163,7 @@ void _start(void) {
                 current_token += 2;
             }
             syscall_gcp_execute(&cmd_to_exec);
+            print("grahai: draw_rect completed\n");
         } else if (strncmp(command_name, "draw_string", 11) == 0) {
             cmd_to_exec.command_id = GCP_CMD_DRAW_STRING;
             for (int j = 0; j < params_obj_size; j++) {
@@ -263,6 +200,12 @@ void _start(void) {
         current_token = command_obj_token + tokens_to_skip;
     }
 
-    print("grahai: Plan execution complete. Halting.\n");
-    while (1);
-}
+    print("grahai: Plan execution complete.\n");
+    
+    // Make sure we flush output before halting
+    asm volatile("" ::: "memory");  // Memory barrier
+    
+    // Exit cleanly OR infinite loop
+    syscall_exit(0);
+
+}   

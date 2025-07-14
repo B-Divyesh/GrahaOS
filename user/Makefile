@@ -1,4 +1,4 @@
-# Makefile for GrahaOS Userland Programs (Phase 6b)
+# Makefile for GrahaOS Userland Programs (Phase 6c)
 
 # Inherit from parent Makefile
 PREFIX ?= /home/atman/GrahaOS/toolchain
@@ -18,17 +18,22 @@ CFLAGS := -I. -I../ -ffreestanding -fno-stack-protector -fpie -g \
 
 LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 
-# MODIFIED: Add json.c to the sources
-SOURCES := grahai.c json.c
-OBJECTS := $(SOURCES:.c=.o)
+# MODIFIED: Build both grahai and gash
+PROGRAMS := grahai gash
 
 .PHONY: all clean
 
-all: grahai
+all: $(PROGRAMS)
 
-grahai: $(OBJECTS) linker.ld
+# Build grahai with its JSON parser
+grahai: grahai.o json.o
 	@echo "Linking user program: $@"
-	@$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
+	@$(LD) $(LDFLAGS) -o $@ $^
+
+# Build gash shell
+gash: gash.o
+	@echo "Linking user program: $@"
+	@$(LD) $(LDFLAGS) -o $@ $^
 
 %.o: %.c
 	@echo "Compiling user C: $<"
@@ -36,4 +41,4 @@ grahai: $(OBJECTS) linker.ld
 
 clean:
 	@echo "Cleaning user programs..."
-	@rm -f $(OBJECTS) grahai
+	@rm -f *.o $(PROGRAMS)

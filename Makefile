@@ -1,4 +1,4 @@
-# Makefile for GrahaOS (Phase 6b - Local GCP Interpreter)
+# Makefile for GrahaOS (Phase 6c - Interactive Shell)
 
 # --- Configuration ---
 PREFIX   := /home/atman/GrahaOS/toolchain
@@ -13,7 +13,8 @@ TAR      := tar
 LIMINE_DIR := limine
 
 # --- Flags ---
-CFLAGS   := -I. -ffreestanding -fno-stack-protector -fno-pie \
+# ADDED: Include path for the new keyboard driver
+CFLAGS   := -I. -I./arch/x86_64/drivers/keyboard -ffreestanding -fno-stack-protector -fno-pie \
             -mno-red-zone -mcmodel=kernel -g -Wall -Wextra \
             -std=gnu11 -fno-stack-check -fno-PIC -m64  \
             -march=x86-64 -mno-80387 -mno-mmx -mno-sse -mno-sse2
@@ -24,6 +25,7 @@ LDFLAGS  := -T linker.ld -nostdlib -static -z max-page-size=0x1000 \
             --build-id=none
 
 # --- Source Files ---
+# MODIFIED: Automatically find the new keyboard.c
 C_SOURCES := $(shell find kernel drivers arch -name "*.c" -type f | sort -u)
 ASM_SOURCES := $(shell find arch -name "*.S" -type f | sort -u)
 
@@ -59,17 +61,21 @@ grahaos.iso: kernel/kernel.elf initrd.tar limine.conf
 	@rm -rf iso_root
 	@echo "Build complete: grahaos.iso"
 
-# MODIFIED: Add plan.json to the initrd
+# MODIFIED: Package gash into the initrd
 initrd.tar: userland etc/motd.txt etc/plan.json
 	@echo "Creating initrd..."
 	@rm -rf initrd_root
-	@mkdir -p initrd_root/bin
-	@mkdir -p initrd_root/etc
+	@mkdir -p initrd_root/bin initrd_root/etc
 	@if [ ! -f user/grahai ]; then \
 		echo "ERROR: user/grahai not found!"; \
 		exit 1; \
 	fi
+	@if [ ! -f user/gash ]; then \
+		echo "ERROR: user/gash not found!"; \
+		exit 1; \
+	fi
 	@cp user/grahai initrd_root/bin/
+	@cp user/gash initrd_root/bin/
 	@cp etc/motd.txt initrd_root/etc/
 	@cp etc/plan.json initrd_root/etc/
 	@echo "Contents of initrd_root before tar:"
@@ -78,7 +84,7 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	@echo "Verifying tar contents:"
 	@$(TAR) -tf initrd.tar
 	@rm -rf initrd_root
-	@echo "initrd.tar created successfully"
+	@echo "initrd.tar created successfully with gash and grahai"
 
 userland:
 	@echo "Building user programs..."

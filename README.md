@@ -22,7 +22,7 @@ The idea is to radically simplify how AI performs operations on the OS. Here's h
    This snapshot is compiled into a structured `.osm` file. Because the OS is being built from scratch, the snapshot architecture is fully customizable and lightweight.
 
 2. **External AI Interface via API**
-   Once the snapshot is created, it is sent to an external AI system over a network interface (network drivers are currently under development). The AI does not run locally—this decision simplifies system design and adds a layer of abstraction and security.
+   Once the snapshot is created, it is sent to an external AI system over a network interface (network drivers are currently under development). The AI does not run locally this decision simplifies system design and adds a layer of abstraction and security.
 
 3. **Action Planning via GCP**
    The AI reads the `.osm` file and uses a set of predefined tools to determine its response. These tools consist of:
@@ -45,7 +45,7 @@ This architecture is intentionally minimalistic, focusing on making AI integrati
 
 ### Vision for GrahaOS
 
-The goal of GrahaOS is to move beyond traditional human-computer interaction paradigms. We envision a future where users can interact with their computers naturally—through voice and conversation—without needing to understand peripherals like keyboards or mice.
+The goal of GrahaOS is to move beyond traditional human-computer interaction paradigms. We envision a future where users can interact with their computers naturally through voice and conversation without needing to understand peripherals like keyboards or mice.
 
 A computer should:
 
@@ -63,7 +63,7 @@ All with minimal or no manual intervention.
 Moving forward, the key milestones include:
 
 * Building a full-scale, modular OS with abstraction layers that optimize snapshot efficiency while retaining semantic fidelity
-* Developing a local SLM (Small Language Model) to autonomously manage:
+* Developing a local SLM (Small Language Model) or ML Algorithm to autonomously manage:
 
   * Memory and page faults
   * File access patterns
@@ -82,7 +82,7 @@ This local model will serve as the AI’s assistant, helping with low-level syst
 > * The compiler: GCC 15.x.x
 
 > **On Originality and Inspiration:**
-> While the concept of an AI-integrated OS is not entirely new—such as Rutgers University's AIOS SDK framework—GrahaOS maintains a unique approach by integrating AI from the kernel level up, not as an application-layer addition. Even if others are exploring similar ideas, I’m committed to continuing this project out of passion and belief in its potential.
+> While the concept of an AI-integrated OS is not entirely new:-such as Rutgers University's AIOS SDK framework, GrahaOS maintains a unique approach by integrating AI from the kernel level up, not as an application-layer addition. Even if others are exploring similar ideas, I’m committed to continuing this project out of passion and belief in its potential.
 
 ---
 
