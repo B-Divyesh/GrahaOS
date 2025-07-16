@@ -71,7 +71,7 @@ Moving forward, the key milestones include:
   * File access patterns
   * System behavior learned from user habits
 
-This local model will serve as the AI’s assistant, helping with low-level system tasks in real-time, improving efficiency through continual learning.
+This local model will serve as the AI’s assistant, helping with low-level system tasks in real-time, improving efficiency through continual learning. We will also be adding dedicated syscalls that the local LLM can use to seperate it from the core Kernel.
 
 ---
 
