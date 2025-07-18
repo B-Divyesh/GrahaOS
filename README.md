@@ -9,6 +9,27 @@
 
 GrahaOS is an AI-integrated operating system built entirely from the ground up. At its core is a custom-designed communication interface known as the **Operating System Control Protocol**, internally referred to as the **GrahaOS Control Protocol (GCP)**. GCP enables seamless and secure interaction between the AI and the OS at a fundamental level.
 
+**Installation Instructions**
+
+1. **Clone the Repository**
+   ```bash
+   git clone https://github.com/yourusername/grahaos.git
+   ```
+   **install dependencies**
+   ```bash
+   #for linux fedora (for which this project was built on)
+   sudo dnf install gcc-c++ make git gcc make xosrriso qemu nasm bison libelf-devel 
+   #please refer to osdev-wiki if you lack any libraries
+   ```
+   **Build the OS**
+   ```bash
+   make clean
+   make install
+   make run
+   #this will allow you to run on qemu
+   ```
+
+
 ### How GCP Works
 
 The idea is to radically simplify how AI performs operations on the OS. Here's how the system functions:
