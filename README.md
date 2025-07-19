@@ -20,6 +20,8 @@ GrahaOS is an AI-integrated operating system built entirely from the ground up. 
    #for linux fedora (for which this project was built on)
    sudo dnf install gcc-c++ make git gcc make xosrriso qemu nasm bison libelf-devel 
    #please refer to osdev-wiki if you lack any libraries
+
+   #go to https://wiki.osdev.org/GCC_Cross-Compiler to understand what to install for your system
    ```
    **Build the OS**
    ```bash
