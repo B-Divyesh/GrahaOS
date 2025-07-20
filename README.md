@@ -22,6 +22,7 @@ GrahaOS is an AI-integrated operating system built entirely from the ground up. 
    #please refer to osdev-wiki if you lack any libraries
 
    #go to https://wiki.osdev.org/GCC_Cross-Compiler to understand what to install for your system
+   #regardless you will still need to intall xorisso and qemu
    ```
    **Build the OS**
    ```bash
@@ -30,7 +31,7 @@ GrahaOS is an AI-integrated operating system built entirely from the ground up. 
    make run
    #this will allow you to run on qemu
    ```
-
+   
 
 ### How GCP Works
 
