@@ -1,6 +1,7 @@
 /* drivers/video/framebuffer.c */
 #include "framebuffer.h"
 #include "../../kernel/limine.h"
+#include "../../kernel/sync/spinlock.h"
 
 // --- Private Variables ---
 static struct limine_framebuffer *fb = NULL;
@@ -8,7 +9,8 @@ static uint32_t *fb_addr = NULL;
 static uint32_t fb_pitch = 0;
 static uint32_t fb_width = 0;
 static uint32_t fb_height = 0;
-
+// Framebuffer spinlock - static initialization
+static spinlock_t fb_lock = SPINLOCK_INITIALIZER("framebuffer");
 // --- Simple 8x16 Bitmap Font ---
 // Basic ASCII characters (32-126)
 static const uint8_t font_8x16[95][16] = {
@@ -136,6 +138,7 @@ static const uint8_t font_8x16[95][16] = {
 
 // --- Helper Functions ---
 static size_t strlen(const char *str) {
+    if (!str) return 0;
     size_t len = 0;
     while (str[len]) len++;
     return len;
@@ -145,8 +148,39 @@ static bool is_valid_coordinates(uint32_t x, uint32_t y) {
     return (x < fb_width && y < fb_height);
 }
 
-// --- Public Function Implementations ---
+// Internal drawing functions (no locking)
+static void _draw_pixel_unsafe(uint32_t x, uint32_t y, uint32_t color) {
+    if (is_valid_coordinates(x, y)) {
+        fb_addr[y * (fb_pitch / 4) + x] = color;
+    }
+}
 
+static void _draw_rect_unsafe(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t color) {
+    uint32_t x_end = (x + width < fb_width) ? x + width : fb_width;
+    uint32_t y_end = (y + height < fb_height) ? y + height : fb_height;
+    
+    for (uint32_t j = y; j < y_end; j++) {
+        for (uint32_t i = x; i < x_end; i++) {
+            fb_addr[j * (fb_pitch / 4) + i] = color;
+        }
+    }
+}
+
+static void _draw_char_unsafe(char c, uint32_t x, uint32_t y, uint32_t fg_color) {
+    if (c < 32 || c > 126) return;
+
+    const uint8_t *glyph = font_8x16[c - 32];
+
+    for (int row = 0; row < 16; row++) {
+        for (int col = 0; col < 8; col++) {
+            if (glyph[row] & (0x80 >> col)) {
+                _draw_pixel_unsafe(x + col, y + row, fg_color);
+            }
+        }
+    }
+}
+
+// Public functions
 bool framebuffer_init(volatile struct limine_framebuffer_request *fb_request) {
     if (!fb_request || !fb_request->response ||
         fb_request->response->framebuffer_count < 1) {
@@ -158,6 +192,9 @@ bool framebuffer_init(volatile struct limine_framebuffer_request *fb_request) {
     fb_pitch = fb->pitch;
     fb_width = fb->width;
     fb_height = fb->height;
+    
+    // Reinitialize the lock (even though it's statically initialized)
+    spinlock_init(&fb_lock, "framebuffer");
 
     return true;
 }
@@ -171,103 +208,102 @@ uint32_t framebuffer_get_height(void) {
 }
 
 void framebuffer_draw_pixel(uint32_t x, uint32_t y, uint32_t color) {
-    if (!is_valid_coordinates(x, y)) return;
-
-    fb_addr[y * (fb_pitch / 4) + x] = color;
+    spinlock_acquire(&fb_lock);
+    _draw_pixel_unsafe(x, y, color);
+    spinlock_release(&fb_lock);
 }
 
 void framebuffer_draw_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t color) {
-    for (uint32_t j = y; j < y + height && j < fb_height; j++) {
-        for (uint32_t i = x; i < x + width && i < fb_width; i++) {
-            fb_addr[j * (fb_pitch / 4) + i] = color;
-        }
+    if (x >= fb_width || y >= fb_height || width == 0 || height == 0) {
+        return;
     }
+    
+    spinlock_acquire(&fb_lock);
+    _draw_rect_unsafe(x, y, width, height, color);
+    spinlock_release(&fb_lock);
 }
 
 void framebuffer_draw_rect_outline(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t color) {
+    if (x >= fb_width || y >= fb_height || width == 0 || height == 0) {
+        return;
+    }
+    
+    spinlock_acquire(&fb_lock);
+    
     // Top and bottom edges
     for (uint32_t i = x; i < x + width && i < fb_width; i++) {
-        if (y < fb_height) fb_addr[y * (fb_pitch / 4) + i] = color;
-        if (y + height - 1 < fb_height) fb_addr[(y + height - 1) * (fb_pitch / 4) + i] = color;
+        _draw_pixel_unsafe(i, y, color);
+        if (y + height - 1 < fb_height) {
+            _draw_pixel_unsafe(i, y + height - 1, color);
+        }
     }
 
     // Left and right edges
-    for (uint32_t j = y; j < y + height && j < fb_height; j++) {
-        if (x < fb_width) fb_addr[j * (fb_pitch / 4) + x] = color;
-        if (x + width - 1 < fb_width) fb_addr[j * (fb_pitch / 4) + (x + width - 1)] = color;
-    }
-}
-
-void framebuffer_clear(uint32_t color) {
-    for (uint32_t i = 0; i < fb_width * fb_height; i++) {
-        fb_addr[i] = color;
-    }
-}
-
-// --- CORRECTED LOGIC ---
-
-/**
- * @brief Draws a single character.
- * @note This version ONLY draws the foreground pixels, making it "transparent".
- *       The background must be drawn beforehand by the calling function (e.g., draw_string).
- */
-void framebuffer_draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color) {
-    if (c < 32 || c > 126) return; // Return on unsupported characters
-
-    const uint8_t *glyph = font_8x16[c - 32];
-
-    for (int row = 0; row < 16; row++) {
-        for (int col = 0; col < 8; col++) {
-            // Check if the bit for the current pixel is set in the font data
-            if (glyph[row] & (0x80 >> col)) {
-                // If it is, draw a pixel. If not, do nothing.
-                // This prevents the background from being overwritten.
-                framebuffer_draw_pixel(x + col, y + row, fg_color);
-            }
+    for (uint32_t j = y + 1; j < y + height - 1 && j < fb_height; j++) {
+        _draw_pixel_unsafe(x, j, color);
+        if (x + width - 1 < fb_width) {
+            _draw_pixel_unsafe(x + width - 1, j, color);
         }
     }
+    
+    spinlock_release(&fb_lock);
 }
 
-/**
- * @brief Draws a null-terminated string.
- * @note This is the new, correct implementation. It first draws a single
- *       background rectangle for the whole string, then draws each character
- *       on top without a background.
- */
+void framebuffer_draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color) {
+    spinlock_acquire(&fb_lock);
+    _draw_char_unsafe(c, x, y, fg_color);
+    spinlock_release(&fb_lock);
+}
+
 void framebuffer_draw_string(const char *str, uint32_t x, uint32_t y, 
                              uint32_t fg_color, uint32_t bg_color) {
+    if (!str) return;
+    
+    spinlock_acquire(&fb_lock);
+    
     size_t len = strlen(str);
+    if (len == 0) {
+        spinlock_release(&fb_lock);
+        return;
+    }
     
     // Draw background
-    framebuffer_draw_rect(x, y, len * 8, 16, bg_color);
+    _draw_rect_unsafe(x, y, len * 8, 16, bg_color);
     
     // Draw characters
     for (size_t i = 0; i < len; i++) {
-        framebuffer_draw_char(str[i], x + (i * 8), y, fg_color);
+        _draw_char_unsafe(str[i], x + (i * 8), y, fg_color);
     }
     
-    // CRITICAL: Force memory write
     asm volatile("mfence" ::: "memory");
+    
+    spinlock_release(&fb_lock);
 }
 
 void framebuffer_draw_hex(uint64_t value, int x, int y, uint32_t fg_color, uint32_t bg_color) {
-    char buffer[19];  // "0x" + 16 hex digits + null terminator
+    char buffer[19];
     const char *hex_chars = "0123456789ABCDEF";
     
-    // Format as "0xFFFFFFFFFFFFFFFF"
     buffer[0] = '0';
     buffer[1] = 'x';
     
-    // Convert 64-bit value to hex string
     for (int i = 0; i < 16; i++) {
-        // Extract nibble (4 bits) from the value
         uint8_t nibble = (value >> (60 - i * 4)) & 0xF;
         buffer[2 + i] = hex_chars[nibble];
     }
-    buffer[18] = '\0';  // Null-terminate
+    buffer[18] = '\0';
     
-    // Draw the formatted hex string
     framebuffer_draw_string(buffer, x, y, fg_color, bg_color);
+}
+
+void framebuffer_clear(uint32_t color) {
+    spinlock_acquire(&fb_lock);
+    
+    for (uint32_t i = 0; i < fb_width * fb_height; i++) {
+        fb_addr[i] = color;
+    }
+    
+    spinlock_release(&fb_lock);
 }
 
 void framebuffer_draw_rsp_error(uint64_t code) {

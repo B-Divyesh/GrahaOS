@@ -2,10 +2,10 @@
 #include "vfs.h"
 #include "../initrd.h"
 #include <stddef.h> // For NULL
-
+#include "../sync/spinlock.h"
 // The system-wide open file table
 static open_file_t open_file_table[MAX_OPEN_FILES];
-
+static spinlock_t vfs_lock = SPINLOCK_INITIALIZER("vfs");
 // Simple memcpy and strlen for internal use
 static void *vfs_memcpy(void *dest, const void *src, size_t n) {
     uint8_t *pdest = (uint8_t *)dest;
@@ -25,9 +25,14 @@ static size_t vfs_strlen(const char *str) {
 }
 
 void vfs_init(void) {
+    // Reinitialize the lock
+    spinlock_init(&vfs_lock, "vfs");
+    
+    spinlock_acquire(&vfs_lock);
     for (int i = 0; i < MAX_OPEN_FILES; i++) {
         open_file_table[i].in_use = false;
     }
+    spinlock_release(&vfs_lock);
 }
 
 int vfs_open(const char *pathname) {
@@ -37,7 +42,7 @@ int vfs_open(const char *pathname) {
     if (file_data == NULL) {
         return -1; // File not found
     }
-
+    spinlock_acquire(&vfs_lock);
     // Find a free file descriptor
     for (int fd = 0; fd < MAX_OPEN_FILES; fd++) {
         if (!open_file_table[fd].in_use) {
@@ -48,7 +53,7 @@ int vfs_open(const char *pathname) {
             return fd;
         }
     }
-
+    spinlock_release(&vfs_lock);
     return -1; // No free file descriptors
 }
 

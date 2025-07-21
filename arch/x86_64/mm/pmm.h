@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include "../../../kernel/limine.h"
 
+#include "../../../kernel/sync/spinlock.h"
+
 #define PAGE_SIZE 4096
 
 /**

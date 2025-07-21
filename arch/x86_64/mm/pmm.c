@@ -1,13 +1,17 @@
 #include "pmm.h"
 #include <stdbool.h>
-#include <stddef.h> // For NULL
+#include <stddef.h>
+#include "../../../kernel/sync/spinlock.h"
 
-// Simple bitmap-based physical memory manager
+// Bitmap-based physical memory manager
 static uint8_t *bitmap = NULL;
 static uint64_t total_pages = 0;
 static uint64_t used_pages = 0;
 static uint64_t usable_memory = 0;
 static uint64_t last_used_index = 0;
+
+// PMM spinlock with static initialization
+static spinlock_t pmm_lock = SPINLOCK_INITIALIZER("pmm");
 
 // Bitmap manipulation functions
 static void bitmap_set_bit(uint64_t page) {
@@ -28,10 +32,11 @@ static bool bitmap_test_bit(uint64_t page) {
     return (bitmap[byte] & (1 << bit)) != 0;
 }
 
-// FIXED: Accept volatile pointer but use non-volatile local variable
 void pmm_init(volatile struct limine_memmap_response *memmap_response) {
-    // FIX: The local variable `entries` should not be volatile.
-    // We are reading a value from a volatile location into a stable local variable.
+    // Initialize the lock
+    spinlock_init(&pmm_lock, "pmm");
+    
+    // No need to lock during init as we're single-threaded here
     struct limine_memmap_entry **entries = memmap_response->entries;
     uint64_t entry_count = memmap_response->entry_count;
     uint64_t highest_addr = 0;
@@ -49,20 +54,19 @@ void pmm_init(volatile struct limine_memmap_response *memmap_response) {
 
     // Calculate total pages and bitmap size
     total_pages = highest_addr / PAGE_SIZE;
-    uint64_t bitmap_size = (total_pages + 7) / 8;  // Round up
+    uint64_t bitmap_size = (total_pages + 7) / 8;
 
     // Find space for bitmap in usable memory
     for (uint64_t i = 0; i < entry_count; i++) {
         if (entries[i]->type == LIMINE_MEMMAP_USABLE &&
             entries[i]->length >= bitmap_size) {
-            // Use higher half mapping (assuming Limine sets this up)
             bitmap = (uint8_t *)(entries[i]->base + 0xFFFF800000000000ULL);
             break;
         }
     }
 
     if (!bitmap) {
-        // Fallback: use direct mapping if higher half isn't available
+        // Fallback: use direct mapping
         for (uint64_t i = 0; i < entry_count; i++) {
             if (entries[i]->type == LIMINE_MEMMAP_USABLE &&
                 entries[i]->length >= bitmap_size) {
@@ -103,12 +107,15 @@ void pmm_init(volatile struct limine_memmap_response *memmap_response) {
 }
 
 void *pmm_alloc_page(void) {
-    // Start searching from last used index for better performance
+    spinlock_acquire(&pmm_lock);
+
+    // Start searching from last used index
     for (uint64_t i = last_used_index; i < total_pages; i++) {
         if (!bitmap_test_bit(i)) {
             bitmap_set_bit(i);
             used_pages++;
             last_used_index = i + 1;
+            spinlock_release(&pmm_lock);
             return (void *)(i * PAGE_SIZE);
         }
     }
@@ -119,18 +126,21 @@ void *pmm_alloc_page(void) {
             bitmap_set_bit(i);
             used_pages++;
             last_used_index = i + 1;
+            spinlock_release(&pmm_lock);
             return (void *)(i * PAGE_SIZE);
         }
     }
 
+    spinlock_release(&pmm_lock);
     return NULL; // Out of memory
 }
 
-// Function to allocate multiple contiguous pages
 void *pmm_alloc_pages(size_t num_pages) {
     if (num_pages == 0) return NULL;
     if (num_pages == 1) return pmm_alloc_page();
 
+    spinlock_acquire(&pmm_lock);
+    
     uint64_t consecutive_pages = 0;
     for (uint64_t i = 0; i < total_pages; i++) {
         if (!bitmap_test_bit(i)) {
@@ -143,31 +153,42 @@ void *pmm_alloc_pages(size_t num_pages) {
             uint64_t start_page = i - num_pages + 1;
             for (uint64_t j = 0; j < num_pages; j++) {
                 bitmap_set_bit(start_page + j);
-                used_pages++;
             }
+            used_pages += num_pages;
+            spinlock_release(&pmm_lock);
             return (void *)(start_page * PAGE_SIZE);
         }
     }
 
+    spinlock_release(&pmm_lock);
     return NULL; // Not enough contiguous pages
 }
 
 void pmm_free_page(void *page) {
+    if (!page) return;
+    
     uint64_t page_index = (uint64_t)page / PAGE_SIZE;
 
+    spinlock_acquire(&pmm_lock);
+    
     if (page_index < total_pages && bitmap_test_bit(page_index)) {
         bitmap_clear_bit(page_index);
         used_pages--;
 
-        // Update last_used_index for faster allocation
         if (page_index < last_used_index) {
             last_used_index = page_index;
         }
     }
+    
+    spinlock_release(&pmm_lock);
 }
 
 void pmm_free_pages(void *pages, size_t num_pages) {
+    if (!pages || num_pages == 0) return;
+    
     uint64_t start_page_index = (uint64_t)pages / PAGE_SIZE;
+    
+    spinlock_acquire(&pmm_lock);
     
     for (size_t i = 0; i < num_pages; i++) {
         uint64_t page_index = start_page_index + i;
@@ -177,16 +198,23 @@ void pmm_free_pages(void *pages, size_t num_pages) {
         }
     }
     
-    // Update last_used_index for faster allocation
     if (start_page_index < last_used_index) {
         last_used_index = start_page_index;
     }
+    
+    spinlock_release(&pmm_lock);
 }
 
 uint64_t pmm_get_total_memory(void) {
-    return usable_memory;
+    spinlock_acquire(&pmm_lock);
+    uint64_t total = usable_memory;
+    spinlock_release(&pmm_lock);
+    return total;
 }
 
 uint64_t pmm_get_free_memory(void) {
-    return usable_memory - (used_pages * PAGE_SIZE);
+    spinlock_acquire(&pmm_lock);
+    uint64_t free_mem = usable_memory - (used_pages * PAGE_SIZE);
+    spinlock_release(&pmm_lock);
+    return free_mem;
 }

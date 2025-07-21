@@ -4,10 +4,14 @@
 #include "../../mm/vmm.h"
 #include "../gdt.h"
 #include "../../../../drivers/video/framebuffer.h"
+#include "../../../../kernel/sync/spinlock.h"
 
 static task_t tasks[MAX_TASKS];
 static int next_task_id = 0;
 static int current_task_index = 0;
+
+// Scheduler spinlock with static initialization
+static spinlock_t sched_lock = SPINLOCK_INITIALIZER("scheduler");
 
 // Simple memset implementation
 static void *memset(void *s, int c, size_t n) {
@@ -19,14 +23,18 @@ static void *memset(void *s, int c, size_t n) {
 }
 
 void sched_init(void) {
+    // Initialize the scheduler lock with proper name
+    spinlock_init(&sched_lock, "scheduler");
+    
+    spinlock_acquire(&sched_lock);
     memset(tasks, 0, sizeof(tasks));
 
     // Task 0 is the kernel's idle task
     tasks[0].id = next_task_id++;
     tasks[0].state = TASK_STATE_RUNNING;
     tasks[0].cr3 = vmm_get_pml4_phys(vmm_get_kernel_space());
-    tasks[0].parent_id = -1; // Kernel has no parent
-    tasks[0].waiting_for_child = -1; // Not waiting for any child
+    tasks[0].parent_id = -1;
+    tasks[0].waiting_for_child = -1;
     
     uint64_t current_rsp;
     asm volatile("mov %%rsp, %0" : "=r"(current_rsp));
@@ -35,6 +43,8 @@ void sched_init(void) {
     kernel_tss.rsp0 = tasks[0].kernel_stack_top;
     
     current_task_index = 0;
+    
+    spinlock_release(&sched_lock);
     
     framebuffer_draw_string("Scheduler initialized with wait() support", 700, 20, COLOR_GREEN, 0x00101828);
 }
@@ -101,11 +111,13 @@ static void sched_hex_to_string(uint64_t value, char *buffer) {
 }
 
 int sched_create_user_process(uint64_t rip, uint64_t cr3) {
+    spinlock_acquire(&sched_lock);
     int id;
     uint64_t flags;
     asm volatile("pushfq; pop %0; cli" : "=r"(flags));
     if (next_task_id >= MAX_TASKS) {
         asm volatile("push %0; popfq" : : "r"(flags));
+        spinlock_release(&sched_lock);
         return -1;
     }
     id = next_task_id++;
@@ -118,7 +130,9 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     tasks[id].exit_status = 0;
     
     asm volatile("push %0; popfq" : : "r"(flags));
-    
+
+    spinlock_release(&sched_lock);
+
     size_t num_pages = KERNEL_STACK_SIZE / PAGE_SIZE;
     void* kstack_phys = pmm_alloc_pages(num_pages);
     if (!kstack_phys) return -1;
@@ -170,6 +184,8 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     while (parent_str[j]) stack_msg[i++] = parent_str[j++];
     stack_msg[i] = '\0';
     framebuffer_draw_string(stack_msg, 700, 60, COLOR_CYAN, 0x00101828);
+
+    spinlock_acquire(&sched_lock);
     
     memset(&tasks[id].regs, 0, sizeof(struct interrupt_frame));
     tasks[id].regs.rip = rip;
@@ -178,7 +194,10 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     tasks[id].regs.cs = 0x20 | 3;
     tasks[id].regs.ss = 0x18 | 3;
     
+    spinlock_release(&sched_lock);
+    
     framebuffer_draw_string("User process created successfully!", 700, 120, COLOR_GREEN, 0x00101828);
+    
     
     return id;
 }

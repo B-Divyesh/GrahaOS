@@ -4,6 +4,8 @@
 #include "../interrupts.h"
 #include "../../mm/vmm.h" // For vmm_address_space_t
 
+#include "../../../../kernel/sync/spinlock.h"
+
 #define MAX_TASKS 32
 #define KERNEL_STACK_SIZE 16384
 

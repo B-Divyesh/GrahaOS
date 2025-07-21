@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "../sync/spinlock.h"
+
 #define MAX_OPEN_FILES 64
 
 typedef long ssize_t;

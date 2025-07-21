@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#include "../../kernel/sync/spinlock.h"
 // Forward declaration
 struct limine_framebuffer_request;
 
