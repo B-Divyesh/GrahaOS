@@ -32,6 +32,7 @@ GrahaOS is an AI-integrated operating system built entirely from the ground up. 
    #this will allow you to run on qemu
    ```
    
+   
 
 ### How GCP Works
 
