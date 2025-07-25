@@ -17,7 +17,7 @@
 #include "../arch/x86_64/drivers/timer/pit.h"
 #include "../arch/x86_64/cpu/interrupts.h"
 
-// --- Limine Requests (no changes) ---
+// --- Limine Requests ---
 __attribute__((used, section(".limine_requests")))
 static volatile LIMINE_BASE_REVISION(3);
 __attribute__((used, section(".limine_requests_start")))
