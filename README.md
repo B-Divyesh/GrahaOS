@@ -13,7 +13,7 @@ GrahaOS is an AI-integrated operating system built entirely from the ground up. 
 
 1. **Clone the Repository**
    ```bash
-   git clone https://github.com/yourusername/grahaos.git
+   git clone https://github.com/B-Divyesh/GrahaOS.git
    ```
    **install dependencies**
    ```bash
