@@ -29,12 +29,23 @@ static uint64_t read_msr(uint32_t msr) {
 }
 
 void syscall_init(void) {
+    // Enable syscall/sysret instructions
     uint64_t efer = read_msr(MSR_EFER);
     write_msr(MSR_EFER, efer | 1);
+    
+    // Set up STAR MSR with kernel and user segments
     uint64_t star = ((uint64_t)0x10 << 48) | ((uint64_t)0x08 << 32);
     write_msr(MSR_STAR, star);
+    
+    // Set syscall entry point
     write_msr(MSR_LSTAR, (uint64_t)syscall_entry);
-    write_msr(MSR_KERNEL_GS_BASE, (uint64_t)&kernel_tss);
+    
+    // CRITICAL FIX: Set MSR_KERNEL_GS_BASE to point to per-CPU data
+    // At this point, GS_BASE is already set up by smp_init()
+    uint32_t cpu_id = smp_get_current_cpu();
+    write_msr(MSR_KERNEL_GS_BASE, (uint64_t)&g_cpu_locals[cpu_id]);
+    
+    // Clear interrupt flag on syscall
     write_msr(MSR_FMASK, 0x200);
 }
 

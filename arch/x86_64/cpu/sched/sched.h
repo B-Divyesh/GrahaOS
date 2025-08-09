@@ -3,7 +3,8 @@
 #include <stddef.h>
 #include "../interrupts.h"
 #include "../../mm/vmm.h" // For vmm_address_space_t
-
+#include "../interrupts.h"
+#include "../smp.h"
 #include "../../../../kernel/sync/spinlock.h"
 
 #define MAX_TASKS 32

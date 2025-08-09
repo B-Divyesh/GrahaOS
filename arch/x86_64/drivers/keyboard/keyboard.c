@@ -37,8 +37,7 @@ static size_t write_index = 0;
 static volatile int keyboard_interrupts_received = 0;
 static volatile bool expecting_scancode_set_response = false;
 
-// US QWERTY Scancode Set 1 to ASCII mapping, using the DELL SK-8115, will add remaining key in the future
-//we get some error about an extra array element here, will work on it later
+// US QWERTY Scancode Set 1 to ASCII mapping
 static const char scancode_set1_map[128] = {
     0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
     '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
@@ -50,6 +49,23 @@ static const char scancode_set1_map[128] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
+
+// Shift key mapping for US QWERTY
+static const char scancode_set1_shift_map[128] = {
+    0,  27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
+    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
+    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
+    0, '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0,
+    '*', 0, ' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, '-', 0, 0, 0, '+', 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+};
+
+// Track shift state
+static bool shift_pressed = false;
+static bool caps_lock = false;
 
 // Wait for PS/2 controller ready
 static void ps2_wait_write(void) {
@@ -89,6 +105,8 @@ void keyboard_init(void) {
     read_index = 0;
     write_index = 0;
     keyboard_interrupts_received = 0;
+    shift_pressed = false;
+    caps_lock = false;
     
     framebuffer_draw_string("KB: Initializing...", 10, 280, COLOR_YELLOW, 0x00101828);
     
@@ -104,9 +122,9 @@ void keyboard_init(void) {
     ps2_send_command(PS2_CMD_READ_CONFIG);
     uint8_t config = kb_read_data();
     
-    // Enable interrupt (bit 0) and disable translation (bit 6)
-    // Disabling translation ensures we get raw scancodes
-    config |= 0x01;   // Enable IRQ1
+    // For polling mode, we disable the interrupt (bit 0)
+    // and disable translation (bit 6)
+    config &= ~0x01;  // Disable IRQ1 for polling mode
     config &= ~0x40;  // Disable translation
     
     // Write configuration back
@@ -129,7 +147,7 @@ void keyboard_init(void) {
         framebuffer_draw_string("KB: Self-test failed", 10, 320, COLOR_RED, 0x00101828);
     }
     
-    // CRITICAL: Set scancode set 1
+    // Set scancode set 1
     framebuffer_draw_string("KB: Setting scancode set 1...", 10, 340, COLOR_YELLOW, 0x00101828);
     
     kb_send_data(KB_CMD_SET_SCANCODE);
@@ -154,7 +172,65 @@ void keyboard_init(void) {
         inb(KEYBOARD_DATA_PORT);
     }
     
-    framebuffer_draw_string("KB: Ready (Set 1)", 10, 280, COLOR_GREEN, 0x00101828);
+    framebuffer_draw_string("KB: Ready (Polling Mode)", 10, 280, COLOR_GREEN, 0x00101828);
+}
+
+void keyboard_handle_scancode(uint8_t scancode) {
+    // Filter out special responses
+    if (scancode >= 0xFA) {
+        return; // ACK, RESEND, etc.
+    }
+    
+    // Handle key releases (bit 7 set)
+    if (scancode & 0x80) {
+        uint8_t key = scancode & 0x7F;
+        
+        // Check for shift release
+        if (key == 0x2A || key == 0x36) {  // Left or right shift
+            shift_pressed = false;
+        }
+        return;
+    }
+    
+    // Handle special keys (key presses)
+    if (scancode == 0x2A || scancode == 0x36) {  // Left or right shift
+        shift_pressed = true;
+        return;
+    }
+    
+    if (scancode == 0x3A) {  // Caps lock
+        caps_lock = !caps_lock;
+        return;
+    }
+    
+    // Convert scancode to ASCII
+    char ascii = 0;
+    
+    if (scancode < 128) {
+        // Check if we should use shifted character
+        bool use_shift = shift_pressed;
+        
+        // For letters, also consider caps lock
+        char base_char = scancode_set1_map[scancode];
+        if (base_char >= 'a' && base_char <= 'z') {
+            use_shift = shift_pressed ^ caps_lock;  // XOR for caps lock effect
+        }
+        
+        if (use_shift) {
+            ascii = scancode_set1_shift_map[scancode];
+        } else {
+            ascii = scancode_set1_map[scancode];
+        }
+        
+        // Store in buffer if we got a valid character
+        if (ascii != 0) {
+            size_t next_write = (write_index + 1) % KEYBOARD_BUFFER_SIZE;
+            if (next_write != read_index) {
+                key_buffer[write_index] = ascii;
+                write_index = next_write;
+            }
+        }
+    }
 }
 
 void keyboard_irq_handler(void) {
@@ -163,52 +239,8 @@ void keyboard_irq_handler(void) {
     // Read the scancode
     uint8_t scancode = inb(KEYBOARD_DATA_PORT);
     
-    // Debug: Show scancode (first 10 keys)
-    static int key_count = 0;
-    if (key_count < 10 && scancode < 0x80) {
-        char msg[48] = "Key ";
-        int i = 4;
-        msg[i++] = '0' + key_count;
-        msg[i++] = ':';
-        msg[i++] = ' ';
-        msg[i++] = '0';
-        msg[i++] = 'x';
-        const char *hex = "0123456789ABCDEF";
-        msg[i++] = hex[(scancode >> 4) & 0xF];
-        msg[i++] = hex[scancode & 0xF];
-        
-        // Show the mapped character
-        if (scancode < 128 && scancode_set1_map[scancode] != 0) {
-            msg[i++] = ' ';
-            msg[i++] = '=';
-            msg[i++] = ' ';
-            msg[i++] = '\'';
-            msg[i++] = scancode_set1_map[scancode];
-            msg[i++] = '\'';
-        }
-        msg[i] = '\0';
-        
-        framebuffer_draw_string(msg, 10, 360 + (key_count * 16), COLOR_CYAN, 0x00101828);
-        key_count++;
-    }
-    
-    // Filter out special responses
-    if (scancode >= 0xFA) {
-        return; // ACK, RESEND, etc.
-    }
-    
-    // Only process key presses (not releases)
-    if (scancode < 0x80) {
-        char ascii = scancode_set1_map[scancode];
-        if (ascii != 0) {
-            // Add to buffer
-            size_t next_write = (write_index + 1) % KEYBOARD_BUFFER_SIZE;
-            if (next_write != read_index) {
-                key_buffer[write_index] = ascii;
-                write_index = next_write;
-            }
-        }
-    }
+    // Process it through the common handler
+    keyboard_handle_scancode(scancode);
 }
 
 char keyboard_getchar(void) {
@@ -219,4 +251,8 @@ char keyboard_getchar(void) {
     char c = key_buffer[read_index];
     read_index = (read_index + 1) % KEYBOARD_BUFFER_SIZE;
     return c;
+}
+
+int keyboard_get_interrupt_count(void) {
+    return keyboard_interrupts_received;
 }

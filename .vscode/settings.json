@@ -1,6 +1,36 @@
 {
     "files.associations": {
         "stddef.h": "c",
-        "framebuffer.h": "c"
+        "framebuffer.h": "c",
+        "lapic.h": "c",
+        "smp.h": "c",
+        "hash_map": "cpp",
+        "hash_set": "cpp",
+        "bitset": "cpp",
+        "deque": "cpp",
+        "forward_list": "cpp",
+        "list": "cpp",
+        "string": "cpp",
+        "unordered_map": "cpp",
+        "unordered_set": "cpp",
+        "vector": "cpp",
+        "internet": "cpp",
+        "iterator": "cpp",
+        "string_view": "cpp",
+        "rope": "cpp",
+        "slist": "cpp",
+        "array": "cpp",
+        "chrono": "cpp",
+        "flat_map": "cpp",
+        "flat_set": "cpp",
+        "format": "cpp",
+        "ranges": "cpp",
+        "span": "cpp",
+        "stacktrace": "cpp",
+        "text_encoding": "cpp",
+        "regex": "cpp",
+        "dynamic_bitset": "cpp",
+        "initializer_list": "cpp",
+        "syscall.h": "c"
     }
 }

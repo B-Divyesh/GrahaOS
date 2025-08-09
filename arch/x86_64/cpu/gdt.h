@@ -17,8 +17,7 @@ struct gdt_ptr {
     uint64_t base;         // Linear address of GDT
 } __attribute__((packed));
 
-// --- NEW: TSS Entry Structure ---
-// A TSS descriptor is larger than a standard GDT entry.
+// TSS Entry Structure
 struct tss_entry {
     uint16_t limit_low;
     uint16_t base_low;
@@ -30,9 +29,7 @@ struct tss_entry {
     uint32_t reserved;
 } __attribute__((packed));
 
-// --- NEW: TSS Structure ---
-// This structure holds the information the CPU needs for tasks.
-// For our purposes, we only care about the kernel stack pointer (RSP0).
+// TSS Structure
 struct tss {
     uint32_t reserved0;
     uint64_t rsp0; // The stack pointer to use when transitioning from user to kernel mode
@@ -51,13 +48,11 @@ struct tss {
     uint16_t iopb_offset;
 } __attribute__((packed));
 
-// --- THE FIX ---
-// Expose the kernel_tss so the scheduler can modify its rsp0 field.
-extern struct tss kernel_tss;
+// Forward declaration of cpu_local_t
+struct cpu_local_t;
 
-/**
- * @brief Initialize the Global Descriptor Table
- * Sets up kernel code and data segments for x86_64 long mode
- * Now also sets up user segments and TSS for privilege switching
- */
+// MODIFIED: Function now takes a cpu_id parameter
+void gdt_init_for_cpu(uint32_t cpu_id);
+
+// Legacy function for compatibility (will call gdt_init_for_cpu(0))
 void gdt_init(void);

@@ -1,6 +1,7 @@
 // kernel/sync/spinlock.c
 #include "spinlock.h"
 #include "../../drivers/video/framebuffer.h"
+#include "../../arch/x86_64/cpu/smp.h"
 #include <stdarg.h>
 
 // Forward declaration to avoid circular dependency
@@ -98,4 +99,10 @@ void _spinlock_release(spinlock_t *lock, const char *file, int line) {
 bool spinlock_held(spinlock_t *lock) {
     if (!lock) return false;
     return lock->locked && lock->owner == get_cpu_id();
+}
+
+// Implementation of get_cpu_id using GS-based method
+uint64_t get_cpu_id(void) {
+    // Use the SMP module's GS-based CPU ID function
+    return (uint64_t)smp_get_current_cpu();
 }

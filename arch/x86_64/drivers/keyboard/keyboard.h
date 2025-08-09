@@ -27,3 +27,9 @@ char keyboard_getchar(void);
  * @return Number of interrupts
  */
 int keyboard_get_interrupt_count(void);
+
+/**
+ * @brief Handle a keyboard scancode (for polling mode)
+ * @param scancode The scancode received from the keyboard
+ */
+void keyboard_handle_scancode(uint8_t scancode);

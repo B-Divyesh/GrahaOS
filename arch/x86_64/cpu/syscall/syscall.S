@@ -18,7 +18,14 @@ syscall_entry:
     
     ; Switch to kernel context
     swapgs
-    mov rsp, [gs:4]
+    
+    ; CRITICAL FIX: Correct offset to TSS.rsp0 is 68, not 4!
+    ; cpu_local_t structure:
+    ; - cpu_id (4 bytes) + lapic_id (4 bytes) = 8 bytes
+    ; - gdt[7] (7 * 8 bytes) = 56 bytes  
+    ; - tss.reserved0 (4 bytes) = 4 bytes
+    ; Total offset to rsp0 = 8 + 56 + 4 = 68
+    mov rsp, [gs:68]
     
     test rsp, rsp
     jz panic
@@ -73,7 +80,7 @@ syscall_entry:
     add rsp, 16
     pop rsp
     
-    ; Return to user - NO CANONICAL CHECK FOR NOW
+    ; Return to user
     swapgs
     db 0x48, 0x0f, 0x07  ; sysretq opcode
 

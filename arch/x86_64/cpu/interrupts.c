@@ -1,8 +1,9 @@
 #include "interrupts.h"
 #include "ports.h"
-#include "sched/sched.h" // For calling the scheduler
+#include "sched/sched.h"
 #include "../../../drivers/video/framebuffer.h"
-#include "../../drivers/keyboard/keyboard.h" // ADDED
+#include "../../drivers/keyboard/keyboard.h"
+#include "../../drivers/lapic/lapic.h"
 
 // PIC (Programmable Interrupt Controller) ports
 #define PIC1_COMMAND 0x20
@@ -12,6 +13,9 @@
 
 // End-of-Interrupt command
 #define PIC_EOI      0x20
+
+// Track if we're using LAPIC (modern) or PIC (legacy) mode
+static bool using_lapic = false;
 
 // Remaps the PIC interrupts to avoid conflicts with CPU exceptions.
 static void pic_remap(void) {
@@ -40,14 +44,22 @@ static void pic_remap(void) {
     outb(PIC2_DATA, a2);
 }
 
-// Called from idt_init()
+// Disable the legacy PIC
+void pic_disable(void) {
+    // Mask all interrupts on both PICs
+    outb(PIC1_DATA, 0xFF);
+    outb(PIC2_DATA, 0xFF);
+    using_lapic = true;  // Switch to LAPIC mode
+}
+
+// Initialize interrupt handling
 void irq_init(void) {
-    pic_remap();
-    keyboard_init(); // ADDED: Initialize keyboard driver
-    // Enable only the timer (IRQ0) and keyboard (IRQ1) for now
-    outb(PIC1_DATA, 0b11111100); // Unmask IRQ0 and IRQ1
-    outb(PIC2_DATA, 0b11111111); // Mask all slave PIC IRQs
-    asm volatile ("sti"); // Enable interrupts
+    // In modern LAPIC mode, we don't need to do anything here
+    // The LAPIC is already configured by smp_init and lapic_timer_init
+    // Just ensure interrupts will be enabled by the caller
+    
+    // Initialize keyboard driver (it will use polling for now)
+    keyboard_init();
 }
 
 // Simple hcf function
@@ -58,16 +70,19 @@ static void hcf(void) {
     }
 }
 
-// Helper to print a hex value at a specific screen location
+// Fixed helper to print a hex value at a specific screen location
 static void print_hex_at(uint64_t value, int x, int y) {
-    char buffer[17] = {0};
+    char buffer[19] = {0};  // 0x + 16 hex digits + null terminator
     const char *hex_chars = "0123456789ABCDEF";
     buffer[0] = '0';
     buffer[1] = 'x';
-    for (int i = 15; i >= 2; i--) {
-        buffer[i] = hex_chars[value & 0xF];
-        value >>= 4;
+    
+    // Fill all 16 hex digits (64 bits = 16 hex digits)
+    for (int i = 0; i < 16; i++) {
+        buffer[2 + i] = hex_chars[(value >> (60 - i * 4)) & 0xF];
     }
+    buffer[18] = '\0';
+    
     framebuffer_draw_string(buffer, x, y, COLOR_WHITE, COLOR_RED);
 }
 
@@ -75,27 +90,21 @@ static void print_hex_value(const char *label, uint64_t value, int x, int y) {
     framebuffer_draw_string(label, x, y, COLOR_WHITE, COLOR_RED);
     
     // Simple hex conversion
-    char hex[17] = "0x";
+    char hex[19] = "0x";
     const char *digits = "0123456789ABCDEF";
-    for (int i = 15; i >= 0; i--) {
-        hex[17 - i] = digits[(value >> (i * 4)) & 0xF];
+    for (int i = 0; i < 16; i++) {
+        hex[2 + i] = digits[(value >> (60 - i * 4)) & 0xF];
     }
-    hex[16] = '\0';
+    hex[18] = '\0';
     
     framebuffer_draw_string(hex, x + 80, y, COLOR_YELLOW, COLOR_RED);
 }
 
-// The main C-level interrupt handler, with corrected page fault diagnostics
+// The main C-level interrupt handler
 void interrupt_handler(struct interrupt_frame *frame) {
     // CRITICAL: Validate frame pointer
     if (!frame) {
-        // This should NEVER happen - indicates severe corruption
-        asm volatile(
-            "cli\n"
-            "mov $0xDEADBEEF, %%rax\n"  // Magic value for debugging
-            "hlt\n"
-            ::: "rax"
-        );
+        asm volatile("cli; hlt");
     }
     
     // Validate frame address is in reasonable range
@@ -149,6 +158,7 @@ void interrupt_handler(struct interrupt_frame *frame) {
         // CPU exception - show detailed info
         framebuffer_draw_rect(0, 0, framebuffer_get_width(), 200, COLOR_RED);
         
+        // FIXED: Avoid undefined behavior
         char msg[64] = "CPU Exception #";
         char num[3];
         int n = frame->int_no;
@@ -157,13 +167,17 @@ void interrupt_handler(struct interrupt_frame *frame) {
             num[i++] = '0' + (n % 10);
             n /= 10;
         } while (n > 0);
-        while (i > 0) {
-            msg[15 + (2-i)] = num[--i];
+        
+        // Reverse the digits properly
+        int len = i;
+        for (int j = 0; j < len; j++) {
+            msg[15 + j] = num[len - 1 - j];
         }
-        msg[17] = '\0';
+        msg[15 + len] = '\0';
+        
         framebuffer_draw_string(msg, 10, 10, COLOR_WHITE, COLOR_RED);
         
-        // Show exception name during hte exception
+        // Show exception name
         const char *exception_names[] = {
             "Divide by Zero", "Debug", "NMI", "Breakpoint",
             "Overflow", "Bound Range", "Invalid Opcode", "Device Not Available",
@@ -189,27 +203,36 @@ void interrupt_handler(struct interrupt_frame *frame) {
         // Show if it's user or kernel mode
         if (frame->cs & 3) {
             framebuffer_draw_string("USER MODE crash", 10, 70, COLOR_YELLOW, COLOR_RED);
-            framebuffer_draw_string("Process was: grahai", 10, 90, COLOR_WHITE, COLOR_RED);
+            framebuffer_draw_string("Process crashed", 10, 90, COLOR_WHITE, COLOR_RED);
         } else {
             framebuffer_draw_string("KERNEL MODE crash", 10, 70, COLOR_YELLOW, COLOR_RED);
         }
         
         hcf();
-    } else if (frame->int_no >= 32 && frame->int_no < 48) {
-        // Is a hardware IRQ
+    } else if (frame->int_no >= 32 && frame->int_no < 256) {
+        // Hardware interrupt
         switch (frame->int_no) {
-            case 32: // IRQ0: Timer
+            case 32: // IRQ0: Timer (now from LAPIC timer)
                 schedule(frame);
                 break;
-            case 33: // IRQ1: Keyboard - ADDED
+            case 33: // IRQ1: Keyboard (if still using legacy keyboard)
                 keyboard_irq_handler();
+                // For keyboard, we might still need PIC EOI if using legacy mode
+                if (!using_lapic) {
+                    outb(PIC1_COMMAND, PIC_EOI);
+                }
+                break;
+            case 255: // Spurious interrupt from LAPIC
+                // Just return, no EOI needed for spurious
+                return;
+            default:
+                // Unknown interrupt - ignore
                 break;
         }
 
-        // Send EOI to the PICs.
-        if (frame->int_no >= 40) {
-            outb(PIC2_COMMAND, PIC_EOI); // EOI to slave
+        // Send EOI to LAPIC for all hardware interrupts (except spurious)
+        if (using_lapic && frame->int_no != 255) {
+            lapic_eoi();
         }
-        outb(PIC1_COMMAND, PIC_EOI); // EOI to master
     }
 }

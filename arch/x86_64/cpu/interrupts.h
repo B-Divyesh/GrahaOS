@@ -80,3 +80,8 @@ struct interrupt_frame {
 void interrupt_handler(struct interrupt_frame *frame);
 void syscall_dispatcher(struct syscall_frame *frame);
 void irq_init(void);
+
+/**
+ * @brief Disables the legacy PIC by masking all interrupts
+ */
+void pic_disable(void);

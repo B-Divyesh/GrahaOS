@@ -5,6 +5,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+
+// Forward declaration to avoid circular dependency
+uint32_t lapic_get_id(void);
+
 // Recursive spinlock structure
 typedef struct spinlock {
     volatile uint64_t owner;      // CPU core ID that owns the lock
@@ -40,10 +44,8 @@ void _spinlock_acquire(spinlock_t *lock, const char *file, int line);
 void _spinlock_release(spinlock_t *lock, const char *file, int line);
 bool spinlock_held(spinlock_t *lock);
 
-// Get current CPU ID (for now, always 0 since we're single-core)
-static inline uint64_t get_cpu_id(void) {
-    return 0;
-}
+// Get current CPU ID - implementation moved to spinlock.c to avoid circular dependency
+uint64_t get_cpu_id(void);
 
 // Panic function declaration
 void kernel_panic(const char *fmt, ...);

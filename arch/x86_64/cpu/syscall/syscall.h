@@ -2,7 +2,7 @@
 #pragma once
 #include <stdint.h>
 #include "../interrupts.h"
-
+#include "../smp.h"
 // Define system call numbers
 #define SYS_TEST 0
 #define SYS_PUTC 1001

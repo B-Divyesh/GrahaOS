@@ -14,7 +14,8 @@ LIMINE_DIR := limine
 
 # --- Flags ---
 # ADDED: Include path for the new keyboard driver
-CFLAGS   := -I. -I./arch/x86_64/drivers/keyboard -ffreestanding -fno-stack-protector -fno-pie \
+CFLAGS   := -I. -I./arch/x86_64/drivers/keyboard -I./arch/x86_64/drivers/lapic_timer \
+            -ffreestanding -fno-stack-protector -fno-pie \
             -mno-red-zone -mcmodel=kernel -g -Wall -Wextra \
             -std=gnu11 -fno-stack-check -fno-PIC -m64  \
             -march=x86-64 -mno-80387 -mno-mmx -mno-sse -mno-sse2
@@ -107,12 +108,13 @@ kernel/kernel.elf: $(OBJECTS) linker.ld
 -include $(DEPS)
 
 run: grahaos.iso
-	@echo "Starting QEMU..."
-	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M
+	@echo "Starting QEMU with SMP support..."
+	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 \
+         -d int,cpu_reset -D qemu.log	
 
 debug: grahaos.iso
 	@echo "Starting QEMU with GDB support..."
-	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -s -S
+	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 -s -S
 
 clean:
 	@echo "Cleaning up..."

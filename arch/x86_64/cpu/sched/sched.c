@@ -13,6 +13,10 @@ static int current_task_index = 0;
 // Scheduler spinlock with static initialization
 static spinlock_t sched_lock = SPINLOCK_INITIALIZER("scheduler");
 
+// Debug counters (for post-mortem analysis only)
+static volatile uint32_t schedule_count = 0;
+static volatile uint32_t context_switches = 0;
+
 // Simple memset implementation
 static void *memset(void *s, int c, size_t n) {
     uint8_t *p = (uint8_t *)s;
@@ -40,12 +44,16 @@ void sched_init(void) {
     asm volatile("mov %%rsp, %0" : "=r"(current_rsp));
     
     tasks[0].kernel_stack_top = (current_rsp & ~0xFFF) + 0x4000;
-    kernel_tss.rsp0 = tasks[0].kernel_stack_top;
+    
+    // Update the per-CPU TSS
+    uint32_t cpu_id = smp_get_current_cpu();
+    g_cpu_locals[cpu_id].tss.rsp0 = tasks[0].kernel_stack_top;
     
     current_task_index = 0;
     
     spinlock_release(&sched_lock);
     
+    // This is BEFORE interrupts are enabled, so it's safe
     framebuffer_draw_string("Scheduler initialized with wait() support", 700, 20, COLOR_GREEN, 0x00101828);
 }
 
@@ -55,8 +63,8 @@ int sched_create_task(void (*entry_point)(void)) {
     int id = next_task_id++;
     tasks[id].id = id;
     tasks[id].state = TASK_STATE_READY;
-    tasks[id].parent_id = tasks[current_task_index].id; // Set parent
-    tasks[id].waiting_for_child = -1; // Not waiting
+    tasks[id].parent_id = tasks[current_task_index].id;
+    tasks[id].waiting_for_child = -1;
 
     size_t num_pages = KERNEL_STACK_SIZE / PAGE_SIZE;
     void* kstack_phys = pmm_alloc_pages(num_pages);
@@ -79,35 +87,10 @@ int sched_create_task(void (*entry_point)(void)) {
     
     tasks[id].cr3 = vmm_get_pml4_phys(vmm_get_kernel_space());
 
+    // Safe to print here - not in interrupt context
     framebuffer_draw_string("Kernel task created", 700, 40, COLOR_CYAN, 0x00101828);
 
     return id;
-}
-
-static void sched_hex_to_string(uint64_t value, char *buffer) {
-    const char hex_chars[] = "0123456789ABCDEF";
-    char temp[17];
-    int i = 0;
-
-    if (value == 0) {
-        buffer[0] = '0';
-        buffer[1] = '\0';
-        return;
-    }
-
-    for (i = 0; i < 16; i++) {
-        temp[i] = hex_chars[(value >> ((15 - i) * 4)) & 0xF];
-    }
-    temp[16] = '\0';
-
-    int start = 0;
-    while (start < 15 && temp[start] == '0') start++;
-    
-    int j = 0;
-    while (start < 16) {
-        buffer[j++] = temp[start++];
-    }
-    buffer[j] = '\0';
 }
 
 int sched_create_user_process(uint64_t rip, uint64_t cr3) {
@@ -125,12 +108,11 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     tasks[id].id = id;
     tasks[id].state = TASK_STATE_READY;
     tasks[id].cr3 = cr3;
-    tasks[id].parent_id = tasks[current_task_index].id; // CRITICAL: Set parent!
+    tasks[id].parent_id = tasks[current_task_index].id;
     tasks[id].waiting_for_child = -1;
     tasks[id].exit_status = 0;
     
     asm volatile("push %0; popfq" : : "r"(flags));
-
     spinlock_release(&sched_lock);
 
     size_t num_pages = KERNEL_STACK_SIZE / PAGE_SIZE;
@@ -173,17 +155,8 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
         return -1;
     }
     
-    char stack_msg[64] = "User process created, parent=";
-    char parent_str[4];
-    int parent_id = tasks[id].parent_id;
-    parent_str[0] = '0' + parent_id;
-    parent_str[1] = '\0';
-    int i = 0;
-    while (stack_msg[i]) i++;
-    int j = 0;
-    while (parent_str[j]) stack_msg[i++] = parent_str[j++];
-    stack_msg[i] = '\0';
-    framebuffer_draw_string(stack_msg, 700, 60, COLOR_CYAN, 0x00101828);
+    // Safe to print here - not in interrupt context
+    framebuffer_draw_string("User process created successfully!", 700, 120, COLOR_GREEN, 0x00101828);
 
     spinlock_acquire(&sched_lock);
     
@@ -196,36 +169,19 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     
     spinlock_release(&sched_lock);
     
-    framebuffer_draw_string("User process created successfully!", 700, 120, COLOR_GREEN, 0x00101828);
-    
-    
     return id;
 }
 
-// NEW: Wake up parent waiting for this child
 void wake_waiting_parent(int child_id) {
-    // Debug
-    char msg[64] = "wake_waiting_parent: child ";
-    msg[28] = '0' + child_id;
-    msg[29] = '\0';
-    framebuffer_draw_string(msg, 700, 540, COLOR_MAGENTA, 0x00101828);
+    // NO FRAMEBUFFER CALLS - might be called from interrupt context
     
-    // Find the parent of this child
     if (child_id < 0 || child_id >= next_task_id || child_id >= MAX_TASKS) {
-        framebuffer_draw_string("  Invalid child_id!", 700, 560, COLOR_RED, 0x00101828);
         return;
     }
     
     int parent_id = tasks[child_id].parent_id;
     
-    // Debug: show parent
-    char pmsg[32] = "  Parent is ";
-    pmsg[12] = '0' + parent_id;
-    pmsg[13] = '\0';
-    framebuffer_draw_string(pmsg, 700, 560, COLOR_MAGENTA, 0x00101828);
-    
     if (parent_id < 0 || parent_id >= next_task_id) {
-        framebuffer_draw_string("  No valid parent", 700, 580, COLOR_YELLOW, 0x00101828);
         return;
     }
     
@@ -237,58 +193,35 @@ void wake_waiting_parent(int child_id) {
         // Wake up the parent
         tasks[parent_id].state = TASK_STATE_READY;
         tasks[parent_id].waiting_for_child = -1;
-        
-        // Debug message
-        framebuffer_draw_string("  Woke up parent!", 700, 600, COLOR_GREEN, 0x00101828);
-    } else {
-        // Debug: show why we didn't wake parent
-        char smsg[64] = "  Parent state: ";
-        if (tasks[parent_id].state == TASK_STATE_READY) smsg[16] = 'R';
-        else if (tasks[parent_id].state == TASK_STATE_RUNNING) smsg[16] = 'N';
-        else if (tasks[parent_id].state == TASK_STATE_BLOCKED) smsg[16] = 'B';
-        else if (tasks[parent_id].state == TASK_STATE_ZOMBIE) smsg[16] = 'Z';
-        else smsg[16] = '?';
-        smsg[17] = '\0';
-        framebuffer_draw_string(smsg, 700, 600, COLOR_YELLOW, 0x00101828);
     }
 }
 
-// External variables from syscall.c for debugging
-extern volatile uint64_t syscall_entry_reached;
-extern volatile uint64_t syscall_about_to_return;
-extern volatile uint64_t syscall_stack_switched;
-
+// CRITICAL: This function is called from interrupt context
+// NO LOCKS THAT CAN BE HELD BY NORMAL CODE!
+// NO FRAMEBUFFER CALLS!
 void schedule(struct interrupt_frame *frame) {
-    static int check_count = 0;
-    check_count++;
-    if (check_count == 10) {
-        if (syscall_entry_reached) {
-            framebuffer_draw_string("SYSCALL ENTRY WAS REACHED!", 700, 160, COLOR_RED, 0x00101828);
-        }
-        if (syscall_about_to_return) {
-            framebuffer_draw_string("SYSCALL RETURN WAS REACHED!", 700, 180, COLOR_GREEN, 0x00101828);
-        }
-        if (syscall_stack_switched) {
-            framebuffer_draw_string("SWAPGS STACK SWITCH OK!", 700, 200, COLOR_GREEN, 0x00101828);
-        }
-    }
+    // Increment counters for debugging (can be read later)
+    schedule_count++;
+    
     if (!frame) {
-        framebuffer_draw_string("PANIC: NULL frame in scheduler!", 10, 10, COLOR_WHITE, COLOR_RED);
+        // Can't print - just halt
         asm volatile("cli; hlt");
     }
     
     if (current_task_index >= next_task_id || current_task_index < 0) {
-        framebuffer_draw_string("PANIC: Invalid current_task_index!", 10, 30, COLOR_WHITE, COLOR_RED);
+        // Can't print - just halt
         asm volatile("cli; hlt");
     }
     
+    // Save current task state
     tasks[current_task_index].regs = *frame;
     
-    // Don't change zombie or blocked tasks back to ready
+    // Update task state
     if (tasks[current_task_index].state == TASK_STATE_RUNNING) {
         tasks[current_task_index].state = TASK_STATE_READY;
     }
 
+    // Find next task to run
     int start_index = current_task_index;
     int next_index = current_task_index;
     bool found = false;
@@ -298,14 +231,17 @@ void schedule(struct interrupt_frame *frame) {
         if (tasks[next_index].state == TASK_STATE_READY) {
             found = true;
             current_task_index = next_index;
+            context_switches++;
             break;
         }
     }
     
     if (!found) {
-        if (tasks[start_index].state == TASK_STATE_READY || tasks[start_index].state == TASK_STATE_RUNNING) {
+        if (tasks[start_index].state == TASK_STATE_READY || 
+            tasks[start_index].state == TASK_STATE_RUNNING) {
             current_task_index = start_index;
         } else {
+            // Check for any non-zombie task
             int non_zombie_count = 0;
             for (int i = 0; i < next_task_id; i++) {
                 if (tasks[i].state != TASK_STATE_ZOMBIE) {
@@ -317,107 +253,48 @@ void schedule(struct interrupt_frame *frame) {
                 }
             }
             if (non_zombie_count == 0) {
-                framebuffer_draw_string("KERNEL: All tasks terminated", 10, 700, COLOR_RED, 0x00101828);
+                // All tasks dead - halt
                 asm volatile("cli; hlt");
             }
         }
     }
 
     tasks[current_task_index].state = TASK_STATE_RUNNING;
-
-    static int switch_count = 0;
-    if (switch_count < 10) {
-        switch_count++;
-        char switch_msg[80];
-        char *p = switch_msg;
-        
-        const char *s1 = "Switch to task ";
-        while (*s1) *p++ = *s1++;
-        *p++ = '0' + current_task_index;
-        
-        const char *s2 = " RIP=0x";
-        while (*s2) *p++ = *s2++;
-        
-        uint64_t rip = tasks[current_task_index].regs.rip;
-        char rip_str[17];
-        sched_hex_to_string(rip, rip_str);
-        char *rs = rip_str;
-        while (*rs) *p++ = *rs++;
-        
-        const char *s3 = " CS=0x";
-        while (*s3) *p++ = *s3++;
-        uint16_t cs = tasks[current_task_index].regs.cs;
-        *p++ = ((cs >> 4) & 0xF) < 10 ? '0' + ((cs >> 4) & 0xF) : 'A' + ((cs >> 4) & 0xF) - 10;
-        *p++ = (cs & 0xF) < 10 ? '0' + (cs & 0xF) : 'A' + (cs & 0xF) - 10;
-        
-        if (cs & 3) {
-            const char *s4 = " (user)";
-            while (*s4) *p++ = *s4++;
-        } else {
-            const char *s4 = " (kernel)";
-            while (*s4) *p++ = *s4++;
-        }
-        
-        *p = '\0';
-        
-        framebuffer_draw_string(switch_msg, 700, 240 + (switch_count * 20), COLOR_GREEN, 0x00101828);
-    }
     
-    kernel_tss.rsp0 = tasks[current_task_index].kernel_stack_top;
-    
-    static int tss_debug_count = 0;
-    if (tss_debug_count < 5 && current_task_index == 1) {
-        tss_debug_count++;
-        char tss_msg[48] = "TSS RSP0 updated: 0x";
-        sched_hex_to_string(kernel_tss.rsp0, tss_msg + 21);
-        framebuffer_draw_string(tss_msg, 700, 340 + (tss_debug_count * 16), COLOR_MAGENTA, 0x00101828);
-    }
+    // Update TSS RSP0
+    uint32_t cpu_id = smp_get_current_cpu();
+    g_cpu_locals[cpu_id].tss.rsp0 = tasks[current_task_index].kernel_stack_top;
 
+    // Switch address space if needed
     uint64_t current_cr3;
     asm volatile ("mov %%cr3, %0" : "=r"(current_cr3));
     if (current_cr3 != tasks[current_task_index].cr3) {
         vmm_switch_address_space_phys(tasks[current_task_index].cr3);
-        
-        static int cr3_switch_count = 0;
-        if (cr3_switch_count < 3) {
-            cr3_switch_count++;
-            framebuffer_draw_string("Address space switched", 700, 400 + (cr3_switch_count * 20), COLOR_CYAN, 0x00101828);
-        }
     }
 
+    // Validate stack pointer
     uint64_t new_rsp = tasks[current_task_index].regs.rsp;
     
     if (current_task_index != 0) {
         if (tasks[current_task_index].regs.cs & 3) {
+            // User mode - check user stack bounds
             if (new_rsp < 0x7FFFFFFFE000 || new_rsp > 0x7FFFFFFFF000) {
-                framebuffer_draw_string("PANIC: Invalid user RSP!", 10, 50, COLOR_WHITE, COLOR_RED);
-                char rsp_str[32];
-                sched_hex_to_string(new_rsp, rsp_str);
-                framebuffer_draw_string(rsp_str, 200, 50, COLOR_WHITE, COLOR_RED);
                 asm volatile("cli; hlt");
             }
         } else {
+            // Kernel mode - check kernel stack bounds
             uint64_t stack_base = tasks[current_task_index].kernel_stack_top - KERNEL_STACK_SIZE;
             if (new_rsp < stack_base || new_rsp > tasks[current_task_index].kernel_stack_top) {
-                framebuffer_draw_string("PANIC: Invalid kernel RSP!", 10, 50, COLOR_WHITE, COLOR_RED);
-                char rsp_str[32];
-                sched_hex_to_string(new_rsp, rsp_str);
-                framebuffer_draw_string(rsp_str, 200, 50, COLOR_WHITE, COLOR_RED);
-                char base_str[32], top_str[32];
-                sched_hex_to_string(stack_base, base_str);
-                sched_hex_to_string(tasks[current_task_index].kernel_stack_top, top_str);
-                framebuffer_draw_string("Expected range:", 10, 70, COLOR_WHITE, COLOR_RED);
-                framebuffer_draw_string(base_str, 150, 70, COLOR_WHITE, COLOR_RED);
-                framebuffer_draw_string(" - ", 250, 70, COLOR_WHITE, COLOR_RED);
-                framebuffer_draw_string(top_str, 280, 70, COLOR_WHITE, COLOR_RED);
                 asm volatile("cli; hlt");
             }
         }
     }
 
+    // Restore new task context
     *frame = tasks[current_task_index].regs;
 }
 
+// These functions are safe - not called from interrupt context
 task_t* sched_get_current_task(void) {
     if (current_task_index >= MAX_TASKS || current_task_index >= next_task_id) {
         return NULL;
@@ -435,104 +312,37 @@ task_t* sched_get_task(int id) {
     return &tasks[id];
 }
 
-// NEW: Check if a process has exited children to reap
 int sched_check_children(int parent_id, int *status) {
-    // Debug
-    char msg[64] = "sched_check_children: parent ";
-    msg[30] = '0' + parent_id;
-    msg[31] = '\0';
-    framebuffer_draw_string(msg, 700, 500, COLOR_CYAN, 0x00101828);
+    // Safe to print - not called from interrupt context
+    framebuffer_draw_string("Checking for zombie children...", 700, 500, COLOR_CYAN, 0x00101828);
     
-    // Look for zombie children of this parent
     for (int i = 0; i < next_task_id; i++) {
-        // Check validity of task slot
         if (i >= MAX_TASKS) break;
         
-        // Debug: show what we're checking
-        if (tasks[i].parent_id == parent_id) {
-            char cmsg[64] = "  Found child ";
-            cmsg[14] = '0' + i;
-            cmsg[15] = ' ';
-            cmsg[16] = 's';
-            cmsg[17] = 't';
-            cmsg[18] = 'a';
-            cmsg[19] = 't';
-            cmsg[20] = 'e';
-            cmsg[21] = '=';
-            if (tasks[i].state == TASK_STATE_ZOMBIE) cmsg[22] = 'Z';
-            else if (tasks[i].state == TASK_STATE_READY) cmsg[22] = 'R';
-            else if (tasks[i].state == TASK_STATE_RUNNING) cmsg[22] = 'N';
-            else if (tasks[i].state == TASK_STATE_BLOCKED) cmsg[22] = 'B';
-            else cmsg[22] = '?';
-            cmsg[23] = '\0';
-            framebuffer_draw_string(cmsg, 700, 520, COLOR_CYAN, 0x00101828);
-        }
-        
-        // Only check zombie children
         if (tasks[i].state == TASK_STATE_ZOMBIE && 
             tasks[i].parent_id == parent_id) {
-            // Found a zombie child
             if (status) {
                 *status = tasks[i].exit_status;
             }
-            framebuffer_draw_string("  Returning zombie child!", 700, 540, COLOR_GREEN, 0x00101828);
-            return i; // Return child PID
+            return i;
         }
     }
-    framebuffer_draw_string("  No zombie children found", 700, 540, COLOR_YELLOW, 0x00101828);
-    return -1; // No zombie children
+    return -1;
 }
 
-// NEW: Mark a child as an orphan when parent dies
 void sched_orphan_children(int parent_id) {
     for (int i = 0; i < next_task_id; i++) {
         if (i >= MAX_TASKS) break;
         
         if (tasks[i].parent_id == parent_id && tasks[i].state != TASK_STATE_ZOMBIE) {
-            // Reparent to init (task 0)
-            tasks[i].parent_id = 0;
-            
-            // Debug
-            char msg[64] = "Orphaned task ";
-            msg[14] = '0' + i;
-            msg[15] = ' ';
-            msg[16] = 't';
-            msg[17] = 'o';
-            msg[18] = ' ';
-            msg[19] = 'i';
-            msg[20] = 'n';
-            msg[21] = 'i';
-            msg[22] = 't';
-            msg[23] = '\0';
-            framebuffer_draw_string(msg, 700, 560, COLOR_YELLOW, 0x00101828);
+            tasks[i].parent_id = 0; // Reparent to init
         }
     }
 }
 
-// NEW: Reap a zombie task
 void sched_reap_zombie(int task_id) {
     if (task_id < 0 || task_id >= next_task_id || task_id >= MAX_TASKS) return;
     if (tasks[task_id].state != TASK_STATE_ZOMBIE) return;
-    
-    // Debug: show what we're reaping
-    char msg[64] = "Reaping zombie task ";
-    msg[20] = '0' + task_id;
-    msg[21] = ' ';
-    msg[22] = 'w';
-    msg[23] = 'i';
-    msg[24] = 't';
-    msg[25] = 'h';
-    msg[26] = ' ';
-    msg[27] = 's';
-    msg[28] = 't';
-    msg[29] = 'a';
-    msg[30] = 't';
-    msg[31] = 'u';
-    msg[32] = 's';
-    msg[33] = ' ';
-    msg[34] = '0' + tasks[task_id].exit_status;
-    msg[35] = '\0';
-    framebuffer_draw_string(msg, 700, 620, COLOR_YELLOW, 0x00101828);
     
     // Free kernel stack
     uint64_t kstack_base = tasks[task_id].kernel_stack_top - KERNEL_STACK_SIZE;
@@ -541,4 +351,35 @@ void sched_reap_zombie(int task_id) {
     
     // Clear the task slot
     memset(&tasks[task_id], 0, sizeof(task_t));
+}
+
+// Debug function - can be called from kernel debugger or panic handler
+void sched_dump_stats(void) {
+    // This is NOT called from interrupt context, so it's safe
+    char msg[64];
+    
+    // Use simple number conversion
+    msg[0] = 'S'; msg[1] = 'c'; msg[2] = 'h'; msg[3] = 'e'; msg[4] = 'd';
+    msg[5] = ' '; msg[6] = 'c'; msg[7] = 'a'; msg[8] = 'l'; msg[9] = 'l';
+    msg[10] = 's'; msg[11] = ':'; msg[12] = ' ';
+    
+    // Convert schedule_count to string (simplified)
+    uint32_t count = schedule_count;
+    int pos = 13;
+    if (count == 0) {
+        msg[pos++] = '0';
+    } else {
+        char digits[10];
+        int digit_count = 0;
+        while (count > 0) {
+            digits[digit_count++] = '0' + (count % 10);
+            count /= 10;
+        }
+        while (digit_count > 0) {
+            msg[pos++] = digits[--digit_count];
+        }
+    }
+    msg[pos] = '\0';
+    
+    framebuffer_draw_string(msg, 10, 750, COLOR_WHITE, COLOR_BLACK);
 }
