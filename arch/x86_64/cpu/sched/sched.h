@@ -95,3 +95,4 @@ void sched_reap_zombie(int task_id);
  * @param child_id Child task ID that exited
  */
 void wake_waiting_parent(int child_id);
+

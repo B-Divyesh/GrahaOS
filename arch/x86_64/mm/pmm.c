@@ -11,7 +11,7 @@ static uint64_t usable_memory = 0;
 static uint64_t last_used_index = 0;
 
 // PMM spinlock with static initialization
-static spinlock_t pmm_lock = SPINLOCK_INITIALIZER("pmm");
+spinlock_t pmm_lock = SPINLOCK_INITIALIZER("pmm");
 
 // Bitmap manipulation functions
 static void bitmap_set_bit(uint64_t page) {

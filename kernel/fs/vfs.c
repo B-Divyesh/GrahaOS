@@ -5,7 +5,7 @@
 #include "../sync/spinlock.h"
 // The system-wide open file table
 static open_file_t open_file_table[MAX_OPEN_FILES];
-static spinlock_t vfs_lock = SPINLOCK_INITIALIZER("vfs");
+spinlock_t vfs_lock = SPINLOCK_INITIALIZER("vfs");
 // Simple memcpy and strlen for internal use
 static void *vfs_memcpy(void *dest, const void *src, size_t n) {
     uint8_t *pdest = (uint8_t *)dest;

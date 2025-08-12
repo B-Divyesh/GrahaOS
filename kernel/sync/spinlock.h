@@ -5,7 +5,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-
 // Forward declaration to avoid circular dependency
 uint32_t lapic_get_id(void);
 
@@ -17,6 +16,7 @@ typedef struct spinlock {
     const char *name;            // Lock name for debugging
     const char *last_file;       // File where lock was last acquired
     int last_line;               // Line where lock was last acquired
+    uint64_t interrupt_state;    // Saved interrupt state (RFLAGS)
 } spinlock_t;
 
 // Static initializer for spinlocks
@@ -26,7 +26,8 @@ typedef struct spinlock {
     .locked = false, \
     .name = lockname, \
     .last_file = NULL, \
-    .last_line = 0 \
+    .last_line = 0, \
+    .interrupt_state = 0 \
 }
 
 // Debug macros
@@ -49,3 +50,10 @@ uint64_t get_cpu_id(void);
 
 // Panic function declaration
 void kernel_panic(const char *fmt, ...);
+
+// Debug functions to check lock states
+bool debug_is_sched_lock_held(void);
+bool debug_is_fb_lock_held(void);
+bool debug_is_pmm_lock_held(void);
+bool debug_is_vfs_lock_held(void);
+void debug_print_lock_states(void);

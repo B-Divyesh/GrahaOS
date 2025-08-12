@@ -1,87 +1,67 @@
 #pragma once
 #include <stdint.h>
 
-// CRITICAL: The struct members must be in REVERSE order of the push sequence
-// because the stack grows DOWN on x86_64.
-// 
-// If assembly does:
-//   push A
-//   push B
-//   push C
-// 
-// Then memory layout is (from low to high):
-//   [C][B][A]
-//   ^
-//   RSP
-// 
-// So struct should be: { C, B, A }
-
-// Based on your CURRENT syscall.S which pushes in this order:
-// push user_rsp, push err_code, push int_no, push rax...push r15
-struct syscall_frame {
-    // GPRs - in REVERSE order of pushes
-    // Your syscall.S pushes: r15 first, then r14...then rax last
-    // So in memory: rax is at lowest address
-    uint64_t rax;    // offset 0 - pushed last
-    uint64_t rbx;    // offset 8
-    uint64_t rcx;    // offset 16 - contains user RIP
-    uint64_t rdx;    // offset 24
-    uint64_t rsi;    // offset 32
-    uint64_t rdi;    // offset 40 - first syscall arg
-    uint64_t rbp;    // offset 48
-    uint64_t r8;     // offset 56
-    uint64_t r9;     // offset 64
-    uint64_t r10;    // offset 72
-    uint64_t r11;    // offset 80 - contains user RFLAGS
-    uint64_t r12;    // offset 88
-    uint64_t r13;    // offset 96
-    uint64_t r14;    // offset 104
-    uint64_t r15;    // offset 112 - pushed first
+// CRITICAL: This must match the EXACT order of pushes in interrupts.S
+// Stack grows DOWN, so first push ends up at highest address
+struct interrupt_frame {
+    // Pushed by our assembly code (isr_common)
+    uint64_t ds;        // Data segment
     
-    // System call info
-    uint64_t int_no;    // offset 120 - syscall number
-    uint64_t err_code;  // offset 128 - always 0 for syscalls
-    uint64_t user_rsp;  // offset 136 - user stack pointer
+    // General purpose registers (pushed in reverse order)
+    uint64_t r15;
+    uint64_t r14;
+    uint64_t r13;
+    uint64_t r12;
+    uint64_t r11;
+    uint64_t r10;
+    uint64_t r9;
+    uint64_t r8;
+    uint64_t rbp;
+    uint64_t rdi;
+    uint64_t rsi;
+    uint64_t rdx;
+    uint64_t rcx;
+    uint64_t rbx;
+    uint64_t rax;
+    
+    // Pushed by interrupt stub
+    uint64_t int_no;    // Interrupt number
+    uint64_t err_code;  // Error code (or 0)
+    
+    // Pushed by CPU on interrupt
+    uint64_t rip;       // Instruction pointer
+    uint64_t cs;        // Code segment
+    uint64_t rflags;    // CPU flags
+    uint64_t rsp;       // Stack pointer
+    uint64_t ss;        // Stack segment
 } __attribute__((packed));
 
-// For interrupts, we need to check interrupts.S push order
-// The isr_common in interrupts.S pushes: r15, r14...rax
-// So same order as syscalls
-struct interrupt_frame {
-    // GPRs - in REVERSE order of pushes
-    uint64_t rax;    // offset 0
-    uint64_t rbx;    // offset 8
-    uint64_t rcx;    // offset 16
-    uint64_t rdx;    // offset 24
-    uint64_t rsi;    // offset 32
-    uint64_t rdi;    // offset 40
-    uint64_t rbp;    // offset 48
-    uint64_t r8;     // offset 56
-    uint64_t r9;     // offset 64
-    uint64_t r10;    // offset 72
-    uint64_t r11;    // offset 80
-    uint64_t r12;    // offset 88
-    uint64_t r13;    // offset 96
-    uint64_t r14;    // offset 104
-    uint64_t r15;    // offset 112
+// Syscall frame structure (different from interrupts)
+struct syscall_frame {
+    // GPRs pushed by syscall.S
+    uint64_t rax;
+    uint64_t rbx;
+    uint64_t rcx;    // Contains user RIP
+    uint64_t rdx;
+    uint64_t rsi;
+    uint64_t rdi;    // First syscall argument
+    uint64_t rbp;
+    uint64_t r8;
+    uint64_t r9;
+    uint64_t r10;
+    uint64_t r11;    // Contains user RFLAGS
+    uint64_t r12;
+    uint64_t r13;
+    uint64_t r14;
+    uint64_t r15;
     
-    // Interrupt info
-    uint64_t int_no;    // offset 120
-    uint64_t err_code;  // offset 128
-    
-    // CPU-pushed values (only for interrupts)
-    uint64_t rip;       // offset 136
-    uint64_t cs;        // offset 144
-    uint64_t rflags;    // offset 152
-    uint64_t rsp;       // offset 160
-    uint64_t ss;        // offset 168
+    // Syscall info
+    uint64_t int_no;    // Syscall number
+    uint64_t err_code;  // Always 0 for syscalls
+    uint64_t user_rsp;  // User stack pointer
 } __attribute__((packed));
 
 void interrupt_handler(struct interrupt_frame *frame);
 void syscall_dispatcher(struct syscall_frame *frame);
 void irq_init(void);
-
-/**
- * @brief Disables the legacy PIC by masking all interrupts
- */
 void pic_disable(void);

@@ -32,8 +32,8 @@ cpu_local_t g_cpu_locals[MAX_CPUS];
 #define MSR_GS_BASE 0xC0000101
 
 // Spinlock for synchronized AP startup
-static spinlock_t ap_startup_lock = SPINLOCK_INITIALIZER("ap_startup");
-static volatile uint32_t aps_started = 0;
+spinlock_t ap_startup_lock = SPINLOCK_INITIALIZER("ap_startup");
+volatile uint32_t aps_started = 0;
 
 // Helper to write MSR
 static void write_msr(uint32_t msr, uint64_t value) {
@@ -96,64 +96,52 @@ void ap_main(struct limine_mp_info *info) {
 #else
 void ap_main(struct limine_smp_info *info) {
 #endif
-    // Disable interrupts during initialization
+    // Keep interrupts disabled during initialization
     asm volatile("cli");
     
-    // Set up per-CPU data FIRST, before any other initialization
+    // Validate info
+    if (!info || info->processor_id >= MAX_CPUS) {
+        asm volatile("hlt");
+        while(1);
+    }
+    
+    // Set up per-CPU data
     g_cpu_locals[info->processor_id].cpu_id = info->processor_id;
     g_cpu_locals[info->processor_id].lapic_id = info->lapic_id;
     write_msr(MSR_GS_BASE, (uint64_t)&g_cpu_locals[info->processor_id]);
     
-    // Now initialize per-core structures
-    gdt_init_for_cpu(info->processor_id);  // Load per-CPU GDT and TSS
-    idt_init();       // Load IDT for this core
-    lapic_init();     // Initialize this core's LAPIC
-    syscall_init();   // Initialize syscall MSRs for this core
+    // Initialize core structures
+    gdt_init_for_cpu(info->processor_id);
+    idt_init();
+    lapic_init();
+    syscall_init();
     
-    // Initialize LAPIC timer for this AP (100Hz, vector 32)
-    lapic_timer_init(100, 32);
-    
-    // Get our CPU ID (now using GS)
-    uint32_t cpu_id = smp_get_current_cpu_id();
-    
-    // Mark ourselves as active
+    // Mark as active
+    uint32_t cpu_id = info->processor_id;
     spinlock_acquire(&ap_startup_lock);
     g_cpu_info[cpu_id].active = true;
     aps_started++;
     
-    // Print startup message
-    char msg[64] = "AP: CPU X (LAPIC ID XX) + Timer online!";
-    if (cpu_id < 10) {
-        msg[8] = '0' + cpu_id;
-    } else {
-        msg[8] = 'A' + (cpu_id - 10); // For CPU IDs > 9, use letters
-    }
-    
-    // Convert LAPIC ID to string
-    uint32_t lapic_id = info->lapic_id;
-    if (lapic_id < 10) {
-        msg[21] = '0' + lapic_id;
-        msg[22] = ')';
-    } else if (lapic_id < 100) {
-        msg[21] = '0' + (lapic_id / 10);
-        msg[22] = '0' + (lapic_id % 10);
-    } else {
-        // Handle 3-digit LAPIC IDs
-        msg[20] = '0' + (lapic_id / 100);
-        msg[21] = '0' + ((lapic_id / 10) % 10);
-        msg[22] = '0' + (lapic_id % 10);
-    }
-    
+    // Print message
+    char msg[64] = "AP: CPU ";
+    msg[8] = '0' + cpu_id;
+    msg[9] = ' ';
+    msg[10] = 'r';
+    msg[11] = 'e';
+    msg[12] = 'a';
+    msg[13] = 'd';
+    msg[14] = 'y';
+    msg[15] = '\0';
     framebuffer_draw_string(msg, 50, 420 + (cpu_id * 20), COLOR_CYAN, 0x00101828);
     spinlock_release(&ap_startup_lock);
     
-    // Enable interrupts and enter idle loop
+    // DON'T start timer yet - wait for BSP
+    // Just enable interrupts and idle
     asm volatile("sti");
     
-    // Enter scheduler idle loop
+    // Idle loop
     while (1) {
         asm volatile("hlt");
-        // Scheduler will take over when timer interrupts fire
     }
 }
 
@@ -193,9 +181,23 @@ void smp_init(volatile struct limine_mp_request *mp_request) {
     
     // Initialize BSP's LAPIC
     lapic_init();
-    // Initialize LAPIC timer for BSP (100Hz, vector 32)
-    lapic_timer_init(100, 32);
-    framebuffer_draw_string("BSP LAPIC Timer initialized", 50, 390, COLOR_GREEN, 0x00101828);
+    
+    
+    
+    // Verify LAPIC is working
+    // Verify LAPIC is working
+    if (!lapic_is_enabled()) {
+        framebuffer_draw_string("ERROR: BSP LAPIC failed!", 50, 380, COLOR_RED, 0x00101828);
+    } else {
+        framebuffer_draw_string("BSP LAPIC initialized", 50, 380, COLOR_GREEN, 0x00101828);
+    }
+    
+    // DON'T start timer here - let main.c do it after everything is ready
+    // lapic_timer_init(100, 32);  // COMMENTED OUT
+    
+    framebuffer_draw_string("BSP ready (timer delayed)", 50, 395, COLOR_YELLOW, 0x00101828);
+    
+
     // Build CPU info table
     for (uint64_t i = 0; i < mp_resp->cpu_count && i < MAX_CPUS; i++) {
         struct limine_mp_info *cpu = mp_resp->cpus[i];
@@ -223,7 +225,7 @@ void smp_init(volatile struct limine_mp_request *mp_request) {
         bsp_msg[23] = '0' + (bsp_id % 10);
         bsp_msg[24] = ')';
     }
-    framebuffer_draw_string(bsp_msg, 50, 400, COLOR_GREEN, 0x00101828);
+    framebuffer_draw_string(bsp_msg, 200, 400, COLOR_GREEN, 0x00101828);
     
     // Start all APs
     uint32_t aps_to_start = 0;
@@ -308,9 +310,19 @@ void smp_init(volatile struct limine_smp_request *smp_request) {
     
     // Initialize BSP's LAPIC
     lapic_init();
-    // Initialize LAPIC timer for BSP (100Hz, vector 32)
-    lapic_timer_init(100, 32);
-    framebuffer_draw_string("BSP LAPIC Timer initialized", 50, 390, COLOR_GREEN, 0x00101828);
+    
+    // Verify LAPIC is working
+    if (!lapic_is_enabled()) {
+        framebuffer_draw_string("ERROR: BSP LAPIC failed!", 50, 380, COLOR_RED, 0x00101828);
+    } else {
+        framebuffer_draw_string("BSP LAPIC initialized", 50, 380, COLOR_GREEN, 0x00101828);
+    }
+    
+    // DON'T start timer here - let main.c do it after everything is ready
+    // lapic_timer_init(100, 32);  // COMMENTED OUT
+    
+    framebuffer_draw_string("BSP ready (timer delayed)", 50, 395, COLOR_YELLOW, 0x00101828);
+    
     // Build CPU info table
     for (uint64_t i = 0; i < smp_resp->cpu_count && i < MAX_CPUS; i++) {
         struct limine_smp_info *cpu = smp_resp->cpus[i];

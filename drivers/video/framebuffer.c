@@ -10,7 +10,7 @@ static uint32_t fb_pitch = 0;
 static uint32_t fb_width = 0;
 static uint32_t fb_height = 0;
 // Framebuffer spinlock - static initialization
-static spinlock_t fb_lock = SPINLOCK_INITIALIZER("framebuffer");
+spinlock_t fb_lock = SPINLOCK_INITIALIZER("framebuffer");
 // --- Simple 8x16 Bitmap Font ---
 // Basic ASCII characters (32-126)
 static const uint8_t font_8x16[95][16] = {
@@ -180,6 +180,35 @@ static void _draw_char_unsafe(char c, uint32_t x, uint32_t y, uint32_t fg_color)
     }
 }
 
+// Check if we're in interrupt context
+static bool in_interrupt_context(void) {
+    // Check if interrupts are disabled - likely in interrupt handler
+    uint64_t flags;
+    asm volatile("pushfq; pop %0" : "=r"(flags));
+    return !(flags & 0x200);  // IF flag
+}
+
+// Non-locking versions for use in interrupt handlers
+void framebuffer_draw_string_nolock(const char *str, uint32_t x, uint32_t y, 
+                                    uint32_t fg_color, uint32_t bg_color) {
+    if (!str || !fb_addr) return;
+    
+    size_t len = strlen(str);
+    if (len == 0) return;
+    
+    // Draw directly without any locking
+    // This is safe only if called from interrupt context where nothing else can run
+    _draw_rect_unsafe(x, y, len * 8, 16, bg_color);
+    
+    for (size_t i = 0; i < len; i++) {
+        _draw_char_unsafe(str[i], x + (i * 8), y, fg_color);
+    }
+    
+    // Memory barrier to ensure writes complete
+    asm volatile("mfence" ::: "memory");
+}
+
+
 // Public functions
 bool framebuffer_init(volatile struct limine_framebuffer_request *fb_request) {
     if (!fb_request || !fb_request->response ||
@@ -218,6 +247,14 @@ void framebuffer_draw_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t heig
         return;
     }
     
+    // Check if in interrupt context
+    if (in_interrupt_context()) {
+        // Draw without lock
+        _draw_rect_unsafe(x, y, width, height, color);
+        return;
+    }
+    
+    // Normal path with lock
     spinlock_acquire(&fb_lock);
     _draw_rect_unsafe(x, y, width, height, color);
     spinlock_release(&fb_lock);
@@ -255,10 +292,103 @@ void framebuffer_draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color) {
     spinlock_release(&fb_lock);
 }
 
+// Modified main framebuffer_draw_string function
 void framebuffer_draw_string(const char *str, uint32_t x, uint32_t y, 
                              uint32_t fg_color, uint32_t bg_color) {
-    if (!str) return;
+    if (!str || !fb_addr) return;
     
+    // Check if we're in interrupt context
+    if (in_interrupt_context()) {
+        // In interrupt - use non-locking version
+        framebuffer_draw_string_nolock(str, x, y, fg_color, bg_color);
+        return;
+    }
+    
+    // Normal context - use locking
+    spinlock_acquire(&fb_lock);
+    
+    size_t len = strlen(str);
+    if (len == 0) {
+        spinlock_release(&fb_lock);
+        return;
+    }
+    
+    _draw_rect_unsafe(x, y, len * 8, 16, bg_color);
+    
+    for (size_t i = 0; i < len; i++) {
+        _draw_char_unsafe(str[i], x + (i * 8), y, fg_color);
+    }
+    
+    asm volatile("mfence" ::: "memory");
+    
+    spinlock_release(&fb_lock);
+}
+
+
+void framebuffer_draw_hex(uint64_t value, int x, int y, uint32_t fg_color, uint32_t bg_color) {
+    char buffer[19];
+    const char *hex_chars = "0123456789ABCDEF";
+    
+    buffer[0] = '0';
+    buffer[1] = 'x';
+    
+    for (int i = 0; i < 16; i++) {
+        uint8_t nibble = (value >> (60 - i * 4)) & 0xF;
+        buffer[2 + i] = hex_chars[nibble];
+    }
+    buffer[18] = '\0';
+    
+    framebuffer_draw_string(buffer, x, y, fg_color, bg_color);
+}
+
+// Clear function with interrupt safety
+void framebuffer_clear(uint32_t color) {
+    if (in_interrupt_context()) {
+        // Clear without lock
+        for (uint32_t i = 0; i < fb_width * fb_height; i++) {
+            fb_addr[i] = color;
+        }
+        return;
+    }
+    
+    spinlock_acquire(&fb_lock);
+    for (uint32_t i = 0; i < fb_width * fb_height; i++) {
+        fb_addr[i] = color;
+    }
+    spinlock_release(&fb_lock);
+}
+
+void framebuffer_draw_rsp_error(uint64_t code) {
+    framebuffer_draw_rect(300, 300, 400, 100, COLOR_RED);
+    framebuffer_draw_string("ZERO RSP DETECTED!", 320, 320, COLOR_WHITE, COLOR_RED);
+    framebuffer_draw_hex(code, 320, 340, COLOR_WHITE, COLOR_RED);
+}
+
+// Thread-safe string drawing that doesn't panic on lock issues
+void framebuffer_draw_string_safe(const char *str, uint32_t x, uint32_t y, 
+                                  uint32_t fg_color, uint32_t bg_color) {
+    if (!str || !fb_addr) return;
+    
+    // Try to acquire lock with timeout
+    int attempts = 1000000;
+    while (fb_lock.locked && attempts-- > 0) {
+        asm volatile("pause");
+    }
+    
+    if (attempts <= 0) {
+        // Couldn't get lock - draw without lock (risky but won't crash)
+        // This is only for initialization messages
+        size_t len = strlen(str);
+        if (len == 0) return;
+        
+        // Draw directly without lock
+        for (size_t i = 0; i < len; i++) {
+            _draw_char_unsafe(str[i], x + (i * 8), y, fg_color);
+        }
+        return;
+    }
+    
+    // Got the lock - use normal path
     spinlock_acquire(&fb_lock);
     
     size_t len = strlen(str);
@@ -278,36 +408,4 @@ void framebuffer_draw_string(const char *str, uint32_t x, uint32_t y,
     asm volatile("mfence" ::: "memory");
     
     spinlock_release(&fb_lock);
-}
-
-void framebuffer_draw_hex(uint64_t value, int x, int y, uint32_t fg_color, uint32_t bg_color) {
-    char buffer[19];
-    const char *hex_chars = "0123456789ABCDEF";
-    
-    buffer[0] = '0';
-    buffer[1] = 'x';
-    
-    for (int i = 0; i < 16; i++) {
-        uint8_t nibble = (value >> (60 - i * 4)) & 0xF;
-        buffer[2 + i] = hex_chars[nibble];
-    }
-    buffer[18] = '\0';
-    
-    framebuffer_draw_string(buffer, x, y, fg_color, bg_color);
-}
-
-void framebuffer_clear(uint32_t color) {
-    spinlock_acquire(&fb_lock);
-    
-    for (uint32_t i = 0; i < fb_width * fb_height; i++) {
-        fb_addr[i] = color;
-    }
-    
-    spinlock_release(&fb_lock);
-}
-
-void framebuffer_draw_rsp_error(uint64_t code) {
-    framebuffer_draw_rect(300, 300, 400, 100, COLOR_RED);
-    framebuffer_draw_string("ZERO RSP DETECTED!", 320, 320, COLOR_WHITE, COLOR_RED);
-    framebuffer_draw_hex(code, 320, 340, COLOR_WHITE, COLOR_RED);
 }

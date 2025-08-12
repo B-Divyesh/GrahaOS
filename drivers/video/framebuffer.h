@@ -100,3 +100,5 @@ void framebuffer_draw_hex(uint64_t value, int x, int y, uint32_t fg_color, uint3
  */
 void framebuffer_clear(uint32_t color);
 
+void framebuffer_draw_string_safe(const char *str, uint32_t x, uint32_t y, 
+                                  uint32_t fg_color, uint32_t bg_color);

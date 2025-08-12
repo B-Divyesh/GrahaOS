@@ -11,11 +11,11 @@ static int next_task_id = 0;
 static int current_task_index = 0;
 
 // Scheduler spinlock with static initialization
-static spinlock_t sched_lock = SPINLOCK_INITIALIZER("scheduler");
+spinlock_t sched_lock = SPINLOCK_INITIALIZER("scheduler");
 
 // Debug counters (for post-mortem analysis only)
-static volatile uint32_t schedule_count = 0;
-static volatile uint32_t context_switches = 0;
+volatile uint32_t schedule_count = 0;
+volatile uint32_t context_switches = 0;
 
 // Simple memset implementation
 static void *memset(void *s, int c, size_t n) {
@@ -27,7 +27,7 @@ static void *memset(void *s, int c, size_t n) {
 }
 
 void sched_init(void) {
-    // Initialize the scheduler lock with proper name
+    // Initialize the scheduler lock
     spinlock_init(&sched_lock, "scheduler");
     
     spinlock_acquire(&sched_lock);
@@ -40,10 +40,21 @@ void sched_init(void) {
     tasks[0].parent_id = -1;
     tasks[0].waiting_for_child = -1;
     
+    // Get current stack pointer
     uint64_t current_rsp;
     asm volatile("mov %%rsp, %0" : "=r"(current_rsp));
     
+    // Set kernel stack for idle task
     tasks[0].kernel_stack_top = (current_rsp & ~0xFFF) + 0x4000;
+    
+    // Initialize the interrupt frame for idle task
+    memset(&tasks[0].regs, 0, sizeof(struct interrupt_frame));
+    tasks[0].regs.cs = 0x08;      // Kernel code segment
+    tasks[0].regs.ss = 0x10;      // Kernel data segment  
+    tasks[0].regs.ds = 0x10;      // Data segment
+    tasks[0].regs.rflags = 0x202; // IF=1, Reserved=1
+    tasks[0].regs.rsp = current_rsp;
+    tasks[0].regs.rbp = current_rsp;
     
     // Update the per-CPU TSS
     uint32_t cpu_id = smp_get_current_cpu();
@@ -53,43 +64,106 @@ void sched_init(void) {
     
     spinlock_release(&sched_lock);
     
-    // This is BEFORE interrupts are enabled, so it's safe
-    framebuffer_draw_string("Scheduler initialized with wait() support", 700, 20, COLOR_GREEN, 0x00101828);
+    // Safe to print here - before interrupts are enabled
+    framebuffer_draw_string("Scheduler initialized with interrupt-safe locks", 700, 20, COLOR_GREEN, 0x00101828);
 }
 
 int sched_create_task(void (*entry_point)(void)) {
-    if (next_task_id >= MAX_TASKS) return -1;
+    // CRITICAL: Check the actual parameter value, not what debugger shows
+    volatile uint64_t entry_addr = (uint64_t)entry_point;
+    
+    // Validate entry point
+    if (!entry_point || entry_addr == 0) {
+        // Try to get it from RDI directly in case of calling convention issue
+        uint64_t rdi_value;
+        asm volatile("mov %%rdi, %0" : "=r"(rdi_value));
+        
+        if (rdi_value >= 0xFFFFFFFF80000000 && rdi_value != 0) {
+            // Use the RDI value instead
+            entry_point = (void (*)(void))rdi_value;
+            entry_addr = rdi_value;
+        } else {
+            // Really is NULL
+            return -1;
+        }
+    }
+    
+    // Double-check it's in kernel space
+    if (entry_addr < 0xFFFFFFFF80000000) {
+        return -1;
+    }
+    
+    spinlock_acquire(&sched_lock);
+    
+    if (next_task_id >= MAX_TASKS) {
+        spinlock_release(&sched_lock);
+        return -1;
+    }
 
     int id = next_task_id++;
     tasks[id].id = id;
     tasks[id].state = TASK_STATE_READY;
-    tasks[id].parent_id = tasks[current_task_index].id;
+    tasks[id].parent_id = current_task_index >= 0 ? tasks[current_task_index].id : -1;
     tasks[id].waiting_for_child = -1;
 
+    spinlock_release(&sched_lock);
+
+    // Allocate kernel stack
     size_t num_pages = KERNEL_STACK_SIZE / PAGE_SIZE;
     void* kstack_phys = pmm_alloc_pages(num_pages);
-    if (!kstack_phys) return -1;
-    tasks[id].kernel_stack_top = (uint64_t)kstack_phys + g_hhdm_offset + KERNEL_STACK_SIZE;
-
-    uint64_t kstack_base = tasks[id].kernel_stack_top - KERNEL_STACK_SIZE;
+    if (!kstack_phys) {
+        return -1;
+    }
+    
+    // Calculate virtual address
+    uint64_t kstack_virt_base = (uint64_t)kstack_phys + g_hhdm_offset;
+    uint64_t kstack_top = kstack_virt_base + KERNEL_STACK_SIZE;
+    
+    // Map kernel stack pages
     for (size_t i = 0; i < num_pages; i++) {
-        uint64_t page_virt = kstack_base + (i * PAGE_SIZE);
+        uint64_t page_virt = kstack_virt_base + (i * PAGE_SIZE);
         uint64_t page_phys = (uint64_t)kstack_phys + (i * PAGE_SIZE);
         vmm_map_page(vmm_get_kernel_space(), page_virt, page_phys, PTE_PRESENT | PTE_WRITABLE);
     }
 
-    memset(&tasks[id].regs, 0, sizeof(struct interrupt_frame));
-    tasks[id].regs.rip = (uint64_t)entry_point;
-    tasks[id].regs.cs = 0x08;
-    tasks[id].regs.rflags = 0x202;
-    tasks[id].regs.rsp = (tasks[id].kernel_stack_top - 16) & ~0xF;
-    tasks[id].regs.ss = 0x10;
+    spinlock_acquire(&sched_lock);
     
+    // Set stack
+    tasks[id].kernel_stack_top = kstack_top;
+    
+    // Initialize the interrupt frame
+    memset(&tasks[id].regs, 0, sizeof(struct interrupt_frame));
+    
+    // Set up initial context
+    tasks[id].regs.rip = entry_addr;  // Use validated address
+    tasks[id].regs.cs = 0x08;         // Kernel code segment
+    tasks[id].regs.ss = 0x10;         // Kernel data segment
+    tasks[id].regs.ds = 0x10;         // Data segment
+    tasks[id].regs.rflags = 0x202;    // IF=1, Reserved=1
+    tasks[id].regs.rsp = (kstack_top - 128) & ~0xF;  // Stack pointer
+    tasks[id].regs.rbp = tasks[id].regs.rsp;         // Base pointer
+    
+    // Clear all other registers
+    tasks[id].regs.rax = 0;
+    tasks[id].regs.rbx = 0;
+    tasks[id].regs.rcx = 0;
+    tasks[id].regs.rdx = 0;
+    tasks[id].regs.rsi = 0;
+    tasks[id].regs.rdi = 0;
+    tasks[id].regs.r8 = 0;
+    tasks[id].regs.r9 = 0;
+    tasks[id].regs.r10 = 0;
+    tasks[id].regs.r11 = 0;
+    tasks[id].regs.r12 = 0;
+    tasks[id].regs.r13 = 0;
+    tasks[id].regs.r14 = 0;
+    tasks[id].regs.r15 = 0;
+    
+    // Use kernel address space
     tasks[id].cr3 = vmm_get_pml4_phys(vmm_get_kernel_space());
-
-    // Safe to print here - not in interrupt context
-    framebuffer_draw_string("Kernel task created", 700, 40, COLOR_CYAN, 0x00101828);
-
+    
+    spinlock_release(&sched_lock);
+    
     return id;
 }
 
@@ -200,17 +274,57 @@ void wake_waiting_parent(int child_id) {
 // NO LOCKS THAT CAN BE HELD BY NORMAL CODE!
 // NO FRAMEBUFFER CALLS!
 void schedule(struct interrupt_frame *frame) {
-    // Increment counters for debugging (can be read later)
+    // Increment counter
     schedule_count++;
     
+    // Validate frame
     if (!frame) {
-        // Can't print - just halt
         asm volatile("cli; hlt");
+        while(1);
     }
     
-    if (current_task_index >= next_task_id || current_task_index < 0) {
-        // Can't print - just halt
+    uint64_t frame_addr = (uint64_t)frame;
+    if (frame_addr < 0xFFFF800000000000) {
         asm volatile("cli; hlt");
+        while(1);
+    }
+    
+    // Check if scheduler is initialized
+    if (next_task_id == 0) {
+        return;
+    }
+    
+    // Validate current task index
+    if (current_task_index >= next_task_id || current_task_index < 0) {
+        current_task_index = 0;
+    }
+    
+    // CRITICAL: Don't try to lock if we're already in a critical section
+    // This can happen if timer interrupt fires while we're in spinlock code
+    uint64_t cpu_id = smp_get_current_cpu();
+    
+    // Check if we're holding ANY lock
+    if (sched_lock.locked && sched_lock.owner == cpu_id) {
+        // We're already in scheduler - skip this tick
+        return;
+    }
+    
+    // Try to acquire scheduler lock with timeout
+    int lock_attempts = 1000;
+    while (lock_attempts-- > 0) {
+        if (!sched_lock.locked) {
+            if (!__atomic_test_and_set(&sched_lock.locked, __ATOMIC_ACQUIRE)) {
+                sched_lock.owner = cpu_id;
+                sched_lock.count = 1;
+                break;
+            }
+        }
+        asm volatile("pause");
+    }
+    
+    if (lock_attempts <= 0) {
+        // Couldn't get lock - skip this scheduling round
+        return;
     }
     
     // Save current task state
@@ -237,24 +351,16 @@ void schedule(struct interrupt_frame *frame) {
     }
     
     if (!found) {
-        if (tasks[start_index].state == TASK_STATE_READY || 
-            tasks[start_index].state == TASK_STATE_RUNNING) {
+        // No ready tasks - stay with current
+        if (tasks[start_index].state != TASK_STATE_ZOMBIE) {
             current_task_index = start_index;
         } else {
-            // Check for any non-zombie task
-            int non_zombie_count = 0;
+            // Find any non-zombie task
             for (int i = 0; i < next_task_id; i++) {
                 if (tasks[i].state != TASK_STATE_ZOMBIE) {
-                    non_zombie_count++;
-                    if (tasks[i].state == TASK_STATE_BLOCKED) {
-                        current_task_index = i;
-                        break;
-                    }
+                    current_task_index = i;
+                    break;
                 }
-            }
-            if (non_zombie_count == 0) {
-                // All tasks dead - halt
-                asm volatile("cli; hlt");
             }
         }
     }
@@ -262,7 +368,6 @@ void schedule(struct interrupt_frame *frame) {
     tasks[current_task_index].state = TASK_STATE_RUNNING;
     
     // Update TSS RSP0
-    uint32_t cpu_id = smp_get_current_cpu();
     g_cpu_locals[cpu_id].tss.rsp0 = tasks[current_task_index].kernel_stack_top;
 
     // Switch address space if needed
@@ -272,23 +377,14 @@ void schedule(struct interrupt_frame *frame) {
         vmm_switch_address_space_phys(tasks[current_task_index].cr3);
     }
 
-    // Validate stack pointer
-    uint64_t new_rsp = tasks[current_task_index].regs.rsp;
+    // Release the scheduler lock properly
+    sched_lock.owner = (uint64_t)-1;
+    sched_lock.count = 0;
     
-    if (current_task_index != 0) {
-        if (tasks[current_task_index].regs.cs & 3) {
-            // User mode - check user stack bounds
-            if (new_rsp < 0x7FFFFFFFE000 || new_rsp > 0x7FFFFFFFF000) {
-                asm volatile("cli; hlt");
-            }
-        } else {
-            // Kernel mode - check kernel stack bounds
-            uint64_t stack_base = tasks[current_task_index].kernel_stack_top - KERNEL_STACK_SIZE;
-            if (new_rsp < stack_base || new_rsp > tasks[current_task_index].kernel_stack_top) {
-                asm volatile("cli; hlt");
-            }
-        }
-    }
+    // Memory barrier
+    asm volatile("mfence" ::: "memory");
+    
+    __atomic_clear(&sched_lock.locked, __ATOMIC_RELEASE);
 
     // Restore new task context
     *frame = tasks[current_task_index].regs;

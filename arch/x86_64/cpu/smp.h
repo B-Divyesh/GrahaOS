@@ -49,6 +49,8 @@ extern uint64_t g_kernel_pml4;
 // External variables from other modules
 extern uint64_t g_hhdm_offset;
 
+extern volatile uint32_t aps_started;
+
 // Function declarations remain the same...
 #if LIMINE_API_REVISION >= 1
 void smp_init(volatile struct limine_mp_request *mp_request);

@@ -6,37 +6,24 @@ global ap_trampoline
 extern ap_main
 extern g_kernel_pml4
 
-; This is the entry point for Application Processors
+; Entry point for Application Processors
 ; Limine starts APs in 64-bit long mode with:
 ; - RDI = pointer to limine_mp_info structure
-; The limine_mp_info struct layout (from limine.h):
-;   uint32_t processor_id;      ; offset 0
-;   uint32_t lapic_id;          ; offset 4
-;   uint64_t reserved;          ; offset 8
-;   limine_goto_address goto;   ; offset 16
-;   uint64_t extra_argument;    ; offset 24  <-- Our stack pointer is here!
 
 ap_trampoline:
-    ; Disable interrupts during initialization
+    ; Disable interrupts immediately
     cli
     
-    ; 1. Set up the stack from the MP info structure
-    ; RDI contains pointer to limine_mp_info
-    ; Stack pointer is at offset 24 (extra_argument)
-    mov rsp, [rdi + 24]
+    ; Save the info pointer
+    push rdi
     
-    ; Align stack to 16 bytes (System V ABI requirement)
-    and rsp, ~0xF
-    
-    ; Reserve red zone (128 bytes below RSP)
-    sub rsp, 128
-    
-    ; 2. Load the kernel's page tables
-    ; The BSP stored the PML4 physical address in g_kernel_pml4
+    ; Load kernel's page tables
     mov rax, [rel g_kernel_pml4]
+    test rax, rax
+    jz .halt_ap  ; If PML4 is not set, halt
     mov cr3, rax
     
-    ; 3. Set up segment registers (should already be set by Limine, but be safe)
+    ; Set up proper segment registers
     mov ax, 0x10    ; Kernel data segment
     mov ds, ax
     mov es, ax
@@ -44,22 +31,50 @@ ap_trampoline:
     mov gs, ax
     mov ss, ax
     
-    ; 4. Enable SSE/SSE2 (required for modern compilers)
+    ; Restore info pointer
+    pop rdi
+    
+    ; Get the stack pointer from the info structure
+    ; Stack pointer is at offset 24 (extra_argument)
+    mov rsp, [rdi + 24]
+    test rsp, rsp
+    jz .halt_ap  ; If no stack, halt
+    
+    ; Validate stack is in kernel space
+    mov rax, rsp
+    mov rbx, 0xFFFF800000000000
+    cmp rax, rbx
+    jb .halt_ap  ; Stack not in kernel space
+    
+    ; Align stack to 16 bytes
+    and rsp, ~0xF
+    
+    ; Reserve space for red zone
+    sub rsp, 128
+    
+    ; Push a canary value for debugging
+    mov rax, 0xDEADBEEFDEADBEEF
+    push rax
+    
+    ; Enable SSE/SSE2 (required for modern compilers)
     mov rax, cr0
-    and eax, 0xFFFFFFFB      ; Clear EM bit (bit 2)
-    or eax, 0x2              ; Set MP bit (bit 1)
+    and eax, 0xFFFFFFFB  ; Clear EM bit
+    or eax, 0x2          ; Set MP bit
     mov cr0, rax
     
     mov rax, cr4
-    or eax, 0x600            ; Set OSFXSR (bit 9) and OSXMMEXCPT (bit 10)
+    or eax, 0x600        ; Set OSFXSR and OSXMMEXCPT
     mov cr4, rax
     
-    ; 5. Jump to C entry point
-    ; RDI already contains limine_mp_info pointer (first argument)
+    ; Clear the direction flag
+    cld
+    
+    ; Call C entry point
+    ; RDI already contains limine_mp_info pointer
     call ap_main
     
-    ; 6. If ap_main returns (it shouldn't), halt forever
-.hang:
+    ; If ap_main returns (it shouldn't), halt
+.halt_ap:
     cli
     hlt
-    jmp .hang   
+    jmp .halt_ap

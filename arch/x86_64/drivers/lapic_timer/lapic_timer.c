@@ -72,17 +72,43 @@ uint32_t lapic_timer_calibrate(void) {
         return 0;
     }
     
+    // CRITICAL: Disable interrupts during calibration
+    uint64_t flags;
+    asm volatile(
+        "pushfq\n"
+        "pop %0\n"
+        "cli"
+        : "=r"(flags)
+    );
+    
     // Set the divider to 16
     lapic_write_reg(LAPIC_TIMER_DIVIDE, LAPIC_TIMER_DIV_16);
+    
+    // Ensure timer is stopped first
+    lapic_write_reg(LAPIC_TIMER_INITIAL, 0);
     
     // Start with the maximum initial count
     lapic_write_reg(LAPIC_TIMER_INITIAL, 0xFFFFFFFF);
     
-    // Wait for 10ms using the PIT
-    pit_wait_ms(10);
+    // Use PIT for timing (more reliable than pit_wait_ms)
+    // Configure PIT channel 0 for one-shot mode
+    outb(0x43, 0x30);  // Channel 0, lobyte/hibyte, one-shot mode
     
-    // Read how much the LAPIC timer counted down
-    uint32_t ticks_in_10ms = 0xFFFFFFFF - lapic_read_reg(LAPIC_TIMER_CURRENT);
+    // For 10ms at 1193182 Hz, we need ~11932 ticks
+    uint16_t pit_count = 11932;
+    outb(0x40, pit_count & 0xFF);
+    outb(0x40, (pit_count >> 8) & 0xFF);
+    
+    // Wait for PIT to count down
+    uint8_t status;
+    do {
+        outb(0x43, 0xE2);  // Read-back command for channel 0
+        status = inb(0x40);
+    } while (!(status & 0x80));  // Wait until output goes high
+    
+    // Read how much the LAPIC timer counted
+    uint32_t current = lapic_read_reg(LAPIC_TIMER_CURRENT);
+    uint32_t ticks_in_10ms = 0xFFFFFFFF - current;
     
     // Stop the timer
     lapic_write_reg(LAPIC_TIMER_INITIAL, 0);
@@ -90,6 +116,11 @@ uint32_t lapic_timer_calibrate(void) {
     // Calculate frequency: ticks_in_10ms * 100 = ticks per second
     // Multiply by 16 because we used a divider of 16
     lapic_timer_frequency = ticks_in_10ms * 100 * 16;
+    
+    // Restore interrupt state
+    if (flags & 0x200) {
+        asm volatile("sti");
+    }
     
     return lapic_timer_frequency;
 }

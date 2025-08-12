@@ -19,6 +19,8 @@
 #include "../arch/x86_64/drivers/lapic_timer/lapic_timer.h"
 #include "../arch/x86_64/cpu/ports.h"
 #include "../arch/x86_64/drivers/keyboard/keyboard.h"
+#include "keyboard_task.h"
+#include "../arch/x86_64/drivers/lapic/lapic.h"
 
 // --- Limine Requests ---
 __attribute__((used, section(".limine_requests")))
@@ -136,17 +138,11 @@ static void hcf(void) {
 }
 
 // --- Keyboard Polling Task ---
-static void keyboard_poll_task(void) {
-    while (1) {
-        // Check if keyboard has data available
-        if (inb(0x64) & 0x01) {
-            uint8_t scancode = inb(0x60);
-            keyboard_handle_scancode(scancode);
-        }
-        // Yield to other tasks
-        asm volatile("hlt");
-    }
-}
+// External keyboard task function from keyboard_task.c
+extern void keyboard_poll_task(void);
+extern void (*get_keyboard_poll_task(void))(void);
+
+
 
 // --- Main Kernel Entry Point ---
 void kmain(void) {
@@ -273,35 +269,141 @@ void kmain(void) {
     framebuffer_draw_string("Shell process created.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
-    // Create keyboard polling task
-    int kbd_task = sched_create_task(keyboard_poll_task);
-    if (kbd_task >= 0) {
-        framebuffer_draw_string("Keyboard polling task created.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    } else {
-        framebuffer_draw_string("WARNING: Failed to create keyboard task!", 50, y_pos, COLOR_YELLOW, 0x00101828);
+    // Initialize keyboard hardware BEFORE creating the polling task
+    keyboard_init();
+    framebuffer_draw_string("Keyboard hardware initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    // Create keyboard polling task with extensive validation - FIXED VERSION
+    framebuffer_draw_string("Creating keyboard polling task...", 50, y_pos, COLOR_YELLOW, 0x00101828);
+    y_pos += 20;
+    
+    // CRITICAL: Use volatile to prevent optimization
+    volatile void (*kbd_func)(void) = keyboard_poll_task;
+    
+    // Double-check the pointer
+    if (!kbd_func) {
+        framebuffer_draw_string("ERROR: keyboard_poll_task is NULL!", 50, y_pos, COLOR_RED, 0x00101828);
+        hcf();
     }
+    
+    // Validate address
+    volatile uint64_t func_addr = (uint64_t)kbd_func;
+    if (func_addr < 0xFFFFFFFF80000000) {
+        framebuffer_draw_string("ERROR: Invalid keyboard task address!", 50, y_pos, COLOR_RED, 0x00101828);
+        hcf();
+    }
+    
+    // Show the address for debugging
+    char addr_msg[64] = "Task addr: 0x";
+    for (int i = 0; i < 16; i++) {
+        char hex = "0123456789ABCDEF"[(func_addr >> (60 - i * 4)) & 0xF];
+        addr_msg[13 + i] = hex;
+    }
+    addr_msg[29] = '\0';
+    framebuffer_draw_string(addr_msg, 50, y_pos, COLOR_CYAN, 0x00101828);
+    y_pos += 20;
+    
+    // CRITICAL: Force the function pointer through memory to avoid register issues
+    void (*task_func)(void) = (void (*)(void))func_addr;
+    
+    // Create the task with explicit type casting
+    int kbd_task_id = sched_create_task(task_func);
+    
+    if (kbd_task_id < 0) {
+        framebuffer_draw_string("ERROR: Failed to create keyboard task!", 50, y_pos, COLOR_RED, 0x00101828);
+        y_pos += 20;
+    } else {
+        framebuffer_draw_string("Keyboard task created successfully", 50, y_pos, COLOR_GREEN, 0x00101828);
+        y_pos += 20;
+        
+        char id_msg[32] = "Task ID: ";
+        id_msg[9] = '0' + kbd_task_id;
+        id_msg[10] = '\0';
+        framebuffer_draw_string(id_msg, 50, y_pos, COLOR_CYAN, 0x00101828);
+        y_pos += 20;
+    }
+
+    // Wait for all CPUs to stabilize
+    framebuffer_draw_string("Waiting for all CPUs to stabilize...", 50, y_pos, COLOR_YELLOW, 0x00101828);
+    for (volatile int i = 0; i < 1000000; i++) {
+        asm volatile("pause");
+    }
+    framebuffer_draw_string("System ready to start.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 30;
 
-    // Brief pause to allow user to read initialization messages
+    // Brief pause to read messages
     for (volatile int i = 0; i < 500000; i++) {
         asm volatile("pause");
     }
 
-    // Clear screen before transferring control to shell
+    // Clear screen
+    framebuffer_clear(0x00101828);
+    
+    // Clear screen
     framebuffer_clear(0x00101828);
     
     // --- FINAL SYSTEM ACTIVATION ---
     
-    // Note: LAPIC timer is already initialized by BSP in smp_init()
-    // and by each AP in ap_main()
-    framebuffer_draw_string("LAPIC Timers active on all CPUs", 10, 10, COLOR_GREEN, 0x00101828);
+    framebuffer_draw_string("System initialization complete", 10, 10, COLOR_GREEN, 0x00101828);
     
-    // Enable hardware interrupts
-    asm volatile("sti");
-    framebuffer_draw_string("Interrupts enabled - System ready!", 10, 30, COLOR_GREEN, 0x00101828);
+    // CRITICAL: Ensure all CPUs are ready before starting ANY timers
+    framebuffer_draw_string("Synchronizing all CPUs...", 10, 30, COLOR_YELLOW, 0x00101828);
     
-    // Enter idle loop - scheduler will handle process switching
-    while (1) {
-        asm volatile("hlt");  // Halt until interrupt
+    // Wait for all APs to be ready
+    while (aps_started < g_cpu_count - 1) {
+        asm volatile("pause");
     }
+    
+    framebuffer_draw_string("All CPUs synchronized", 10, 30, COLOR_GREEN, 0x00101828);
+    
+    // Long delay to ensure everything is stable
+    for (volatile int i = 0; i < 2000000; i++) {
+        asm volatile("pause");
+    }
+    
+    // Enable interrupts FIRST (but no timers running yet)
+    framebuffer_draw_string("Enabling interrupts...", 10, 50, COLOR_YELLOW, 0x00101828);
+    asm volatile("sti");
+    
+    // Wait to ensure no pending issues
+    for (volatile int i = 0; i < 1000000; i++) {
+        asm volatile("pause");
+    }
+    
+    // NOW start the timer on BSP only
+    framebuffer_draw_string("Starting scheduler timer on BSP...", 10, 70, COLOR_YELLOW, 0x00101828);
+    
+    // Disable interrupts briefly while starting timer
+    asm volatile("cli");
+    lapic_timer_init(100, 32);
+    asm volatile("sti");
+    
+    if (!lapic_timer_is_running()) {
+        framebuffer_draw_string("ERROR: Timer failed to start!", 10, 90, COLOR_RED, 0x00101828);
+    } else {
+        framebuffer_draw_string("System running!", 10, 90, COLOR_GREEN, 0x00101828);
+    }
+    
+    // OPTIONAL: Start timers on APs later (commented out for now)
+    // This would require IPI (Inter-Processor Interrupts) to signal APs
+    // For now, only BSP handles scheduling
+    
+    // Main idle loop
+    uint64_t loop_count = 0;
+    while (1) {
+        // Periodically check system health
+        if ((loop_count++ & 0xFFFFF) == 0) {
+            // Check stack
+            uint64_t rsp;
+            asm volatile("mov %%rsp, %0" : "=r"(rsp));
+            if (rsp < 0xFFFF800000000000) {
+                framebuffer_draw_string("FATAL: Stack corrupted!", 10, 200, COLOR_RED, 0x00101828);
+                asm volatile("cli; hlt");
+            }
+        }
+        
+        asm volatile("hlt");
+    }
+
 }

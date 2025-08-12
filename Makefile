@@ -116,6 +116,12 @@ debug: grahaos.iso
 	@echo "Starting QEMU with GDB support..."
 	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 -s -S
 
+debug-monitor: grahaos.iso
+	@echo "Starting QEMU with monitor..."
+	@echo "Press Ctrl+Alt+2 for QEMU monitor"
+	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 \
+	    -monitor stdio -d int,cpu_reset -D qemu.log
+
 clean:
 	@echo "Cleaning up..."
 	@rm -rf $(C_OBJECTS) $(ASM_OBJECTS) $(DEPS) kernel/kernel.elf grahaos.iso iso_root initrd.tar initrd_root

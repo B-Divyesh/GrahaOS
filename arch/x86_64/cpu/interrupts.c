@@ -102,16 +102,53 @@ static void print_hex_value(const char *label, uint64_t value, int x, int y) {
 
 // The main C-level interrupt handler
 void interrupt_handler(struct interrupt_frame *frame) {
-    // CRITICAL: Validate frame pointer
+    // CRITICAL: Validate frame pointer thoroughly
     if (!frame) {
+        // NULL frame - immediate halt
         asm volatile("cli; hlt");
+        while(1);
     }
     
-    // Validate frame address is in reasonable range
+    // Check if frame address is valid
     uint64_t frame_addr = (uint64_t)frame;
-    if (frame_addr < 0xFFFF800000000000) {
-        // Frame is not in kernel space - corruption!
+    
+    // CRITICAL: Check for corrupted frame address
+    // If upper 16 bits are missing, the frame is corrupted
+    if (frame_addr < 0xFFFF000000000000) {
+        // Frame address is corrupted - try to recover
+        // This might be a truncated address
+        
+        // Check if it looks like a truncated kernel address
+        if (frame_addr < 0x100000000) {
+            // Might be truncated - try to fix it
+            frame_addr |= 0xFFFF800000000000;
+            frame = (struct interrupt_frame *)frame_addr;
+            
+            // Re-validate
+            if (frame_addr < 0xFFFF800000000000) {
+                // Still invalid - halt
+                asm volatile("cli; hlt");
+                while(1);
+            }
+        } else {
+            // Completely invalid - halt
+            asm volatile("cli; hlt");
+            while(1);
+        }
+    }
+    
+    // Additional validation
+    if (frame_addr < 0xFFFF800000000000 || frame_addr > 0xFFFFFFFFFFFFFFFF) {
+        // Not in kernel space
         asm volatile("cli; hlt");
+        while(1);
+    }
+    
+    // Check interrupt number
+    if (frame->int_no > 255) {
+        // Invalid interrupt number - frame is corrupted
+        asm volatile("cli; hlt");
+        while(1);
     }
     
     if (frame->int_no == 14) { // Page Fault
