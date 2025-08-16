@@ -4,44 +4,40 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-
 #include "../sync/spinlock.h"
 
 #define MAX_OPEN_FILES 64
+#define MAX_BLOCK_DEVICES 8 // NEW: Maximum number of block devices
 
 typedef long ssize_t;
+
 // Represents an open file in the system
 typedef struct {
-    bool in_use;             // Is this file descriptor slot in use?
-    void *file_data;         // Pointer to the file's data in the initrd
-    size_t size;             // Total size of the file
-    size_t offset;           // Current read offset
+    bool in_use;
+    void *file_data;
+    size_t size;
+    size_t offset;
 } open_file_t;
 
-/**
- * @brief Initializes the Virtual File System.
- */
+// NEW: Represents a block device in the system
+typedef struct {
+    bool in_use;
+    int device_id;
+    size_t block_size;
+    // Function pointers for read/write operations
+    int (*read_blocks)(int dev_id, uint64_t lba, uint16_t count, void* buf);
+    int (*write_blocks)(int dev_id, uint64_t lba, uint16_t count, void* buf);
+} block_device_t;
+
 void vfs_init(void);
-
-/**
- * @brief Opens a file and returns a file descriptor.
- * @param pathname The null-terminated path of the file to open.
- * @return A non-negative file descriptor on success, -1 on failure.
- */
 int vfs_open(const char *pathname);
-
-/**
- * @brief Reads from an open file.
- * @param fd The file descriptor to read from.
- * @param buffer A pointer to the user-space buffer to store data.
- * @param count The maximum number of bytes to read.
- * @return The number of bytes read, 0 on EOF, or -1 on error.
- */
 ssize_t vfs_read(int fd, void *buffer, size_t count);
-
-/**
- * @brief Closes an open file descriptor.
- * @param fd The file descriptor to close.
- * @return 0 on success, -1 on failure.
- */
 int vfs_close(int fd);
+
+// NEW: Function to register a block device
+void vfs_register_block_device(int dev_id, size_t block_size, 
+                               int (*read_func)(int, uint64_t, uint16_t, void*),
+                               int (*write_func)(int, uint64_t, uint16_t, void*));
+
+// NEW: Get a block device by ID
+block_device_t* vfs_get_block_device(int dev_id);

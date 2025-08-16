@@ -21,6 +21,7 @@
 #include "../arch/x86_64/drivers/keyboard/keyboard.h"
 #include "keyboard_task.h"
 #include "../arch/x86_64/drivers/lapic/lapic.h"
+#include "../arch/x86_64/drivers/ahci/ahci.h"
 
 // --- Limine Requests ---
 __attribute__((used, section(".limine_requests")))
@@ -141,7 +142,57 @@ static void hcf(void) {
 // External keyboard task function from keyboard_task.c
 extern void keyboard_poll_task(void);
 extern void (*get_keyboard_poll_task(void))(void);
+// --- Test function for AHCI ---
+static void test_ahci(void) {
+    // Allocate a page-aligned buffer for our test data
+    void* buffer_phys = pmm_alloc_page();
+    if (!buffer_phys) {
+        framebuffer_draw_string("AHCI TEST: Buffer allocation failed!", 10, 700, COLOR_RED, 0x00101828);
+        return;
+    }
+    
+    // Get virtual address of the buffer
+    void* buffer = (void*)((uint64_t)buffer_phys + g_hhdm_offset);
 
+    // Create a test pattern to write
+    uint8_t* write_buf = (uint8_t*)buffer;
+    for(int i = 0; i < 512; i++) {
+        write_buf[i] = (uint8_t)(i % 256);
+    }
+    write_buf[0] = 'G'; write_buf[1] = 'R'; write_buf[2] = 'A'; write_buf[3] = 'H';
+    write_buf[4] = 'A'; write_buf[5] = 'O'; write_buf[6] = 'S';
+
+    // Write one sector (512 bytes) to LBA 0 of the first drive (port 0)
+    framebuffer_draw_string("AHCI TEST: Writing to LBA 0...", 10, 680, COLOR_YELLOW, 0x00101828);
+    if (ahci_write(0, 0, 1, buffer) != 0) {
+        framebuffer_draw_string("AHCI TEST: Write FAILED!", 10, 700, COLOR_RED, 0x00101828);
+        pmm_free_page(buffer_phys);
+        return;
+    }
+    framebuffer_draw_string("AHCI TEST: Write successful.", 10, 700, COLOR_GREEN, 0x00101828);
+
+    // Clear the buffer to ensure our read works
+    for(int i = 0; i < 512; i++) { 
+        write_buf[i] = 0; 
+    }
+
+    // Read the sector back
+    framebuffer_draw_string("AHCI TEST: Reading from LBA 0...", 10, 720, COLOR_YELLOW, 0x00101828);
+    if (ahci_read(0, 0, 1, buffer) != 0) {
+        framebuffer_draw_string("AHCI TEST: Read FAILED!", 10, 720, COLOR_RED, 0x00101828);
+        pmm_free_page(buffer_phys);
+        return;
+    }
+
+    // Verify the pattern
+    if (write_buf[0] == 'G' && write_buf[6] == 'S' && write_buf[255] == 255) {
+        framebuffer_draw_string("AHCI TEST: Data verified successfully! Storage is persistent.", 10, 740, COLOR_GREEN, 0x00101828);
+    } else {
+        framebuffer_draw_string("AHCI TEST: Data verification FAILED!", 10, 740, COLOR_RED, 0x00101828);
+    }
+    
+    pmm_free_page(buffer_phys);
+}
 
 
 // --- Main Kernel Entry Point ---
@@ -231,6 +282,10 @@ void kmain(void) {
     vfs_init();
     framebuffer_draw_string("VFS Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 40;
+
+    //adding AHCI
+    ahci_init();
+    y_pos += 20;
 
     // --- USER SPACE INITIALIZATION ---
     framebuffer_draw_string("=== Loading Interactive Shell ===", 50, y_pos, COLOR_WHITE, 0x00101828);
@@ -385,6 +440,8 @@ void kmain(void) {
         framebuffer_draw_string("System running!", 10, 90, COLOR_GREEN, 0x00101828);
     }
     
+    // NEW: Run our storage test
+    test_ahci();
     // OPTIONAL: Start timers on APs later (commented out for now)
     // This would require IPI (Inter-Processor Interrupts) to signal APs
     // For now, only BSP handles scheduling

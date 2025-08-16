@@ -40,7 +40,12 @@ DEPS := $(C_OBJECTS:.o=.d)
 
 all: grahaos.iso
 
-grahaos.iso: kernel/kernel.elf initrd.tar limine.conf
+disk.img:
+	@echo "Creating virtual hard disk..."
+	@dd if=/dev/zero of=disk.img bs=1M count=128 2>/dev/null
+	@echo "Virtual disk created: disk.img (128MB)"
+
+grahaos.iso: kernel/kernel.elf initrd.tar limine.conf disk.img
 	@echo "Creating ISO image..."
 	@rm -rf iso_root
 	@mkdir -p iso_root/boot
@@ -108,23 +113,32 @@ kernel/kernel.elf: $(OBJECTS) linker.ld
 -include $(DEPS)
 
 run: grahaos.iso
-	@echo "Starting QEMU with SMP support..."
+	@echo "Starting QEMU with SMP and AHCI support..."
 	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 \
-         -d int,cpu_reset -D qemu.log	
+	     -drive file=disk.img,format=raw,if=none,id=mydisk \
+	     -device ich9-ahci,id=ahci \
+	     -device ide-hd,drive=mydisk,bus=ahci.0 \
+	     -d int,cpu_reset -D qemu.log
 
 debug: grahaos.iso
 	@echo "Starting QEMU with GDB support..."
-	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 -s -S
+	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 -s -S \
+	     -drive file=disk.img,format=raw,if=none,id=mydisk \
+	     -device ich9-ahci,id=ahci \
+	     -device ide-hd,drive=mydisk,bus=ahci.0
 
 debug-monitor: grahaos.iso
 	@echo "Starting QEMU with monitor..."
 	@echo "Press Ctrl+Alt+2 for QEMU monitor"
 	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 \
-	    -monitor stdio -d int,cpu_reset -D qemu.log
+	    -monitor stdio -d int,cpu_reset -D qemu.log \
+	    -drive file=disk.img,format=raw,if=none,id=mydisk \
+	    -device ich9-ahci,id=ahci \
+	    -device ide-hd,drive=mydisk,bus=ahci.0
 
 clean:
 	@echo "Cleaning up..."
-	@rm -rf $(C_OBJECTS) $(ASM_OBJECTS) $(DEPS) kernel/kernel.elf grahaos.iso iso_root initrd.tar initrd_root
+	@rm -rf $(C_OBJECTS) $(ASM_OBJECTS) $(DEPS) kernel/kernel.elf grahaos.iso iso_root initrd.tar initrd_root disk.img
 	@$(MAKE) -C user clean
 
 info:
