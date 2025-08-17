@@ -68,12 +68,24 @@ static void port_rebase(ahci_port_t *port, int portno) {
 }
 
 // VFS block device read/write functions
-int ahci_vfs_read(int dev_id, uint64_t lba, uint16_t count, void* buf) {
-    return ahci_read(dev_id, lba, count, buf);
+// CRITICAL: GrahaFS uses 4096-byte blocks, but AHCI uses 512-byte sectors
+// We need to convert block numbers to sector numbers!
+
+int ahci_vfs_read(int dev_id, uint64_t block_num, uint16_t block_count, void* buf) {
+    // Convert 4096-byte blocks to 512-byte sectors
+    // 1 block = 8 sectors (4096 / 512 = 8)
+    uint64_t sector_lba = block_num * 8;
+    uint16_t sector_count = block_count * 8;
+    
+    return ahci_read(dev_id, sector_lba, sector_count, buf);
 }
 
-int ahci_vfs_write(int dev_id, uint64_t lba, uint16_t count, void* buf) {
-    return ahci_write(dev_id, lba, count, buf);
+int ahci_vfs_write(int dev_id, uint64_t block_num, uint16_t block_count, void* buf) {
+    // Convert 4096-byte blocks to 512-byte sectors
+    uint64_t sector_lba = block_num * 8;
+    uint16_t sector_count = block_count * 8;
+    
+    return ahci_write(dev_id, sector_lba, sector_count, buf);
 }
 
 void ahci_init(void) {
@@ -119,7 +131,7 @@ void ahci_init(void) {
                     
                     char msg[] = "AHCI: Found SATA drive at port X";
                     msg[30] = '0' + i;
-                    framebuffer_draw_string(msg, 10, 620 + (i*20), COLOR_GREEN, 0x00101828);
+                    framebuffer_draw_string(msg, 100, 620 + (i*20), COLOR_GREEN, 0x00101828);
                 }
             }
         }
@@ -156,10 +168,20 @@ int ahci_read(int port_num, uint64_t lba, uint16_t count, void *buf) {
 
     ahci_cmd_table_t *cmd_table = (ahci_cmd_table_t*)((cmd_header->ctba + g_hhdm_offset));
     
-    // Convert virtual buffer to physical for DMA
-    uint64_t buf_phys = (uint64_t)buf;
-    if (buf_phys >= 0xFFFF800000000000ULL) {
-        buf_phys -= g_hhdm_offset;
+    // CRITICAL FIX: Properly handle buffer address
+    // The buffer passed in is a virtual address that might be:
+    // 1. A physical address already (< 0xFFFF800000000000)
+    // 2. A HHDM-mapped address (>= 0xFFFF800000000000)
+    
+    uint64_t buf_phys;
+    uint64_t buf_addr = (uint64_t)buf;
+    
+    if (buf_addr >= 0xFFFF800000000000ULL) {
+        // It's a virtual address in HHDM range, convert to physical
+        buf_phys = buf_addr - g_hhdm_offset;
+    } else {
+        // It's already a physical address
+        buf_phys = buf_addr;
     }
     
     // Setup PRDT
@@ -169,6 +191,7 @@ int ahci_read(int port_num, uint64_t lba, uint16_t count, void *buf) {
         cmd_table->prdt_entry[i].dbc = 8192 - 1; // 8K bytes
         cmd_table->prdt_entry[i].i = 1;
     }
+    // Last PRDT entry
     cmd_table->prdt_entry[i].dba = buf_phys + (i * 8192);
     cmd_table->prdt_entry[i].dbc = ((count % 16 == 0) ? 16 : (count % 16)) * 512 - 1;
     cmd_table->prdt_entry[i].i = 1;
@@ -176,14 +199,14 @@ int ahci_read(int port_num, uint64_t lba, uint16_t count, void *buf) {
     // Setup command FIS
     fis_reg_h2d_t *cmdfis = (fis_reg_h2d_t*)(&cmd_table->cfis);
     
-    // Clear the FIS
+    // Clear the entire FIS
     for (int j = 0; j < 64; j++) {
         cmd_table->cfis[j] = 0;
     }
     
     cmdfis->fis_type = 0x27;
     cmdfis->c = 1;
-    cmdfis->command = 0x25; // DMA READ EXT
+    cmdfis->command = 0x25; // READ DMA EXT
     cmdfis->lba0 = (uint8_t)lba;
     cmdfis->lba1 = (uint8_t)(lba >> 8);
     cmdfis->lba2 = (uint8_t)(lba >> 16);
@@ -231,31 +254,39 @@ int ahci_write(int port_num, uint64_t lba, uint16_t count, void *buf) {
 
     ahci_cmd_table_t *cmd_table = (ahci_cmd_table_t*)((cmd_header->ctba + g_hhdm_offset));
     
-    // Convert virtual buffer to physical for DMA
-    uint64_t buf_phys = (uint64_t)buf;
-    if (buf_phys >= 0xFFFF800000000000ULL) {
-        buf_phys -= g_hhdm_offset;
+    // CRITICAL FIX: Properly handle buffer address
+    uint64_t buf_phys;
+    uint64_t buf_addr = (uint64_t)buf;
+    
+    if (buf_addr >= 0xFFFF800000000000ULL) {
+        // It's a virtual address in HHDM range, convert to physical
+        buf_phys = buf_addr - g_hhdm_offset;
+    } else {
+        // It's already a physical address
+        buf_phys = buf_addr;
     }
     
+    // Setup PRDT
     int i;
     for (i = 0; i < cmd_header->prdtl - 1; i++) {
         cmd_table->prdt_entry[i].dba = buf_phys + (i * 8192);
         cmd_table->prdt_entry[i].dbc = 8192 - 1;
     }
+    // Last PRDT entry
     cmd_table->prdt_entry[i].dba = buf_phys + (i * 8192);
     cmd_table->prdt_entry[i].dbc = ((count % 16 == 0) ? 16 : (count % 16)) * 512 - 1;
 
     // Setup command FIS
     fis_reg_h2d_t *cmdfis = (fis_reg_h2d_t*)(&cmd_table->cfis);
     
-    // Clear the FIS
+    // Clear the entire FIS
     for (int j = 0; j < 64; j++) {
         cmd_table->cfis[j] = 0;
     }
     
     cmdfis->fis_type = 0x27;
     cmdfis->c = 1;
-    cmdfis->command = 0x35; // DMA WRITE EXT
+    cmdfis->command = 0x35; // WRITE DMA EXT
     cmdfis->lba0 = (uint8_t)lba;
     cmdfis->lba1 = (uint8_t)(lba >> 8);
     cmdfis->lba2 = (uint8_t)(lba >> 16);

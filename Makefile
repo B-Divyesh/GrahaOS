@@ -5,6 +5,7 @@ PREFIX   := /home/atman/GrahaOS/toolchain
 TARGET   := x86_64-elf
 
 # Tools
+HOST_CC  := gcc
 CC       := $(PREFIX)/bin/$(TARGET)-gcc
 LD       := $(PREFIX)/bin/$(TARGET)-ld
 AS       := $(PREFIX)/bin/$(TARGET)-as
@@ -39,6 +40,16 @@ DEPS := $(C_OBJECTS:.o=.d)
 .PHONY: all clean run help debug info userland
 
 all: grahaos.iso
+
+# Build the host formatting tool
+scripts/mkfs.gfs: scripts/mkfs.gfs.c kernel/fs/grahafs.h
+	@echo "Building host tool: mkfs.gfs..."
+	@$(HOST_CC) -o $@ $< -I.
+
+# Format the disk image with GrahaFS
+format-disk: scripts/mkfs.gfs disk.img
+	@echo "Formatting disk.img with GrahaFS..."
+	@./scripts/mkfs.gfs disk.img
 
 disk.img:
 	@echo "Creating virtual hard disk..."
@@ -112,7 +123,7 @@ kernel/kernel.elf: $(OBJECTS) linker.ld
 
 -include $(DEPS)
 
-run: grahaos.iso
+run: grahaos.iso format-disk
 	@echo "Starting QEMU with SMP and AHCI support..."
 	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 \
 	     -drive file=disk.img,format=raw,if=none,id=mydisk \
@@ -120,14 +131,14 @@ run: grahaos.iso
 	     -device ide-hd,drive=mydisk,bus=ahci.0 \
 	     -d int,cpu_reset -D qemu.log
 
-debug: grahaos.iso
+debug: grahaos.iso format-disk
 	@echo "Starting QEMU with GDB support..."
 	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 -s -S \
 	     -drive file=disk.img,format=raw,if=none,id=mydisk \
 	     -device ich9-ahci,id=ahci \
 	     -device ide-hd,drive=mydisk,bus=ahci.0
 
-debug-monitor: grahaos.iso
+debug-monitor: grahaos.iso format-disk
 	@echo "Starting QEMU with monitor..."
 	@echo "Press Ctrl+Alt+2 for QEMU monitor"
 	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 \
@@ -138,8 +149,13 @@ debug-monitor: grahaos.iso
 
 clean:
 	@echo "Cleaning up..."
-	@rm -rf $(C_OBJECTS) $(ASM_OBJECTS) $(DEPS) kernel/kernel.elf grahaos.iso iso_root initrd.tar initrd_root disk.img
+	@rm -rf $(C_OBJECTS) $(ASM_OBJECTS) $(DEPS) kernel/kernel.elf grahaos.iso iso_root initrd.tar initrd_root disk.img scripts/mkfs.gfs
 	@$(MAKE) -C user clean
+
+reformat: scripts/mkfs.gfs
+	@rm -f disk.img
+	@$(MAKE) disk.img
+	@$(MAKE) format-disk
 
 info:
 	@echo "=== Build Information ==="
