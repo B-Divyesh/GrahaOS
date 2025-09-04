@@ -124,3 +124,5 @@ int ahci_read(int port_num, uint64_t lba, uint16_t count, void *buf);
  * @return 0 on success, non-zero on failure.
  */
 int ahci_write(int port_num, uint64_t lba, uint16_t count, void *buf);
+
+int ahci_flush_cache(int port_num);

@@ -139,178 +139,16 @@ static void hcf(void) {
     }
 }
 
+size_t strlen(const char *str) {
+    size_t len = 0;
+    while (str[len]) len++;
+    return len;
+}
+
 // --- Keyboard Polling Task ---
 // External keyboard task function from keyboard_task.c
 extern void keyboard_poll_task(void);
 extern void (*get_keyboard_poll_task(void))(void);
-
-// --- Test function for GrahaFS ---
-static void test_grahafs(void) {
-    // Initialize the GrahaFS driver
-    grahafs_init();
-    
-    // Get the block device we registered earlier
-    block_device_t* hdd = vfs_get_block_device(0);
-    if (!hdd) {
-        framebuffer_draw_string("GFS TEST: Could not get block device 0.", 10, 570, COLOR_RED, 0x00101828);
-        return;
-    }
-    framebuffer_draw_string("GFS TEST: Got block device 0.", 10, 570, COLOR_GREEN, 0x00101828);
-
-    // Mount the filesystem
-    vfs_node_t* root = grahafs_mount(hdd);
-    if (!root) {
-        framebuffer_draw_string("GFS TEST: Mount failed!", 10, 590, COLOR_RED, 0x00101828);
-        return;
-    }
-    framebuffer_draw_string("GFS TEST: Mount successful!", 10, 590, COLOR_GREEN, 0x00101828);
-    
-    // Debug: Show root inode info
-    char info_msg[80] = "GFS TEST: Root node - inode: ";
-    int pos = 30;
-    uint32_t inode_num = root->inode;
-    if (inode_num == 0) {
-        info_msg[pos++] = '0';
-    } else {
-        char digits[10];
-        int digit_count = 0;
-        while (inode_num > 0) {
-            digits[digit_count++] = '0' + (inode_num % 10);
-            inode_num /= 10;
-        }
-        while (digit_count > 0) {
-            info_msg[pos++] = digits[--digit_count];
-        }
-    }
-    info_msg[pos++] = ',';
-    info_msg[pos++] = ' ';
-    info_msg[pos++] = 's';
-    info_msg[pos++] = 'i';
-    info_msg[pos++] = 'z';
-    info_msg[pos++] = 'e';
-    info_msg[pos++] = ':';
-    info_msg[pos++] = ' ';
-    uint64_t size = root->size;
-    if (size == 0) {
-        info_msg[pos++] = '0';
-    } else {
-        char size_digits[20];
-        int size_count = 0;
-        while (size > 0) {
-            size_digits[size_count++] = '0' + (size % 10);
-            size /= 10;
-        }
-        while (size_count > 0) {
-            info_msg[pos++] = size_digits[--size_count];
-        }
-    }
-    info_msg[pos] = '\0';
-    framebuffer_draw_string(info_msg, 210, 610, COLOR_CYAN, 0x00101828);
-    
-    // Test directory listing
-    framebuffer_draw_string("GFS TEST: Listing root directory...", 10, 630, COLOR_YELLOW, 0x00101828);
-    
-    int entries_found = 0;
-    for (uint32_t i = 0; i < 10; i++) {  // Try up to 10 entries
-        vfs_node_t* entry = root->readdir(root, i);
-        if (!entry) {
-            if (i == 0) {
-                framebuffer_draw_string("  No entries found!", 10, 650, COLOR_RED, 0x00101828);
-            }
-            break;
-        }
-        
-        entries_found++;
-        
-        char msg[80] = "  [";
-        int j = 3;
-        
-        // Add index
-        if (i < 10) {
-            msg[j++] = '0' + i;
-        } else {
-            msg[j++] = '1';
-            msg[j++] = '0' + (i - 10);
-        }
-        msg[j++] = ']';
-        msg[j++] = ' ';
-        
-        // Add name
-        const char* name = entry->name;
-        while (*name && j < 30) {
-            msg[j++] = *name++;
-        }
-        
-        // Add type
-        msg[j++] = ' ';
-        msg[j++] = '(';
-        if (entry->type == VFS_DIRECTORY) {
-            msg[j++] = 'd';
-            msg[j++] = 'i';
-            msg[j++] = 'r';
-        } else {
-            msg[j++] = 'f';
-            msg[j++] = 'i';
-            msg[j++] = 'l';
-            msg[j++] = 'e';
-        }
-        msg[j++] = ',';
-        msg[j++] = ' ';
-        msg[j++] = 'i';
-        msg[j++] = 'n';
-        msg[j++] = 'o';
-        msg[j++] = 'd';
-        msg[j++] = 'e';
-        msg[j++] = ':';
-        msg[j++] = ' ';
-        
-        // Add inode number
-        uint32_t entry_inode = entry->inode;
-        if (entry_inode == 0) {
-            msg[j++] = '0';
-        } else {
-            char inode_digits[10];
-            int inode_count = 0;
-            while (entry_inode > 0) {
-                inode_digits[inode_count++] = '0' + (entry_inode % 10);
-                entry_inode /= 10;
-            }
-            while (inode_count > 0) {
-                msg[j++] = inode_digits[--inode_count];
-            }
-        }
-        msg[j++] = ')';
-        msg[j] = '\0';
-        
-        framebuffer_draw_string(msg, 10, 670 + (i * 20), COLOR_CYAN, 0x00101828);
-        
-        vfs_destroy_node(entry);
-    }
-    
-    if (entries_found > 0) {
-        char summary[64] = "GFS TEST: Found ";
-        int s = 16;
-        if (entries_found < 10) {
-            summary[s++] = '0' + entries_found;
-        } else {
-            summary[s++] = '1';
-            summary[s++] = '0' + (entries_found - 10);
-        }
-        summary[s++] = ' ';
-        summary[s++] = 'e';
-        summary[s++] = 'n';
-        summary[s++] = 't';
-        summary[s++] = 'r';
-        summary[s++] = 'i';
-        summary[s++] = 'e';
-        summary[s++] = 's';
-        summary[s] = '\0';
-        framebuffer_draw_string(summary, 10, 690 + (entries_found * 20) + 20, COLOR_GREEN, 0x00101828);
-    }
-    
-    framebuffer_draw_string("GFS TEST: Complete!", 10, 710, COLOR_GREEN, 0x00101828);
-}
-
 
 // --- Main Kernel Entry Point ---
 void kmain(void) {
@@ -403,6 +241,37 @@ void kmain(void) {
     //adding AHCI
     ahci_init();
     y_pos += 20;
+
+    // Initialize filesystem AFTER a small delay to let AHCI stabilize
+    for (volatile int i = 0; i < 1000000; i++) {
+        asm volatile("pause");
+    }
+
+    framebuffer_draw_string("Mounting GrahaFS filesystem...", 10, y_pos, COLOR_YELLOW, 0x00101828);
+    y_pos += 20;
+
+    // Initialize GrahaFS driver
+    grahafs_init();
+
+    // Get first block device (disk 0)
+    block_device_t* hdd = vfs_get_block_device(0);
+    if (hdd) {
+        framebuffer_draw_string("Found block device 0", 10, y_pos, COLOR_GREEN, 0x00101828);
+        y_pos += 20;
+        
+        vfs_node_t* root = grahafs_mount(hdd);
+        if (root) {
+            framebuffer_draw_string("GrahaFS mounted successfully on /", 10, y_pos, COLOR_GREEN, 0x00101828);
+            y_pos += 20;
+        } else {
+            framebuffer_draw_string("Failed to mount GrahaFS!", 10, y_pos, COLOR_RED, 0x00101828);
+            framebuffer_draw_string("Disk may need formatting with mkfs.gfs", 10, y_pos + 20, COLOR_YELLOW, 0x00101828);
+            y_pos += 40;
+        }
+    } else {
+        framebuffer_draw_string("No block device found!", 10, y_pos, COLOR_RED, 0x00101828);
+        y_pos += 20;
+    }
 
     // --- USER SPACE INITIALIZATION ---
     framebuffer_draw_string("=== Loading Interactive Shell ===", 50, y_pos, COLOR_WHITE, 0x00101828);
@@ -557,8 +426,7 @@ void kmain(void) {
         framebuffer_draw_string("System running!", 10, 90, COLOR_GREEN, 0x00101828);
     }
     
-    // NEW: Run our filesystem test
-    test_grahafs();
+   
     // OPTIONAL: Start timers on APs later (commented out for now)
     // This would require IPI (Inter-Processor Interrupts) to signal APs
     // For now, only BSP handles scheduling

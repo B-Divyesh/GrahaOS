@@ -46,8 +46,9 @@ void keyboard_poll_task(void) {
                 uint8_t scancode;
                 asm volatile("inb %1, %0" : "=a"(scancode) : "Nd"((uint16_t)0x60));
                 
-                // Only process valid scancodes
-                if (scancode != 0xFF && scancode != 0x00 && scancode < 0x80) {
+                // CRITICAL FIX: Process ALL scancodes including releases!
+                // Don't filter out >= 0x80 (key releases)
+                if (scancode != 0xFF && scancode != 0x00) {
                     keyboard_handle_scancode(scancode);
                 }
             } else {

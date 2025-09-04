@@ -120,3 +120,7 @@ void vfs_set_root(vfs_node_t* root);
 // NEW: Node operations
 vfs_node_t* vfs_create_node(const char* name, uint32_t type);
 void vfs_destroy_node(vfs_node_t* node);
+
+int vfs_create(const char* path, uint32_t mode);
+int vfs_mkdir(const char* path, uint32_t mode);
+void vfs_sync(void);

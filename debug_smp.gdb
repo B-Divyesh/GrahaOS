@@ -1,114 +1,99 @@
-# Complete debugging script
 target remote localhost:1234
-symbol-file kernel/kernel.elf
-set architecture i386:x86-64
-set pagination off
-set print pretty on
 
-# Monitor keyboard task creation
-break sched_create_task
-commands
-    printf "\n=== sched_create_task ===\n"
-    printf "entry_point parameter: 0x%lx\n", entry_point
-    printf "RDI register: 0x%lx\n", $rdi
-    
-    # Check what's at RDI
-    if $rdi != 0
-        x/i $rdi
-    end
-    
-    # Let it continue if valid
-    if entry_point != 0 || $rdi >= 0xFFFFFFFF80000000
-        continue
-    else
-        echo NULL or invalid entry point - stopping\n
+break grahafs_write
+break grahafs_create
+break ahci_flush_cache
+break ahci_write
+break write_fs_block
+break vfs_sync
+
+break write_superblock
+
+set logging file gdb_persistence.log
+set logging on
+
+define dump_superblock
+    print "=== Superblock Debug ==="
+    x/32xg &superblock
+    print "Magic: "
+    print/x superblock.magic
+    print "Total blocks: "
+    print superblock.total_blocks
+    print "Free blocks: "
+    print superblock.free_blocks
+    print "Root inode: "
+    print superblock.root_inode
+end
+
+define dump_ahci_state
+    print "=== AHCI State ==="
+    print "Port count: "
+    print port_count
+    print "HBA memory base: "
+    print/x hba_mem
+    # Check port command/status
+    if ports[0] != 0
+        print "Port 0 TFD: "
+        x/1xw &(ports[0]->tfd)
+        print "Port 0 CMD: "
+        x/1xw &(ports[0]->cmd)
+        print "Port 0 CI: "
+        x/1xw &(ports[0]->ci)
     end
 end
 
-# Monitor frame issues
-break interrupt_handler
-commands
-    silent
-    set $addr = (uint64_t)frame
-    
-    # Only print if frame looks wrong
-    if $addr < 0xFFFF800000000000
-        printf "\n*** BAD FRAME: 0x%lx ***\n", $addr
-        printf "RSP: 0x%lx\n", $rsp
-        printf "RDI: 0x%lx\n", $rdi
-        bt 3
-        
-        # Try to see what interrupt it is
-        if $addr != 0
-            printf "Trying to read int_no at bad address...\n"
-            # Don't actually read it as it will fail
-        end
-    else
-        # Frame looks okay, continue
-        continue  
-    end
-end
-
-# Monitor keyboard task execution
-break keyboard_poll_task
-commands
-    printf "\n*** Keyboard task started on CPU %d ***\n", smp_get_current_cpu()
-    printf "RSP: 0x%lx\n", $rsp
-    
-    # Check if stack is valid
-    if $rsp < 0xFFFF800000000000
-        echo ERROR: Invalid stack pointer!\n
-    else
-        echo Stack looks good\n
+define trace_write_operation
+    print "=== Tracing Write Operation ==="
+    set $watch_block = $arg0
+    watch *((uint32_t*)($watch_block))
+    commands
+        silent
+        backtrace 2
         continue
     end
 end
 
-# Check when interrupts are enabled
-break *kmain+2000
-commands
-    echo \n*** Near end of kmain ***\n
+commands 1
+    print "grahafs_write called"
+    print "offset="
+    print offset
+    print "size="
+    print size
     continue
 end
 
-# Monitor LAPIC timer
-break lapic_timer_init
-commands
-    printf "\n*** LAPIC timer init on CPU %d ***\n", smp_get_current_cpu()
+commands 2
+    print "grahafs_create called"
+    print "name="
+    print name
+    print "type="
+    print type
     continue
 end
 
-break lapic_timer_stop
-commands
-    printf "\n*** LAPIC timer stop on CPU %d ***\n", smp_get_current_cpu()
+commands 3
+    print "ahci_flush_cache called"
+    print "port_num="
+    print port_num
+    dump_ahci_state
     continue
 end
 
-# Custom commands
-define check_tasks
-    echo \n=== Task List ===\n
-    set $i = 0
-    while $i < next_task_id
-        if tasks[$i].state != 0
-            printf "Task %d: state=%d rip=0x%lx rsp=0x%lx\n", \
-                $i, tasks[$i].state, tasks[$i].regs.rip, tasks[$i].regs.rsp
-        end
-        set $i = $i + 1
-    end
+commands 4
+    print "ahci_write called"
+    print "lba="
+    print lba
+    print "count="
+    print count
+    continue
 end
 
-define check_cpus
-    echo \n=== CPU Status ===\n
-    printf "CPU count: %d\n", g_cpu_count
-    printf "APs started: %d\n", aps_started
-    set $i = 0
-    while $i < g_cpu_count
-        printf "CPU %d: active=%d lapic_id=%d\n", \
-            $i, g_cpu_info[$i].active, g_cpu_info[$i].lapic_id
-        set $i = $i + 1
-    end
+commands 5
+    print "write_fs_block called"
+    print "block_num="
+    print block_num
+    continue
 end
 
-echo \n=== Starting GrahaOS Debug ===\n
-echo Commands: check_tasks, check_cpus\n
+
 continue

@@ -18,7 +18,12 @@ typedef long ssize_t;
 #define SYS_EXEC        1007
 #define SYS_EXIT        1008
 #define SYS_WAIT        1009
-
+#define SYS_WRITE  1010
+#define SYS_CREATE 1011
+#define SYS_MKDIR  1012
+#define SYS_STAT   1013
+#define SYS_READDIR 1014
+#define SYS_SYNC  1015
 // --- Syscall Wrappers (Inline Assembly) ---
 
 static inline void syscall_putc(char c) {
@@ -93,4 +98,26 @@ static inline int syscall_wait(int *status) {
 // Convenience wrapper that ignores exit status
 static inline int wait(void) {
     return syscall_wait(NULL);
+}
+
+static inline ssize_t syscall_write(int fd, const void *buf, size_t count) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret) : "a"(SYS_WRITE), "D"(fd), "S"(buf), "d"(count) : "rcx", "r11", "memory");
+    return (ssize_t)ret;
+}
+
+static inline int syscall_create(const char *pathname, uint32_t mode) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret) : "a"(SYS_CREATE), "D"(pathname), "S"(mode) : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+static inline int syscall_mkdir(const char *pathname, uint32_t mode) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret) : "a"(SYS_MKDIR), "D"(pathname), "S"(mode) : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+static inline void syscall_sync(void) {
+    asm volatile("syscall" : : "a"(SYS_SYNC) : "rcx", "r11", "memory");
 }

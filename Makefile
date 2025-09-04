@@ -39,7 +39,7 @@ DEPS := $(C_OBJECTS:.o=.d)
 # --- Build Targets ---
 .PHONY: all clean run help debug info userland
 
-all: grahaos.iso
+all: grahaos.iso format-disk
 
 # Build the host formatting tool
 scripts/mkfs.gfs: scripts/mkfs.gfs.c kernel/fs/grahafs.h
@@ -123,20 +123,21 @@ kernel/kernel.elf: $(OBJECTS) linker.ld
 
 -include $(DEPS)
 
-run: grahaos.iso format-disk
-	@echo "Starting QEMU with SMP and AHCI support..."
+run: grahaos.iso 
+	@echo "Starting QEMU with persistent disk..."
 	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 \
-	     -drive file=disk.img,format=raw,if=none,id=mydisk \
+	     -drive file=disk.img,format=raw,if=none,id=mydisk,cache=none,aio=native \
 	     -device ich9-ahci,id=ahci \
 	     -device ide-hd,drive=mydisk,bus=ahci.0 \
 	     -d int,cpu_reset -D qemu.log
 
-debug: grahaos.iso format-disk
+debug: grahaos.iso 
 	@echo "Starting QEMU with GDB support..."
 	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 -s -S \
-	     -drive file=disk.img,format=raw,if=none,id=mydisk \
+	     -drive file=disk.img,format=raw,if=none,id=mydisk,cache=none,aio=native \
 	     -device ich9-ahci,id=ahci \
 	     -device ide-hd,drive=mydisk,bus=ahci.0
+
 
 debug-monitor: grahaos.iso format-disk
 	@echo "Starting QEMU with monitor..."

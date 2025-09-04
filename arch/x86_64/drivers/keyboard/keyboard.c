@@ -63,8 +63,9 @@ static const char scancode_set1_shift_map[128] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 
-// Track shift state
-static bool shift_pressed = false;
+// Track shift state - FIX: separate left and right shift
+static bool left_shift_pressed = false;
+static bool right_shift_pressed = false;
 static bool caps_lock = false;
 
 // Wait for PS/2 controller ready
@@ -105,7 +106,8 @@ void keyboard_init(void) {
     read_index = 0;
     write_index = 0;
     keyboard_interrupts_received = 0;
-    shift_pressed = false;
+    left_shift_pressed = false;
+    right_shift_pressed = false;
     caps_lock = false;
     
     framebuffer_draw_string("KB: Initializing...", 10, 280, COLOR_YELLOW, 0x00101828);
@@ -181,32 +183,55 @@ void keyboard_handle_scancode(uint8_t scancode) {
         return; // ACK, RESEND, etc.
     }
     
+    // E0 prefix handling for extended scancodes (arrow keys, etc.)
+    static bool e0_prefix = false;
+    if (scancode == 0xE0) {
+        e0_prefix = true;
+        return;
+    }
+    
     // Handle key releases (bit 7 set)
     if (scancode & 0x80) {
         uint8_t key = scancode & 0x7F;
         
-        // Check for shift release
-        if (key == 0x2A || key == 0x36) {  // Left or right shift
-            shift_pressed = false;
+        // Check for shift release - FIX: handle separately
+        if (key == 0x2A) {  // Left shift release
+            left_shift_pressed = false;
+        } else if (key == 0x36) {  // Right shift release
+            right_shift_pressed = false;
         }
+        
+        e0_prefix = false; // Clear E0 prefix on any key release
         return;
     }
     
     // Handle special keys (key presses)
-    if (scancode == 0x2A || scancode == 0x36) {  // Left or right shift
-        shift_pressed = true;
+    if (scancode == 0x2A) {  // Left shift press
+        left_shift_pressed = true;
+        e0_prefix = false;
+        return;
+    } else if (scancode == 0x36) {  // Right shift press
+        right_shift_pressed = true;
+        e0_prefix = false;
         return;
     }
     
     if (scancode == 0x3A) {  // Caps lock
         caps_lock = !caps_lock;
+        e0_prefix = false;
         return;
     }
+    
+    // Clear E0 prefix for normal keys
+    e0_prefix = false;
     
     // Convert scancode to ASCII
     char ascii = 0;
     
     if (scancode < 128) {
+        // Check if ANY shift key is pressed
+        bool shift_pressed = left_shift_pressed || right_shift_pressed;
+        
         // Check if we should use shifted character
         bool use_shift = shift_pressed;
         

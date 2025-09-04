@@ -146,6 +146,45 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             break;
         }
 
+        case SYS_WRITE: {
+            int fd = (int)frame->rdi;
+            const void *buffer_user = (const void *)frame->rsi;
+            size_t count = (size_t)frame->rdx;
+            frame->rax = vfs_write(fd, (void*)buffer_user, count);
+            break;
+        }
+
+        case SYS_CREATE: {
+            const char *pathname_user = (const char *)frame->rdi;
+            uint32_t mode = (uint32_t)frame->rsi;
+            char pathname_kernel[256];
+            if (copy_string_from_user(pathname_user, pathname_kernel, sizeof(pathname_kernel)) > 0) {
+                frame->rax = vfs_create(pathname_kernel, mode);
+            } else {
+                frame->rax = -1;
+            }
+            break;
+        }
+
+        case SYS_MKDIR: {
+            const char *pathname_user = (const char *)frame->rdi;
+            uint32_t mode = (uint32_t)frame->rsi;
+            char pathname_kernel[256];
+            if (copy_string_from_user(pathname_user, pathname_kernel, sizeof(pathname_kernel)) > 0) {
+                frame->rax = vfs_mkdir(pathname_kernel, mode);
+            } else {
+                frame->rax = -1;
+            }
+            break;
+        }
+
+        case SYS_SYNC: {
+            // Flush all pending writes to disk
+            vfs_sync();
+            frame->rax = 0;
+            break;
+        }
+
         case SYS_GCP_EXECUTE: {
             gcp_command_t *user_cmd = (gcp_command_t *)frame->rdi;
             gcp_command_t kernel_cmd;

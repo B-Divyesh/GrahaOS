@@ -24,6 +24,12 @@
 #define SYS_EXIT 1008
 
 #define SYS_WAIT 1009
+#define SYS_WRITE  1010
+#define SYS_CREATE 1011
+#define SYS_MKDIR  1012
+#define SYS_STAT   1013
+#define SYS_READDIR 1014
+#define SYS_SYNC 1015
 
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);

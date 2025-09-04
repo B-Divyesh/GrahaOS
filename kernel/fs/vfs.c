@@ -1,53 +1,41 @@
-// kernel/fs/vfs.c
+// kernel/fs/vfs.c - COMPLETE FILE
 #include "vfs.h"
 #include "../initrd.h"
 #include <stddef.h>
 #include "../sync/spinlock.h"
 #include "../../arch/x86_64/mm/pmm.h"
 #include "../../arch/x86_64/mm/vmm.h"
+#include "../../drivers/video/framebuffer.h"
+#include "../../arch/x86_64/drivers/ahci/ahci.h"
 
-// The system-wide open file table
 static open_file_t open_file_table[MAX_OPEN_FILES];
-// The system-wide block device table
 static block_device_t block_device_table[MAX_BLOCK_DEVICES];
-// NEW: Filesystem table
 static vfs_filesystem_t filesystem_table[MAX_FILESYSTEMS];
-// NEW: Root filesystem node
 static vfs_node_t* vfs_root = NULL;
-
 spinlock_t vfs_lock = SPINLOCK_INITIALIZER("vfs");
 
-// Simple memory functions for internal use
+// Memory utilities
 static void *vfs_memcpy(void *dest, const void *src, size_t n) {
     uint8_t *pdest = (uint8_t *)dest;
     const uint8_t *psrc = (const uint8_t *)src;
-    for (size_t i = 0; i < n; i++) {
-        pdest[i] = psrc[i];
-    }
+    for (size_t i = 0; i < n; i++) pdest[i] = psrc[i];
     return dest;
 }
 
 static void *vfs_memset(void *s, int c, size_t n) {
     uint8_t *p = (uint8_t *)s;
-    for (size_t i = 0; i < n; i++) {
-        p[i] = (uint8_t)c;
-    }
+    for (size_t i = 0; i < n; i++) p[i] = (uint8_t)c;
     return s;
 }
 
 static size_t vfs_strlen(const char *str) {
     size_t len = 0;
-    while (str[len]) {
-        len++;
-    }
+    while (str[len]) len++;
     return len;
 }
 
 static int vfs_strcmp(const char *s1, const char *s2) {
-    while (*s1 && (*s1 == *s2)) {
-        s1++;
-        s2++;
-    }
+    while (*s1 && (*s1 == *s2)) { s1++; s2++; }
     return *(const unsigned char*)s1 - *(const unsigned char*)s2;
 }
 
@@ -55,6 +43,98 @@ static char* vfs_strcpy(char *dest, const char *src) {
     char *ret = dest;
     while ((*dest++ = *src++));
     return ret;
+}
+
+static char* vfs_strdup(const char *src) {
+    size_t len = vfs_strlen(src) + 1;
+    char *dst = (char*)((uint64_t)pmm_alloc_page() + g_hhdm_offset);
+    if (dst) vfs_memcpy(dst, src, len);
+    return dst;
+}
+
+// Parse path component by component
+static char* get_next_path_component(char** path) {
+    if (!*path || **path == '\0') return NULL;
+    
+    // Skip leading slashes
+    while (**path == '/') (*path)++;
+    
+    if (**path == '\0') return NULL;
+    
+    char* start = *path;
+    
+    // Find next slash or end
+    while (**path && **path != '/') (*path)++;
+    
+    // Temporarily terminate the component
+    if (**path == '/') {
+        **path = '\0';
+        (*path)++;
+    }
+    
+    return start;
+}
+
+// Path traversal with proper error handling
+vfs_node_t* vfs_path_to_node(const char* path) {
+    if (!path || !vfs_root) return NULL;
+    
+    // Handle root directory
+    if (vfs_strcmp(path, "/") == 0) {
+        vfs_root->refcount++;
+        return vfs_root;
+    }
+    
+    // Make a copy of the path for parsing
+    char* path_copy = vfs_strdup(path);
+    if (!path_copy) return NULL;
+    
+    char* p = path_copy;
+    vfs_node_t* current = vfs_root;
+    current->refcount++;
+    
+    char* component;
+    while ((component = get_next_path_component(&p)) != NULL) {
+        // Skip empty components (from //)
+        if (vfs_strlen(component) == 0) continue;
+        
+        // Handle special directories
+        if (vfs_strcmp(component, ".") == 0) {
+            continue; // Stay in current directory
+        }
+        
+        if (vfs_strcmp(component, "..") == 0) {
+            // Go up to parent (if we have one)
+            if (current->parent) {
+                vfs_node_t* parent = current->parent;
+                parent->refcount++;
+                vfs_destroy_node(current);
+                current = parent;
+            }
+            continue;
+        }
+        
+        // Look for the component in current directory
+        if (current->type != VFS_DIRECTORY || !current->finddir) {
+            vfs_destroy_node(current);
+            pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+            return NULL;
+        }
+        
+        vfs_node_t* next = current->finddir(current, component);
+        if (!next) {
+            vfs_destroy_node(current);
+            pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+            return NULL;
+        }
+        
+        next->parent = current;
+        vfs_destroy_node(current);
+        current = next;
+    }
+    
+    pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+    return current;
 }
 
 void vfs_init(void) {
@@ -77,9 +157,8 @@ void vfs_init(void) {
 void vfs_register_block_device(int dev_id, size_t block_size, 
                                int (*read_func)(int, uint64_t, uint16_t, void*),
                                int (*write_func)(int, uint64_t, uint16_t, void*)) {
-    if (dev_id < 0 || dev_id >= MAX_BLOCK_DEVICES) {
-        return;
-    }
+    if (dev_id < 0 || dev_id >= MAX_BLOCK_DEVICES) return;
+    
     spinlock_acquire(&vfs_lock);
     block_device_table[dev_id].in_use = true;
     block_device_table[dev_id].device_id = dev_id;
@@ -90,9 +169,8 @@ void vfs_register_block_device(int dev_id, size_t block_size,
 }
 
 block_device_t* vfs_get_block_device(int dev_id) {
-    if (dev_id < 0 || dev_id >= MAX_BLOCK_DEVICES) {
-        return NULL;
-    }
+    if (dev_id < 0 || dev_id >= MAX_BLOCK_DEVICES) return NULL;
+    
     spinlock_acquire(&vfs_lock);
     block_device_t* dev = NULL;
     if (block_device_table[dev_id].in_use) {
@@ -102,7 +180,6 @@ block_device_t* vfs_get_block_device(int dev_id) {
     return dev;
 }
 
-// NEW: Node management functions
 vfs_node_t* vfs_create_node(const char* name, uint32_t type) {
     void* node_mem = pmm_alloc_page();
     if (!node_mem) return NULL;
@@ -127,12 +204,10 @@ void vfs_destroy_node(vfs_node_t* node) {
     if (!node) return;
     
     if (--node->refcount == 0) {
-        // Close the node if it has a close handler
         if (node->close) {
             node->close(node);
         }
         
-        // Free the memory
         uint64_t phys = (uint64_t)node - g_hhdm_offset;
         pmm_free_page((void*)phys);
     }
@@ -146,49 +221,49 @@ void vfs_set_root(vfs_node_t* root) {
     vfs_root = root;
 }
 
-// Modified open function to work with nodes
 int vfs_open(const char *pathname) {
-    // First try to open from filesystem if mounted
-    if (vfs_root && vfs_root->finddir) {
-        vfs_node_t* node = vfs_root->finddir(vfs_root, pathname);
-        if (node) {
-            spinlock_acquire(&vfs_lock);
-            for (int fd = 0; fd < MAX_OPEN_FILES; fd++) {
-                if (!open_file_table[fd].in_use) {
-                    open_file_table[fd].in_use = true;
-                    open_file_table[fd].node = node;
-                    open_file_table[fd].size = node->size;
-                    open_file_table[fd].offset = 0;
-                    open_file_table[fd].file_data = NULL;
-                    spinlock_release(&vfs_lock);
-                    return fd;
-                }
-            }
+    spinlock_acquire(&vfs_lock);
+    
+    vfs_node_t* node = vfs_path_to_node(pathname);
+    if (!node) {
+        // Try initrd as fallback
+        size_t file_size;
+        void *file_data = initrd_lookup(pathname, &file_size);
+        
+        if (file_data == NULL) {
             spinlock_release(&vfs_lock);
             return -1;
         }
-    }
-    
-    // Fall back to initrd
-    size_t file_size;
-    void *file_data = initrd_lookup(pathname, &file_size);
-
-    if (file_data == NULL) {
+        
+        for (int fd = 0; fd < MAX_OPEN_FILES; fd++) {
+            if (!open_file_table[fd].in_use) {
+                open_file_table[fd].in_use = true;
+                open_file_table[fd].file_data = file_data;
+                open_file_table[fd].size = file_size;
+                open_file_table[fd].offset = 0;
+                open_file_table[fd].node = NULL;
+                spinlock_release(&vfs_lock);
+                return fd;
+            }
+        }
+        spinlock_release(&vfs_lock);
         return -1;
     }
     
-    spinlock_acquire(&vfs_lock);
+    // Find free file descriptor
     for (int fd = 0; fd < MAX_OPEN_FILES; fd++) {
         if (!open_file_table[fd].in_use) {
             open_file_table[fd].in_use = true;
-            open_file_table[fd].file_data = file_data;
-            open_file_table[fd].size = file_size;
+            open_file_table[fd].node = node;
             open_file_table[fd].offset = 0;
-            open_file_table[fd].node = NULL;
+            open_file_table[fd].size = node->size;
+            open_file_table[fd].file_data = NULL;
             spinlock_release(&vfs_lock);
             return fd;
         }
     }
+    
+    vfs_destroy_node(node);
     spinlock_release(&vfs_lock);
     return -1;
 }
@@ -202,7 +277,6 @@ ssize_t vfs_read(int fd, void *buffer, size_t count) {
 
     open_file_t *file = &open_file_table[fd];
     
-    // If it's a node-based file
     if (file->node && file->node->read) {
         ssize_t result = file->node->read(file->node, file->offset, count, buffer);
         if (result > 0) {
@@ -212,22 +286,27 @@ ssize_t vfs_read(int fd, void *buffer, size_t count) {
         return result;
     }
     
-    // Otherwise, it's an initrd file
-    if (file->offset >= file->size) {
+    // Initrd fallback
+    if (file->file_data) {
+        if (file->offset >= file->size) {
+            spinlock_release(&vfs_lock);
+            return 0;
+        }
+        
+        size_t bytes_to_read = count;
+        if (file->offset + count > file->size) {
+            bytes_to_read = file->size - file->offset;
+        }
+        
+        vfs_memcpy(buffer, (uint8_t *)file->file_data + file->offset, bytes_to_read);
+        file->offset += bytes_to_read;
+        
         spinlock_release(&vfs_lock);
-        return 0;
+        return bytes_to_read;
     }
-
-    size_t bytes_to_read = count;
-    if (file->offset + count > file->size) {
-        bytes_to_read = file->size - file->offset;
-    }
-
-    vfs_memcpy(buffer, (uint8_t *)file->file_data + file->offset, bytes_to_read);
-    file->offset += bytes_to_read;
     
     spinlock_release(&vfs_lock);
-    return bytes_to_read;
+    return -1;
 }
 
 ssize_t vfs_write(int fd, void *buffer, size_t count) {
@@ -239,17 +318,19 @@ ssize_t vfs_write(int fd, void *buffer, size_t count) {
 
     open_file_t *file = &open_file_table[fd];
     
-    // If it's a node-based file with write support
     if (file->node && file->node->write) {
         ssize_t result = file->node->write(file->node, file->offset, count, buffer);
         if (result > 0) {
             file->offset += result;
+            // Update file size if we extended it
+            if (file->offset > file->node->size) {
+                file->node->size = file->offset;
+            }
         }
         spinlock_release(&vfs_lock);
         return result;
     }
     
-    // Initrd files are read-only
     spinlock_release(&vfs_lock);
     return -1;
 }
@@ -263,12 +344,106 @@ int vfs_close(int fd) {
     
     open_file_t *file = &open_file_table[fd];
     
-    // If it's a node-based file
     if (file->node) {
         vfs_destroy_node(file->node);
     }
     
     open_file_table[fd].in_use = false;
+    open_file_table[fd].node = NULL;
+    open_file_table[fd].file_data = NULL;
+    
     spinlock_release(&vfs_lock);
     return 0;
+}
+
+// Create a new file
+int vfs_create(const char* path, uint32_t mode) {
+    if (!path || !vfs_root) return -1;
+    
+    // Find parent directory
+    char* path_copy = vfs_strdup(path);
+    if (!path_copy) return -1;
+    
+    // Find last slash
+    char* last_slash = NULL;
+    for (char* p = path_copy; *p; p++) {
+        if (*p == '/') last_slash = p;
+    }
+    
+    if (!last_slash) {
+        pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+        return -1;
+    }
+    
+    *last_slash = '\0';
+    char* filename = last_slash + 1;
+    
+    vfs_node_t* parent = vfs_path_to_node(path_copy);
+    if (!parent || parent->type != VFS_DIRECTORY) {
+        if (parent) vfs_destroy_node(parent);
+        pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+        return -1;
+    }
+    
+    // Create file in parent directory
+    int result = -1;
+    if (parent->create) {
+        result = parent->create(parent, filename, VFS_FILE);
+    }
+    
+    vfs_destroy_node(parent);
+    pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+    
+    return result;
+}
+
+// Create a directory
+int vfs_mkdir(const char* path, uint32_t mode) {
+    if (!path || !vfs_root) return -1;
+    
+    // Find parent directory
+    char* path_copy = vfs_strdup(path);
+    if (!path_copy) return -1;
+    
+    // Find last slash
+    char* last_slash = NULL;
+    for (char* p = path_copy; *p; p++) {
+        if (*p == '/') last_slash = p;
+    }
+    
+    if (!last_slash) {
+        pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+        return -1;
+    }
+    
+    *last_slash = '\0';
+    char* dirname = last_slash + 1;
+    
+    vfs_node_t* parent = vfs_path_to_node(path_copy);
+    if (!parent || parent->type != VFS_DIRECTORY) {
+        if (parent) vfs_destroy_node(parent);
+        pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+        return -1;
+    }
+    
+    // Create directory in parent
+    int result = -1;
+    if (parent->create) {
+        result = parent->create(parent, dirname, VFS_DIRECTORY);
+    }
+    
+    vfs_destroy_node(parent);
+    pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+    
+    return result;
+}
+
+void vfs_sync(void) {
+    // Flush all block devices
+    for (int i = 0; i < MAX_BLOCK_DEVICES; i++) {
+        if (block_device_table[i].in_use) {
+            // Call AHCI flush for this device
+            ahci_flush_cache(i);
+        }
+    }
 }
