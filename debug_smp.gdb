@@ -1,99 +1,47 @@
 target remote localhost:1234
 
-break grahafs_write
 break grahafs_create
-break ahci_flush_cache
-break ahci_write
-break write_fs_block
-break vfs_sync
-
+break add_dirent
+break allocate_block
+break allocate_inode
+break write_inode
 break write_superblock
 
-set logging file gdb_persistence.log
-set logging on
-
-define dump_superblock
-    print "=== Superblock Debug ==="
-    x/32xg &superblock
-    print "Magic: "
-    print/x superblock.magic
-    print "Total blocks: "
-    print superblock.total_blocks
-    print "Free blocks: "
+define check_superblock
+    print "=== Checking Superblock ==="
+    if superblock.magic == 0x47524148414F5321
+        print "✓ Magic valid"
+    else
+        print "✗ Magic corrupted!"
+        print/x superblock.magic
+    end
+    print "Free blocks:"
     print superblock.free_blocks
-    print "Root inode: "
-    print superblock.root_inode
+    print "Free inodes:"
+    print superblock.free_inodes
 end
 
-define dump_ahci_state
-    print "=== AHCI State ==="
-    print "Port count: "
-    print port_count
-    print "HBA memory base: "
-    print/x hba_mem
-    # Check port command/status
-    if ports[0] != 0
-        print "Port 0 TFD: "
-        x/1xw &(ports[0]->tfd)
-        print "Port 0 CMD: "
-        x/1xw &(ports[0]->cmd)
-        print "Port 0 CI: "
-        x/1xw &(ports[0]->ci)
+define check_params
+    print "=== Parameters ==="
+    print "Parent node:"
+    print/x parent
+    if parent != 0 && parent < 0xFFFF800000000000
+        print "✗ Invalid parent pointer!"
     end
-end
-
-define trace_write_operation
-    print "=== Tracing Write Operation ==="
-    set $watch_block = $arg0
-    watch *((uint32_t*)($watch_block))
-    commands
-        silent
-        backtrace 2
-        continue
+    print "Name:"
+    if name != 0
+        x/s name
+    else
+        print "✗ NULL name!"
     end
+    print "Type:"
+    print type
 end
 
 commands 1
-    print "grahafs_write called"
-    print "offset="
-    print offset
-    print "size="
-    print size
+    check_params
+    check_superblock
     continue
 end
-
-commands 2
-    print "grahafs_create called"
-    print "name="
-    print name
-    print "type="
-    print type
-    continue
-end
-
-commands 3
-    print "ahci_flush_cache called"
-    print "port_num="
-    print port_num
-    dump_ahci_state
-    continue
-end
-
-commands 4
-    print "ahci_write called"
-    print "lba="
-    print lba
-    print "count="
-    print count
-    continue
-end
-
-commands 5
-    print "write_fs_block called"
-    print "block_num="
-    print block_num
-    continue
-end
-
 
 continue

@@ -24,6 +24,13 @@ typedef long ssize_t;
 #define SYS_STAT   1013
 #define SYS_READDIR 1014
 #define SYS_SYNC  1015
+
+// Directory entry structure for user space
+typedef struct {
+    uint32_t type;
+    char name[28];
+} user_dirent_t;
+
 // --- Syscall Wrappers (Inline Assembly) ---
 
 static inline void syscall_putc(char c) {
@@ -115,6 +122,12 @@ static inline int syscall_create(const char *pathname, uint32_t mode) {
 static inline int syscall_mkdir(const char *pathname, uint32_t mode) {
     long ret;
     asm volatile("syscall" : "=a"(ret) : "a"(SYS_MKDIR), "D"(pathname), "S"(mode) : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+static inline int syscall_readdir(const char *pathname, uint32_t index, user_dirent_t *dirent) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret) : "a"(SYS_READDIR), "D"(pathname), "S"(index), "d"(dirent) : "rcx", "r11", "memory");
     return (int)ret;
 }
 

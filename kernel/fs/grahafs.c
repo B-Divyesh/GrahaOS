@@ -111,7 +111,29 @@ static int write_fs_block(uint32_t block_num, void* buf) {
 
 // Update superblock on disk
 static int write_superblock(void) {
-    return write_fs_block(0, &superblock);
+    if (!fs_mounted) return -1;
+    
+    void* sb_buffer_phys = pmm_alloc_page();
+    if (!sb_buffer_phys) return -1;
+    
+    void* sb_buffer = (void*)((uint64_t)sb_buffer_phys + g_hhdm_offset);
+    
+    // Copy superblock to buffer
+    memcpy(sb_buffer, &superblock, sizeof(grahafs_superblock_t));
+    
+    // Ensure rest of block is zeroed
+    memset((uint8_t*)sb_buffer + sizeof(grahafs_superblock_t), 0, 
+           GRAHAFS_BLOCK_SIZE - sizeof(grahafs_superblock_t));
+    
+    int result = write_fs_block(0, sb_buffer);
+    pmm_free_page(sb_buffer_phys);
+    
+    // Force flush after superblock write
+    if (result == 0 && fs_device && fs_device->device_id >= 0) {
+        ahci_flush_cache(fs_device->device_id);
+    }
+    
+    return result;
 }
 
 // Allocate a free block
@@ -246,9 +268,13 @@ static int read_inode(uint32_t inode_num, grahafs_inode_t* inode) {
     return 0;
 }
 
-// Write an inode
+// Write an inode - FIX the bounds check
 static int write_inode(uint32_t inode_num, grahafs_inode_t* inode) {
-    if (inode_num >= GRAHAFS_MAX_INODES) return -1;
+    if (!inode || !fs_mounted) return -1;
+    if (inode_num >= GRAHAFS_MAX_INODES) {
+        framebuffer_draw_string("ERROR: Invalid inode number in write_inode", 10, 800, COLOR_RED, 0x00101828);
+        return -1;
+    }
 
     uint32_t bytes_offset = inode_num * sizeof(grahafs_inode_t);
     uint32_t block = superblock.inode_table_start_block + (bytes_offset / GRAHAFS_BLOCK_SIZE);
@@ -268,12 +294,21 @@ static int write_inode(uint32_t inode_num, grahafs_inode_t* inode) {
     
     int result = write_fs_block(block, buffer);
     pmm_free_page(buffer_phys);
+    
+    // Flush after inode write
+    if (result == 0 && fs_device && fs_device->device_id >= 0) {
+        ahci_flush_cache(fs_device->device_id);
+    }
+    
     return result;
 }
 
-// Add directory entry
+
+// Fix add_dirent to validate parameters
 static int add_dirent(grahafs_inode_t* dir_inode, uint32_t dir_inode_num, const char* name, uint32_t inode_num) {
+    if (!dir_inode || !name || !fs_mounted) return -1;
     if (dir_inode->type != GRAHAFS_INODE_TYPE_DIRECTORY) return -1;
+    if (dir_inode_num >= GRAHAFS_MAX_INODES || inode_num >= GRAHAFS_MAX_INODES) return -1;
     
     void* buffer_phys = pmm_alloc_page();
     if (!buffer_phys) return -1;
@@ -468,11 +503,32 @@ ssize_t grahafs_write(vfs_node_t* node, uint64_t offset, size_t size, void* buff
     return bytes_written;
 }
 
-// Create file or directory
+// Create file or directory - ADD VALIDATION
 int grahafs_create(vfs_node_t* parent, const char* name, uint32_t type) {
-    if (!parent || !name || strlen(name) >= GRAHAFS_MAX_FILENAME) return -1;
+    // Validate inputs
+    if (!parent || !name || !fs_mounted) {
+        framebuffer_draw_string("ERROR: Invalid params to grahafs_create", 10, 820, COLOR_RED, 0x00101828);
+        return -1;
+    }
+    
+    if (strlen(name) == 0 || strlen(name) >= GRAHAFS_MAX_FILENAME) {
+        framebuffer_draw_string("ERROR: Invalid filename length", 10, 840, COLOR_RED, 0x00101828);
+        return -1;
+    }
+    
+    if (type != VFS_FILE && type != VFS_DIRECTORY) {
+        framebuffer_draw_string("ERROR: Invalid file type", 10, 860, COLOR_RED, 0x00101828);
+        return -1;
+    }
     
     spinlock_acquire(&grahafs_lock);
+    
+    // Validate parent is a valid inode
+    if (parent->inode >= GRAHAFS_MAX_INODES) {
+        framebuffer_draw_string("ERROR: Parent has invalid inode", 10, 880, COLOR_RED, 0x00101828);
+        spinlock_release(&grahafs_lock);
+        return -1;
+    }
     
     // Read parent inode
     grahafs_inode_t parent_inode;
@@ -486,9 +542,31 @@ int grahafs_create(vfs_node_t* parent, const char* name, uint32_t type) {
         return -1;
     }
     
+    // Check if file already exists
+    if (parent_inode.direct_blocks[0] != 0) {
+        void* buffer_phys = pmm_alloc_page();
+        if (buffer_phys) {
+            void* buffer = (void*)((uint64_t)buffer_phys + g_hhdm_offset);
+            if (read_fs_block(parent_inode.direct_blocks[0], buffer) == 0) {
+                grahafs_dirent_t* entries = (grahafs_dirent_t*)buffer;
+                int max_entries = GRAHAFS_BLOCK_SIZE / sizeof(grahafs_dirent_t);
+                
+                for (int i = 0; i < max_entries; i++) {
+                    if (entries[i].inode_num != 0 && strcmp(entries[i].name, name) == 0) {
+                        // File already exists
+                        pmm_free_page(buffer_phys);
+                        spinlock_release(&grahafs_lock);
+                        return -1;
+                    }
+                }
+            }
+            pmm_free_page(buffer_phys);
+        }
+    }
+    
     // Allocate new inode
     uint32_t new_inode_num = allocate_inode();
-    if (new_inode_num == 0) {
+    if (new_inode_num == 0 || new_inode_num >= GRAHAFS_MAX_INODES) {
         spinlock_release(&grahafs_lock);
         return -1;
     }
@@ -501,10 +579,10 @@ int grahafs_create(vfs_node_t* parent, const char* name, uint32_t type) {
     new_inode.link_count = 1;
     new_inode.uid = 0;
     new_inode.gid = 0;
-    new_inode.mode = 0755;
+    new_inode.mode = (type == VFS_DIRECTORY) ? 0755 : 0644;
     
     // Get current time (simplified - just use a counter)
-    static uint64_t timestamp = 0;
+    static uint64_t timestamp = 1000000;
     timestamp++;
     new_inode.creation_time = timestamp;
     new_inode.modification_time = timestamp;
@@ -514,6 +592,11 @@ int grahafs_create(vfs_node_t* parent, const char* name, uint32_t type) {
     if (type == VFS_DIRECTORY) {
         uint32_t dir_block = allocate_block();
         if (dir_block == 0) {
+            // Return the inode to free pool
+            memset(&new_inode, 0, sizeof(grahafs_inode_t));
+            write_inode(new_inode_num, &new_inode);
+            superblock.free_inodes++;
+            write_superblock();
             spinlock_release(&grahafs_lock);
             return -1;
         }
@@ -523,6 +606,10 @@ int grahafs_create(vfs_node_t* parent, const char* name, uint32_t type) {
         void* buffer_phys = pmm_alloc_page();
         if (!buffer_phys) {
             free_block(dir_block);
+            memset(&new_inode, 0, sizeof(grahafs_inode_t));
+            write_inode(new_inode_num, &new_inode);
+            superblock.free_inodes++;
+            write_superblock();
             spinlock_release(&grahafs_lock);
             return -1;
         }
@@ -549,6 +636,10 @@ int grahafs_create(vfs_node_t* parent, const char* name, uint32_t type) {
     // Write new inode
     if (write_inode(new_inode_num, &new_inode) != 0) {
         if (new_inode.direct_blocks[0]) free_block(new_inode.direct_blocks[0]);
+        memset(&new_inode, 0, sizeof(grahafs_inode_t));
+        write_inode(new_inode_num, &new_inode);
+        superblock.free_inodes++;
+        write_superblock();
         spinlock_release(&grahafs_lock);
         return -1;
     }
@@ -559,11 +650,13 @@ int grahafs_create(vfs_node_t* parent, const char* name, uint32_t type) {
         if (new_inode.direct_blocks[0]) free_block(new_inode.direct_blocks[0]);
         memset(&new_inode, 0, sizeof(grahafs_inode_t));
         write_inode(new_inode_num, &new_inode);
+        superblock.free_inodes++;
+        write_superblock();
         spinlock_release(&grahafs_lock);
         return -1;
     }
-
-    // After successful write/create, flush to ensure persistence
+    
+    // Force flush to disk
     if (fs_device && fs_device->device_id >= 0) {
         ahci_flush_cache(fs_device->device_id);
     }

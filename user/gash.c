@@ -104,30 +104,52 @@ int parse_command(char* cmd, char* argv[], int max_args) {
 void cmd_ls(char* path) {
     if (!path || strlen(path) == 0) path = "/";
     
-    int fd = syscall_open(path);
-    if (fd < 0) {
-        print("ls: cannot access '");
-        print(path);
-        print("': No such file or directory\n");
-        return;
+    print("Directory listing of ");
+    print(path);
+    print(":\n");
+    
+    user_dirent_t dirent;
+    uint32_t index = 0;
+    int count = 0;
+    
+    while (1) {
+        int result = syscall_readdir(path, index, &dirent);
+        
+        if (result <= 0) {
+            if (result < 0 && index == 0) {
+                print("ls: cannot access '");
+                print(path);
+                print("': ");
+                if (result == -2) {
+                    print("Not a directory\n");
+                } else {
+                    print("No such file or directory\n");
+                }
+            }
+            break;
+        }
+        
+        // Skip empty entries
+        if (dirent.name[0] == '\0') {
+            index++;
+            continue;
+        }
+        
+        // Print entry with type indicator
+        if (dirent.type == 2) { // VFS_DIRECTORY
+            print(dirent.name);
+            print("/");
+        } else {
+            print(dirent.name);
+        }
+        print("\n");
+        
+        count++;
+        index++;
     }
     
-    // Read directory entries (simplified - assumes directory structure)
-    char buffer[4096];
-    ssize_t bytes = syscall_read(fd, buffer, sizeof(buffer));
-    syscall_close(fd);
-    
-    if (bytes > 0) {
-        // Parse directory entries (simplified)
-        print("Directory listing of ");
-        print(path);
-        print(":\n");
-        
-        // For now, just print raw data
-        // In a real implementation, we'd parse the directory structure
-        print(".\n");
-        print("..\n");
-        // Additional entries would be parsed here
+    if (count == 0 && index > 0) {
+        print("(empty)\n");
     }
 }
 

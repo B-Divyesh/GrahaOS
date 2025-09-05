@@ -51,6 +51,19 @@ format-disk: scripts/mkfs.gfs disk.img
 	@echo "Formatting disk.img with GrahaFS..."
 	@./scripts/mkfs.gfs disk.img
 
+format-disk-if-needed: scripts/mkfs.gfs
+	@if [ ! -f disk.img ]; then \
+		echo "No disk.img found, creating and formatting..."; \
+		$(MAKE) disk.img; \
+		./scripts/mkfs.gfs disk.img; \
+	elif [ ! -f .disk_formatted ]; then \
+		echo "Disk exists but not formatted, formatting..."; \
+		./scripts/mkfs.gfs disk.img; \
+		touch .disk_formatted; \
+	else \
+		echo "Using existing formatted disk.img"; \
+	fi
+
 disk.img:
 	@echo "Creating virtual hard disk..."
 	@dd if=/dev/zero of=disk.img bs=1M count=128 2>/dev/null
@@ -123,7 +136,7 @@ kernel/kernel.elf: $(OBJECTS) linker.ld
 
 -include $(DEPS)
 
-run: grahaos.iso 
+run: grahaos.iso format-disk-if-needed
 	@echo "Starting QEMU with persistent disk..."
 	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 \
 	     -drive file=disk.img,format=raw,if=none,id=mydisk,cache=none,aio=native \

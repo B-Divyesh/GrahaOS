@@ -360,32 +360,65 @@ int vfs_close(int fd) {
 int vfs_create(const char* path, uint32_t mode) {
     if (!path || !vfs_root) return -1;
     
-    // Find parent directory
+    spinlock_acquire(&vfs_lock);
+    
+    // Make a copy of the path for manipulation
     char* path_copy = vfs_strdup(path);
-    if (!path_copy) return -1;
-    
-    // Find last slash
-    char* last_slash = NULL;
-    for (char* p = path_copy; *p; p++) {
-        if (*p == '/') last_slash = p;
-    }
-    
-    if (!last_slash) {
-        pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+    if (!path_copy) {
+        spinlock_release(&vfs_lock);
         return -1;
     }
     
-    *last_slash = '\0';
-    char* filename = last_slash + 1;
+    // Find the last slash to separate directory and filename
+    char* last_slash = NULL;
+    char* p = path_copy;
+    while (*p) {
+        if (*p == '/') last_slash = p;
+        p++;
+    }
     
-    vfs_node_t* parent = vfs_path_to_node(path_copy);
+    char* filename;
+    vfs_node_t* parent;
+    
+    if (last_slash) {
+        // Has a directory component
+        *last_slash = '\0';
+        filename = last_slash + 1;
+        
+        // If path_copy is now empty, it means root directory
+        if (path_copy[0] == '\0') {
+            parent = vfs_root;
+            parent->refcount++;
+        } else {
+            parent = vfs_path_to_node(path_copy);
+        }
+    } else {
+        // No directory component, create in root
+        filename = path_copy;
+        parent = vfs_root;
+        parent->refcount++;
+    }
+    
     if (!parent || parent->type != VFS_DIRECTORY) {
         if (parent) vfs_destroy_node(parent);
         pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+        spinlock_release(&vfs_lock);
         return -1;
     }
     
-    // Create file in parent directory
+    // Check if file already exists
+    if (parent->finddir) {
+        vfs_node_t* existing = parent->finddir(parent, filename);
+        if (existing) {
+            vfs_destroy_node(existing);
+            vfs_destroy_node(parent);
+            pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+            spinlock_release(&vfs_lock);
+            return -1; // File already exists
+        }
+    }
+    
+    // Create the file
     int result = -1;
     if (parent->create) {
         result = parent->create(parent, filename, VFS_FILE);
@@ -393,40 +426,75 @@ int vfs_create(const char* path, uint32_t mode) {
     
     vfs_destroy_node(parent);
     pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+    spinlock_release(&vfs_lock);
     
     return result;
 }
+
 
 // Create a directory
 int vfs_mkdir(const char* path, uint32_t mode) {
     if (!path || !vfs_root) return -1;
     
-    // Find parent directory
+    spinlock_acquire(&vfs_lock);
+    
+    // Make a copy of the path for manipulation
     char* path_copy = vfs_strdup(path);
-    if (!path_copy) return -1;
-    
-    // Find last slash
-    char* last_slash = NULL;
-    for (char* p = path_copy; *p; p++) {
-        if (*p == '/') last_slash = p;
-    }
-    
-    if (!last_slash) {
-        pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+    if (!path_copy) {
+        spinlock_release(&vfs_lock);
         return -1;
     }
     
-    *last_slash = '\0';
-    char* dirname = last_slash + 1;
+    // Find the last slash to separate directory and dirname
+    char* last_slash = NULL;
+    char* p = path_copy;
+    while (*p) {
+        if (*p == '/') last_slash = p;
+        p++;
+    }
     
-    vfs_node_t* parent = vfs_path_to_node(path_copy);
+    char* dirname;
+    vfs_node_t* parent;
+    
+    if (last_slash) {
+        // Has a directory component
+        *last_slash = '\0';
+        dirname = last_slash + 1;
+        
+        // If path_copy is now empty, it means root directory
+        if (path_copy[0] == '\0') {
+            parent = vfs_root;
+            parent->refcount++;
+        } else {
+            parent = vfs_path_to_node(path_copy);
+        }
+    } else {
+        // No directory component, create in root
+        dirname = path_copy;
+        parent = vfs_root;
+        parent->refcount++;
+    }
+    
     if (!parent || parent->type != VFS_DIRECTORY) {
         if (parent) vfs_destroy_node(parent);
         pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+        spinlock_release(&vfs_lock);
         return -1;
     }
     
-    // Create directory in parent
+    // Check if directory already exists
+    if (parent->finddir) {
+        vfs_node_t* existing = parent->finddir(parent, dirname);
+        if (existing) {
+            vfs_destroy_node(existing);
+            vfs_destroy_node(parent);
+            pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+            spinlock_release(&vfs_lock);
+            return -1; // Directory already exists
+        }
+    }
+    
+    // Create the directory
     int result = -1;
     if (parent->create) {
         result = parent->create(parent, dirname, VFS_DIRECTORY);
@@ -434,6 +502,7 @@ int vfs_mkdir(const char* path, uint32_t mode) {
     
     vfs_destroy_node(parent);
     pmm_free_page((void*)((uint64_t)path_copy - g_hhdm_offset));
+    spinlock_release(&vfs_lock);
     
     return result;
 }

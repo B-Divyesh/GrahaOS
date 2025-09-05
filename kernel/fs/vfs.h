@@ -124,3 +124,4 @@ void vfs_destroy_node(vfs_node_t* node);
 int vfs_create(const char* path, uint32_t mode);
 int vfs_mkdir(const char* path, uint32_t mode);
 void vfs_sync(void);
+vfs_node_t* vfs_path_to_node(const char* path);

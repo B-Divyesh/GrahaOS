@@ -178,6 +178,56 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             break;
         }
 
+        case SYS_READDIR: {
+            const char *pathname_user = (const char *)frame->rdi;
+            uint32_t index = (uint32_t)frame->rsi;
+            void *dirent_buffer = (void *)frame->rdx;
+            
+            char pathname_kernel[256];
+            if (copy_string_from_user(pathname_user, pathname_kernel, sizeof(pathname_kernel)) <= 0) {
+                frame->rax = -1;
+                break;
+            }
+            
+            // Open the directory
+            vfs_node_t* dir = vfs_path_to_node(pathname_kernel);
+            if (!dir) {
+                frame->rax = -1;
+                break;
+            }
+            
+            if (dir->type != VFS_DIRECTORY) {
+                vfs_destroy_node(dir);
+                frame->rax = -2; // Not a directory
+                break;
+            }
+            
+            // Read the directory entry at index
+            vfs_node_t* entry = NULL;
+            if (dir->readdir) {
+                entry = dir->readdir(dir, index);
+            }
+            
+            if (!entry) {
+                vfs_destroy_node(dir);
+                frame->rax = 0; // No more entries
+                break;
+            }
+            
+            // Copy entry info to user buffer
+            // Simple format: 4 bytes type, 28 bytes name
+            if (dirent_buffer) {
+                uint32_t type = entry->type;
+                memcpy(dirent_buffer, &type, 4);
+                memcpy((uint8_t*)dirent_buffer + 4, entry->name, 28);
+            }
+            
+            vfs_destroy_node(entry);
+            vfs_destroy_node(dir);
+            frame->rax = 1; // Success
+            break;
+        }
+
         case SYS_SYNC: {
             // Flush all pending writes to disk
             vfs_sync();
