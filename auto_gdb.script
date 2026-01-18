@@ -1,0 +1,12 @@
+
+# Connect to QEMU
+target remote localhost:1234
+
+# Log all output
+set logging file gdb.log
+set logging overwrite on
+set logging enabled on
+set pagination off
+
+# Continue execution
+continue

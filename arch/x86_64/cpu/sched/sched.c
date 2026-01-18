@@ -5,6 +5,7 @@
 #include "../gdt.h"
 #include "../../../../drivers/video/framebuffer.h"
 #include "../../../../kernel/sync/spinlock.h"
+#include "../../drivers/serial/serial.h"
 
 static task_t tasks[MAX_TASKS];
 static int next_task_id = 0;
@@ -240,9 +241,16 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     tasks[id].regs.rsp = user_stack_page_base + PAGE_SIZE - 16;
     tasks[id].regs.cs = 0x20 | 3;
     tasks[id].regs.ss = 0x18 | 3;
-    
+
+    // Phase 7c: Initialize heap management fields
+    // Heap starts at 4GB (0x100000000) in user space
+    // This is well above typical code/data sections and below stack
+    tasks[id].heap_start = 0x100000000ULL;
+    tasks[id].brk = tasks[id].heap_start;  // Initially empty heap
+    tasks[id].stack_top = user_stack_addr;  // Top of stack for collision detection
+
     spinlock_release(&sched_lock);
-    
+
     return id;
 }
 
@@ -276,6 +284,12 @@ void wake_waiting_parent(int child_id) {
 void schedule(struct interrupt_frame *frame) {
     // Increment counter
     schedule_count++;
+
+    // Minimal logging for debugging context switches
+    static volatile uint32_t sched_log_count = 0;
+    if ((sched_log_count++ & 0xFF) == 0) {  // Log every 256 calls
+        serial_write("[SCHED] schedule() called\n");
+    }
     
     // Validate frame
     if (!frame) {
@@ -346,6 +360,17 @@ void schedule(struct interrupt_frame *frame) {
             found = true;
             current_task_index = next_index;
             context_switches++;
+
+            // Log first switch to each task
+            static uint8_t task_switched[MAX_TASKS] = {0};
+            if (!task_switched[next_index]) {
+                task_switched[next_index] = 1;
+                serial_write("[SCHED] First switch to task ");
+                serial_write_dec(next_index);
+                serial_write(" (id=");
+                serial_write_dec(tasks[next_index].id);
+                serial_write(")\n");
+            }
             break;
         }
     }
@@ -374,6 +399,16 @@ void schedule(struct interrupt_frame *frame) {
     uint64_t current_cr3;
     asm volatile ("mov %%cr3, %0" : "=r"(current_cr3));
     if (current_cr3 != tasks[current_task_index].cr3) {
+        // Log CR3 switch (only first time per task)
+        static uint8_t task_cr3_switched[MAX_TASKS] = {0};
+        if (!task_cr3_switched[current_task_index]) {
+            task_cr3_switched[current_task_index] = 1;
+            serial_write("[SCHED] Switching CR3 to 0x");
+            serial_write_hex(tasks[current_task_index].cr3);
+            serial_write(" for task ");
+            serial_write_dec(current_task_index);
+            serial_write("\n");
+        }
         vmm_switch_address_space_phys(tasks[current_task_index].cr3);
     }
 

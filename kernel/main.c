@@ -23,6 +23,7 @@
 #include "../arch/x86_64/drivers/lapic/lapic.h"
 #include "../arch/x86_64/drivers/ahci/ahci.h"
 #include "fs/grahafs.h"
+#include "../arch/x86_64/drivers/serial/serial.h"
 
 // --- Limine Requests ---
 __attribute__((used, section(".limine_requests")))
@@ -171,12 +172,19 @@ void kmain(void) {
         hcf();
     }
 
+    // Initialize serial port FIRST for logging
+    serial_init();
+    serial_write("\n=== GrahaOS Boot Log ===\n");
+    serial_write("Serial port initialized\n");
+
     // Initialize framebuffer for early output
     if (!framebuffer_init(&framebuffer_request)) {
+        serial_write("ERROR: Framebuffer init failed!\n");
         hcf();
     }
 
     framebuffer_clear(0x00101828);
+    serial_write("Framebuffer initialized\n");
 
     // Display boot banner
     framebuffer_draw_rect(50, 50, 600, 140, COLOR_GRAHA_BLUE);
@@ -197,121 +205,191 @@ void kmain(void) {
     // --- CRITICAL: CORRECT INITIALIZATION ORDER ---
     
     // 1. Initialize Physical Memory Manager
+    serial_write("Initializing PMM...\n");
     pmm_init(memmap_request.response);
     framebuffer_draw_string("PMM Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    serial_write("PMM initialized successfully\n");
     y_pos += 20;
-    
+
     // 2. Initialize Virtual Memory Manager and enable paging
+    serial_write("Initializing VMM...\n");
     vmm_init(memmap_request.response, framebuffer_request.response,
              kernel_phys_base, kernel_virt_base, hhdm_offset);
     framebuffer_init(&framebuffer_request);  // Reinitialize after paging
     framebuffer_draw_string("VMM Initialized. Paging is now active!", 50, y_pos, COLOR_GREEN, 0x00101828);
+    serial_write("VMM initialized, paging active\n");
     y_pos += 20;
     
     // 3. CRITICAL: Initialize SMP FIRST (sets up GDT/TSS for BSP and starts APs)
     // This also initializes LAPIC and LAPIC timer for all CPUs
+    serial_write("About to initialize SMP...\n");
     #if LIMINE_API_REVISION >= 1
+        serial_write("Calling smp_init (mp_request)...\n");
         smp_init(&mp_request);
     #else
+        serial_write("Calling smp_init (smp_request)...\n");
         smp_init(&smp_request);
     #endif
+    serial_write("SMP initialized successfully\n");
+    serial_write("Drawing framebuffer message...\n");
     framebuffer_draw_string("SMP Initialized - All CPUs online!", 50, y_pos, COLOR_GREEN, 0x00101828);
+    serial_write("Framebuffer drawn OK\n");
     y_pos += 20;
-    
+
     // 4. NOW we can initialize IDT (after GDT is set up)
+    serial_write("About to initialize IDT...\n");
     idt_init();
+    serial_write("IDT initialized successfully\n");
     framebuffer_draw_string("IDT Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
-    
+
     // 5. Initialize scheduler (after per-CPU structures exist)
+    serial_write("About to initialize scheduler...\n");
     sched_init();
+    serial_write("Scheduler initialized successfully\n");
     framebuffer_draw_string("Scheduler Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
     
     // 6. Initialize syscall interface (after per-CPU structures exist)
+    serial_write("About to initialize syscalls...\n");
     syscall_init();
+    serial_write("Syscalls initialized successfully\n");
     framebuffer_draw_string("Syscall Interface Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
-    
+
     // 7. Initialize Virtual File System
+    serial_write("About to initialize VFS...\n");
     vfs_init();
+    serial_write("VFS initialized successfully\n");
     framebuffer_draw_string("VFS Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 40;
 
     //adding AHCI
+    serial_write("About to initialize AHCI...\n");
     ahci_init();
+    serial_write("AHCI initialized successfully\n");
     y_pos += 20;
 
     // Initialize filesystem AFTER a small delay to let AHCI stabilize
+    serial_write("Waiting for AHCI to stabilize...\n");
     for (volatile int i = 0; i < 1000000; i++) {
         asm volatile("pause");
     }
+    serial_write("AHCI stabilized\n");
 
     framebuffer_draw_string("Mounting GrahaFS filesystem...", 10, y_pos, COLOR_YELLOW, 0x00101828);
     y_pos += 20;
 
     // Initialize GrahaFS driver
+    serial_write("Initializing GrahaFS driver...\n");
     grahafs_init();
+    serial_write("GrahaFS driver initialized\n");
 
     // Get first block device (disk 0)
+    serial_write("About to call vfs_get_block_device(0)...\n");
     block_device_t* hdd = vfs_get_block_device(0);
+    serial_write("vfs_get_block_device(0) returned: ");
+    serial_write_hex((uint64_t)hdd);
+    serial_write("\n");
+
     if (hdd) {
+        serial_write("Block device found, drawing framebuffer msg...\n");
         framebuffer_draw_string("Found block device 0", 10, y_pos, COLOR_GREEN, 0x00101828);
+        serial_write("Framebuffer msg drawn\n");
         y_pos += 20;
-        
+
+        serial_write("About to call grahafs_mount...\n");
         vfs_node_t* root = grahafs_mount(hdd);
+        serial_write("grahafs_mount returned: ");
+        serial_write_hex((uint64_t)root);
+        serial_write("\n");
+
         if (root) {
+            serial_write("Mount successful, drawing success msg...\n");
             framebuffer_draw_string("GrahaFS mounted successfully on /", 10, y_pos, COLOR_GREEN, 0x00101828);
+            serial_write("Success msg drawn\n");
             y_pos += 20;
         } else {
+            serial_write("Mount failed, drawing error msgs...\n");
             framebuffer_draw_string("Failed to mount GrahaFS!", 10, y_pos, COLOR_RED, 0x00101828);
             framebuffer_draw_string("Disk may need formatting with mkfs.gfs", 10, y_pos + 20, COLOR_YELLOW, 0x00101828);
+            serial_write("Error msgs drawn\n");
             y_pos += 40;
         }
     } else {
+        serial_write("No block device found, drawing error msg...\n");
         framebuffer_draw_string("No block device found!", 10, y_pos, COLOR_RED, 0x00101828);
+        serial_write("Error msg drawn\n");
         y_pos += 20;
     }
 
     // --- USER SPACE INITIALIZATION ---
+    serial_write("=== USER SPACE INITIALIZATION ===\n");
     framebuffer_draw_string("=== Loading Interactive Shell ===", 50, y_pos, COLOR_WHITE, 0x00101828);
     y_pos += 30;
 
     // Initialize Initial RAM Disk
+    serial_write("Initializing initrd...\n");
     initrd_init(&module_request);
+    serial_write("Initrd initialized\n");
     framebuffer_draw_string("Initrd initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
     // Locate shell binary in initrd
+    serial_write("Looking up bin/gash in initrd...\n");
     size_t gash_size;
     void *gash_data = initrd_lookup("bin/gash", &gash_size);
     if (!gash_data) {
+        serial_write("FATAL: Could not find bin/gash in initrd!\n");
         framebuffer_draw_string("FATAL: Could not find bin/gash in initrd!", 50, y_pos, COLOR_RED, 0x00101828);
         hcf();
     }
-    framebuffer_draw_string("Found bin/gash in initrd.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    serial_write("Found bin/gash, size=");
+    serial_write_dec(gash_size);
+    serial_write("\n");
+    framebuffer_draw_string("Found bin/gash (shell) in initrd.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
     // Load shell ELF binary
+    serial_write("About to call elf_load for gash...\n");
     uint64_t entry_point, cr3;
     if (!elf_load(gash_data, &entry_point, &cr3)) {
+        serial_write("FATAL: elf_load failed!\n");
         framebuffer_draw_string("FATAL: Failed to load shell ELF file!", 50, y_pos, COLOR_RED, 0x00101828);
         hcf();
     }
+    serial_write("elf_load succeeded! entry_point=");
+    serial_write_hex(entry_point);
+    serial_write(" cr3=");
+    serial_write_hex(cr3);
+    serial_write("\n");
+
+    serial_write("Drawing 'Shell loaded' message...\n");
     framebuffer_draw_string("Shell loaded successfully into memory.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    serial_write("Message drawn\n");
     y_pos += 20;
 
     // Create shell process
+    serial_write("Creating shell process...\n");
     int process_id = sched_create_user_process(entry_point, cr3);
     if (process_id < 0) {
+        serial_write("ERROR: Failed to create shell process!\n");
         framebuffer_draw_string("FATAL: Failed to create shell process!", 50, y_pos, COLOR_RED, 0x00101828);
         hcf();
     }
+    serial_write("Shell process created, ID=");
+    serial_write_dec(process_id);
+    serial_write("\n");
+
+    serial_write("Drawing 'Shell process created' message...\n");
     framebuffer_draw_string("Shell process created.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    serial_write("Message drawn\n");
     y_pos += 20;
 
     // Initialize keyboard hardware BEFORE creating the polling task
+    serial_write("Initializing keyboard...\n");
     keyboard_init();
+    serial_write("Keyboard initialized\n");
     framebuffer_draw_string("Keyboard hardware initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
@@ -347,9 +425,13 @@ void kmain(void) {
     
     // CRITICAL: Force the function pointer through memory to avoid register issues
     void (*task_func)(void) = (void (*)(void))func_addr;
-    
+
     // Create the task with explicit type casting
+    serial_write("Creating keyboard task...\n");
     int kbd_task_id = sched_create_task(task_func);
+    serial_write("sched_create_task returned: ");
+    serial_write_dec(kbd_task_id);
+    serial_write("\n");
     
     if (kbd_task_id < 0) {
         framebuffer_draw_string("ERROR: Failed to create keyboard task!", 50, y_pos, COLOR_RED, 0x00101828);
@@ -404,25 +486,35 @@ void kmain(void) {
     }
     
     // Enable interrupts FIRST (but no timers running yet)
+    serial_write("About to enable interrupts...\n");
     framebuffer_draw_string("Enabling interrupts...", 10, 50, COLOR_YELLOW, 0x00101828);
     asm volatile("sti");
-    
+    serial_write("Interrupts enabled\n");
+
     // Wait to ensure no pending issues
+    serial_write("Waiting after STI...\n");
     for (volatile int i = 0; i < 1000000; i++) {
         asm volatile("pause");
     }
-    
+    serial_write("Wait complete\n");
+
     // NOW start the timer on BSP only
+    serial_write("About to start scheduler timer...\n");
     framebuffer_draw_string("Starting scheduler timer on BSP...", 10, 70, COLOR_YELLOW, 0x00101828);
     
     // Disable interrupts briefly while starting timer
     asm volatile("cli");
+    serial_write("Calling lapic_timer_init...\n");
     lapic_timer_init(100, 32);
+    serial_write("lapic_timer_init returned\n");
     asm volatile("sti");
-    
+    serial_write("Re-enabled interrupts after timer init\n");
+
     if (!lapic_timer_is_running()) {
+        serial_write("ERROR: Timer failed to start!\n");
         framebuffer_draw_string("ERROR: Timer failed to start!", 10, 90, COLOR_RED, 0x00101828);
     } else {
+        serial_write("Timer is running, system initialized!\n");
         framebuffer_draw_string("System running!", 10, 90, COLOR_GREEN, 0x00101828);
     }
     
@@ -430,7 +522,10 @@ void kmain(void) {
     // OPTIONAL: Start timers on APs later (commented out for now)
     // This would require IPI (Inter-Processor Interrupts) to signal APs
     // For now, only BSP handles scheduling
-    
+
+    serial_write("\n=== ENTERING IDLE LOOP ===\n");
+    serial_write("System fully initialized, waiting for timer interrupts...\n\n");
+
     // Main idle loop
     uint64_t loop_count = 0;
     while (1) {

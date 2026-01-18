@@ -103,3 +103,30 @@ uint64_t vmm_get_pml4_phys(vmm_address_space_t *addr_space);
  * @param pml4_phys Physical address of the PML4 table.
  */
 void vmm_switch_address_space_phys(uint64_t pml4_phys);
+
+// --- HELPER FUNCTIONS FOR PHASE 7C (sys_brk) ---
+
+/**
+ * @brief Gets the physical address mapped to a virtual address.
+ * @param cr3 Physical address of the PML4 table (CR3 value).
+ * @param virt Virtual address to look up.
+ * @return Physical address if mapped, 0 if not mapped.
+ */
+uint64_t vmm_get_physical_address(uint64_t cr3, uint64_t virt);
+
+/**
+ * @brief Maps a page using CR3 directly (for syscall handlers).
+ * @param cr3 Physical address of the PML4 table (CR3 value).
+ * @param virt Virtual address to map (must be page-aligned).
+ * @param phys Physical address to map to (must be page-aligned).
+ * @param flags Page table entry flags.
+ * @return True on success, false on failure.
+ */
+bool vmm_map_page_by_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags);
+
+/**
+ * @brief Unmaps a page using CR3 directly (for syscall handlers).
+ * @param cr3 Physical address of the PML4 table (CR3 value).
+ * @param virt Virtual address to unmap (must be page-aligned).
+ */
+void vmm_unmap_page_by_cr3(uint64_t cr3, uint64_t virt);

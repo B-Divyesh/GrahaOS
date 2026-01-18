@@ -197,13 +197,13 @@ vmm_address_space_t* vmm_create_address_space(void) {
     }
 
     vmm_address_space_t *space = &address_space_pool[next_address_space_idx++];
-    
+
     // Allocate a new PML4 table
     void *pml4_phys = pmm_alloc_page();
     if (!pml4_phys) {
         return NULL;
     }
-    
+
     // Set up the address space structure
     space->top_level = (uint64_t*)((uint64_t)pml4_phys + g_hhdm_offset);
     vmm_memset(space->top_level, 0, PAGE_SIZE);
@@ -217,4 +217,104 @@ vmm_address_space_t* vmm_create_address_space(void) {
     }
 
     return space;
+}
+
+// --- PHASE 7C HELPER FUNCTIONS ---
+
+uint64_t vmm_get_physical_address(uint64_t cr3, uint64_t virt) {
+    // Calculate indices for each page table level
+    uint64_t pml4_index = (virt >> 39) & 0x1FF;
+    uint64_t pdpt_index = (virt >> 30) & 0x1FF;
+    uint64_t pd_index   = (virt >> 21) & 0x1FF;
+    uint64_t pt_index   = (virt >> 12) & 0x1FF;
+    uint64_t offset     = virt & 0xFFF;
+
+    // Walk the page tables
+    uint64_t *pml4 = (uint64_t*)(cr3 + g_hhdm_offset);
+    if (!(pml4[pml4_index] & PTE_PRESENT)) return 0;
+
+    uint64_t *pdpt = (uint64_t*)((pml4[pml4_index] & PAGE_MASK) + g_hhdm_offset);
+    if (!(pdpt[pdpt_index] & PTE_PRESENT)) return 0;
+
+    uint64_t *pd = (uint64_t*)((pdpt[pdpt_index] & PAGE_MASK) + g_hhdm_offset);
+    if (!(pd[pd_index] & PTE_PRESENT)) return 0;
+
+    uint64_t *pt = (uint64_t*)((pd[pd_index] & PAGE_MASK) + g_hhdm_offset);
+    if (!(pt[pt_index] & PTE_PRESENT)) return 0;
+
+    // Return physical address with offset
+    return (pt[pt_index] & PAGE_MASK) | offset;
+}
+
+bool vmm_map_page_by_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags) {
+    // Calculate indices for each page table level
+    uint64_t pml4_index = (virt >> 39) & 0x1FF;
+    uint64_t pdpt_index = (virt >> 30) & 0x1FF;
+    uint64_t pd_index   = (virt >> 21) & 0x1FF;
+    uint64_t pt_index   = (virt >> 12) & 0x1FF;
+
+    // Level 1: Page Map Level 4 (PML4)
+    uint64_t *pml4 = (uint64_t*)(cr3 + g_hhdm_offset);
+    if (!(pml4[pml4_index] & PTE_PRESENT)) {
+        void *pdpt_phys = pmm_alloc_page();
+        if (!pdpt_phys) return false;
+        uint64_t *pdpt_virt = (uint64_t*)((uint64_t)pdpt_phys + g_hhdm_offset);
+        vmm_memset(pdpt_virt, 0, PAGE_SIZE);
+        pml4[pml4_index] = (uint64_t)pdpt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    }
+
+    // Level 2: Page Directory Pointer Table (PDPT)
+    uint64_t *pdpt = (uint64_t*)((pml4[pml4_index] & PAGE_MASK) + g_hhdm_offset);
+    if (!(pdpt[pdpt_index] & PTE_PRESENT)) {
+        void *pd_phys = pmm_alloc_page();
+        if (!pd_phys) return false;
+        uint64_t *pd_virt = (uint64_t*)((uint64_t)pd_phys + g_hhdm_offset);
+        vmm_memset(pd_virt, 0, PAGE_SIZE);
+        pdpt[pdpt_index] = (uint64_t)pd_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    }
+
+    // Level 3: Page Directory (PD)
+    uint64_t *pd = (uint64_t*)((pdpt[pdpt_index] & PAGE_MASK) + g_hhdm_offset);
+    if (!(pd[pd_index] & PTE_PRESENT)) {
+        void *pt_phys = pmm_alloc_page();
+        if (!pt_phys) return false;
+        uint64_t* pt_virt = (uint64_t*)((uint64_t)pt_phys + g_hhdm_offset);
+        vmm_memset(pt_virt, 0, PAGE_SIZE);
+        pd[pd_index] = (uint64_t)pt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    }
+
+    // Level 4: Page Table (PT)
+    uint64_t *pt = (uint64_t*)((pd[pd_index] & PAGE_MASK) + g_hhdm_offset);
+    pt[pt_index] = phys | flags;
+
+    // CRITICAL FIX: Invalidate TLB entry for this page
+    // When mapping pages for another process, the TLB must be flushed
+    // so the CPU picks up the new mapping when the process runs
+    asm volatile("invlpg (%0)" : : "r" (virt) : "memory");
+
+    return true;
+}
+
+void vmm_unmap_page_by_cr3(uint64_t cr3, uint64_t virt) {
+    // Calculate indices for each page table level
+    uint64_t pml4_index = (virt >> 39) & 0x1FF;
+    uint64_t pdpt_index = (virt >> 30) & 0x1FF;
+    uint64_t pd_index   = (virt >> 21) & 0x1FF;
+    uint64_t pt_index   = (virt >> 12) & 0x1FF;
+
+    // Walk the page tables
+    uint64_t *pml4 = (uint64_t*)(cr3 + g_hhdm_offset);
+    if (!(pml4[pml4_index] & PTE_PRESENT)) return;
+
+    uint64_t *pdpt = (uint64_t*)((pml4[pml4_index] & PAGE_MASK) + g_hhdm_offset);
+    if (!(pdpt[pdpt_index] & PTE_PRESENT)) return;
+
+    uint64_t *pd = (uint64_t*)((pdpt[pdpt_index] & PAGE_MASK) + g_hhdm_offset);
+    if (!(pd[pd_index] & PTE_PRESENT)) return;
+
+    uint64_t *pt = (uint64_t*)((pd[pd_index] & PAGE_MASK) + g_hhdm_offset);
+
+    // Clear the page table entry and invalidate TLB
+    pt[pt_index] = 0;
+    asm volatile("invlpg (%0)" : : "r" (virt) : "memory");
 }

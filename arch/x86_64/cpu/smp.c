@@ -11,6 +11,7 @@
 #include "syscall/syscall.h"
 #include "sched/sched.h"
 #include "interrupts.h"
+#include "../drivers/serial/serial.h"
 
 // External assembly function from ap_start.S
 #if LIMINE_API_REVISION >= 1
@@ -147,43 +148,62 @@ void ap_main(struct limine_smp_info *info) {
 
 #if LIMINE_API_REVISION >= 1
 void smp_init(volatile struct limine_mp_request *mp_request) {
+    serial_write("[SMP] Entered smp_init\n");
+
     if (!mp_request || !mp_request->response) {
+        serial_write("[SMP] ERROR: No MP support from bootloader!\n");
         framebuffer_draw_string("No MP support from bootloader!", 50, 400, COLOR_RED, 0x00101828);
         return;
     }
-    
+
+    serial_write("[SMP] MP request validated\n");
     struct limine_mp_response *mp_resp = mp_request->response;
-    
+
     // Initialize CPU count and BSP ID
     g_cpu_count = (uint32_t)mp_resp->cpu_count;
     g_bsp_lapic_id = mp_resp->bsp_lapic_id;
+
+    serial_write("[SMP] CPU count: ");
+    serial_write_dec(g_cpu_count);
+    serial_write("\n");
     
     if (g_cpu_count > MAX_CPUS) {
         g_cpu_count = MAX_CPUS;
     }
-    
+
     // Initialize all cpu_locals to invalid state
+    serial_write("[SMP] Initializing cpu_locals...\n");
     for (int i = 0; i < MAX_CPUS; i++) {
         g_cpu_locals[i].cpu_id = (uint32_t)-1;
         g_cpu_locals[i].lapic_id = (uint32_t)-1;
     }
-    
+
     // Store kernel PML4 for APs
+    serial_write("[SMP] Getting kernel PML4...\n");
     g_kernel_pml4 = vmm_get_pml4_phys(vmm_get_kernel_space());
-    
+    serial_write("[SMP] PML4=");
+    serial_write_hex(g_kernel_pml4);
+    serial_write("\n");
+
     // Initialize BSP's per-CPU data FIRST
+    serial_write("[SMP] Init BSP cpu_local...\n");
     g_cpu_locals[0].cpu_id = 0;
     g_cpu_locals[0].lapic_id = g_bsp_lapic_id;
     write_msr(MSR_GS_BASE, (uint64_t)&g_cpu_locals[0]);
-    
+    serial_write("[SMP] BSP GS_BASE set\n");
+
     // Initialize BSP's GDT and TSS (per-CPU version)
+    serial_write("[SMP] Calling gdt_init_for_cpu...\n");
     gdt_init_for_cpu(0);
-    
+    serial_write("[SMP] GDT init done\n");
+
     // Initialize BSP's LAPIC
+    serial_write("[SMP] Calling lapic_init...\n");
     lapic_init();
-    
-    
-    
+    serial_write("[SMP] LAPIC init done\n");
+
+
+
     // Verify LAPIC is working
     // Verify LAPIC is working
     if (!lapic_is_enabled()) {

@@ -1,0 +1,42 @@
+#!/usr/bin/expect -f
+# Automated test script for libctest
+
+set timeout 60
+
+# Start QEMU
+spawn qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 \
+     -drive file=disk.img,format=raw,if=none,id=mydisk,cache=none,aio=native \
+     -device ich9-ahci,id=ahci \
+     -device ide-hd,drive=mydisk,bus=ahci.0 \
+     -nographic
+
+# Wait for shell prompt
+expect {
+    "gash>" {
+        send "libctest\r"
+    }
+    timeout {
+        puts "ERROR: Timeout waiting for shell"
+        exit 1
+    }
+}
+
+# Wait for test to complete or crash
+expect {
+    "ALL TESTS PASSED" {
+        puts "\n=== SUCCESS: All tests passed ==="
+        exit 0
+    }
+    "Page Fault" {
+        puts "\n=== ERROR: Page fault occurred ==="
+        exit 1
+    }
+    "Triple Fault" {
+        puts "\n=== ERROR: Triple fault occurred ==="
+        exit 1
+    }
+    timeout {
+        puts "\n=== ERROR: Test timed out ==="
+        exit 1
+    }
+}

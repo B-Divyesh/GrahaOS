@@ -30,6 +30,7 @@
 #define SYS_STAT   1013
 #define SYS_READDIR 1014
 #define SYS_SYNC 1015
+#define SYS_BRK  1016
 
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);

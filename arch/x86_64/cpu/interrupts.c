@@ -4,6 +4,7 @@
 #include "../../../drivers/video/framebuffer.h"
 #include "../../drivers/keyboard/keyboard.h"
 #include "../../drivers/lapic/lapic.h"
+#include "../../drivers/serial/serial.h"
 
 // PIC (Programmable Interrupt Controller) ports
 #define PIC1_COMMAND 0x20
@@ -250,6 +251,11 @@ void interrupt_handler(struct interrupt_frame *frame) {
         // Hardware interrupt
         switch (frame->int_no) {
             case 32: // IRQ0: Timer (now from LAPIC timer)
+                // Note: Minimal logging to avoid slowing down interrupts
+                static volatile uint32_t timer_tick_count = 0;
+                if ((timer_tick_count++ & 0xFF) == 0) {  // Log every 256 ticks
+                    serial_write("[TIMER] Tick\n");
+                }
                 schedule(frame);
                 break;
             case 33: // IRQ1: Keyboard (if still using legacy keyboard)

@@ -8,6 +8,10 @@
 #include "../../../../kernel/elf.h"
 #include "../sched/sched.h"
 #include "../../../../kernel/initrd.h"
+#include "../../mm/pmm.h"
+#include "../../mm/vmm.h"
+#include "../../drivers/serial/serial.h"
+#include <stdbool.h>
 
 // MSR definitions
 #define MSR_EFER 0xC0000080
@@ -85,8 +89,8 @@ extern void wake_waiting_parent(int child_id);
 
 // The C-level dispatcher
 void syscall_dispatcher(struct syscall_frame *frame) {
-
     if (!frame) {
+        serial_write("[SYSCALL] ERROR: NULL frame!\n");
         framebuffer_draw_string("PANIC: NULL syscall frame!", 10, 10, COLOR_WHITE, COLOR_RED);
         asm volatile("cli; hlt");
     }
@@ -96,6 +100,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
     switch (syscall_num) {
         case SYS_PUTC: {
             char c = (char)frame->rdi;
+            // DEBUG: Also output to serial for automated testing
+            serial_putc(c);
             if (c == '\n') {
                 term_x = 0;
                 term_y += 16;
@@ -232,6 +238,119 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             // Flush all pending writes to disk
             vfs_sync();
             frame->rax = 0;
+            break;
+        }
+
+        case SYS_BRK: {
+            void *addr = (void *)frame->rdi;
+            task_t *current = sched_get_current_task();
+
+            serial_write("[SYS_BRK] addr=");
+            serial_write_hex((uint64_t)addr);
+            serial_write("\n");
+
+            if (!current) {
+                serial_write("[SYS_BRK] ERROR: No current process!\n");
+                frame->rax = -1;
+                break;
+            }
+
+            // If addr is NULL, just return current brk
+            if (addr == NULL) {
+                serial_write("[SYS_BRK] Return current brk=");
+                serial_write_hex(current->brk);
+                serial_write("\n");
+                frame->rax = (uint64_t)current->brk;
+                break;
+            }
+
+            serial_write("[SYS_BRK] curr_brk=");
+            serial_write_hex(current->brk);
+            serial_write(" heap_start=");
+            serial_write_hex(current->heap_start);
+            serial_write("\n");
+
+            // Validate address bounds
+            // Must be >= heap_start and < stack_top with guard space
+            #define HEAP_STACK_GUARD (16 * 4096)  // 64KB guard
+
+            if ((uint64_t)addr < current->heap_start ||
+                (uint64_t)addr >= current->stack_top - HEAP_STACK_GUARD) {
+                frame->rax = (uint64_t)-1;  // ENOMEM
+                break;
+            }
+
+            // Calculate page-aligned boundaries
+            #define ALIGN_UP(x, align) (((x) + (align) - 1) & ~((align) - 1))
+            #define ALIGN_DOWN(x, align) ((x) & ~((align) - 1))
+
+            uint64_t old_brk_page = ALIGN_UP(current->brk, PAGE_SIZE);
+            uint64_t new_brk_page = ALIGN_UP((uint64_t)addr, PAGE_SIZE);
+
+            if (new_brk_page > old_brk_page) {
+                // Growing heap - allocate and map new pages
+                bool success = true;
+                for (uint64_t page = old_brk_page; page < new_brk_page; page += PAGE_SIZE) {
+                    void *phys = pmm_alloc_page();
+                    if (!phys) {
+                        // Out of memory - rollback what we allocated
+                        for (uint64_t p = old_brk_page; p < page; p += PAGE_SIZE) {
+                            // Get physical address using vmm
+                            uint64_t old_phys = vmm_get_physical_address(current->cr3, p);
+                            if (old_phys) {
+                                vmm_unmap_page_by_cr3(current->cr3, p);
+                                pmm_free_page((void*)old_phys);
+                            }
+                        }
+                        success = false;
+                        break;
+                    }
+
+                    // Map with user permissions (writable, user-accessible)
+                    if (!vmm_map_page_by_cr3(current->cr3, page, (uint64_t)phys,
+                                            PTE_PRESENT | PTE_WRITABLE | PTE_USER)) {
+                        // Mapping failed - free this page and rollback
+                        pmm_free_page(phys);
+                        for (uint64_t p = old_brk_page; p < page; p += PAGE_SIZE) {
+                            uint64_t old_phys = vmm_get_physical_address(current->cr3, p);
+                            if (old_phys) {
+                                vmm_unmap_page_by_cr3(current->cr3, p);
+                                pmm_free_page((void*)old_phys);
+                            }
+                        }
+                        success = false;
+                        break;
+                    }
+                }
+
+                if (success) {
+                    current->brk = (uint64_t)addr;
+                    frame->rax = current->brk;
+                    serial_write("[SYS_BRK] SUCCESS: new_brk=");
+                    serial_write_hex(current->brk);
+                    serial_write("\n");
+                } else {
+                    frame->rax = (uint64_t)-1;  // ENOMEM
+                    serial_write("[SYS_BRK] FAILED: Out of memory or mapping failed\n");
+                }
+            } else if (new_brk_page < old_brk_page) {
+                // Shrinking heap - unmap and free pages
+                for (uint64_t page = new_brk_page; page < old_brk_page; page += PAGE_SIZE) {
+                    uint64_t phys = vmm_get_physical_address(current->cr3, page);
+                    if (phys) {
+                        vmm_unmap_page_by_cr3(current->cr3, page);
+                        pmm_free_page((void*)phys);
+                    }
+                }
+
+                current->brk = (uint64_t)addr;
+                frame->rax = current->brk;
+            } else {
+                // No page boundary crossed, just update brk
+                current->brk = (uint64_t)addr;
+                frame->rax = current->brk;
+            }
+
             break;
         }
 

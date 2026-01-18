@@ -356,9 +356,33 @@ void _start(void) {
             syscall_exit(0);
         }
         else {
-            print("Unknown command: '");
-            print(cmd);
-            print("'\n");
+            // Try to execute as a program from /bin/
+            char path[128];
+
+            // Check if command starts with /
+            if (cmd[0] == '/') {
+                strcpy(path, cmd);
+            } else {
+                // Try bin/ prefix first
+                strcpy(path, "bin/");
+                int len = strlen(path);
+                int cmd_len = strlen(cmd);
+                if (len + cmd_len < 127) {
+                    strcpy(path + len, cmd);
+                }
+            }
+
+            int pid = syscall_exec(path);
+            if (pid < 0) {
+                print("Unknown command: '");
+                print(cmd);
+                print("'\n");
+                print("Type 'help' for available commands.\n");
+            } else {
+                // Wait for program to complete
+                int exit_status;
+                syscall_wait(&exit_status);
+            }
         }
     }
 }

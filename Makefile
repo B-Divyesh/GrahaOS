@@ -91,7 +91,7 @@ grahaos.iso: kernel/kernel.elf initrd.tar limine.conf disk.img
 	@rm -rf iso_root
 	@echo "Build complete: grahaos.iso"
 
-# MODIFIED: Package gash into the initrd
+# MODIFIED: Package gash, grahai, and libctest into the initrd (Phase 7c)
 initrd.tar: userland etc/motd.txt etc/plan.json
 	@echo "Creating initrd..."
 	@rm -rf initrd_root
@@ -104,8 +104,23 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 		echo "ERROR: user/gash not found!"; \
 		exit 1; \
 	fi
+	@if [ ! -f user/libctest ]; then \
+		echo "ERROR: user/libctest not found!"; \
+		exit 1; \
+	fi
+	@if [ ! -f user/sbrk_test ]; then \
+		echo "ERROR: user/sbrk_test not found!"; \
+		exit 1; \
+	fi
+	@if [ ! -f user/printf_test ]; then \
+		echo "ERROR: user/printf_test not found!"; \
+		exit 1; \
+	fi
 	@cp user/grahai initrd_root/bin/
 	@cp user/gash initrd_root/bin/
+	@cp user/libctest initrd_root/bin/
+	@cp user/sbrk_test initrd_root/bin/
+	@cp user/printf_test initrd_root/bin/
 	@cp etc/motd.txt initrd_root/etc/
 	@cp etc/plan.json initrd_root/etc/
 	@echo "Contents of initrd_root before tar:"
@@ -114,7 +129,7 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	@echo "Verifying tar contents:"
 	@$(TAR) -tf initrd.tar
 	@rm -rf initrd_root
-	@echo "initrd.tar created successfully with gash and grahai"
+	@echo "initrd.tar created successfully with gash, grahai, and libctest"
 
 userland:
 	@echo "Building user programs..."

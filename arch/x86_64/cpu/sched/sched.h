@@ -29,6 +29,11 @@ typedef struct {
     int exit_status;
     // Track what child we're waiting for (-1 = any child)
     int waiting_for_child;
+
+    // Heap management (Phase 7c)
+    uint64_t heap_start;     // Start of heap region
+    uint64_t brk;            // Current program break (end of heap)
+    uint64_t stack_top;      // Top of user stack (to prevent heap collision)
 } task_t;
 
 /**
