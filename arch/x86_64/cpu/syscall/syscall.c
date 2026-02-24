@@ -11,7 +11,17 @@
 #include "../../mm/pmm.h"
 #include "../../mm/vmm.h"
 #include "../../drivers/serial/serial.h"
+#include "../../../../kernel/state.h"
 #include <stdbool.h>
+
+// Forward declarations for state collection (kernel/state.c)
+extern int state_get_size(uint32_t category);
+extern void state_collect_memory(state_memory_t *out);
+extern void state_collect_processes(state_process_list_t *out);
+extern void state_collect_filesystem(state_filesystem_t *out);
+extern void state_collect_system(state_system_t *out);
+extern void state_collect_drivers(state_driver_list_t *out);
+extern int state_collect_all(state_snapshot_t *out);
 
 // MSR definitions
 #define MSR_EFER 0xC0000080
@@ -648,6 +658,65 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = current->id;
             } else {
                 frame->rax = -1;
+            }
+            break;
+        }
+
+        case SYS_GET_SYSTEM_STATE: {
+            uint32_t category = (uint32_t)frame->rdi;
+            void *user_buf = (void *)frame->rsi;
+            size_t buf_size = (size_t)frame->rdx;
+
+            // If user_buf is NULL, return the required size
+            int required = state_get_size(category);
+            if (required < 0) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+
+            if (user_buf == NULL) {
+                frame->rax = (uint64_t)required;
+                break;
+            }
+
+            if ((size_t)required > buf_size) {
+                // Buffer too small - return negative of required size
+                frame->rax = (uint64_t)(-(long)required);
+                break;
+            }
+
+            if (!is_user_pointer(user_buf, required)) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+
+            // Collect the requested category into user buffer
+            switch (category) {
+                case STATE_CAT_MEMORY:
+                    state_collect_memory((state_memory_t *)user_buf);
+                    break;
+                case STATE_CAT_PROCESSES:
+                    state_collect_processes((state_process_list_t *)user_buf);
+                    break;
+                case STATE_CAT_FILESYSTEM:
+                    state_collect_filesystem((state_filesystem_t *)user_buf);
+                    break;
+                case STATE_CAT_SYSTEM:
+                    state_collect_system((state_system_t *)user_buf);
+                    break;
+                case STATE_CAT_DRIVERS:
+                    state_collect_drivers((state_driver_list_t *)user_buf);
+                    break;
+                case STATE_CAT_ALL:
+                    state_collect_all((state_snapshot_t *)user_buf);
+                    break;
+                default:
+                    frame->rax = (uint64_t)-1;
+                    break;
+            }
+
+            if (frame->rax != (uint64_t)-1) {
+                frame->rax = (uint64_t)required;
             }
             break;
         }

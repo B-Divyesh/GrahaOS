@@ -82,3 +82,7 @@ struct vfs_node* grahafs_open(struct vfs_node* node, const char* name);
 void grahafs_close(struct vfs_node* node);
 struct vfs_node* grahafs_readdir(struct vfs_node* node, uint32_t index);
 struct vfs_node* grahafs_finddir(struct vfs_node* node, const char* name);
+
+// Phase 8a: Get GrahaFS statistics for system state reporting
+void grahafs_get_stats(uint32_t *mounted, uint32_t *total_blocks,
+                       uint32_t *free_blocks, uint32_t *free_inodes);

@@ -38,6 +38,9 @@
 #define SYS_SIGNAL 1019
 #define SYS_GETPID 1020
 
+// Phase 8a: System State Introspection
+#define SYS_GET_SYSTEM_STATE 1021
+
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);
 

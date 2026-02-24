@@ -787,3 +787,41 @@ void sched_dump_stats(void) {
     
     framebuffer_draw_string(msg, 10, 750, COLOR_WHITE, COLOR_BLACK);
 }
+
+// Phase 8a: Snapshot all processes for system state reporting
+int sched_snapshot_processes(state_process_t *out, int max_count) {
+    if (!out || max_count <= 0) return 0;
+
+    spinlock_acquire(&sched_lock);
+
+    int count = 0;
+    int limit = next_task_id;
+    if (limit > max_count) limit = max_count;
+    if (limit > MAX_TASKS) limit = MAX_TASKS;
+
+    for (int i = 0; i < limit; i++) {
+        out[count].pid = tasks[i].id;
+        out[count].parent_pid = tasks[i].parent_id;
+        out[count].pgid = tasks[i].pgid;
+        out[count].state = (uint32_t)tasks[i].state;
+
+        // Copy name
+        int j;
+        for (j = 0; j < STATE_PROC_NAME_LEN - 1 && tasks[i].name[j]; j++) {
+            out[count].name[j] = tasks[i].name[j];
+        }
+        out[count].name[j] = '\0';
+
+        out[count].heap_start = tasks[i].heap_start;
+        out[count].brk = tasks[i].brk;
+        out[count].stack_top = tasks[i].stack_top;
+        out[count].heap_used = (tasks[i].brk > tasks[i].heap_start) ?
+                                tasks[i].brk - tasks[i].heap_start : 0;
+        out[count].pending_signals = tasks[i].pending_signals;
+        out[count].exit_status = tasks[i].exit_status;
+        count++;
+    }
+
+    spinlock_release(&sched_lock);
+    return count;
+}

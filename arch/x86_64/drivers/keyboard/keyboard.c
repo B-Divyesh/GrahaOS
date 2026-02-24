@@ -2,6 +2,7 @@
 #include "keyboard.h"
 #include "../../cpu/ports.h"
 #include "drivers/video/framebuffer.h"
+#include "../../../../kernel/driver.h"
 #include <stddef.h>
 
 #define KEYBOARD_DATA_PORT 0x60
@@ -101,6 +102,22 @@ static uint8_t kb_read_data(void) {
     return inb(KEYBOARD_DATA_PORT);
 }
 
+// Driver framework stats callback
+static int keyboard_get_driver_stats(state_driver_stat_t *stats, int max) {
+    if (!stats || max < 2) return 0;
+    const char *k0 = "interrupts";
+    for (int i = 0; k0[i] && i < STATE_STAT_KEY_LEN - 1; i++) stats[0].key[i] = k0[i];
+    stats[0].key[STATE_STAT_KEY_LEN - 1] = '\0';
+    stats[0].value = (uint64_t)keyboard_interrupts_received;
+    const char *k1 = "buf_used";
+    for (int i = 0; k1[i] && i < STATE_STAT_KEY_LEN - 1; i++) stats[1].key[i] = k1[i];
+    stats[1].key[STATE_STAT_KEY_LEN - 1] = '\0';
+    stats[1].value = (write_index >= read_index) ?
+        (write_index - read_index) :
+        (KEYBOARD_BUFFER_SIZE - read_index + write_index);
+    return 2;
+}
+
 void keyboard_init(void) {
     // Clear the buffer
     read_index = 0;
@@ -175,6 +192,18 @@ void keyboard_init(void) {
     }
     
     framebuffer_draw_string("KB: Ready (Polling Mode)", 10, 280, COLOR_GREEN, 0x00101828);
+
+    // Register with driver framework
+    driver_descriptor_t desc = {
+        .name = "keyboard",
+        .type = DRIVER_TYPE_INPUT,
+        .get_stats = keyboard_get_driver_stats,
+        .op_count = 1,
+        .ops = {
+            { .name = "getchar", .param_count = 0, .flags = DRIVER_OP_QUERY },
+        }
+    };
+    driver_register(&desc);
 }
 
 void keyboard_handle_scancode(uint8_t scancode) {

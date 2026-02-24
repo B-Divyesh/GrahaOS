@@ -2,6 +2,7 @@
 #include "framebuffer.h"
 #include "../../kernel/limine.h"
 #include "../../kernel/sync/spinlock.h"
+#include "../../kernel/driver.h"
 
 // --- Private Variables ---
 static struct limine_framebuffer *fb = NULL;
@@ -209,6 +210,24 @@ void framebuffer_draw_string_nolock(const char *str, uint32_t x, uint32_t y,
 }
 
 
+// Driver framework stats callback
+static int fb_get_driver_stats(state_driver_stat_t *stats, int max) {
+    if (!stats || max < 3) return 0;
+    const char *k0 = "width";
+    for (int i = 0; k0[i] && i < STATE_STAT_KEY_LEN - 1; i++) stats[0].key[i] = k0[i];
+    stats[0].key[STATE_STAT_KEY_LEN - 1] = '\0';
+    stats[0].value = (uint64_t)fb_width;
+    const char *k1 = "height";
+    for (int i = 0; k1[i] && i < STATE_STAT_KEY_LEN - 1; i++) stats[1].key[i] = k1[i];
+    stats[1].key[STATE_STAT_KEY_LEN - 1] = '\0';
+    stats[1].value = (uint64_t)fb_height;
+    const char *k2 = "pitch";
+    for (int i = 0; k2[i] && i < STATE_STAT_KEY_LEN - 1; i++) stats[2].key[i] = k2[i];
+    stats[2].key[STATE_STAT_KEY_LEN - 1] = '\0';
+    stats[2].value = (uint64_t)fb_pitch;
+    return 3;
+}
+
 // Public functions
 bool framebuffer_init(volatile struct limine_framebuffer_request *fb_request) {
     if (!fb_request || !fb_request->response ||
@@ -224,6 +243,25 @@ bool framebuffer_init(volatile struct limine_framebuffer_request *fb_request) {
     
     // Reinitialize the lock (even though it's statically initialized)
     spinlock_init(&fb_lock, "framebuffer");
+
+    // Register with driver framework (only once - framebuffer_init may be called twice)
+    static int fb_registered = 0;
+    if (!fb_registered) {
+        driver_descriptor_t desc = {
+            .name = "framebuffer",
+            .type = DRIVER_TYPE_DISPLAY,
+            .get_stats = fb_get_driver_stats,
+            .op_count = 4,
+            .ops = {
+                { .name = "draw_rect",   .param_count = 5, .flags = DRIVER_OP_MUTATING },
+                { .name = "draw_string", .param_count = 5, .flags = DRIVER_OP_MUTATING },
+                { .name = "draw_char",   .param_count = 4, .flags = DRIVER_OP_MUTATING },
+                { .name = "clear",       .param_count = 1, .flags = DRIVER_OP_MUTATING },
+            }
+        };
+        driver_register(&desc);
+        fb_registered = 1;
+    }
 
     return true;
 }

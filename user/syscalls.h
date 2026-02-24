@@ -28,6 +28,7 @@ typedef long ssize_t;
 #define SYS_KILL    1018
 #define SYS_SIGNAL  1019
 #define SYS_GETPID  1020
+#define SYS_GET_SYSTEM_STATE 1021
 
 // Directory entry structure for user space
 typedef struct {
@@ -158,4 +159,17 @@ static inline int syscall_getpid(void) {
     long ret;
     asm volatile("syscall" : "=a"(ret) : "a"(SYS_GETPID) : "rcx", "r11", "memory");
     return (int)ret;
+}
+
+// Phase 8a: Get system state snapshot
+// category: STATE_CAT_* from state.h
+// buf: user buffer to fill, or NULL to query required size
+// buf_size: size of user buffer
+// Returns: bytes written on success, required size if buf is NULL, negative on error
+static inline long syscall_get_system_state(uint32_t category, void *buf, size_t buf_size) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_GET_SYSTEM_STATE), "D"(category), "S"(buf), "d"(buf_size)
+        : "rcx", "r11", "memory");
+    return ret;
 }

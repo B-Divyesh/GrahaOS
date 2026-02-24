@@ -29,6 +29,7 @@
 #define SYS_KILL        1018
 #define SYS_SIGNAL      1019
 #define SYS_GETPID      1020
+#define SYS_GET_SYSTEM_STATE 1021
 #define SYS_DEBUG       9999
 
 // Generic syscall functions
@@ -223,6 +224,12 @@ int usleep(unsigned int usec) {
     // TODO: Implement SYS_NANOSLEEP in kernel
     for (volatile unsigned long j = 0; j < usec * 100; j++);
     return 0;
+}
+
+// ===== SYSTEM STATE (Phase 8a) =====
+
+long get_system_state(uint32_t category, void *buf, size_t buf_size) {
+    return syscall3(SYS_GET_SYSTEM_STATE, category, (long)buf, buf_size);
 }
 
 // ===== GCP (GrahaOS Control Protocol) =====

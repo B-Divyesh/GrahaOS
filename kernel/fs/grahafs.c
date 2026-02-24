@@ -7,6 +7,7 @@
 #include "../sync/spinlock.h"
 #include "../../arch/x86_64/drivers/ahci/ahci.h"
 #include "../../arch/x86_64/drivers/serial/serial.h"
+#include "../driver.h"
 
 static block_device_t* fs_device = NULL;
 static grahafs_superblock_t superblock;
@@ -818,9 +819,44 @@ vfs_node_t* grahafs_readdir(vfs_node_t* node, uint32_t index) {
 
 
 
+// Driver framework stats callback
+static int grahafs_get_driver_stats(state_driver_stat_t *stats, int max) {
+    if (!stats || max < 4) return 0;
+    const char *k0 = "mounted";
+    for (int i = 0; k0[i] && i < STATE_STAT_KEY_LEN - 1; i++) stats[0].key[i] = k0[i];
+    stats[0].key[STATE_STAT_KEY_LEN - 1] = '\0';
+    stats[0].value = fs_mounted ? 1 : 0;
+    const char *k1 = "total_blocks";
+    for (int i = 0; k1[i] && i < STATE_STAT_KEY_LEN - 1; i++) stats[1].key[i] = k1[i];
+    stats[1].key[STATE_STAT_KEY_LEN - 1] = '\0';
+    stats[1].value = fs_mounted ? (uint64_t)superblock.total_blocks : 0;
+    const char *k2 = "free_blocks";
+    for (int i = 0; k2[i] && i < STATE_STAT_KEY_LEN - 1; i++) stats[2].key[i] = k2[i];
+    stats[2].key[STATE_STAT_KEY_LEN - 1] = '\0';
+    stats[2].value = fs_mounted ? (uint64_t)superblock.free_blocks : 0;
+    const char *k3 = "free_inodes";
+    for (int i = 0; k3[i] && i < STATE_STAT_KEY_LEN - 1; i++) stats[3].key[i] = k3[i];
+    stats[3].key[STATE_STAT_KEY_LEN - 1] = '\0';
+    stats[3].value = fs_mounted ? (uint64_t)superblock.free_inodes : 0;
+    return 4;
+}
+
 void grahafs_init(void) {
     spinlock_init(&grahafs_lock, "grahafs");
     framebuffer_draw_string("GrahaFS: Driver initialized.", 10, 650, COLOR_GREEN, 0x00101828);
+
+    // Register with driver framework
+    driver_descriptor_t desc = {
+        .name = "grahafs",
+        .type = DRIVER_TYPE_FS,
+        .get_stats = grahafs_get_driver_stats,
+        .op_count = 2,
+        .ops = {
+            { .name = "mount", .param_count = 1, .flags = DRIVER_OP_MUTATING },
+            { .name = "sync",  .param_count = 0, .flags = DRIVER_OP_MUTATING },
+        }
+    };
+    driver_register(&desc);
 }
 
 // Mount function with robust diagnostics
@@ -1043,7 +1079,26 @@ int grahafs_unmount(vfs_node_t* root) {
     }
     
     fs_device = NULL;
-    
+
     spinlock_release(&grahafs_lock);
     return 0;
+}
+
+// Phase 8a: Get GrahaFS statistics for system state reporting
+void grahafs_get_stats(uint32_t *mounted, uint32_t *total_blocks,
+                       uint32_t *free_blocks, uint32_t *free_inodes) {
+    spinlock_acquire(&grahafs_lock);
+
+    if (mounted) *mounted = fs_mounted ? 1 : 0;
+    if (fs_mounted) {
+        if (total_blocks) *total_blocks = superblock.total_blocks;
+        if (free_blocks) *free_blocks = superblock.free_blocks;
+        if (free_inodes) *free_inodes = superblock.free_inodes;
+    } else {
+        if (total_blocks) *total_blocks = 0;
+        if (free_blocks) *free_blocks = 0;
+        if (free_inodes) *free_inodes = 0;
+    }
+
+    spinlock_release(&grahafs_lock);
 }

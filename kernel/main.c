@@ -381,6 +381,17 @@ void kmain(void) {
     serial_write_dec(process_id);
     serial_write("\n");
 
+    // Set process name for the shell
+    {
+        task_t *shell_task = sched_get_task(process_id);
+        if (shell_task) {
+            const char *n = "gash";
+            int j = 0;
+            while (n[j] && j < 31) { shell_task->name[j] = n[j]; j++; }
+            shell_task->name[j] = '\0';
+        }
+    }
+
     serial_write("Drawing 'Shell process created' message...\n");
     framebuffer_draw_string("Shell process created.", 50, y_pos, COLOR_GREEN, 0x00101828);
     serial_write("Message drawn\n");
@@ -432,7 +443,18 @@ void kmain(void) {
     serial_write("sched_create_task returned: ");
     serial_write_dec(kbd_task_id);
     serial_write("\n");
-    
+
+    // Set task name for keyboard polling
+    {
+        task_t *kbd_task = sched_get_task(kbd_task_id);
+        if (kbd_task) {
+            const char *n = "kbd_poll";
+            int j = 0;
+            while (n[j] && j < 31) { kbd_task->name[j] = n[j]; j++; }
+            kbd_task->name[j] = '\0';
+        }
+    }
+
     if (kbd_task_id < 0) {
         framebuffer_draw_string("ERROR: Failed to create keyboard task!", 50, y_pos, COLOR_RED, 0x00101828);
         y_pos += 20;

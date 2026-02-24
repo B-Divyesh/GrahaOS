@@ -516,3 +516,25 @@ void vfs_sync(void) {
         }
     }
 }
+
+// Phase 8a: Get VFS statistics for system state reporting
+void vfs_get_stats(uint32_t *open_files, uint32_t *block_devs, uint32_t *mounted_fs) {
+    spinlock_acquire(&vfs_lock);
+
+    uint32_t of = 0, bd = 0, mf = 0;
+    for (int i = 0; i < MAX_OPEN_FILES; i++) {
+        if (open_file_table[i].in_use) of++;
+    }
+    for (int i = 0; i < MAX_BLOCK_DEVICES; i++) {
+        if (block_device_table[i].in_use) bd++;
+    }
+    for (int i = 0; i < MAX_FILESYSTEMS; i++) {
+        if (filesystem_table[i].mounted) mf++;
+    }
+
+    spinlock_release(&vfs_lock);
+
+    if (open_files) *open_files = of;
+    if (block_devs) *block_devs = bd;
+    if (mounted_fs) *mounted_fs = mf;
+}

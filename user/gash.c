@@ -1,5 +1,6 @@
 // user/gash.c - COMPLETE FILE
 #include "syscalls.h"
+#include "../kernel/state.h"
 
 // Helper functions
 int strcmp(const char *s1, const char *s2) {
@@ -38,23 +39,54 @@ void int_to_string(int num, char *str) {
         str[1] = '\0';
         return;
     }
-    
+
     int i = 0, is_negative = 0;
     if (num < 0) {
         is_negative = 1;
         num = -num;
     }
-    
+
     char temp[12];
     while (num > 0) {
         temp[i++] = '0' + (num % 10);
         num /= 10;
     }
-    
+
     int j = 0;
     if (is_negative) str[j++] = '-';
     while (i > 0) str[j++] = temp[--i];
     str[j] = '\0';
+}
+
+void uint64_to_str(uint64_t num, char *str) {
+    if (num == 0) {
+        str[0] = '0';
+        str[1] = '\0';
+        return;
+    }
+    char temp[21];
+    int i = 0;
+    while (num > 0) {
+        temp[i++] = '0' + (num % 10);
+        num /= 10;
+    }
+    int j = 0;
+    while (i > 0) str[j++] = temp[--i];
+    str[j] = '\0';
+}
+
+// Print uint64 with a label
+void print_u64(const char *label, uint64_t val) {
+    print(label);
+    char buf[21];
+    uint64_to_str(val, buf);
+    print(buf);
+    print("\n");
+}
+
+// Print uint32 with a label
+void print_u32(const char *label, uint32_t val) {
+    print_u64(label, (uint64_t)val);
 }
 
 void readline(char *buffer, int max_len) {
@@ -244,18 +276,267 @@ void cmd_echo(char* argv[], int argc) {
 }
 
 void cmd_memstate(void) {
+    state_memory_t mem;
+    long ret = syscall_get_system_state(STATE_CAT_MEMORY, &mem, sizeof(mem));
+    if (ret < 0) {
+        print("memstate: failed to get memory state\n");
+        return;
+    }
+
     print("=== Memory State ===\n");
     print("Physical Memory:\n");
-    print("  Total: [Implemented in kernel]\n");
-    print("  Used:  [Implemented in kernel]\n");
-    print("  Free:  [Implemented in kernel]\n");
-    print("\nVirtual Memory:\n");
-    print("  Kernel Space: 0xFFFF800000000000 - 0xFFFFFFFFFFFFFFFF\n");
-    print("  User Space:   0x0000000000000000 - 0x00007FFFFFFFFFFF\n");
-    print("\nFilesystem:\n");
-    print("  Mounted: GrahaFS on /\n");
-    print("  Block Size: 4096 bytes\n");
-    print("===================\n");
+    print_u64("  Total:     ", mem.total_physical);
+    print_u64("  Used:      ", mem.used_physical);
+    print_u64("  Free:      ", mem.free_physical);
+    print_u64("  Page Size: ", mem.page_size);
+    print_u64("  Total Pages: ", mem.total_pages);
+    print_u64("  Used Pages:  ", mem.used_pages);
+
+    // Also show filesystem stats
+    state_filesystem_t fs;
+    ret = syscall_get_system_state(STATE_CAT_FILESYSTEM, &fs, sizeof(fs));
+    if (ret > 0) {
+        print("\nFilesystem:\n");
+        print_u32("  Open Files:     ", fs.open_files);
+        print_u32("  Block Devices:  ", fs.block_devices);
+        print_u32("  Mounted FS:     ", fs.mounted_fs);
+        if (fs.grahafs_mounted) {
+            print("  GrahaFS: mounted\n");
+            print_u32("    Total Blocks: ", fs.grahafs_total_blocks);
+            print_u32("    Free Blocks:  ", fs.grahafs_free_blocks);
+            print_u32("    Free Inodes:  ", fs.grahafs_free_inodes);
+            print_u32("    Block Size:   ", fs.grahafs_block_size);
+        } else {
+            print("  GrahaFS: not mounted\n");
+        }
+    }
+    print("====================\n");
+}
+
+static const char *proc_state_str(uint32_t state) {
+    switch (state) {
+        case STATE_PROC_ZOMBIE:  return "ZOMBIE ";
+        case STATE_PROC_READY:   return "READY  ";
+        case STATE_PROC_RUNNING: return "RUNNING";
+        case STATE_PROC_BLOCKED: return "BLOCKED";
+        default:                 return "UNKNOWN";
+    }
+}
+
+void cmd_ps(void) {
+    state_process_list_t procs;
+    long ret = syscall_get_system_state(STATE_CAT_PROCESSES, &procs, sizeof(procs));
+    if (ret < 0) {
+        print("ps: failed to get process list\n");
+        return;
+    }
+
+    print("PID  PPID PGID STATE   HEAP_USED  NAME\n");
+    print("---- ---- ---- ------- ---------- ----------------\n");
+
+    char buf[21];
+    for (uint32_t i = 0; i < procs.count; i++) {
+        state_process_t *p = &procs.procs[i];
+
+        // PID (left-padded to 4)
+        int_to_string(p->pid, buf);
+        int len = strlen(buf);
+        for (int j = 0; j < 4 - len; j++) print(" ");
+        print(buf);
+        print(" ");
+
+        // PPID
+        int_to_string(p->parent_pid, buf);
+        len = strlen(buf);
+        for (int j = 0; j < 4 - len; j++) print(" ");
+        print(buf);
+        print(" ");
+
+        // PGID
+        int_to_string(p->pgid, buf);
+        len = strlen(buf);
+        for (int j = 0; j < 4 - len; j++) print(" ");
+        print(buf);
+        print(" ");
+
+        // State
+        print(proc_state_str(p->state));
+        print(" ");
+
+        // Heap used
+        uint64_to_str(p->heap_used, buf);
+        len = strlen(buf);
+        for (int j = 0; j < 10 - len; j++) print(" ");
+        print(buf);
+        print(" ");
+
+        // Name
+        if (p->name[0]) {
+            print(p->name);
+        } else {
+            print("<unnamed>");
+        }
+        print("\n");
+    }
+
+    print("\nTotal: ");
+    uint64_to_str(procs.count, buf);
+    print(buf);
+    print(" processes\n");
+}
+
+static const char *driver_type_str(uint32_t type) {
+    switch (type) {
+        case STATE_DRIVER_BLOCK:   return "BLOCK  ";
+        case STATE_DRIVER_INPUT:   return "INPUT  ";
+        case STATE_DRIVER_DISPLAY: return "DISPLAY";
+        case STATE_DRIVER_TIMER:   return "TIMER  ";
+        case STATE_DRIVER_SERIAL:  return "SERIAL ";
+        case STATE_DRIVER_FS:      return "FS     ";
+        default:                   return "OTHER  ";
+    }
+}
+
+void cmd_drivers(void) {
+    state_driver_list_t drivers;
+    long ret = syscall_get_system_state(STATE_CAT_DRIVERS, &drivers, sizeof(drivers));
+    if (ret < 0) {
+        print("drivers: failed to get driver list\n");
+        return;
+    }
+
+    char buf[21];
+
+    print("=== Registered Drivers ===\n\n");
+    for (uint32_t i = 0; i < drivers.count; i++) {
+        state_driver_info_t *d = &drivers.drivers[i];
+
+        print("[");
+        uint64_to_str(i, buf);
+        print(buf);
+        print("] ");
+        print(d->name);
+        print("  type=");
+        print(driver_type_str(d->type));
+        print("\n");
+
+        // Print stats
+        if (d->stat_count > 0) {
+            print("  Stats:\n");
+            for (uint32_t j = 0; j < d->stat_count; j++) {
+                print("    ");
+                print(d->stats[j].key);
+                print(" = ");
+                uint64_to_str(d->stats[j].value, buf);
+                print(buf);
+                print("\n");
+            }
+        }
+
+        // Print operations
+        if (d->op_count > 0) {
+            print("  Ops:");
+            for (uint32_t j = 0; j < d->op_count; j++) {
+                print(" ");
+                print(d->ops[j].name);
+                if (d->ops[j].flags == 1) {
+                    print("(w)");
+                } else {
+                    print("(r)");
+                }
+            }
+            print("\n");
+        }
+        print("\n");
+    }
+
+    print("Total: ");
+    uint64_to_str(drivers.count, buf);
+    print(buf);
+    print(" drivers\n");
+}
+
+void cmd_sysstate(void) {
+    // Full system state dump - the AI-readable command
+    state_snapshot_t state;
+    long ret = syscall_get_system_state(STATE_CAT_ALL, &state, sizeof(state));
+    if (ret < 0) {
+        print("sysstate: failed to get system state\n");
+        return;
+    }
+
+    char buf[21];
+
+    print("=== GrahaOS System State v");
+    uint64_to_str(state.version, buf);
+    print(buf);
+    print(" ===\n\n");
+
+    // Memory
+    print("[MEMORY]\n");
+    print_u64("  total=", state.memory.total_physical);
+    print_u64("  free=", state.memory.free_physical);
+    print_u64("  used=", state.memory.used_physical);
+    print_u64("  pages_total=", state.memory.total_pages);
+    print_u64("  pages_used=", state.memory.used_pages);
+
+    // CPU
+    print("\n[SYSTEM]\n");
+    print_u32("  cpus=", state.system.cpu_count);
+    print_u32("  bsp_lapic=", state.system.bsp_lapic_id);
+    print_u32("  schedules=", state.system.schedule_count);
+    print_u32("  ctx_switches=", state.system.context_switches);
+
+    // Processes
+    print("\n[PROCESSES] count=");
+    uint64_to_str(state.processes.count, buf);
+    print(buf);
+    print("\n");
+    for (uint32_t i = 0; i < state.processes.count; i++) {
+        state_process_t *p = &state.processes.procs[i];
+        print("  pid=");
+        int_to_string(p->pid, buf);
+        print(buf);
+        print(" state=");
+        print(proc_state_str(p->state));
+        print(" name=");
+        print(p->name[0] ? p->name : "<unnamed>");
+        print("\n");
+    }
+
+    // Filesystem
+    print("\n[FILESYSTEM]\n");
+    print_u32("  open_files=", state.filesystem.open_files);
+    print_u32("  block_devices=", state.filesystem.block_devices);
+    print_u32("  mounted_fs=", state.filesystem.mounted_fs);
+    print_u32("  grahafs_mounted=", state.filesystem.grahafs_mounted);
+    if (state.filesystem.grahafs_mounted) {
+        print_u32("  grahafs_total_blocks=", state.filesystem.grahafs_total_blocks);
+        print_u32("  grahafs_free_blocks=", state.filesystem.grahafs_free_blocks);
+        print_u32("  grahafs_free_inodes=", state.filesystem.grahafs_free_inodes);
+    }
+
+    // Drivers
+    print("\n[DRIVERS] count=");
+    uint64_to_str(state.drivers.count, buf);
+    print(buf);
+    print("\n");
+    for (uint32_t i = 0; i < state.drivers.count; i++) {
+        state_driver_info_t *d = &state.drivers.drivers[i];
+        print("  ");
+        print(d->name);
+        print(" type=");
+        print(driver_type_str(d->type));
+        print(" ops=");
+        uint64_to_str(d->op_count, buf);
+        print(buf);
+        print(" stats=");
+        uint64_to_str(d->stat_count, buf);
+        print(buf);
+        print("\n");
+    }
+
+    print("\n=== End System State ===\n");
 }
 
 // Helper: spawn and wait for a program
@@ -302,9 +583,13 @@ void _start(void) {
             print("  mkdir <dir>     - Create directory\n");
             print("  echo <text>     - Print text\n");
             print("  echo <text> > <file> - Write text to file\n");
-            print("  memstate        - Show memory information\n");
+            print("  memstate        - Show memory & filesystem state\n");
+            print("  ps              - List running processes\n");
+            print("  drivers         - List registered drivers\n");
+            print("  sysstate        - Full system state dump\n");
             print("  pid             - Show current process ID\n");
             print("  kill <pid>      - Terminate a process\n");
+            print("  sync            - Flush filesystem to disk\n");
             print("  test            - Keyboard test\n");
             print("  grahai          - Run GCP interpreter\n");
             print("  exit            - Exit the shell\n");
@@ -343,6 +628,15 @@ void _start(void) {
         }
         else if (strcmp(cmd, "memstate") == 0) {
             cmd_memstate();
+        }
+        else if (strcmp(cmd, "ps") == 0) {
+            cmd_ps();
+        }
+        else if (strcmp(cmd, "drivers") == 0) {
+            cmd_drivers();
+        }
+        else if (strcmp(cmd, "sysstate") == 0) {
+            cmd_sysstate();
         }
         else if (strcmp(cmd, "pid") == 0) {
             int current_pid = syscall_getpid();

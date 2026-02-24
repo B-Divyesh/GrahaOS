@@ -5,6 +5,7 @@
 #include "../../mm/vmm.h" // For vmm_address_space_t
 #include "../smp.h"
 #include "../../../../kernel/sync/spinlock.h"
+#include "../../../../kernel/state.h"
 
 #define MAX_TASKS 32
 #define KERNEL_STACK_SIZE 16384
@@ -168,4 +169,16 @@ task_t* sched_get_task_any(int id);
  * @return Current task index
  */
 int sched_get_current_task_index(void);
+
+// Phase 8a: Scheduler statistics (read-only, volatile)
+extern volatile uint32_t schedule_count;
+extern volatile uint32_t context_switches;
+
+/**
+ * @brief Snapshot all processes for system state reporting (Phase 8a)
+ * @param out Array of state_process_t to fill
+ * @param max_count Maximum entries to write
+ * @return Number of entries written
+ */
+int sched_snapshot_processes(state_process_t *out, int max_count);
 

@@ -125,3 +125,6 @@ int vfs_create(const char* path, uint32_t mode);
 int vfs_mkdir(const char* path, uint32_t mode);
 void vfs_sync(void);
 vfs_node_t* vfs_path_to_node(const char* path);
+
+// Phase 8a: Get VFS statistics for system state reporting
+void vfs_get_stats(uint32_t *open_files, uint32_t *block_devs, uint32_t *mounted_fs);

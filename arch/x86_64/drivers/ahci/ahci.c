@@ -6,6 +6,7 @@
 #include "../../../../drivers/video/framebuffer.h"
 #include "../../../../kernel/fs/vfs.h"
 #include "../../../../kernel/sync/spinlock.h"
+#include "../../../../kernel/driver.h"
 
 #define HBA_PORT_DEV_PRESENT 0x3
 #define HBA_PORT_IPM_ACTIVE 0x1
@@ -188,6 +189,22 @@ int ahci_vfs_write(int dev_id, uint64_t block_num, uint16_t block_count, void* b
     return result;
 }
 
+// Driver framework stats callback
+static int ahci_get_driver_stats(state_driver_stat_t *stats, int max) {
+    if (!stats || max < 2) return 0;
+    // Stat 0: port_count
+    const char *k0 = "port_count";
+    for (int i = 0; k0[i] && i < STATE_STAT_KEY_LEN - 1; i++) stats[0].key[i] = k0[i];
+    stats[0].key[STATE_STAT_KEY_LEN - 1] = '\0';
+    stats[0].value = (uint64_t)port_count;
+    // Stat 1: sector_size
+    const char *k1 = "sector_size";
+    for (int i = 0; k1[i] && i < STATE_STAT_KEY_LEN - 1; i++) stats[1].key[i] = k1[i];
+    stats[1].key[STATE_STAT_KEY_LEN - 1] = '\0';
+    stats[1].value = 512;
+    return 2;
+}
+
 void ahci_init(void) {
     spinlock_init(&ahci_lock, "ahci");
     
@@ -234,6 +251,20 @@ void ahci_init(void) {
             }
         }
     }
+
+    // Register with driver framework
+    driver_descriptor_t desc = {
+        .name = "ahci",
+        .type = DRIVER_TYPE_BLOCK,
+        .get_stats = ahci_get_driver_stats,
+        .op_count = 3,
+        .ops = {
+            { .name = "read",  .param_count = 3, .flags = DRIVER_OP_QUERY },
+            { .name = "write", .param_count = 3, .flags = DRIVER_OP_MUTATING },
+            { .name = "flush", .param_count = 1, .flags = DRIVER_OP_MUTATING },
+        }
+    };
+    driver_register(&desc);
 }
 
 int ahci_read(int port_num, uint64_t lba, uint16_t count, void *buf) {

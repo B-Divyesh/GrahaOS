@@ -3,10 +3,25 @@
 
 #include "serial.h"
 #include "../../cpu/ports.h"
+#include "../../../../kernel/driver.h"
 
 #define PORT_COM1 0x3F8
 
 static int serial_initialized = 0;
+
+// Driver framework stats callback
+static int serial_get_driver_stats(state_driver_stat_t *stats, int max) {
+    if (!stats || max < 2) return 0;
+    const char *k0 = "initialized";
+    for (int i = 0; k0[i] && i < STATE_STAT_KEY_LEN - 1; i++) stats[0].key[i] = k0[i];
+    stats[0].key[STATE_STAT_KEY_LEN - 1] = '\0';
+    stats[0].value = (uint64_t)serial_initialized;
+    const char *k1 = "baud_rate";
+    for (int i = 0; k1[i] && i < STATE_STAT_KEY_LEN - 1; i++) stats[1].key[i] = k1[i];
+    stats[1].key[STATE_STAT_KEY_LEN - 1] = '\0';
+    stats[1].value = 38400;
+    return 2;
+}
 
 void serial_init(void) {
     // Disable interrupts
@@ -29,6 +44,19 @@ void serial_init(void) {
     outb(PORT_COM1 + 4, 0x0B);
 
     serial_initialized = 1;
+
+    // Register with driver framework
+    driver_descriptor_t desc = {
+        .name = "serial",
+        .type = DRIVER_TYPE_SERIAL,
+        .get_stats = serial_get_driver_stats,
+        .op_count = 2,
+        .ops = {
+            { .name = "write", .param_count = 1, .flags = DRIVER_OP_MUTATING },
+            { .name = "putc",  .param_count = 1, .flags = DRIVER_OP_MUTATING },
+        }
+    };
+    driver_register(&desc);
 }
 
 static int is_transmit_empty(void) {
