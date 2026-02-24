@@ -32,6 +32,12 @@
 #define SYS_SYNC 1015
 #define SYS_BRK  1016
 
+// Phase 7d: Modern Process Management
+#define SYS_SPAWN  1017
+#define SYS_KILL   1018
+#define SYS_SIGNAL 1019
+#define SYS_GETPID 1020
+
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);
 

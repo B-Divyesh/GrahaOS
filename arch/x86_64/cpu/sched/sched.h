@@ -3,12 +3,23 @@
 #include <stddef.h>
 #include "../interrupts.h"
 #include "../../mm/vmm.h" // For vmm_address_space_t
-#include "../interrupts.h"
 #include "../smp.h"
 #include "../../../../kernel/sync/spinlock.h"
 
 #define MAX_TASKS 32
 #define KERNEL_STACK_SIZE 16384
+
+// Signal definitions (Phase 7d)
+#define SIGTERM   1   // Terminate process (catchable)
+#define SIGKILL   2   // Kill process (uncatchable)
+#define SIGUSR1   3   // User-defined signal 1
+#define SIGUSR2   4   // User-defined signal 2
+#define SIGCHLD   5   // Child process exited
+#define MAX_SIGNALS 16
+
+// Default signal actions
+#define SIG_DFL  ((void (*)(int))0)   // Default action (terminate)
+#define SIG_IGN  ((void (*)(int))1)   // Ignore signal
 
 // Task states
 typedef enum {
@@ -17,6 +28,13 @@ typedef enum {
     TASK_STATE_RUNNING,
     TASK_STATE_BLOCKED
 } task_state_t;
+
+// Spawn attributes for sys_spawn (Phase 7d)
+typedef struct {
+    int inherit_fds;      // Whether to inherit parent's file descriptors
+    int priority;         // Scheduling priority (reserved for future use)
+    uint32_t flags;       // Additional flags (reserved)
+} spawn_attrs_t;
 
 // Task structure
 typedef struct {
@@ -34,6 +52,12 @@ typedef struct {
     uint64_t heap_start;     // Start of heap region
     uint64_t brk;            // Current program break (end of heap)
     uint64_t stack_top;      // Top of user stack (to prevent heap collision)
+
+    // Process management (Phase 7d)
+    char name[32];                          // Process name
+    int pgid;                               // Process group ID
+    uint32_t pending_signals;               // Bitmask of pending signals
+    void (*signal_handlers[MAX_SIGNALS])(int); // Signal handler function pointers
 } task_t;
 
 /**
@@ -100,4 +124,48 @@ void sched_reap_zombie(int task_id);
  * @param child_id Child task ID that exited
  */
 void wake_waiting_parent(int child_id);
+
+/**
+ * @brief Spawn a new process from an ELF binary (Phase 7d)
+ * @param path Path to ELF binary in initrd
+ * @param parent_id ID of the parent process
+ * @return Child PID on success, -1 on failure
+ */
+int sched_spawn_process(const char *path, int parent_id);
+
+/**
+ * @brief Send a signal to a process
+ * @param pid Target process ID
+ * @param signal Signal number
+ * @return 0 on success, -1 on failure
+ */
+int sched_send_signal(int pid, int signal);
+
+/**
+ * @brief Register a signal handler for the current process
+ * @param signal Signal number
+ * @param handler Handler function pointer
+ * @return Previous handler, or SIG_DFL on error
+ */
+void* sched_set_signal_handler(int signal, void (*handler)(int));
+
+/**
+ * @brief Check and deliver pending signals for a task
+ * @param task Task to check
+ * @return 1 if a signal was delivered, 0 otherwise
+ */
+int sched_deliver_signals(task_t *task);
+
+/**
+ * @brief Get a task by ID (including zombies)
+ * @param id Task ID
+ * @return Pointer to the task, or NULL if not found
+ */
+task_t* sched_get_task_any(int id);
+
+/**
+ * @brief Get the current task index
+ * @return Current task index
+ */
+int sched_get_current_task_index(void);
 

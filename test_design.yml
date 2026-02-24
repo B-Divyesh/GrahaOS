@@ -1,0 +1,206 @@
+# GrahaOS Test Design Document
+# This document describes ALL features and how to test them.
+# Update this after every implementation phase.
+# Last Updated: Phase 7d (memory corruption fixes)
+
+---
+
+boot_test:
+  description: "Verify GrahaOS boots successfully"
+  method: "QEMU with serial output"
+  command: >
+    timeout 25 qemu-system-x86_64 -cdrom grahaos.iso
+    -serial file:/tmp/grahaos_serial.log -m 512M -smp 4
+    -drive file=disk.img,format=raw,if=none,id=mydisk,cache=none
+    -device ich9-ahci,id=ahci
+    -device ide-hd,drive=mydisk,bus=ahci.0
+    -display none
+  expected_output:
+    - "=== GrahaOS Boot Log ==="
+    - "PMM initialized successfully"
+    - "VMM initialized, paging active"
+    - "SMP initialized successfully"
+    - "IDT initialized successfully"
+    - "Scheduler initialized successfully"
+    - "Syscalls initialized successfully"
+    - "AHCI initialized successfully"
+    - "GrahaFS driver initialized"
+    - "gash>"
+  status: PASSING
+
+multicore_test:
+  description: "Verify SMP multi-core initialization"
+  method: "Check serial output for CPU online messages"
+  expected_output:
+    - "CPU count: 4"
+    - "SMP initialized successfully"
+  status: PASSING
+
+filesystem_test:
+  description: "Verify GrahaFS mount and basic operations"
+  method: "Check serial output and use gash commands"
+  gash_commands:
+    - command: "ls /"
+      expected: "Directory listing showing bin/ and etc/"
+    - command: "cat /etc/motd.txt"
+      expected: "File contents displayed"
+    - command: "touch /testfile"
+      expected: "Created file: /testfile"
+    - command: "mkdir /testdir"
+      expected: "Created directory: /testdir"
+    - command: "echo hello > /testfile"
+      expected: "Written to /testfile"
+    - command: "sync"
+      expected: "Sync complete."
+  status: PASSING
+
+libc_test:
+  description: "Verify user-space C library (Phase 7c)"
+  method: "Run libctest from gash"
+  gash_command: "libctest"
+  expected_output:
+    - "ALL TESTS PASSED!"
+    - "Passed: 37"
+    - "Failed: 0"
+  tests_covered:
+    - sys_brk/sbrk heap operations (6 tests)
+    - malloc/free/calloc/realloc (11 tests)
+    - string.h functions (14 tests)
+    - printf format specifiers (1 test)
+    - stress tests (3 tests)
+  status: PASSING
+
+spawn_test:
+  description: "Verify modern process management (Phase 7d)"
+  method: "Run spawntest from gash"
+  gash_command: "spawntest"
+  expected_output:
+    - "getpid returns valid PID"
+    - "spawn returns valid child PID"
+    - "wait reaps spawned child"
+    - "spawn rejects invalid path"
+    - "wait returns error with no children"
+    - "kill rejects invalid PID"
+    - "getpid returns consistent PID"
+    - "ALL TESTS PASSED!"
+  tests_covered:
+    - sys_getpid returns valid PID
+    - sys_spawn creates child process from ELF
+    - sys_wait reaps zombie child and returns exit status
+    - sys_spawn rejects nonexistent paths
+    - sys_wait returns error when no children exist
+    - sys_kill rejects invalid PIDs
+    - sys_getpid returns consistent value
+  status: NEEDS_VERIFICATION
+
+gash_spawn_test:
+  description: "Verify gash shell uses spawn model correctly"
+  method: "Interactive gash testing"
+  gash_commands:
+    - command: "pid"
+      expected: "Shows current PID"
+    - command: "help"
+      expected: "Shows help with kill and pid commands"
+    - command: "libctest"
+      expected: "Spawns and waits for libctest, shows exit status"
+    - command: "grahai"
+      expected: "Spawns and waits for grahai"
+    - command: "kill 999"
+      expected: "kill: failed to kill process 999"
+  status: NEEDS_VERIFICATION
+
+signal_test:
+  description: "Verify signal handling (Phase 7d)"
+  method: "Test via sys_kill from gash"
+  tests:
+    - description: "SIGTERM default action terminates process"
+      method: "Spawn a long-running process, send SIGTERM from gash"
+    - description: "SIGKILL cannot be caught"
+      method: "Send SIGKILL, verify process terminates immediately"
+    - description: "Invalid signal number rejected"
+      method: "Send signal 0 or >= MAX_SIGNALS"
+  status: NEEDS_VERIFICATION
+
+memory_safety_test:
+  description: "Verify memory corruption fixes (Phase 7d hardening)"
+  fixes_applied:
+    - "vmm_destroy_address_space: walks user-half page tables, frees all pages"
+    - "sched_reap_zombie: now destroys user address space on process cleanup"
+    - "Duplicate stack fix: removed 2MB stack from elf_load, sched uses 64-page stack"
+    - "Race condition fix: tasks start BLOCKED, set READY only after full init"
+    - "Signal delivery fix: falls back to idle task if no runnable task found"
+    - "SIGKILL fix: proper locking during state transition"
+    - "User pointer validation: is_user_pointer() checks in all syscall handlers"
+    - "Address space pool reuse: vmm_create_address_space reuses freed slots"
+  gdb_checks:
+    - "break vmm_destroy_address_space - verify called on process exit"
+    - "break sched_reap_zombie - verify address space freed"
+    - "p used_pages before and after spawn+exit - verify pages returned"
+    - "p tasks[N].state - verify BLOCKED during init, READY after"
+  status: NEEDS_VERIFICATION
+
+gdb_verification:
+  description: "GDB debugging verification steps"
+  command: >
+    make debug
+    # In another terminal:
+    gdb -ex "target remote localhost:1234"
+        -ex "symbol-file kernel/kernel.elf"
+  breakpoints:
+    - "break sched_spawn_process"
+    - "break syscall_dispatcher"
+    - "break sched_send_signal"
+    - "break sched_deliver_signals"
+    - "break wake_waiting_parent"
+    - "break vmm_destroy_address_space"
+    - "break sched_reap_zombie"
+  memory_checks:
+    - "Verify no leaked pages after spawn+exit cycle"
+    - "Verify task slots are properly cleared after reap"
+    - "Verify signal handler array is initialized"
+    - "Verify address space pool slots are reused"
+  status: NEEDS_VERIFICATION
+
+automated_test:
+  description: "Automated test via expect script"
+  command: "expect test_gash.exp"
+  tests_covered:
+    - "Boot to shell prompt"
+    - "help command"
+    - "pid command"
+    - "ls command"
+    - "echo command"
+    - "Invalid command handling"
+  output_log: "test_serial.log"
+  status: NEEDS_VERIFICATION
+
+---
+
+# Phase History
+phases_tested:
+  phase_0: "Foundation - VERIFIED"
+  phase_1: "Graphics - VERIFIED"
+  phase_2: "Core Kernel - VERIFIED"
+  phase_3: "Virtual Memory - VERIFIED"
+  phase_4: "Multitasking - VERIFIED"
+  phase_5: "User Space - VERIFIED"
+  phase_6: "Shell & VFS - VERIFIED"
+  phase_7a: "SMP - VERIFIED"
+  phase_7b: "GrahaFS & AHCI - VERIFIED"
+  phase_7c: "libc & malloc - VERIFIED (37 tests passing)"
+  phase_7d: "Process Management + Memory Safety Hardening - IN PROGRESS"
+
+# How to run all tests
+full_test_procedure:
+  steps:
+    - "make clean && make all"
+    - "make run"
+    - "In QEMU gash: libctest"
+    - "In QEMU gash: spawntest"
+    - "In QEMU gash: pid"
+    - "In QEMU gash: kill 999"
+    - "In QEMU gash: ls /"
+    - "In QEMU gash: touch /test && cat /test"
+    - "In QEMU gash: sync"
+    - "Verify no crashes, all tests pass"
+    - "expect test_gash.exp  # Automated testing"

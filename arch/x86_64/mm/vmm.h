@@ -130,3 +130,19 @@ bool vmm_map_page_by_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fl
  * @param virt Virtual address to unmap (must be page-aligned).
  */
 void vmm_unmap_page_by_cr3(uint64_t cr3, uint64_t virt);
+
+/**
+ * @brief Destroys a user address space, freeing all user-half pages and page tables.
+ * Only frees the lower half (entries 0-255 of PML4) which is user space.
+ * The kernel half (entries 256-511) is shared and must NOT be freed.
+ * Also frees the PML4 page itself and clears the pool slot.
+ * @param space Pointer to the address space to destroy.
+ */
+void vmm_destroy_address_space(vmm_address_space_t *space);
+
+/**
+ * @brief Destroys a user address space identified by CR3 value.
+ * Finds the address space in the pool and calls vmm_destroy_address_space.
+ * @param cr3 Physical address of the PML4 table.
+ */
+void vmm_destroy_address_space_by_cr3(uint64_t cr3);

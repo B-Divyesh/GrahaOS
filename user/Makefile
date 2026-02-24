@@ -25,8 +25,8 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 # Phase 7c: Link against libc
 LIBC := ../libc/libc.a
 
-# MODIFIED: Build grahai, gash, libctest, sbrk_test, and printf_test
-PROGRAMS := grahai gash libctest sbrk_test printf_test
+# Build all user programs
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest
 
 .PHONY: all clean libc
 
@@ -61,6 +61,11 @@ sbrk_test: sbrk_test.o
 printf_test: printf_test.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
 	@$(LD) $(LDFLAGS) -o $@ printf_test.o $(LIBC)
+
+# Build spawn test (Phase 7d, with libc)
+spawntest: spawntest.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ spawntest.o $(LIBC)
 
 %.o: %.c
 	@echo "Compiling user C: $<"

@@ -116,11 +116,16 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 		echo "ERROR: user/printf_test not found!"; \
 		exit 1; \
 	fi
+	@if [ ! -f user/spawntest ]; then \
+		echo "ERROR: user/spawntest not found!"; \
+		exit 1; \
+	fi
 	@cp user/grahai initrd_root/bin/
 	@cp user/gash initrd_root/bin/
 	@cp user/libctest initrd_root/bin/
 	@cp user/sbrk_test initrd_root/bin/
 	@cp user/printf_test initrd_root/bin/
+	@cp user/spawntest initrd_root/bin/
 	@cp etc/motd.txt initrd_root/etc/
 	@cp etc/plan.json initrd_root/etc/
 	@echo "Contents of initrd_root before tar:"
@@ -129,7 +134,7 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	@echo "Verifying tar contents:"
 	@$(TAR) -tf initrd.tar
 	@rm -rf initrd_root
-	@echo "initrd.tar created successfully with gash, grahai, and libctest"
+	@echo "initrd.tar created successfully with gash, grahai, libctest, and spawntest"
 
 userland:
 	@echo "Building user programs..."

@@ -109,42 +109,8 @@ bool elf_load(void *file_data, uint64_t *entry_point, uint64_t *cr3) {
     }
     serial_write("[ELF] Address space created\n");
 
-    // Map user stack FIRST (critical fix)
-    const uint64_t user_stack_top = 0x00007FFFFFFFE000;
-    const uint64_t user_stack_size = 0x200000; // 2MB stack
-
-    // Allocate physical pages for stack
-    serial_write("[ELF] Mapping user stack (");
-    serial_write_dec(user_stack_size / PAGE_SIZE);
-    serial_write(" pages)...\n");
-
-    size_t stack_pages = user_stack_size / PAGE_SIZE;
-    for (size_t i = 0; i < stack_pages; i++) {
-        void *stack_page_phys = pmm_alloc_page();
-        if (!stack_page_phys) {
-            serial_write("[ELF] ERROR: Failed to allocate stack page!\n");
-            framebuffer_draw_string("ELF: Failed to allocate stack", 10, 500, COLOR_RED, 0x00101828);
-            return false;
-        }
-
-        // Clear the page
-        void *stack_page_virt = (void *)((uint64_t)stack_page_phys + g_hhdm_offset);
-        for (int j = 0; j < PAGE_SIZE; j++) {
-            ((uint8_t *)stack_page_virt)[j] = 0;
-        }
-
-        // Map the stack page
-        uint64_t stack_vaddr = user_stack_top - user_stack_size + (i * PAGE_SIZE);
-        if (!vmm_map_page(addr_space, stack_vaddr, (uint64_t)stack_page_phys,
-                         PTE_PRESENT | PTE_WRITABLE | PTE_USER)) {
-            serial_write("[ELF] ERROR: Failed to map stack page!\n");
-            framebuffer_draw_string("ELF: Failed to map stack page", 10, 520, COLOR_RED, 0x00101828);
-            return false;
-        }
-    }
-
-    serial_write("[ELF] Stack mapped successfully\n");
-    framebuffer_draw_string("ELF: Stack mapped", 10, 440, COLOR_GREEN, 0x00101828);
+    // NOTE: User stack is allocated by sched_create_user_process(), not here.
+    // elf_load only loads code/data segments into the address space.
 
     // Get program headers
     serial_write("[ELF] Getting program headers...\n");

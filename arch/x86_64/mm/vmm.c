@@ -191,12 +191,22 @@ void vmm_switch_address_space_phys(uint64_t pml4_phys) {
 }
 
 vmm_address_space_t* vmm_create_address_space(void) {
-    // Check if we have space for another address space
-    if (next_address_space_idx >= MAX_ADDRESS_SPACES) {
-        return NULL;
+    // First, try to reuse a freed slot (top_level == NULL)
+    vmm_address_space_t *space = NULL;
+    for (int i = 0; i < MAX_ADDRESS_SPACES; i++) {
+        if (address_space_pool[i].top_level == NULL) {
+            space = &address_space_pool[i];
+            break;
+        }
     }
 
-    vmm_address_space_t *space = &address_space_pool[next_address_space_idx++];
+    if (!space) {
+        // No free slots available
+        if (next_address_space_idx >= MAX_ADDRESS_SPACES) {
+            return NULL;
+        }
+        space = &address_space_pool[next_address_space_idx++];
+    }
 
     // Allocate a new PML4 table
     void *pml4_phys = pmm_alloc_page();
@@ -293,6 +303,67 @@ bool vmm_map_page_by_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fl
     asm volatile("invlpg (%0)" : : "r" (virt) : "memory");
 
     return true;
+}
+
+void vmm_destroy_address_space(vmm_address_space_t *space) {
+    if (!space || !space->top_level) return;
+
+    uint64_t *pml4 = space->top_level;
+
+    // Only walk the user half (PML4 entries 0-255).
+    // Entries 256-511 are shared kernel mappings and must NOT be freed.
+    for (int i = 0; i < 256; i++) {
+        if (!(pml4[i] & PTE_PRESENT)) continue;
+
+        uint64_t *pdpt = (uint64_t*)((pml4[i] & PAGE_MASK) + g_hhdm_offset);
+
+        for (int j = 0; j < 512; j++) {
+            if (!(pdpt[j] & PTE_PRESENT)) continue;
+            if (pdpt[j] & PTE_LARGEPAGE) continue; // 1GB huge page - skip
+
+            uint64_t *pd = (uint64_t*)((pdpt[j] & PAGE_MASK) + g_hhdm_offset);
+
+            for (int k = 0; k < 512; k++) {
+                if (!(pd[k] & PTE_PRESENT)) continue;
+                if (pd[k] & PTE_LARGEPAGE) continue; // 2MB huge page - skip
+
+                uint64_t *pt = (uint64_t*)((pd[k] & PAGE_MASK) + g_hhdm_offset);
+
+                // Free all mapped physical pages in this page table
+                for (int l = 0; l < 512; l++) {
+                    if (!(pt[l] & PTE_PRESENT)) continue;
+                    pmm_free_page((void*)(pt[l] & PAGE_MASK));
+                }
+
+                // Free the PT page itself
+                pmm_free_page((void*)(pd[k] & PAGE_MASK));
+            }
+
+            // Free the PD page itself
+            pmm_free_page((void*)(pdpt[j] & PAGE_MASK));
+        }
+
+        // Free the PDPT page itself
+        pmm_free_page((void*)(pml4[i] & PAGE_MASK));
+    }
+
+    // Free the PML4 page itself
+    uint64_t pml4_phys = (uint64_t)pml4 - g_hhdm_offset;
+    pmm_free_page((void*)pml4_phys);
+
+    // Clear the pool entry so it can be reused
+    space->top_level = NULL;
+}
+
+void vmm_destroy_address_space_by_cr3(uint64_t cr3) {
+    // Find the address space in the pool
+    for (int i = 0; i < MAX_ADDRESS_SPACES; i++) {
+        if (address_space_pool[i].top_level &&
+            vmm_get_pml4_phys(&address_space_pool[i]) == cr3) {
+            vmm_destroy_address_space(&address_space_pool[i]);
+            return;
+        }
+    }
 }
 
 void vmm_unmap_page_by_cr3(uint64_t cr3, uint64_t virt) {

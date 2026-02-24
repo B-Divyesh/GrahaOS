@@ -67,9 +67,22 @@ volatile uint64_t syscall_frame_created = 0;
 volatile uint64_t syscall_pre_dispatch = 0;
 volatile uint64_t syscall_stack_switched = 0;
 
+// Validate that a pointer is in user-space (below kernel boundary)
+static inline bool is_user_pointer(const void *ptr, size_t size) {
+    uint64_t addr = (uint64_t)ptr;
+    // User space is below 0x0000800000000000 (canonical address boundary)
+    // Reject NULL, kernel addresses, and overflow
+    if (addr == 0) return false;
+    if (addr >= 0x0000800000000000ULL) return false;
+    if (addr + size < addr) return false;  // overflow check
+    if (addr + size > 0x0000800000000000ULL) return false;
+    return true;
+}
+
 // Helper to safely copy string from user-space
 static int copy_string_from_user(const char *user_src, char *k_dest, size_t max_len) {
     if (user_src == NULL || k_dest == NULL) return -1;
+    if (!is_user_pointer(user_src, 1)) return -1;
     size_t i = 0;
     for (i = 0; i < max_len - 1; ++i) {
         k_dest[i] = user_src[i];
@@ -142,6 +155,10 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             int fd = (int)frame->rdi;
             void *buffer_user = (void *)frame->rsi;
             size_t count = (size_t)frame->rdx;
+            if (!is_user_pointer(buffer_user, count)) {
+                frame->rax = -1;
+                break;
+            }
             frame->rax = vfs_read(fd, buffer_user, count);
             break;
         }
@@ -156,6 +173,10 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             int fd = (int)frame->rdi;
             const void *buffer_user = (const void *)frame->rsi;
             size_t count = (size_t)frame->rdx;
+            if (!is_user_pointer(buffer_user, count)) {
+                frame->rax = -1;
+                break;
+            }
             frame->rax = vfs_write(fd, (void*)buffer_user, count);
             break;
         }
@@ -223,6 +244,12 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             // Copy entry info to user buffer
             // Simple format: 4 bytes type, 28 bytes name
             if (dirent_buffer) {
+                if (!is_user_pointer(dirent_buffer, 32)) {
+                    vfs_destroy_node(entry);
+                    vfs_destroy_node(dir);
+                    frame->rax = -1;
+                    break;
+                }
                 uint32_t type = entry->type;
                 memcpy(dirent_buffer, &type, 4);
                 memcpy((uint8_t*)dirent_buffer + 4, entry->name, 28);
@@ -356,6 +383,10 @@ void syscall_dispatcher(struct syscall_frame *frame) {
 
         case SYS_GCP_EXECUTE: {
             gcp_command_t *user_cmd = (gcp_command_t *)frame->rdi;
+            if (!is_user_pointer(user_cmd, sizeof(gcp_command_t))) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
             gcp_command_t kernel_cmd;
 
             memcpy(&kernel_cmd, user_cmd, sizeof(gcp_command_t));
@@ -526,6 +557,10 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             if (child_pid >= 0) {
                 // Found a zombie child - reap it immediately
                 if (status_ptr) {
+                    if (!is_user_pointer(status_ptr, sizeof(int))) {
+                        frame->rax = -1;
+                        break;
+                    }
                     *status_ptr = exit_status;
                 }
                 sched_reap_zombie(child_pid);
@@ -547,6 +582,72 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = -99; // Special "retry" value
                 
                 framebuffer_draw_string("wait(): Parent blocked waiting for children", 400, 660, COLOR_YELLOW, 0x00101828);
+            }
+            break;
+        }
+
+        case SYS_SPAWN: {
+            const char *path_user = (const char *)frame->rdi;
+            char path_kernel[256];
+
+            if (copy_string_from_user(path_user, path_kernel, sizeof(path_kernel)) <= 0) {
+                serial_write("[SYS_SPAWN] Bad path\n");
+                frame->rax = -1;
+                break;
+            }
+
+            serial_write("[SYS_SPAWN] Path: ");
+            serial_write(path_kernel);
+            serial_write("\n");
+
+            task_t *current = sched_get_current_task();
+            if (!current) {
+                frame->rax = -1;
+                break;
+            }
+
+            int pid = sched_spawn_process(path_kernel, current->id);
+            if (pid < 0) {
+                serial_write("[SYS_SPAWN] Failed\n");
+                frame->rax = -1;
+            } else {
+                serial_write("[SYS_SPAWN] Success: pid=");
+                serial_write_dec(pid);
+                serial_write("\n");
+                frame->rax = pid;
+            }
+            break;
+        }
+
+        case SYS_KILL: {
+            int target_pid = (int)frame->rdi;
+            int signal = (int)frame->rsi;
+
+            serial_write("[SYS_KILL] pid=");
+            serial_write_dec(target_pid);
+            serial_write(" sig=");
+            serial_write_dec(signal);
+            serial_write("\n");
+
+            frame->rax = sched_send_signal(target_pid, signal);
+            break;
+        }
+
+        case SYS_SIGNAL: {
+            int signal = (int)frame->rdi;
+            void (*handler)(int) = (void (*)(int))frame->rsi;
+
+            void *old_handler = sched_set_signal_handler(signal, handler);
+            frame->rax = (uint64_t)old_handler;
+            break;
+        }
+
+        case SYS_GETPID: {
+            task_t *current = sched_get_current_task();
+            if (current) {
+                frame->rax = current->id;
+            } else {
+                frame->rax = -1;
             }
             break;
         }

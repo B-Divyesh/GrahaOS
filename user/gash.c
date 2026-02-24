@@ -258,10 +258,28 @@ void cmd_memstate(void) {
     print("===================\n");
 }
 
+// Helper: spawn and wait for a program
+int run_program(const char *path) {
+    int pid = syscall_spawn(path);
+    if (pid < 0) return -1;
+
+    int exit_status;
+    syscall_wait(&exit_status);
+    return exit_status;
+}
+
 // Main shell
 void _start(void) {
-    print("=== GrahaOS Shell v1.0 (Full Filesystem) ===\n");
+    print("=== GrahaOS Shell v2.0 (spawn model) ===\n");
     print("Type 'help' for commands.\n\n");
+
+    // Display our PID
+    int my_pid = syscall_getpid();
+    print("Shell PID: ");
+    char pid_str[12];
+    int_to_string(my_pid, pid_str);
+    print(pid_str);
+    print("\n\n");
 
     char command_buffer[256];
     char* argv[32];
@@ -269,12 +287,12 @@ void _start(void) {
     while (1) {
         print("gash> ");
         readline(command_buffer, sizeof(command_buffer));
-        
+
         int argc = parse_command(command_buffer, argv, 32);
         if (argc == 0) continue;
-        
+
         char* cmd = argv[0];
-        
+
         if (strcmp(cmd, "help") == 0) {
             print("Available commands:\n");
             print("  help            - Show this message\n");
@@ -285,6 +303,8 @@ void _start(void) {
             print("  echo <text>     - Print text\n");
             print("  echo <text> > <file> - Write text to file\n");
             print("  memstate        - Show memory information\n");
+            print("  pid             - Show current process ID\n");
+            print("  kill <pid>      - Terminate a process\n");
             print("  test            - Keyboard test\n");
             print("  grahai          - Run GCP interpreter\n");
             print("  exit            - Exit the shell\n");
@@ -324,6 +344,37 @@ void _start(void) {
         else if (strcmp(cmd, "memstate") == 0) {
             cmd_memstate();
         }
+        else if (strcmp(cmd, "pid") == 0) {
+            int current_pid = syscall_getpid();
+            print("PID: ");
+            char buf[12];
+            int_to_string(current_pid, buf);
+            print(buf);
+            print("\n");
+        }
+        else if (strcmp(cmd, "kill") == 0) {
+            if (argc < 2) {
+                print("kill: usage: kill <pid>\n");
+            } else {
+                // Simple string to int conversion
+                int target_pid = 0;
+                for (int i = 0; argv[1][i]; i++) {
+                    if (argv[1][i] >= '0' && argv[1][i] <= '9') {
+                        target_pid = target_pid * 10 + (argv[1][i] - '0');
+                    }
+                }
+                int result = syscall_kill(target_pid, 1); // SIGTERM
+                if (result < 0) {
+                    print("kill: failed to kill process ");
+                    print(argv[1]);
+                    print("\n");
+                } else {
+                    print("Signal sent to process ");
+                    print(argv[1]);
+                    print("\n");
+                }
+            }
+        }
         else if (strcmp(cmd, "test") == 0) {
             print("Keyboard test - type 'q' to quit\n");
             char ch;
@@ -335,20 +386,23 @@ void _start(void) {
             print("Test complete.\n");
         }
         else if (strcmp(cmd, "grahai") == 0) {
-            print("Launching grahai...\n");
-            int pid = syscall_exec("bin/grahai");
+            print("Spawning grahai...\n");
+            int pid = syscall_spawn("bin/grahai");
             if (pid < 0) {
-                print("ERROR: Failed to execute 'bin/grahai'\n");
+                print("ERROR: Failed to spawn 'bin/grahai'\n");
             } else {
-                print("grahai launched (pid=");
-                char pid_str[12];
-                int_to_string(pid, pid_str);
-                print(pid_str);
+                print("grahai spawned (pid=");
+                char spid[12];
+                int_to_string(pid, spid);
+                print(spid);
                 print(")\n");
-                
+
                 int exit_status;
                 syscall_wait(&exit_status);
-                print("grahai completed\n");
+                print("grahai completed (status=");
+                int_to_string(exit_status, spid);
+                print(spid);
+                print(")\n");
             }
         }
         else if (strcmp(cmd, "exit") == 0) {
@@ -356,7 +410,7 @@ void _start(void) {
             syscall_exit(0);
         }
         else {
-            // Try to execute as a program from /bin/
+            // Try to spawn as a program from /bin/
             char path[128];
 
             // Check if command starts with /
@@ -372,14 +426,14 @@ void _start(void) {
                 }
             }
 
-            int pid = syscall_exec(path);
+            int pid = syscall_spawn(path);
             if (pid < 0) {
                 print("Unknown command: '");
                 print(cmd);
                 print("'\n");
                 print("Type 'help' for available commands.\n");
             } else {
-                // Wait for program to complete
+                // Wait for spawned program to complete
                 int exit_status;
                 syscall_wait(&exit_status);
             }

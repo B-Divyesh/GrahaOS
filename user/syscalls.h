@@ -23,7 +23,11 @@ typedef long ssize_t;
 #define SYS_MKDIR  1012
 #define SYS_STAT   1013
 #define SYS_READDIR 1014
-#define SYS_SYNC  1015
+#define SYS_SYNC    1015
+#define SYS_SPAWN   1017
+#define SYS_KILL    1018
+#define SYS_SIGNAL  1019
+#define SYS_GETPID  1020
 
 // Directory entry structure for user space
 typedef struct {
@@ -133,4 +137,25 @@ static inline int syscall_readdir(const char *pathname, uint32_t index, user_dir
 
 static inline void syscall_sync(void) {
     asm volatile("syscall" : : "a"(SYS_SYNC) : "rcx", "r11", "memory");
+}
+
+// Phase 7d: Spawn a new process (modern replacement for fork+exec)
+static inline int syscall_spawn(const char *path) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret) : "a"(SYS_SPAWN), "D"(path) : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 7d: Send a signal to a process
+static inline int syscall_kill(int pid, int signal) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret) : "a"(SYS_KILL), "D"(pid), "S"(signal) : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 7d: Get current process ID
+static inline int syscall_getpid(void) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret) : "a"(SYS_GETPID) : "rcx", "r11", "memory");
+    return (int)ret;
 }

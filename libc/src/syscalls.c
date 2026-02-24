@@ -25,6 +25,10 @@
 #define SYS_READDIR     1014
 #define SYS_SYNC        1015
 #define SYS_BRK         1016
+#define SYS_SPAWN       1017
+#define SYS_KILL        1018
+#define SYS_SIGNAL      1019
+#define SYS_GETPID      1020
 #define SYS_DEBUG       9999
 
 // Generic syscall functions
@@ -107,16 +111,24 @@ int wait(int *status) {
     return (int)ret;
 }
 
-// Get process ID (placeholder - not yet implemented in kernel)
+// Get process ID
 int getpid(void) {
-    // TODO: Implement SYS_GETPID in kernel
-    return 1;
+    return (int)syscall0(SYS_GETPID);
 }
 
-// Fork (placeholder - not yet implemented in kernel)
-int fork(void) {
-    // TODO: Implement SYS_FORK in kernel
-    return -1;
+// Spawn a new process (modern replacement for fork+exec)
+int spawn(const char *path) {
+    return (int)syscall1(SYS_SPAWN, (long)path);
+}
+
+// Send a signal to a process
+int kill(int pid, int sig) {
+    return (int)syscall2(SYS_KILL, pid, sig);
+}
+
+// Register a signal handler
+void (*signal(int sig, void (*handler)(int)))(int) {
+    return (void (*)(int))syscall2(SYS_SIGNAL, sig, (long)handler);
 }
 
 // ===== MEMORY MANAGEMENT =====
