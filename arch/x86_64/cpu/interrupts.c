@@ -187,8 +187,25 @@ void interrupt_handler(struct interrupt_frame *frame) {
             print_hex_value("RSP:", frame->rsp, 500, 440);
             print_hex_value("RIP:", frame->rip, 500, 460);
             print_hex_value("R11:", frame->r11, 500, 480);
+
+            // Kill the user process instead of halting the entire system
+            task_t *current = sched_get_current_task();
+            if (current) {
+                serial_write("[PF] Killing user process ");
+                serial_write_dec(current->id);
+                serial_write(" (page fault at ");
+                serial_write_hex(fault_addr);
+                serial_write(")\n");
+                current->exit_status = 128 + 14;  // SIGSEGV-like
+                current->state = TASK_STATE_ZOMBIE;
+                sched_orphan_children(current->id);
+                wake_waiting_parent(current->id);
+            }
+            schedule(frame);
+            return;
         }
 
+        // Kernel mode page fault is still fatal
         hcf();
     }
 
@@ -240,12 +257,30 @@ void interrupt_handler(struct interrupt_frame *frame) {
         
         // Show if it's user or kernel mode
         if (frame->cs & 3) {
-            framebuffer_draw_string("USER MODE crash", 10, 70, COLOR_YELLOW, COLOR_RED);
-            framebuffer_draw_string("Process crashed", 10, 90, COLOR_WHITE, COLOR_RED);
+            framebuffer_draw_string("USER MODE crash - killing process", 10, 70, COLOR_YELLOW, COLOR_RED);
+
+            // Kill the user process instead of halting the entire system
+            task_t *current = sched_get_current_task();
+            if (current) {
+                serial_write("[EXCEPTION] Killing user process ");
+                serial_write_dec(current->id);
+                serial_write(" (exception #");
+                serial_write_dec(frame->int_no);
+                serial_write(" at RIP=");
+                serial_write_hex(frame->rip);
+                serial_write(")\n");
+                current->exit_status = 128 + frame->int_no;
+                current->state = TASK_STATE_ZOMBIE;
+                sched_orphan_children(current->id);
+                wake_waiting_parent(current->id);
+            }
+            schedule(frame);
+            return;
         } else {
             framebuffer_draw_string("KERNEL MODE crash", 10, 70, COLOR_YELLOW, COLOR_RED);
         }
-        
+
+        // Kernel mode exception is still fatal
         hcf();
     } else if (frame->int_no >= 32 && frame->int_no < 256) {
         // Hardware interrupt

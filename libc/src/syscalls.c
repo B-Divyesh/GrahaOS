@@ -78,9 +78,10 @@ int close(int fd) {
 
 void _exit(int status) {
     syscall1(SYS_EXIT, status);
-    // Should never return, but just in case
+    // Should never return - task is now ZOMBIE, scheduler will skip it
+    // NOTE: Do NOT use hlt here - it's privileged and causes #GP in Ring 3
     while (1) {
-        asm volatile("hlt");
+        asm volatile("pause");
     }
 }
 

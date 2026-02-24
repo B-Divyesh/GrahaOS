@@ -39,7 +39,7 @@ DEPS := $(C_OBJECTS:.o=.d)
 # --- Build Targets ---
 .PHONY: all clean run help debug info userland
 
-all: grahaos.iso format-disk
+all: grahaos.iso format-disk-if-needed
 
 # Build the host formatting tool
 scripts/mkfs.gfs: scripts/mkfs.gfs.c kernel/fs/grahafs.h
@@ -50,18 +50,21 @@ scripts/mkfs.gfs: scripts/mkfs.gfs.c kernel/fs/grahafs.h
 format-disk: scripts/mkfs.gfs disk.img
 	@echo "Formatting disk.img with GrahaFS..."
 	@./scripts/mkfs.gfs disk.img
+	@touch .disk_formatted
 
+# Verify disk has valid GrahaFS magic, format if not
 format-disk-if-needed: scripts/mkfs.gfs
 	@if [ ! -f disk.img ]; then \
 		echo "No disk.img found, creating and formatting..."; \
 		$(MAKE) disk.img; \
 		./scripts/mkfs.gfs disk.img; \
-	elif [ ! -f .disk_formatted ]; then \
-		echo "Disk exists but not formatted, formatting..."; \
+		touch .disk_formatted; \
+	elif ! xxd -l 8 -p disk.img 2>/dev/null | grep -qi "21534f4148415247"; then \
+		echo "Disk exists but has no valid GrahaFS magic, formatting..."; \
 		./scripts/mkfs.gfs disk.img; \
 		touch .disk_formatted; \
 	else \
-		echo "Using existing formatted disk.img"; \
+		echo "Using existing formatted disk.img (GrahaFS magic verified)"; \
 	fi
 
 disk.img:
@@ -159,15 +162,15 @@ kernel/kernel.elf: $(OBJECTS) linker.ld
 run: grahaos.iso format-disk-if-needed
 	@echo "Starting QEMU with persistent disk..."
 	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 \
-	     -drive file=disk.img,format=raw,if=none,id=mydisk,cache=none,aio=native \
+	     -drive file=disk.img,format=raw,if=none,id=mydisk \
 	     -device ich9-ahci,id=ahci \
 	     -device ide-hd,drive=mydisk,bus=ahci.0 \
 	     -d int,cpu_reset -D qemu.log
 
-debug: grahaos.iso 
+debug: grahaos.iso format-disk-if-needed
 	@echo "Starting QEMU with GDB support..."
 	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 -s -S \
-	     -drive file=disk.img,format=raw,if=none,id=mydisk,cache=none,aio=native \
+	     -drive file=disk.img,format=raw,if=none,id=mydisk \
 	     -device ich9-ahci,id=ahci \
 	     -device ide-hd,drive=mydisk,bus=ahci.0
 
@@ -183,11 +186,11 @@ debug-monitor: grahaos.iso format-disk
 
 clean:
 	@echo "Cleaning up..."
-	@rm -rf $(C_OBJECTS) $(ASM_OBJECTS) $(DEPS) kernel/kernel.elf grahaos.iso iso_root initrd.tar initrd_root disk.img scripts/mkfs.gfs
+	@rm -rf $(C_OBJECTS) $(ASM_OBJECTS) $(DEPS) kernel/kernel.elf grahaos.iso iso_root initrd.tar initrd_root disk.img scripts/mkfs.gfs .disk_formatted
 	@$(MAKE) -C user clean
 
 reformat: scripts/mkfs.gfs
-	@rm -f disk.img
+	@rm -f disk.img .disk_formatted
 	@$(MAKE) disk.img
 	@$(MAKE) format-disk
 

@@ -26,7 +26,7 @@ typedef struct {
     uint32_t root_inode;
     uint32_t free_blocks;
     uint32_t free_inodes;
-    uint8_t  padding[4036];  // Pad to 4096 bytes
+    uint8_t  padding[4060];  // Pad to 4096 bytes (36 bytes of fields + 4060 = 4096)
 } __attribute__((packed)) grahafs_superblock_t;
 
 // On-disk inode structure

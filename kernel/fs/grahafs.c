@@ -6,6 +6,7 @@
 #include "../../drivers/video/framebuffer.h"
 #include "../sync/spinlock.h"
 #include "../../arch/x86_64/drivers/ahci/ahci.h"
+#include "../../arch/x86_64/drivers/serial/serial.h"
 
 static block_device_t* fs_device = NULL;
 static grahafs_superblock_t superblock;
@@ -822,12 +823,27 @@ void grahafs_init(void) {
     framebuffer_draw_string("GrahaFS: Driver initialized.", 10, 650, COLOR_GREEN, 0x00101828);
 }
 
-// Fix mount function to properly preserve superblock
+// Mount function with robust diagnostics
 vfs_node_t* grahafs_mount(block_device_t* device) {
-    if (!device) return NULL;
-    
+    serial_write("[GrahaFS] mount called\n");
+
+    if (!device) {
+        serial_write("[GrahaFS] ERROR: NULL device!\n");
+        return NULL;
+    }
+
+    serial_write("[GrahaFS] device_id=");
+    serial_write_dec(device->device_id);
+    serial_write(" block_size=");
+    serial_write_dec(device->block_size);
+    serial_write(" read_blocks=");
+    serial_write_hex((uint64_t)device->read_blocks);
+    serial_write(" write_blocks=");
+    serial_write_hex((uint64_t)device->write_blocks);
+    serial_write("\n");
+
     spinlock_acquire(&grahafs_lock);
-    
+
     // Clear any previous mount
     fs_mounted = false;
     fs_device = device;
@@ -835,27 +851,66 @@ vfs_node_t* grahafs_mount(block_device_t* device) {
     // Allocate buffer for superblock
     void* sb_buffer_phys = pmm_alloc_page();
     if (!sb_buffer_phys) {
+        serial_write("[GrahaFS] ERROR: Failed to allocate page for superblock buffer!\n");
         spinlock_release(&grahafs_lock);
         return NULL;
     }
     void* sb_buffer = (void*)((uint64_t)sb_buffer_phys + g_hhdm_offset);
+    serial_write("[GrahaFS] sb_buffer phys=");
+    serial_write_hex((uint64_t)sb_buffer_phys);
+    serial_write(" virt=");
+    serial_write_hex((uint64_t)sb_buffer);
+    serial_write("\n");
+
+    // Clear the buffer first to detect if read actually writes data
+    memset(sb_buffer, 0xAA, 4096);
 
     // Read superblock from disk
-    if (device->read_blocks(device->device_id, 0, 1, sb_buffer) != 0) {
+    serial_write("[GrahaFS] Reading block 0...\n");
+    int read_result = device->read_blocks(device->device_id, 0, 1, sb_buffer);
+    serial_write("[GrahaFS] read_blocks returned: ");
+    serial_write_dec(read_result);
+    serial_write("\n");
+
+    if (read_result != 0) {
+        serial_write("[GrahaFS] ERROR: Failed to read superblock from disk!\n");
         framebuffer_draw_string("GrahaFS: Failed to read superblock.", 10, 750, COLOR_RED, 0x00101828);
         pmm_free_page(sb_buffer_phys);
         spinlock_release(&grahafs_lock);
         return NULL;
     }
-    
+
+    // Hex dump first 64 bytes for debugging
+    serial_write("[GrahaFS] First 64 bytes of block 0:\n");
+    uint8_t *raw = (uint8_t*)sb_buffer;
+    for (int row = 0; row < 4; row++) {
+        serial_write("  ");
+        for (int col = 0; col < 16; col++) {
+            serial_write_hex(raw[row * 16 + col]);
+            serial_write(" ");
+        }
+        serial_write("\n");
+    }
+
     // Copy to our global superblock structure
     memcpy(&superblock, sb_buffer, sizeof(grahafs_superblock_t));
     pmm_free_page(sb_buffer_phys);
 
+    serial_write("[GrahaFS] Superblock magic read: 0x");
+    serial_write_hex(superblock.magic);
+    serial_write("\n");
+    serial_write("[GrahaFS] Expected magic:        0x");
+    serial_write_hex(GRAHAFS_MAGIC);
+    serial_write("\n");
+    serial_write("[GrahaFS] sizeof(superblock_t) = ");
+    serial_write_dec(sizeof(grahafs_superblock_t));
+    serial_write("\n");
+
     // Verify magic
     if (superblock.magic != GRAHAFS_MAGIC) {
+        serial_write("[GrahaFS] ERROR: Magic mismatch!\n");
         framebuffer_draw_string("GrahaFS: Invalid magic number!", 10, 750, COLOR_RED, 0x00101828);
-        
+
         // Display the actual magic we got
         char msg[80] = "Expected: 0x47524148414F5321, Got: 0x";
         int pos = 38;
@@ -866,13 +921,33 @@ vfs_node_t* grahafs_mount(block_device_t* device) {
         }
         msg[pos] = '\0';
         framebuffer_draw_string(msg, 10, 770, COLOR_RED, 0x00101828);
-        
+
         spinlock_release(&grahafs_lock);
         return NULL;
     }
 
+    serial_write("[GrahaFS] Magic verified OK!\n");
+
+    // Log superblock fields
+    serial_write("[GrahaFS] total_blocks=");
+    serial_write_dec(superblock.total_blocks);
+    serial_write(" bitmap_start=");
+    serial_write_dec(superblock.bitmap_start_block);
+    serial_write(" inode_start=");
+    serial_write_dec(superblock.inode_table_start_block);
+    serial_write(" data_start=");
+    serial_write_dec(superblock.data_blocks_start_block);
+    serial_write(" root_inode=");
+    serial_write_dec(superblock.root_inode);
+    serial_write(" free_blocks=");
+    serial_write_dec(superblock.free_blocks);
+    serial_write(" free_inodes=");
+    serial_write_dec(superblock.free_inodes);
+    serial_write("\n");
+
     // Validate superblock fields
     if (superblock.total_blocks == 0 || superblock.total_blocks > 65536) {
+        serial_write("[GrahaFS] ERROR: Invalid block count!\n");
         framebuffer_draw_string("GrahaFS: Invalid block count!", 10, 750, COLOR_RED, 0x00101828);
         spinlock_release(&grahafs_lock);
         return NULL;
@@ -902,7 +977,8 @@ vfs_node_t* grahafs_mount(block_device_t* device) {
 
     // Mark as mounted
     fs_mounted = true;
-    
+
+    serial_write("[GrahaFS] Bitmap loaded, filesystem mounted!\n");
     framebuffer_draw_string("GrahaFS: Filesystem mounted successfully!", 10, 750, COLOR_GREEN, 0x00101828);
 
     // Create root VFS node
@@ -943,7 +1019,8 @@ vfs_node_t* grahafs_mount(block_device_t* device) {
     }
     
     vfs_set_root(root);
-    
+
+    serial_write("[GrahaFS] Root VFS node created, mount complete\n");
     spinlock_release(&grahafs_lock);
     return root;
 }
