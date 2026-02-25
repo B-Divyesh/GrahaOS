@@ -456,6 +456,239 @@ void cmd_drivers(void) {
     print(" drivers\n");
 }
 
+// --- Capability Activation Network Commands ---
+
+static const char *cap_type_str(uint32_t type) {
+    switch (type) {
+        case 0: return "HARDWARE";
+        case 1: return "DRIVER";
+        case 2: return "SERVICE";
+        case 3: return "APPLICATION";
+        case 4: return "FEATURE";
+        case 5: return "COMPOSITE";
+        default: return "UNKNOWN";
+    }
+}
+
+static const char *cap_state_str(uint32_t state) {
+    switch (state) {
+        case 0: return "OFF";
+        case 1: return "STARTING";
+        case 2: return "ON";
+        case 3: return "ERROR";
+        default: return "???";
+    }
+}
+
+void cmd_caps(void) {
+    state_cap_list_t caps;
+    long ret = syscall_get_system_state(STATE_CAT_CAPABILITIES, &caps, sizeof(caps));
+    if (ret < 0) {
+        print("caps: failed to get capability list\n");
+        return;
+    }
+
+    char buf[21];
+    uint32_t active_count = 0;
+
+    print("=== Capability Activation Map ===\n");
+
+    // Print grouped by layer (type 0-5)
+    for (uint32_t layer = 0; layer <= 5; layer++) {
+        int has_entries = 0;
+        for (uint32_t i = 0; i < caps.count; i++) {
+            if (caps.caps[i].type == layer) {
+                if (!has_entries) {
+                    print("--- ");
+                    print(cap_type_str(layer));
+                    print(" ---\n");
+                    has_entries = 1;
+                }
+
+                // State indicator
+                if (caps.caps[i].state == 2) {
+                    print("  [ON]  ");
+                    active_count++;
+                } else if (caps.caps[i].state == 3) {
+                    print("  [ERR] ");
+                } else {
+                    print("  [OFF] ");
+                }
+
+                print(caps.caps[i].name);
+
+                // Show deps for non-HARDWARE caps
+                if (caps.caps[i].dep_count > 0) {
+                    print(" (deps: ");
+                    for (uint32_t d = 0; d < caps.caps[i].dep_count; d++) {
+                        uint32_t dep_idx = caps.caps[i].dep_indices[d];
+                        if (dep_idx < caps.count) {
+                            if (d > 0) print(", ");
+                            print(caps.caps[dep_idx].name);
+                        }
+                    }
+                    print(")");
+                }
+                print("\n");
+            }
+        }
+    }
+
+    print("\nTotal: ");
+    uint64_to_str(caps.count, buf);
+    print(buf);
+    print(" capabilities, ");
+    uint64_to_str(active_count, buf);
+    print(buf);
+    print(" active\n");
+}
+
+void cmd_activate(const char *name) {
+    if (!name || name[0] == '\0') {
+        print("activate: usage: activate <capability_name>\n");
+        return;
+    }
+    int result = syscall_cap_activate(name);
+    if (result == 0) {
+        print("Activated: ");
+        print(name);
+        print("\n");
+    } else {
+        print("Failed to activate '");
+        print(name);
+        print("' (error=");
+        char buf[12];
+        int_to_string(result, buf);
+        print(buf);
+        print(")\n");
+    }
+}
+
+void cmd_deactivate(const char *name) {
+    if (!name || name[0] == '\0') {
+        print("deactivate: usage: deactivate <capability_name>\n");
+        return;
+    }
+    int result = syscall_cap_deactivate(name);
+    if (result == 0) {
+        print("Deactivated: ");
+        print(name);
+        print("\n");
+    } else {
+        print("Failed to deactivate '");
+        print(name);
+        print("' (error=");
+        char buf[12];
+        int_to_string(result, buf);
+        print(buf);
+        print(")\n");
+    }
+}
+
+void cmd_why_not(const char *name) {
+    if (!name || name[0] == '\0') {
+        print("why_not: usage: why_not <capability_name>\n");
+        return;
+    }
+
+    // Find the capability in the list
+    state_cap_list_t caps;
+    long ret = syscall_get_system_state(STATE_CAT_CAPABILITIES, &caps, sizeof(caps));
+    if (ret < 0) {
+        print("why_not: failed to query capabilities\n");
+        return;
+    }
+
+    int found = -1;
+    for (uint32_t i = 0; i < caps.count; i++) {
+        if (strcmp(caps.caps[i].name, name) == 0) {
+            found = (int)i;
+            break;
+        }
+    }
+
+    if (found < 0) {
+        print("why_not: '");
+        print(name);
+        print("' not found in capability registry\n");
+        return;
+    }
+
+    state_cap_entry_t *cap = &caps.caps[found];
+
+    if (cap->state == 2) {
+        print("'");
+        print(name);
+        print("' is already ON\n");
+        return;
+    }
+
+    if (cap->state == 3) {
+        print("'");
+        print(name);
+        print("' is in ERROR state (activation previously failed)\n");
+    }
+
+    // Check which deps are OFF
+    int all_deps_on = 1;
+    for (uint32_t d = 0; d < cap->dep_count; d++) {
+        uint32_t dep_idx = cap->dep_indices[d];
+        if (dep_idx < caps.count && caps.caps[dep_idx].state != 2) {
+            print("  dep '");
+            print(caps.caps[dep_idx].name);
+            print("' is ");
+            print(cap_state_str(caps.caps[dep_idx].state));
+            print("\n");
+            all_deps_on = 0;
+        }
+    }
+
+    if (all_deps_on && cap->state != 3) {
+        print("'");
+        print(name);
+        print("' can be activated (all deps are ON)\n");
+    }
+}
+
+void cmd_available(void) {
+    state_cap_list_t caps;
+    long ret = syscall_get_system_state(STATE_CAT_CAPABILITIES, &caps, sizeof(caps));
+    if (ret < 0) {
+        print("available: failed to query capabilities\n");
+        return;
+    }
+
+    print("=== Available for Activation ===\n");
+    int found = 0;
+    for (uint32_t i = 0; i < caps.count; i++) {
+        if (caps.caps[i].state == 2) continue;  // skip already ON
+        if (caps.caps[i].state == 1) continue;  // skip STARTING
+
+        // Check if all deps are ON
+        int all_deps_on = 1;
+        for (uint32_t d = 0; d < caps.caps[i].dep_count; d++) {
+            uint32_t dep_idx = caps.caps[i].dep_indices[d];
+            if (dep_idx < caps.count && caps.caps[dep_idx].state != 2) {
+                all_deps_on = 0;
+                break;
+            }
+        }
+
+        if (all_deps_on) {
+            print("  ");
+            print(caps.caps[i].name);
+            print(" (");
+            print(cap_type_str(caps.caps[i].type));
+            print(")\n");
+            found++;
+        }
+    }
+
+    if (!found) {
+        print("  (none - all capabilities are active)\n");
+    }
+}
+
 void cmd_sysstate(void) {
     // Full system state dump - the AI-readable command
     state_snapshot_t state;
@@ -536,6 +769,28 @@ void cmd_sysstate(void) {
         print("\n");
     }
 
+    // Capabilities
+    print("\n[CAPABILITIES] count=");
+    uint64_to_str(state.capabilities.count, buf);
+    print(buf);
+    print("\n");
+    for (uint32_t i = 0; i < state.capabilities.count; i++) {
+        state_cap_entry_t *c = &state.capabilities.caps[i];
+        print("  ");
+        print(c->name);
+        print(" type=");
+        print(cap_type_str(c->type));
+        print(" state=");
+        print(cap_state_str(c->state));
+        print(" deps=");
+        uint64_to_str(c->dep_count, buf);
+        print(buf);
+        print(" ops=");
+        uint64_to_str(c->op_count, buf);
+        print(buf);
+        print("\n");
+    }
+
     print("\n=== End System State ===\n");
 }
 
@@ -576,23 +831,28 @@ void _start(void) {
 
         if (strcmp(cmd, "help") == 0) {
             print("Available commands:\n");
-            print("  help            - Show this message\n");
-            print("  ls [path]       - List directory contents\n");
-            print("  cat <file>      - Display file contents\n");
-            print("  touch <file>    - Create empty file\n");
-            print("  mkdir <dir>     - Create directory\n");
-            print("  echo <text>     - Print text\n");
+            print("  help                - Show this message\n");
+            print("  ls [path]           - List directory contents\n");
+            print("  cat <file>          - Display file contents\n");
+            print("  touch <file>        - Create empty file\n");
+            print("  mkdir <dir>         - Create directory\n");
+            print("  echo <text>         - Print text\n");
             print("  echo <text> > <file> - Write text to file\n");
-            print("  memstate        - Show memory & filesystem state\n");
-            print("  ps              - List running processes\n");
-            print("  drivers         - List registered drivers\n");
-            print("  sysstate        - Full system state dump\n");
-            print("  pid             - Show current process ID\n");
-            print("  kill <pid>      - Terminate a process\n");
-            print("  sync            - Flush filesystem to disk\n");
-            print("  test            - Keyboard test\n");
-            print("  grahai          - Run GCP interpreter\n");
-            print("  exit            - Exit the shell\n");
+            print("  memstate            - Show memory & filesystem state\n");
+            print("  ps                  - List running processes\n");
+            print("  drivers             - List registered drivers\n");
+            print("  sysstate            - Full system state dump\n");
+            print("  caps                - Capability activation map\n");
+            print("  activate <name>     - Activate a capability\n");
+            print("  deactivate <name>   - Deactivate a capability\n");
+            print("  why_not <name>      - Explain why cap can't activate\n");
+            print("  available           - Show activatable capabilities\n");
+            print("  pid                 - Show current process ID\n");
+            print("  kill <pid>          - Terminate a process\n");
+            print("  sync                - Flush filesystem to disk\n");
+            print("  test                - Keyboard test\n");
+            print("  grahai              - Run GCP interpreter\n");
+            print("  exit                - Exit the shell\n");
         }
         else if (strcmp(cmd, "ls") == 0) {
             cmd_ls(argc > 1 ? argv[1] : "/");
@@ -637,6 +897,21 @@ void _start(void) {
         }
         else if (strcmp(cmd, "sysstate") == 0) {
             cmd_sysstate();
+        }
+        else if (strcmp(cmd, "caps") == 0) {
+            cmd_caps();
+        }
+        else if (strcmp(cmd, "activate") == 0) {
+            cmd_activate(argc > 1 ? argv[1] : "");
+        }
+        else if (strcmp(cmd, "deactivate") == 0) {
+            cmd_deactivate(argc > 1 ? argv[1] : "");
+        }
+        else if (strcmp(cmd, "why_not") == 0) {
+            cmd_why_not(argc > 1 ? argv[1] : "");
+        }
+        else if (strcmp(cmd, "available") == 0) {
+            cmd_available();
         }
         else if (strcmp(cmd, "pid") == 0) {
             int current_pid = syscall_getpid();

@@ -8,6 +8,7 @@
 #include "../../arch/x86_64/drivers/ahci/ahci.h"
 #include "../../arch/x86_64/drivers/serial/serial.h"
 #include "../driver.h"
+#include "../capability.h"
 
 static block_device_t* fs_device = NULL;
 static grahafs_superblock_t superblock;
@@ -857,6 +858,14 @@ void grahafs_init(void) {
         }
     };
     driver_register(&desc);
+
+    // Register with Capability Activation Network
+    const char *gfs_deps[] = {"disk"};
+    cap_op_t gfs_ops[2];
+    cap_op_set(&gfs_ops[0], "mount", 1, 1);
+    cap_op_set(&gfs_ops[1], "sync",  0, 1);
+    cap_register("filesystem", CAP_SERVICE, -1, gfs_deps, 1,
+                 NULL, NULL, gfs_ops, 2, grahafs_get_driver_stats);
 }
 
 // Mount function with robust diagnostics

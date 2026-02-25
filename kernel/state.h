@@ -10,8 +10,9 @@
 #define STATE_CAT_PROCESSES  1
 #define STATE_CAT_FILESYSTEM 2
 #define STATE_CAT_SYSTEM     3
-#define STATE_CAT_DRIVERS    4
-#define STATE_CAT_ALL        255
+#define STATE_CAT_DRIVERS        4
+#define STATE_CAT_CAPABILITIES   5
+#define STATE_CAT_ALL            255
 
 // Limits (must match kernel defines)
 #define STATE_MAX_TASKS       32
@@ -23,6 +24,9 @@
 #define STATE_STAT_KEY_LEN    16
 #define STATE_MAX_DRIVER_STATS 8
 #define STATE_MAX_CPUS        16
+#define STATE_MAX_CAPS        64
+#define STATE_CAP_NAME_LEN    32
+#define STATE_MAX_CAP_DEPS    8
 
 // Process state values (match task_state_t in sched.h)
 #define STATE_PROC_ZOMBIE     0
@@ -132,6 +136,25 @@ typedef struct {
     state_driver_info_t drivers[STATE_MAX_DRIVERS];
 } state_driver_list_t;
 
+// --- Per-capability snapshot (Phase 8b) ---
+typedef struct {
+    char     name[STATE_CAP_NAME_LEN];
+    uint32_t type;           // CAP_HARDWARE..CAP_COMPOSITE
+    uint32_t state;          // CAP_STATE_*
+    int32_t  owner_pid;      // -1=kernel
+    uint32_t dep_count;
+    uint32_t dep_indices[STATE_MAX_CAP_DEPS];
+    uint32_t op_count;
+    uint64_t activation_count;
+} state_cap_entry_t;
+
+// --- Capability list ---
+typedef struct {
+    uint32_t count;
+    uint32_t _pad;
+    state_cap_entry_t caps[STATE_MAX_CAPS];
+} state_cap_list_t;
+
 // --- Combined full snapshot ---
 typedef struct {
     uint32_t version;
@@ -141,4 +164,5 @@ typedef struct {
     state_filesystem_t   filesystem;
     state_system_t       system;
     state_driver_list_t  drivers;
+    state_cap_list_t     capabilities;
 } state_snapshot_t;

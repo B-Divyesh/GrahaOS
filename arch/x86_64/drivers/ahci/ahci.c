@@ -7,6 +7,7 @@
 #include "../../../../kernel/fs/vfs.h"
 #include "../../../../kernel/sync/spinlock.h"
 #include "../../../../kernel/driver.h"
+#include "../../../../kernel/capability.h"
 
 #define HBA_PORT_DEV_PRESENT 0x3
 #define HBA_PORT_IPM_ACTIVE 0x1
@@ -265,6 +266,15 @@ void ahci_init(void) {
         }
     };
     driver_register(&desc);
+
+    // Register with Capability Activation Network
+    const char *ahci_deps[] = {"pci_bus"};
+    cap_op_t ahci_ops[3];
+    cap_op_set(&ahci_ops[0], "read",  3, 0);
+    cap_op_set(&ahci_ops[1], "write", 3, 1);
+    cap_op_set(&ahci_ops[2], "flush", 1, 1);
+    cap_register("disk", CAP_DRIVER, -1, ahci_deps, 1,
+                 NULL, NULL, ahci_ops, 3, ahci_get_driver_stats);
 }
 
 int ahci_read(int port_num, uint64_t lba, uint16_t count, void *buf) {

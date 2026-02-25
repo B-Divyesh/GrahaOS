@@ -41,6 +41,10 @@
 // Phase 8a: System State Introspection
 #define SYS_GET_SYSTEM_STATE 1021
 
+// Phase 8b: Capability Activation Network
+#define SYS_CAP_ACTIVATE   1031
+#define SYS_CAP_DEACTIVATE 1032
+
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);
 

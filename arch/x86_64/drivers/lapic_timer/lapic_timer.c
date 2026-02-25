@@ -4,6 +4,7 @@
 #include "../../cpu/ports.h"
 #include "../../../../drivers/video/framebuffer.h"
 #include "../../../../kernel/driver.h"
+#include "../../../../kernel/capability.h"
 
 // LAPIC Timer registers (offsets from LAPIC base)
 #define LAPIC_TIMER_LVT         0x320  // LVT Timer Register
@@ -181,6 +182,13 @@ void lapic_timer_init(uint32_t frequency, uint8_t vector) {
         }
     };
     driver_register(&desc);
+
+    // Register with Capability Activation Network
+    const char *timer_deps[] = {"interrupt_controller"};
+    cap_op_t timer_ops[1];
+    cap_op_set(&timer_ops[0], "stop", 0, 1);
+    cap_register("timer", CAP_DRIVER, -1, timer_deps, 1,
+                 NULL, NULL, timer_ops, 1, lapic_timer_get_driver_stats);
 }
 
 void lapic_timer_stop(void) {

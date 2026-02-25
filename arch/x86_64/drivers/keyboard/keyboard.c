@@ -3,6 +3,7 @@
 #include "../../cpu/ports.h"
 #include "drivers/video/framebuffer.h"
 #include "../../../../kernel/driver.h"
+#include "../../../../kernel/capability.h"
 #include <stddef.h>
 
 #define KEYBOARD_DATA_PORT 0x60
@@ -204,6 +205,13 @@ void keyboard_init(void) {
         }
     };
     driver_register(&desc);
+
+    // Register with Capability Activation Network
+    const char *kbd_deps[] = {"interrupt_controller"};
+    cap_op_t kbd_ops[1];
+    cap_op_set(&kbd_ops[0], "getchar", 0, 0);
+    cap_register("keyboard_input", CAP_DRIVER, -1, kbd_deps, 1,
+                 NULL, NULL, kbd_ops, 1, keyboard_get_driver_stats);
 }
 
 void keyboard_handle_scancode(uint8_t scancode) {

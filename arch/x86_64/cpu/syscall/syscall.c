@@ -12,6 +12,7 @@
 #include "../../mm/vmm.h"
 #include "../../drivers/serial/serial.h"
 #include "../../../../kernel/state.h"
+#include "../../../../kernel/capability.h"
 #include <stdbool.h>
 
 // Forward declarations for state collection (kernel/state.c)
@@ -22,6 +23,7 @@ extern void state_collect_filesystem(state_filesystem_t *out);
 extern void state_collect_system(state_system_t *out);
 extern void state_collect_drivers(state_driver_list_t *out);
 extern int state_collect_all(state_snapshot_t *out);
+extern void state_collect_capabilities(state_cap_list_t *out);
 
 // MSR definitions
 #define MSR_EFER 0xC0000080
@@ -707,6 +709,9 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 case STATE_CAT_DRIVERS:
                     state_collect_drivers((state_driver_list_t *)user_buf);
                     break;
+                case STATE_CAT_CAPABILITIES:
+                    state_collect_capabilities((state_cap_list_t *)user_buf);
+                    break;
                 case STATE_CAT_ALL:
                     state_collect_all((state_snapshot_t *)user_buf);
                     break;
@@ -718,6 +723,37 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             if (frame->rax != (uint64_t)-1) {
                 frame->rax = (uint64_t)required;
             }
+            break;
+        }
+
+        case SYS_CAP_ACTIVATE: {
+            // RDI = user string pointer (capability name)
+            char kname[32];
+            if (copy_string_from_user((const char *)frame->rdi, kname, 32) <= 0) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            int id = cap_find(kname);
+            if (id < 0) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            frame->rax = (uint64_t)(long)cap_activate(id);
+            break;
+        }
+
+        case SYS_CAP_DEACTIVATE: {
+            char kname[32];
+            if (copy_string_from_user((const char *)frame->rdi, kname, 32) <= 0) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            int id = cap_find(kname);
+            if (id < 0) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            frame->rax = (uint64_t)(long)cap_deactivate(id);
             break;
         }
 

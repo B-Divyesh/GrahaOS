@@ -29,6 +29,8 @@ typedef long ssize_t;
 #define SYS_SIGNAL  1019
 #define SYS_GETPID  1020
 #define SYS_GET_SYSTEM_STATE 1021
+#define SYS_CAP_ACTIVATE     1031
+#define SYS_CAP_DEACTIVATE   1032
 
 // Directory entry structure for user space
 typedef struct {
@@ -172,4 +174,21 @@ static inline long syscall_get_system_state(uint32_t category, void *buf, size_t
         : "a"(SYS_GET_SYSTEM_STATE), "D"(category), "S"(buf), "d"(buf_size)
         : "rcx", "r11", "memory");
     return ret;
+}
+
+// Phase 8b: Capability Activation Network
+static inline int syscall_cap_activate(const char *name) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_CAP_ACTIVATE), "D"(name)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+static inline int syscall_cap_deactivate(const char *name) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_CAP_DEACTIVATE), "D"(name)
+        : "rcx", "r11", "memory");
+    return (int)ret;
 }

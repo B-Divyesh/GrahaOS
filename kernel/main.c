@@ -24,6 +24,7 @@
 #include "../arch/x86_64/drivers/ahci/ahci.h"
 #include "fs/grahafs.h"
 #include "../arch/x86_64/drivers/serial/serial.h"
+#include "capability.h"
 
 // --- Limine Requests ---
 __attribute__((used, section(".limine_requests")))
@@ -176,6 +177,16 @@ void kmain(void) {
     serial_init();
     serial_write("\n=== GrahaOS Boot Log ===\n");
     serial_write("Serial port initialized\n");
+
+    // Register hardware base capabilities (always ON, no deps)
+    // Must happen after serial_init (for logging) but before driver inits
+    serial_write("Registering hardware capabilities...\n");
+    cap_register("cpu", CAP_HARDWARE, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    cap_register("memory", CAP_HARDWARE, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    cap_register("interrupt_controller", CAP_HARDWARE, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    cap_register("pci_bus", CAP_HARDWARE, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    cap_register("framebuffer_hw", CAP_HARDWARE, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    serial_write("Hardware capabilities registered\n");
 
     // Initialize framebuffer for early output
     if (!framebuffer_init(&framebuffer_request)) {
@@ -544,6 +555,25 @@ void kmain(void) {
     // OPTIONAL: Start timers on APs later (commented out for now)
     // This would require IPI (Inter-Processor Interrupts) to signal APs
     // For now, only BSP handles scheduling
+
+    // Register service and application capabilities
+    serial_write("Registering service/application capabilities...\n");
+    {
+        const char *sched_deps[] = {"timer", "memory"};
+        cap_register("scheduler", CAP_SERVICE, -1, sched_deps, 2,
+                     NULL, NULL, NULL, 0, NULL);
+
+        const char *shell_deps[] = {"display", "keyboard_input", "filesystem"};
+        cap_register("shell", CAP_APPLICATION, -1, shell_deps, 3,
+                     NULL, NULL, NULL, 0, NULL);
+    }
+
+    // Activate all registered capabilities
+    serial_write("Activating all capabilities...\n");
+    for (int i = 0; i < cap_get_count(); i++) {
+        cap_activate(i);
+    }
+    serial_write("All capabilities activated\n");
 
     serial_write("\n=== ENTERING IDLE LOOP ===\n");
     serial_write("System fully initialized, waiting for timer interrupts...\n\n");

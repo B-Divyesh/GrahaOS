@@ -3,6 +3,7 @@
 #include "../../kernel/limine.h"
 #include "../../kernel/sync/spinlock.h"
 #include "../../kernel/driver.h"
+#include "../../kernel/capability.h"
 
 // --- Private Variables ---
 static struct limine_framebuffer *fb = NULL;
@@ -260,6 +261,17 @@ bool framebuffer_init(volatile struct limine_framebuffer_request *fb_request) {
             }
         };
         driver_register(&desc);
+
+        // Register with Capability Activation Network
+        const char *fb_deps[] = {"framebuffer_hw"};
+        cap_op_t fb_ops[4];
+        cap_op_set(&fb_ops[0], "draw_rect",   5, 1);
+        cap_op_set(&fb_ops[1], "draw_string", 5, 1);
+        cap_op_set(&fb_ops[2], "draw_char",   4, 1);
+        cap_op_set(&fb_ops[3], "clear",       1, 1);
+        cap_register("display", CAP_DRIVER, -1, fb_deps, 1,
+                     NULL, NULL, fb_ops, 4, fb_get_driver_stats);
+
         fb_registered = 1;
     }
 

@@ -2,6 +2,7 @@
 // Phase 8a: System state collection and snapshot module
 #include "state.h"
 #include "driver.h"
+#include "capability.h"
 #include "../arch/x86_64/mm/pmm.h"
 #include "../arch/x86_64/cpu/sched/sched.h"
 #include "../arch/x86_64/cpu/smp.h"
@@ -86,17 +87,25 @@ void state_collect_drivers(state_driver_list_t *out) {
     out->count = driver_snapshot_all(out->drivers, STATE_MAX_DRIVERS);
 }
 
+void state_collect_capabilities(state_cap_list_t *out) {
+    if (!out) return;
+    state_memset(out, 0, sizeof(*out));
+
+    out->count = cap_query_all(out->caps, STATE_MAX_CAPS);
+}
+
 int state_collect_all(state_snapshot_t *out) {
     if (!out) return -1;
     state_memset(out, 0, sizeof(*out));
 
-    out->version = 1;  // Phase 8a v1
+    out->version = 2;  // Phase 8b v2
 
     state_collect_memory(&out->memory);
     state_collect_processes(&out->processes);
     state_collect_filesystem(&out->filesystem);
     state_collect_system(&out->system);
     state_collect_drivers(&out->drivers);
+    state_collect_capabilities(&out->capabilities);
 
     return 0;
 }
@@ -108,8 +117,9 @@ int state_get_size(uint32_t category) {
         case STATE_CAT_PROCESSES:  return sizeof(state_process_list_t);
         case STATE_CAT_FILESYSTEM: return sizeof(state_filesystem_t);
         case STATE_CAT_SYSTEM:     return sizeof(state_system_t);
-        case STATE_CAT_DRIVERS:    return sizeof(state_driver_list_t);
-        case STATE_CAT_ALL:        return sizeof(state_snapshot_t);
+        case STATE_CAT_DRIVERS:        return sizeof(state_driver_list_t);
+        case STATE_CAT_CAPABILITIES:   return sizeof(state_cap_list_t);
+        case STATE_CAT_ALL:            return sizeof(state_snapshot_t);
         default:                   return -1;
     }
 }

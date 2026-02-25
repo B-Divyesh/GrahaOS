@@ -4,6 +4,7 @@
 #include "serial.h"
 #include "../../cpu/ports.h"
 #include "../../../../kernel/driver.h"
+#include "../../../../kernel/capability.h"
 
 #define PORT_COM1 0x3F8
 
@@ -57,6 +58,13 @@ void serial_init(void) {
         }
     };
     driver_register(&desc);
+
+    // Register with Capability Activation Network
+    cap_op_t serial_ops[2];
+    cap_op_set(&serial_ops[0], "write", 1, 1);
+    cap_op_set(&serial_ops[1], "putc",  1, 1);
+    cap_register("serial_output", CAP_DRIVER, -1, NULL, 0,
+                 NULL, NULL, serial_ops, 2, serial_get_driver_stats);
 }
 
 static int is_transmit_empty(void) {
