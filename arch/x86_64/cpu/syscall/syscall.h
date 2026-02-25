@@ -44,6 +44,8 @@
 // Phase 8b: Capability Activation Network
 #define SYS_CAP_ACTIVATE   1031
 #define SYS_CAP_DEACTIVATE 1032
+#define SYS_CAP_REGISTER   1033
+#define SYS_CAP_UNREGISTER 1034
 
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);

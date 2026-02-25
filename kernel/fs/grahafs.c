@@ -7,7 +7,6 @@
 #include "../sync/spinlock.h"
 #include "../../arch/x86_64/drivers/ahci/ahci.h"
 #include "../../arch/x86_64/drivers/serial/serial.h"
-#include "../driver.h"
 #include "../capability.h"
 
 static block_device_t* fs_device = NULL;
@@ -846,25 +845,12 @@ void grahafs_init(void) {
     spinlock_init(&grahafs_lock, "grahafs");
     framebuffer_draw_string("GrahaFS: Driver initialized.", 10, 650, COLOR_GREEN, 0x00101828);
 
-    // Register with driver framework
-    driver_descriptor_t desc = {
-        .name = "grahafs",
-        .type = DRIVER_TYPE_FS,
-        .get_stats = grahafs_get_driver_stats,
-        .op_count = 2,
-        .ops = {
-            { .name = "mount", .param_count = 1, .flags = DRIVER_OP_MUTATING },
-            { .name = "sync",  .param_count = 0, .flags = DRIVER_OP_MUTATING },
-        }
-    };
-    driver_register(&desc);
-
     // Register with Capability Activation Network
     const char *gfs_deps[] = {"disk"};
     cap_op_t gfs_ops[2];
     cap_op_set(&gfs_ops[0], "mount", 1, 1);
     cap_op_set(&gfs_ops[1], "sync",  0, 1);
-    cap_register("filesystem", CAP_SERVICE, -1, gfs_deps, 1,
+    cap_register("filesystem", CAP_SERVICE, CAP_SUBTYPE_FS, -1, gfs_deps, 1,
                  NULL, NULL, gfs_ops, 2, grahafs_get_driver_stats);
 }
 

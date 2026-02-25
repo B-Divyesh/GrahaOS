@@ -518,7 +518,10 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             
             current->exit_status = status;
             current->state = TASK_STATE_ZOMBIE;
-            
+
+            // Unregister all user-owned capabilities for this process
+            cap_unregister_by_owner(current->id);
+
             sched_orphan_children(current->id);
             wake_waiting_parent(current->id);
             
@@ -754,6 +757,85 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 break;
             }
             frame->rax = (uint64_t)(long)cap_deactivate(id);
+            break;
+        }
+
+        case SYS_CAP_REGISTER: {
+            // RDI=name, RSI=type, RDX=dep_names array, R10=dep_count
+            char kname[32];
+            if (copy_string_from_user((const char *)frame->rdi, kname, 32) <= 0) {
+                frame->rax = (uint64_t)(long)CAP_ERR_NAME_EMPTY;
+                break;
+            }
+
+            uint32_t cap_type = (uint32_t)frame->rsi;
+
+            // Only APPLICATION, FEATURE, COMPOSITE allowed from user-space
+            if (cap_type < CAP_APPLICATION) {
+                frame->rax = (uint64_t)(long)CAP_ERR_LAYER_VIOLATION;
+                break;
+            }
+
+            int dep_count = (int)frame->r10;
+            if (dep_count < 0 || dep_count > MAX_CAP_DEPS) {
+                frame->rax = (uint64_t)(long)CAP_ERR_DEP_UNRESOLVED;
+                break;
+            }
+
+            // Copy dep names from user-space
+            const char **user_dep_names = (const char **)frame->rdx;
+            const char *k_dep_ptrs[MAX_CAP_DEPS];
+            char k_dep_bufs[MAX_CAP_DEPS][CAP_NAME_LEN];
+
+            for (int i = 0; i < dep_count; i++) {
+                if (!is_user_pointer(user_dep_names, (dep_count) * sizeof(char *))) {
+                    frame->rax = (uint64_t)(long)CAP_ERR_DEP_UNRESOLVED;
+                    goto cap_reg_done;
+                }
+                const char *user_dep = user_dep_names[i];
+                if (copy_string_from_user(user_dep, k_dep_bufs[i], CAP_NAME_LEN) <= 0) {
+                    frame->rax = (uint64_t)(long)CAP_ERR_DEP_UNRESOLVED;
+                    goto cap_reg_done;
+                }
+                k_dep_ptrs[i] = k_dep_bufs[i];
+            }
+
+            {
+                task_t *current = sched_get_current_task();
+                int32_t owner = current ? current->id : -1;
+                int ret = cap_register(kname, cap_type, 0, owner,
+                                       dep_count > 0 ? k_dep_ptrs : NULL, dep_count,
+                                       NULL, NULL, NULL, 0, NULL);
+                frame->rax = (uint64_t)(long)ret;
+            }
+            cap_reg_done:
+            break;
+        }
+
+        case SYS_CAP_UNREGISTER: {
+            // RDI=name
+            char kname[32];
+            if (copy_string_from_user((const char *)frame->rdi, kname, 32) <= 0) {
+                frame->rax = (uint64_t)(long)CAP_ERR_NAME_EMPTY;
+                break;
+            }
+
+            int id = cap_find(kname);
+            if (id < 0) {
+                frame->rax = (uint64_t)(long)CAP_ERR_NOT_FOUND;
+                break;
+            }
+
+            // Verify caller owns the cap
+            task_t *current = sched_get_current_task();
+            int32_t caller_pid = current ? current->id : -1;
+            int32_t cap_owner = cap_get_owner(id);
+            if (cap_owner == -1 || cap_owner != caller_pid) {
+                frame->rax = (uint64_t)(long)CAP_ERR_KERNEL_OWNED;
+                break;
+            }
+
+            frame->rax = (uint64_t)(long)cap_unregister(id);
             break;
         }
 

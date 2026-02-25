@@ -12,32 +12,40 @@ extern syscall_stack_switched
 section .text
 syscall_entry:
     mov qword [syscall_entry_reached], 1
-    
-    ; Save user RSP
-    mov r10, rsp
-    
-    ; Switch to kernel context
+
+    ; Switch to kernel GS FIRST (needed for per-CPU scratch area)
     swapgs
-    
-    ; CRITICAL FIX: Correct offset to TSS.rsp0 is 68, not 4!
+
+    ; Save original R10 to per-CPU scratch BEFORE clobbering it
+    ; R10 carries the 4th syscall argument in System V AMD64 ABI
+    ; cpu_local_t.syscall_scratch is at offset 168
+    mov [gs:168], r10
+
+    ; Now safe to use R10 as scratch for user RSP
+    mov r10, rsp
+
+    ; Load kernel stack from TSS.rsp0
     ; cpu_local_t structure:
     ; - cpu_id (4 bytes) + lapic_id (4 bytes) = 8 bytes
-    ; - gdt[7] (7 * 8 bytes) = 56 bytes  
+    ; - gdt[7] (7 * 8 bytes) = 56 bytes
     ; - tss.reserved0 (4 bytes) = 4 bytes
     ; Total offset to rsp0 = 8 + 56 + 4 = 68
     mov rsp, [gs:68]
-    
+
     test rsp, rsp
     jz panic
-    
+
     mov qword [syscall_stack_switched], 1
-    
+
     ; Build syscall_frame
     push r10            ; user_rsp
     push 0              ; err_code
     push rax            ; int_no
-    
-    ; Push all GPRs
+
+    ; Restore original R10 from per-CPU scratch
+    mov r10, [gs:168]
+
+    ; Push all GPRs (R10 is now the original value from user-space)
     push r15
     push r14
     push r13

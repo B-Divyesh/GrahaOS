@@ -2,7 +2,6 @@
 #include "framebuffer.h"
 #include "../../kernel/limine.h"
 #include "../../kernel/sync/spinlock.h"
-#include "../../kernel/driver.h"
 #include "../../kernel/capability.h"
 
 // --- Private Variables ---
@@ -248,20 +247,6 @@ bool framebuffer_init(volatile struct limine_framebuffer_request *fb_request) {
     // Register with driver framework (only once - framebuffer_init may be called twice)
     static int fb_registered = 0;
     if (!fb_registered) {
-        driver_descriptor_t desc = {
-            .name = "framebuffer",
-            .type = DRIVER_TYPE_DISPLAY,
-            .get_stats = fb_get_driver_stats,
-            .op_count = 4,
-            .ops = {
-                { .name = "draw_rect",   .param_count = 5, .flags = DRIVER_OP_MUTATING },
-                { .name = "draw_string", .param_count = 5, .flags = DRIVER_OP_MUTATING },
-                { .name = "draw_char",   .param_count = 4, .flags = DRIVER_OP_MUTATING },
-                { .name = "clear",       .param_count = 1, .flags = DRIVER_OP_MUTATING },
-            }
-        };
-        driver_register(&desc);
-
         // Register with Capability Activation Network
         const char *fb_deps[] = {"framebuffer_hw"};
         cap_op_t fb_ops[4];
@@ -269,7 +254,7 @@ bool framebuffer_init(volatile struct limine_framebuffer_request *fb_request) {
         cap_op_set(&fb_ops[1], "draw_string", 5, 1);
         cap_op_set(&fb_ops[2], "draw_char",   4, 1);
         cap_op_set(&fb_ops[3], "clear",       1, 1);
-        cap_register("display", CAP_DRIVER, -1, fb_deps, 1,
+        cap_register("display", CAP_DRIVER, CAP_SUBTYPE_DISPLAY, -1, fb_deps, 1,
                      NULL, NULL, fb_ops, 4, fb_get_driver_stats);
 
         fb_registered = 1;

@@ -31,6 +31,8 @@ typedef long ssize_t;
 #define SYS_GET_SYSTEM_STATE 1021
 #define SYS_CAP_ACTIVATE     1031
 #define SYS_CAP_DEACTIVATE   1032
+#define SYS_CAP_REGISTER     1033
+#define SYS_CAP_UNREGISTER   1034
 
 // Directory entry structure for user space
 typedef struct {
@@ -189,6 +191,30 @@ static inline int syscall_cap_deactivate(const char *name) {
     long ret;
     asm volatile("syscall" : "=a"(ret)
         : "a"(SYS_CAP_DEACTIVATE), "D"(name)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 8b-ii: Register a user-owned capability
+// type: CAP_APPLICATION(3), CAP_FEATURE(4), or CAP_COMPOSITE(5)
+// dep_names: array of dependency name strings, dep_count: number of deps
+// Returns: cap_id (>=0) on success, negative error on failure
+static inline int syscall_cap_register(const char *name, uint32_t type,
+                                       const char **dep_names, int dep_count) {
+    long ret;
+    register long r10 asm("r10") = (long)dep_count;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_CAP_REGISTER), "D"(name), "S"(type), "d"(dep_names), "r"(r10)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 8b-ii: Unregister a user-owned capability
+// Returns: 0 on success, negative error on failure
+static inline int syscall_cap_unregister(const char *name) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_CAP_UNREGISTER), "D"(name)
         : "rcx", "r11", "memory");
     return (int)ret;
 }

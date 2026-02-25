@@ -2,7 +2,6 @@
 #include "keyboard.h"
 #include "../../cpu/ports.h"
 #include "drivers/video/framebuffer.h"
-#include "../../../../kernel/driver.h"
 #include "../../../../kernel/capability.h"
 #include <stddef.h>
 
@@ -194,23 +193,11 @@ void keyboard_init(void) {
     
     framebuffer_draw_string("KB: Ready (Polling Mode)", 10, 280, COLOR_GREEN, 0x00101828);
 
-    // Register with driver framework
-    driver_descriptor_t desc = {
-        .name = "keyboard",
-        .type = DRIVER_TYPE_INPUT,
-        .get_stats = keyboard_get_driver_stats,
-        .op_count = 1,
-        .ops = {
-            { .name = "getchar", .param_count = 0, .flags = DRIVER_OP_QUERY },
-        }
-    };
-    driver_register(&desc);
-
     // Register with Capability Activation Network
     const char *kbd_deps[] = {"interrupt_controller"};
     cap_op_t kbd_ops[1];
     cap_op_set(&kbd_ops[0], "getchar", 0, 0);
-    cap_register("keyboard_input", CAP_DRIVER, -1, kbd_deps, 1,
+    cap_register("keyboard_input", CAP_DRIVER, CAP_SUBTYPE_INPUT, -1, kbd_deps, 1,
                  NULL, NULL, kbd_ops, 1, keyboard_get_driver_stats);
 }
 

@@ -1,6 +1,6 @@
 // kernel/capability.c
-// Phase 8b-i: Capability Activation Network (CAN) - Core Engine
-// 3-pass registration compiler, recursive activation, cascade deactivation.
+// Phase 8b: Capability Activation Network (CAN) - Core Engine
+// 6-pass registration compiler, recursive activation, cascade deactivation.
 #include "capability.h"
 #include "sync/spinlock.h"
 #include "../arch/x86_64/drivers/serial/serial.h"
@@ -70,9 +70,20 @@ static int layer_allows_dep(uint32_t my_type, uint32_t dep_type) {
     }
 }
 
-// --- Registration (3-pass compiler) ---
+// --- Internal: DFS helper for cycle detection and reachability ---
+// Walks transitive deps from `start_id`, sets visited[i]=1 for each reachable cap.
+static void dfs_walk(uint32_t start_id, uint8_t *visited) {
+    if (start_id >= g_cap_count || g_caps[start_id].deleted || visited[start_id])
+        return;
+    visited[start_id] = 1;
+    for (uint32_t i = 0; i < g_caps[start_id].dep_count; i++) {
+        dfs_walk(g_caps[start_id].dep_indices[i], visited);
+    }
+}
 
-int cap_register(const char *name, uint32_t type, int32_t owner,
+// --- Registration (6-pass compiler) ---
+
+int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owner,
                  const char **dep_names, int dep_count,
                  int (*activate_fn)(void), void (*deactivate_fn)(void),
                  cap_op_t *ops, int op_count,
@@ -89,8 +100,9 @@ int cap_register(const char *name, uint32_t type, int32_t owner,
         return CAP_ERR_NAME_EMPTY;
     }
 
-    // Check for duplicate name
+    // Check for duplicate name (skip deleted slots)
     for (uint32_t i = 0; i < g_cap_count; i++) {
+        if (g_caps[i].deleted) continue;
         if (cap_strcmp(g_caps[i].name, name) == 0) {
             serial_write("[CAN] ERR: duplicate name: ");
             serial_write(name);
@@ -143,9 +155,10 @@ int cap_register(const char *name, uint32_t type, int32_t owner,
             return CAP_ERR_DEP_SELF;
         }
 
-        // Resolve name to index
+        // Resolve name to index (skip deleted slots)
         int found = -1;
         for (uint32_t j = 0; j < g_cap_count; j++) {
+            if (g_caps[j].deleted) continue;
             if (cap_strcmp(g_caps[j].name, dep_names[i]) == 0) {
                 found = (int)j;
                 break;
@@ -184,6 +197,80 @@ int cap_register(const char *name, uint32_t type, int32_t owner,
         }
     }
 
+    // --- PASS 4: Cycle Safety Check ---
+    // Defense-in-depth: with "deps must already exist" rule, cycles cannot form.
+    // This verifies that invariant by DFS from each dep to ensure the new cap's
+    // name does not appear in the transitive closure.
+    if (dep_count > 0) {
+        uint8_t visited[MAX_CAPABILITIES];
+        cap_memset(visited, 0, sizeof(visited));
+        for (int i = 0; i < dep_count; i++) {
+            dfs_walk(resolved_deps[i], visited);
+        }
+        // Since the new cap isn't committed yet, check if any visited cap
+        // has the same name (shouldn't happen since pass 1 rejects duplicates,
+        // but validates the graph structure)
+        for (uint32_t i = 0; i < g_cap_count; i++) {
+            if (visited[i] && !g_caps[i].deleted && cap_strcmp(g_caps[i].name, name) == 0) {
+                serial_write("[CAN] ERR: cycle detected for: ");
+                serial_write(name);
+                serial_write("\n");
+                spinlock_release(&g_cap_lock);
+                return CAP_ERR_CYCLE;
+            }
+        }
+    }
+
+    // --- PASS 5: Reachability Warning (advisory) ---
+    // Check if any transitive dependency reaches a HARDWARE node.
+    // Non-HARDWARE caps with no path to HARDWARE can never be truly grounded.
+    if (type != CAP_HARDWARE && dep_count > 0) {
+        uint8_t visited[MAX_CAPABILITIES];
+        cap_memset(visited, 0, sizeof(visited));
+        for (int i = 0; i < dep_count; i++) {
+            dfs_walk(resolved_deps[i], visited);
+        }
+        int has_hw = 0;
+        for (uint32_t i = 0; i < g_cap_count; i++) {
+            if (visited[i] && g_caps[i].type == CAP_HARDWARE && !g_caps[i].deleted) {
+                has_hw = 1;
+                break;
+            }
+        }
+        if (!has_hw) {
+            serial_write("[CAN] PASS5 WARN: '");
+            serial_write(name);
+            serial_write("' has no path to HARDWARE\n");
+        }
+    }
+
+    // --- PASS 6: Transitive Redundancy Detection (advisory) ---
+    // If dep A is transitively reachable via dep B, the direct dep on A is redundant.
+    if (dep_count > 1) {
+        for (int i = 0; i < dep_count; i++) {
+            for (int j = 0; j < dep_count; j++) {
+                if (i == j) continue;
+                // Check if resolved_deps[i] is reachable from resolved_deps[j]
+                uint8_t visited[MAX_CAPABILITIES];
+                cap_memset(visited, 0, sizeof(visited));
+                // Walk from dep j's children (not dep j itself)
+                for (uint32_t k = 0; k < g_caps[resolved_deps[j]].dep_count; k++) {
+                    dfs_walk(g_caps[resolved_deps[j]].dep_indices[k], visited);
+                }
+                if (visited[resolved_deps[i]]) {
+                    serial_write("[CAN] PASS6 WARN: dep '");
+                    serial_write(dep_names[i]);
+                    serial_write("' in '");
+                    serial_write(name);
+                    serial_write("' transitively redundant via '");
+                    serial_write(dep_names[j]);
+                    serial_write("'\n");
+                    break;  // Only warn once per redundant dep
+                }
+            }
+        }
+    }
+
     // --- All passes OK: commit to registry ---
 
     uint32_t id = g_cap_count;
@@ -192,6 +279,7 @@ int cap_register(const char *name, uint32_t type, int32_t owner,
 
     cap_strcpy(cap->name, name, CAP_NAME_LEN);
     cap->type = type;
+    cap->subtype = subtype;
     cap->owner_pid = owner;
     cap->dep_count = (uint32_t)dep_count;
 
@@ -225,6 +313,7 @@ int cap_register(const char *name, uint32_t type, int32_t owner,
     }
 
     cap->compiled = 1;
+    cap->deleted = 0;
     g_cap_count++;
 
     // Log
@@ -250,6 +339,9 @@ int cap_activate(int cap_id) {
     if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return CAP_ERR_NOT_FOUND;
 
     capability_t *cap = &g_caps[cap_id];
+
+    // Deleted caps cannot be activated
+    if (cap->deleted) return CAP_ERR_DELETED;
 
     // Already ON - idempotent
     if (cap->state == CAP_STATE_ON) return CAP_OK;
@@ -306,11 +398,15 @@ int cap_deactivate(int cap_id) {
 
     capability_t *cap = &g_caps[cap_id];
 
+    // Deleted caps
+    if (cap->deleted) return CAP_ERR_DELETED;
+
     // Already OFF - no-op
     if (cap->state == CAP_STATE_OFF) return CAP_OK;
 
     // First, cascade: deactivate all capabilities that depend on this one
     for (uint32_t i = 0; i < g_cap_count; i++) {
+        if (g_caps[i].deleted) continue;
         if (g_caps[i].state != CAP_STATE_ON && g_caps[i].state != CAP_STATE_STARTING)
             continue;
         for (uint32_t j = 0; j < g_caps[i].dep_count; j++) {
@@ -335,12 +431,64 @@ int cap_deactivate(int cap_id) {
     return CAP_OK;
 }
 
+// --- Unregistration ---
+
+int cap_unregister(int cap_id) {
+    if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return CAP_ERR_NOT_FOUND;
+
+    spinlock_acquire(&g_cap_lock);
+    capability_t *cap = &g_caps[cap_id];
+
+    if (cap->deleted) {
+        spinlock_release(&g_cap_lock);
+        return CAP_ERR_DELETED;
+    }
+
+    // Only APPLICATION, FEATURE, COMPOSITE can be unregistered
+    if (cap->type < CAP_APPLICATION) {
+        spinlock_release(&g_cap_lock);
+        return CAP_ERR_KERNEL_OWNED;
+    }
+
+    // Deactivate first if active (cascade to dependents)
+    if (cap->state == CAP_STATE_ON || cap->state == CAP_STATE_STARTING) {
+        spinlock_release(&g_cap_lock);
+        cap_deactivate(cap_id);
+        spinlock_acquire(&g_cap_lock);
+    }
+
+    cap->deleted = 1;
+    cap->state = CAP_STATE_OFF;
+
+    serial_write("[CAN] Unregistered: ");
+    serial_write(cap->name);
+    serial_write("\n");
+
+    spinlock_release(&g_cap_lock);
+    return CAP_OK;
+}
+
+void cap_unregister_by_owner(int32_t owner_pid) {
+    for (uint32_t i = 0; i < g_cap_count; i++) {
+        if (!g_caps[i].deleted && g_caps[i].owner_pid == owner_pid) {
+            cap_unregister((int)i);
+        }
+    }
+}
+
+int32_t cap_get_owner(int cap_id) {
+    if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return -1;
+    if (g_caps[cap_id].deleted) return -1;
+    return g_caps[cap_id].owner_pid;
+}
+
 // --- Query Functions ---
 
 int cap_find(const char *name) {
     if (!name || name[0] == '\0') return CAP_ERR_NOT_FOUND;
 
     for (uint32_t i = 0; i < g_cap_count; i++) {
+        if (g_caps[i].deleted) continue;
         if (cap_strcmp(g_caps[i].name, name) == 0) {
             return (int)i;
         }
@@ -365,6 +513,11 @@ int cap_why_not(int cap_id, char *buf, int buflen) {
 
     capability_t *cap = &g_caps[cap_id];
 
+    if (cap->deleted) {
+        if (buf && buflen > 0) cap_strcpy(buf, "deleted", buflen);
+        return CAP_ERR_DELETED;
+    }
+
     // Already ON
     if (cap->state == CAP_STATE_ON) {
         if (buf && buflen > 0) cap_strcpy(buf, "already active", buflen);
@@ -377,7 +530,7 @@ int cap_why_not(int cap_id, char *buf, int buflen) {
     for (uint32_t i = 0; i < cap->dep_count; i++) {
         uint32_t dep_id = cap->dep_indices[i];
         if (dep_id >= g_cap_count) continue;
-        if (g_caps[dep_id].state != CAP_STATE_ON) {
+        if (g_caps[dep_id].deleted || g_caps[dep_id].state != CAP_STATE_ON) {
             if (buf && pos < buflen - 1) {
                 if (found_issue && pos < buflen - 3) {
                     buf[pos++] = ',';
@@ -399,14 +552,12 @@ int cap_why_not(int cap_id, char *buf, int buflen) {
         // All deps are ON but we're still OFF - might be error state
         if (cap->state == CAP_STATE_ERROR) {
             if (buf && buflen > 0) {
-                const char *msg = "activation callback failed";
                 if (cap->error_dep < g_cap_count) {
-                    // A dep failed
                     cap_strcpy(buf, "dep failed: ", buflen);
                     int l = cap_strlen(buf);
                     cap_strcpy(buf + l, g_caps[cap->error_dep].name, buflen - l);
                 } else {
-                    cap_strcpy(buf, msg, buflen);
+                    cap_strcpy(buf, "activation callback failed", buflen);
                 }
             }
             return CAP_ERR_ACTIVATE_FAIL;
@@ -420,6 +571,7 @@ int cap_why_not(int cap_id, char *buf, int buflen) {
     return CAP_ERR_DEP_FAILED;
 }
 
+// Snapshot all capabilities (including deleted slots to preserve index stability)
 int cap_query_all(state_cap_entry_t *out, int max) {
     if (!out || max <= 0) return 0;
 
@@ -439,8 +591,53 @@ int cap_query_all(state_cap_entry_t *out, int max) {
         }
         out[i].op_count = g_caps[i].op_count;
         out[i].activation_count = g_caps[i].activation_count;
+        out[i].deleted = g_caps[i].deleted;
+        out[i].subtype = g_caps[i].subtype;
     }
 
     spinlock_release(&g_cap_lock);
     return count;
+}
+
+// --- Driver Compatibility ---
+// Snapshot driver-type capabilities into the old state_driver_info_t format.
+// This replaces driver_snapshot_all() from the deleted driver.c.
+int cap_snapshot_drivers(state_driver_info_t *out, int max) {
+    if (!out || max <= 0) return 0;
+
+    spinlock_acquire(&g_cap_lock);
+
+    int written = 0;
+    for (uint32_t i = 0; i < g_cap_count && written < max; i++) {
+        if (g_caps[i].deleted) continue;
+        // Include DRIVER and SERVICE caps (these are the "drivers" in the old sense)
+        if (g_caps[i].type != CAP_DRIVER && g_caps[i].type != CAP_SERVICE) continue;
+
+        state_driver_info_t *d = &out[written];
+        cap_memset(d, 0, sizeof(*d));
+
+        cap_strcpy(d->name, g_caps[i].name, STATE_DRIVER_NAME_LEN);
+        d->type = g_caps[i].subtype;
+        d->initialized = (g_caps[i].state == CAP_STATE_ON) ? 1 : 0;
+
+        // Copy operation descriptors
+        d->op_count = g_caps[i].op_count;
+        for (uint32_t j = 0; j < g_caps[i].op_count && j < STATE_MAX_DRIVER_OPS; j++) {
+            cap_strcpy(d->ops[j].name, g_caps[i].ops[j].name, STATE_OP_NAME_LEN);
+            d->ops[j].param_count = g_caps[i].ops[j].param_count;
+            d->ops[j].flags = g_caps[i].ops[j].flags;
+        }
+
+        // Call stats callback for live data
+        if (g_caps[i].get_stats_fn) {
+            d->stat_count = g_caps[i].get_stats_fn(d->stats, STATE_MAX_DRIVER_STATS);
+        } else {
+            d->stat_count = 0;
+        }
+
+        written++;
+    }
+
+    spinlock_release(&g_cap_lock);
+    return written;
 }

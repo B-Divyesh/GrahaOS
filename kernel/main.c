@@ -181,11 +181,11 @@ void kmain(void) {
     // Register hardware base capabilities (always ON, no deps)
     // Must happen after serial_init (for logging) but before driver inits
     serial_write("Registering hardware capabilities...\n");
-    cap_register("cpu", CAP_HARDWARE, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
-    cap_register("memory", CAP_HARDWARE, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
-    cap_register("interrupt_controller", CAP_HARDWARE, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
-    cap_register("pci_bus", CAP_HARDWARE, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
-    cap_register("framebuffer_hw", CAP_HARDWARE, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    cap_register("cpu", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    cap_register("memory", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    cap_register("interrupt_controller", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    cap_register("pci_bus", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    cap_register("framebuffer_hw", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
     serial_write("Hardware capabilities registered\n");
 
     // Initialize framebuffer for early output
@@ -560,11 +560,11 @@ void kmain(void) {
     serial_write("Registering service/application capabilities...\n");
     {
         const char *sched_deps[] = {"timer", "memory"};
-        cap_register("scheduler", CAP_SERVICE, -1, sched_deps, 2,
+        cap_register("scheduler", CAP_SERVICE, 0, -1, sched_deps, 2,
                      NULL, NULL, NULL, 0, NULL);
 
         const char *shell_deps[] = {"display", "keyboard_input", "filesystem"};
-        cap_register("shell", CAP_APPLICATION, -1, shell_deps, 3,
+        cap_register("shell", CAP_APPLICATION, 0, -1, shell_deps, 3,
                      NULL, NULL, NULL, 0, NULL);
     }
 

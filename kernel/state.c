@@ -1,7 +1,6 @@
 // kernel/state.c
 // Phase 8a: System state collection and snapshot module
 #include "state.h"
-#include "driver.h"
 #include "capability.h"
 #include "../arch/x86_64/mm/pmm.h"
 #include "../arch/x86_64/cpu/sched/sched.h"
@@ -84,7 +83,7 @@ void state_collect_drivers(state_driver_list_t *out) {
     if (!out) return;
     state_memset(out, 0, sizeof(*out));
 
-    out->count = driver_snapshot_all(out->drivers, STATE_MAX_DRIVERS);
+    out->count = cap_snapshot_drivers(out->drivers, STATE_MAX_DRIVERS);
 }
 
 void state_collect_capabilities(state_cap_list_t *out) {

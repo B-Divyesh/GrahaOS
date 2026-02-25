@@ -6,7 +6,6 @@
 #include "../../../../drivers/video/framebuffer.h"
 #include "../../../../kernel/fs/vfs.h"
 #include "../../../../kernel/sync/spinlock.h"
-#include "../../../../kernel/driver.h"
 #include "../../../../kernel/capability.h"
 
 #define HBA_PORT_DEV_PRESENT 0x3
@@ -253,27 +252,13 @@ void ahci_init(void) {
         }
     }
 
-    // Register with driver framework
-    driver_descriptor_t desc = {
-        .name = "ahci",
-        .type = DRIVER_TYPE_BLOCK,
-        .get_stats = ahci_get_driver_stats,
-        .op_count = 3,
-        .ops = {
-            { .name = "read",  .param_count = 3, .flags = DRIVER_OP_QUERY },
-            { .name = "write", .param_count = 3, .flags = DRIVER_OP_MUTATING },
-            { .name = "flush", .param_count = 1, .flags = DRIVER_OP_MUTATING },
-        }
-    };
-    driver_register(&desc);
-
     // Register with Capability Activation Network
     const char *ahci_deps[] = {"pci_bus"};
     cap_op_t ahci_ops[3];
     cap_op_set(&ahci_ops[0], "read",  3, 0);
     cap_op_set(&ahci_ops[1], "write", 3, 1);
     cap_op_set(&ahci_ops[2], "flush", 1, 1);
-    cap_register("disk", CAP_DRIVER, -1, ahci_deps, 1,
+    cap_register("disk", CAP_DRIVER, CAP_SUBTYPE_BLOCK, -1, ahci_deps, 1,
                  NULL, NULL, ahci_ops, 3, ahci_get_driver_stats);
 }
 

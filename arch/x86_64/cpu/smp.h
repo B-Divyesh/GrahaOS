@@ -32,7 +32,8 @@ typedef struct {
     // Per-CPU GDT and TSS
     struct gdt_entry gdt[7];  // 7 entries as per your GDT_ENTRIES
     struct tss tss;
-    // Add more per-CPU data here in the future
+    // Per-CPU scratch for syscall entry (R10 save area)
+    uint64_t syscall_scratch;   // offset = 4+4+56+104 = 168
 } __attribute__((packed)) cpu_local_t;
 
 // Global CPU information array

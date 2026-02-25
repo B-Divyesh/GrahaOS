@@ -34,7 +34,7 @@
 #define STATE_PROC_RUNNING    2
 #define STATE_PROC_BLOCKED    3
 
-// Driver type values (match DRIVER_TYPE_* in driver.h)
+// Driver type values (match CAP_SUBTYPE_* in capability.h)
 #define STATE_DRIVER_BLOCK    0
 #define STATE_DRIVER_INPUT    1
 #define STATE_DRIVER_DISPLAY  2
@@ -146,6 +146,8 @@ typedef struct {
     uint32_t dep_indices[STATE_MAX_CAP_DEPS];
     uint32_t op_count;
     uint64_t activation_count;
+    uint32_t subtype;        // CAP_SUBTYPE_* for DRIVER/SERVICE caps, 0 otherwise
+    uint32_t deleted;        // 1=slot marked deleted by cap_unregister
 } state_cap_entry_t;
 
 // --- Capability list ---

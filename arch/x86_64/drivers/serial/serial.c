@@ -3,7 +3,6 @@
 
 #include "serial.h"
 #include "../../cpu/ports.h"
-#include "../../../../kernel/driver.h"
 #include "../../../../kernel/capability.h"
 
 #define PORT_COM1 0x3F8
@@ -46,24 +45,11 @@ void serial_init(void) {
 
     serial_initialized = 1;
 
-    // Register with driver framework
-    driver_descriptor_t desc = {
-        .name = "serial",
-        .type = DRIVER_TYPE_SERIAL,
-        .get_stats = serial_get_driver_stats,
-        .op_count = 2,
-        .ops = {
-            { .name = "write", .param_count = 1, .flags = DRIVER_OP_MUTATING },
-            { .name = "putc",  .param_count = 1, .flags = DRIVER_OP_MUTATING },
-        }
-    };
-    driver_register(&desc);
-
     // Register with Capability Activation Network
     cap_op_t serial_ops[2];
     cap_op_set(&serial_ops[0], "write", 1, 1);
     cap_op_set(&serial_ops[1], "putc",  1, 1);
-    cap_register("serial_output", CAP_DRIVER, -1, NULL, 0,
+    cap_register("serial_output", CAP_DRIVER, CAP_SUBTYPE_SERIAL, -1, NULL, 0,
                  NULL, NULL, serial_ops, 2, serial_get_driver_stats);
 }
 

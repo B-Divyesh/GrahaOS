@@ -3,7 +3,6 @@
 #include "../lapic/lapic.h"
 #include "../../cpu/ports.h"
 #include "../../../../drivers/video/framebuffer.h"
-#include "../../../../kernel/driver.h"
 #include "../../../../kernel/capability.h"
 
 // LAPIC Timer registers (offsets from LAPIC base)
@@ -171,23 +170,11 @@ void lapic_timer_init(uint32_t frequency, uint8_t vector) {
     
     timer_initialized = true;
 
-    // Register with driver framework
-    driver_descriptor_t desc = {
-        .name = "lapic_timer",
-        .type = DRIVER_TYPE_TIMER,
-        .get_stats = lapic_timer_get_driver_stats,
-        .op_count = 1,
-        .ops = {
-            { .name = "stop", .param_count = 0, .flags = DRIVER_OP_MUTATING },
-        }
-    };
-    driver_register(&desc);
-
     // Register with Capability Activation Network
     const char *timer_deps[] = {"interrupt_controller"};
     cap_op_t timer_ops[1];
     cap_op_set(&timer_ops[0], "stop", 0, 1);
-    cap_register("timer", CAP_DRIVER, -1, timer_deps, 1,
+    cap_register("timer", CAP_DRIVER, CAP_SUBTYPE_TIMER, -1, timer_deps, 1,
                  NULL, NULL, timer_ops, 1, lapic_timer_get_driver_stats);
 }
 

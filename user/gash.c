@@ -497,6 +497,7 @@ void cmd_caps(void) {
     for (uint32_t layer = 0; layer <= 5; layer++) {
         int has_entries = 0;
         for (uint32_t i = 0; i < caps.count; i++) {
+            if (caps.caps[i].deleted) continue;
             if (caps.caps[i].type == layer) {
                 if (!has_entries) {
                     print("--- ");

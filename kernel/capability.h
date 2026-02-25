@@ -1,5 +1,5 @@
 // kernel/capability.h
-// Phase 8b-i: Capability Activation Network (CAN)
+// Phase 8b: Capability Activation Network (CAN)
 //
 // Every system component - hardware, drivers, services, applications - is a
 // "switch" with ON/OFF state and declared dependencies. To use something, you
@@ -10,6 +10,14 @@
 // instantly knows the cursor, UI toolkit, and every application using the mouse
 // are affected - no debugging, no guesswork. The dependency chain IS the
 // diagnostic. `why_not` walks the chain and tells you exactly what's wrong.
+//
+// 6-pass registration compiler:
+//   Pass 1: Lexical validation (name format, uniqueness)
+//   Pass 2: Dependency resolution (names -> indices)
+//   Pass 3: Layer checking (no upward dependencies)
+//   Pass 4: Cycle detection (DFS safety check)
+//   Pass 5: Reachability analysis (advisory: warns if no path to HARDWARE)
+//   Pass 6: Transitive redundancy detection (advisory: warns about redundant deps)
 //
 // This is control-plane only - manages component lifecycle, not data-plane I/O.
 // Zero overhead on hot paths (read/write/spawn).
@@ -42,6 +50,17 @@
 #define MAX_CAP_OPS        8
 #define CAP_OP_NAME_LEN   24
 
+// --- Driver Subtype Constants ---
+// Used in capability_t.subtype for CAP_DRIVER/CAP_SERVICE caps.
+// Replaces the old DRIVER_TYPE_* constants from driver.h.
+#define CAP_SUBTYPE_BLOCK    0
+#define CAP_SUBTYPE_INPUT    1
+#define CAP_SUBTYPE_DISPLAY  2
+#define CAP_SUBTYPE_TIMER    3
+#define CAP_SUBTYPE_SERIAL   4
+#define CAP_SUBTYPE_FS       5
+#define CAP_SUBTYPE_OTHER    255
+
 // --- Error Codes ---
 #define CAP_OK                 0
 #define CAP_ERR_NAME_EMPTY    -1
@@ -55,6 +74,8 @@
 #define CAP_ERR_ACTIVATE_FAIL -9
 #define CAP_ERR_DEP_FAILED    -10
 #define CAP_ERR_CYCLE         -11
+#define CAP_ERR_KERNEL_OWNED  -12
+#define CAP_ERR_DELETED       -14
 
 // --- Operation Descriptor ---
 typedef struct {
@@ -88,15 +109,19 @@ typedef struct {
     uint64_t activation_count;
     uint32_t error_dep;          // index of dep that caused last failure
     uint32_t compiled;           // 1=passed all compilation passes
+    uint32_t subtype;            // CAP_SUBTYPE_* for DRIVER/SERVICE caps, 0 otherwise
+    uint32_t deleted;            // 1=slot marked deleted by cap_unregister
 } capability_t;
 
 // --- Registration API ---
 
 // Register a capability with the CAN.
-// 3-pass compiler: (1) lexical, (2) dep resolution, (3) layer checking.
+// 6-pass compiler: (1) lexical, (2) dep resolution, (3) layer checking,
+// (4) cycle detection, (5) reachability analysis, (6) transitive redundancy.
 // HARDWARE caps are set to ON immediately. All others start OFF.
+// subtype: CAP_SUBTYPE_* for DRIVER/SERVICE caps, 0 for others.
 // Returns: cap_id (>=0) on success, negative CAP_ERR_* on failure.
-int cap_register(const char *name, uint32_t type, int32_t owner,
+int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owner,
                  const char **dep_names, int dep_count,
                  int (*activate_fn)(void), void (*deactivate_fn)(void),
                  cap_op_t *ops, int op_count,
@@ -131,6 +156,27 @@ int cap_why_not(int cap_id, char *buf, int buflen);
 // Snapshot all capabilities into user-space buffer.
 // Returns: number of entries written.
 int cap_query_all(state_cap_entry_t *out, int max);
+
+// --- Unregistration API ---
+
+// Unregister a capability. Only user-owned APPLICATION/FEATURE/COMPOSITE.
+// Deactivates first if active (cascading). Marks slot as deleted.
+// Returns: 0 on success, negative error on failure.
+int cap_unregister(int cap_id);
+
+// Unregister all capabilities owned by a process. Called from SYS_EXIT.
+void cap_unregister_by_owner(int32_t owner_pid);
+
+// Get owner PID for a capability. Returns -1 if not found or kernel-owned.
+int32_t cap_get_owner(int cap_id);
+
+// --- Driver Compatibility ---
+
+// Snapshot driver-type capabilities into state_driver_info_t format.
+// Replaces the old driver_snapshot_all() from driver.c.
+// Iterates DRIVER/SERVICE caps, calls get_stats_fn for live stats.
+// Returns: number of entries written.
+int cap_snapshot_drivers(state_driver_info_t *out, int max);
 
 // --- Helper ---
 
