@@ -33,6 +33,9 @@ typedef long ssize_t;
 #define SYS_CAP_DEACTIVATE   1032
 #define SYS_CAP_REGISTER     1033
 #define SYS_CAP_UNREGISTER   1034
+#define SYS_SET_AI_METADATA  1035
+#define SYS_GET_AI_METADATA  1036
+#define SYS_SEARCH_BY_TAG    1037
 
 // Directory entry structure for user space
 typedef struct {
@@ -215,6 +218,35 @@ static inline int syscall_cap_unregister(const char *name) {
     long ret;
     asm volatile("syscall" : "=a"(ret)
         : "a"(SYS_CAP_UNREGISTER), "D"(name)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 8c: AI Metadata operations
+// Set AI metadata on a file by path
+static inline int syscall_set_ai_metadata(const char *path, const void *meta) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_SET_AI_METADATA), "D"(path), "S"(meta)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Get AI metadata from a file by path
+static inline int syscall_get_ai_metadata(const char *path, void *meta) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_GET_AI_METADATA), "D"(path), "S"(meta)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Search files by tag substring
+// Returns: number of matches found, negative on error
+static inline int syscall_search_by_tag(const char *tag, void *results, int max) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_SEARCH_BY_TAG), "D"(tag), "S"(results), "d"(max)
         : "rcx", "r11", "memory");
     return (int)ret;
 }

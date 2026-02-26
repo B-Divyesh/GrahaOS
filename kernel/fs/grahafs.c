@@ -46,6 +46,17 @@ static size_t strlen(const char* str) {
     return len;
 }
 
+static const char* grahafs_strstr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    if (!needle[0]) return haystack;
+    for (; *haystack; haystack++) {
+        const char *h = haystack, *n = needle;
+        while (*h && *n && *h == *n) { h++; n++; }
+        if (!*n) return haystack;
+    }
+    return NULL;
+}
+
 // Bitmap operations
 static void bitmap_set(uint8_t* bitmap, uint32_t bit) {
     bitmap[bit / 8] |= (1 << (bit % 8));
@@ -959,6 +970,27 @@ vfs_node_t* grahafs_mount(block_device_t* device) {
 
     serial_write("[GrahaFS] Magic verified OK!\n");
 
+    // Verify filesystem version
+    if (superblock.version == 0) {
+        serial_write("[GrahaFS] ERROR: Old format (version 0), run 'make reformat' to update\n");
+        framebuffer_draw_string("GrahaFS: Old disk format! Run make reformat", 10, 750, COLOR_RED, 0x00101828);
+        spinlock_release(&grahafs_lock);
+        return NULL;
+    }
+    if (superblock.version > GRAHAFS_VERSION) {
+        serial_write("[GrahaFS] ERROR: Unsupported version ");
+        serial_write_dec(superblock.version);
+        serial_write(", expected ");
+        serial_write_dec(GRAHAFS_VERSION);
+        serial_write("\n");
+        framebuffer_draw_string("GrahaFS: Unsupported disk version!", 10, 750, COLOR_RED, 0x00101828);
+        spinlock_release(&grahafs_lock);
+        return NULL;
+    }
+    serial_write("[GrahaFS] Version: ");
+    serial_write_dec(superblock.version);
+    serial_write("\n");
+
     // Log superblock fields
     serial_write("[GrahaFS] total_blocks=");
     serial_write_dec(superblock.total_blocks);
@@ -1096,4 +1128,278 @@ void grahafs_get_stats(uint32_t *mounted, uint32_t *total_blocks,
     }
 
     spinlock_release(&grahafs_lock);
+}
+
+// Phase 8c: AI Metadata Operations
+
+int grahafs_set_ai_metadata(uint32_t inode_num, const grahafs_ai_metadata_t *meta) {
+    if (!meta || !fs_mounted) return -1;
+    if (inode_num >= GRAHAFS_MAX_INODES) return -1;
+
+    spinlock_acquire(&grahafs_lock);
+
+    grahafs_inode_t inode;
+    if (read_inode(inode_num, &inode) != 0) {
+        spinlock_release(&grahafs_lock);
+        return -1;
+    }
+
+    // Must be an allocated inode
+    if (inode.type == 0) {
+        spinlock_release(&grahafs_lock);
+        return -2;
+    }
+
+    // Set importance (always stored inline)
+    if (meta->flags & GRAHAFS_META_FLAG_IMPORTANCE) {
+        inode.ai_importance = meta->importance > 100 ? 100 : meta->importance;
+    }
+
+    // Set tags (inline up to 95 chars, extended for overflow)
+    if (meta->flags & GRAHAFS_META_FLAG_TAGS) {
+        size_t tag_len = strlen(meta->tags);
+        size_t inline_len = tag_len > 95 ? 95 : tag_len;
+        memcpy(inode.ai_tags, meta->tags, inline_len);
+        inode.ai_tags[inline_len] = '\0';
+        inode.ai_flags |= GRAHAFS_AI_HAS_TAGS;
+
+        if (tag_len > 95) {
+            inode.ai_flags |= GRAHAFS_AI_HAS_EXTENDED;
+        }
+    }
+
+    // Determine if extended block is needed
+    bool need_extended = (meta->flags & GRAHAFS_META_FLAG_SUMMARY) ||
+                         (meta->flags & GRAHAFS_META_FLAG_EMBEDDING) ||
+                         ((meta->flags & GRAHAFS_META_FLAG_TAGS) && strlen(meta->tags) > 95);
+
+    if (need_extended) {
+        // Allocate extended block if not yet allocated
+        if (inode.ai_metadata_block == 0) {
+            uint32_t ext_block = allocate_block();
+            if (ext_block == 0) {
+                spinlock_release(&grahafs_lock);
+                return -3;
+            }
+            inode.ai_metadata_block = ext_block;
+            inode.ai_flags |= GRAHAFS_AI_HAS_EXTENDED;
+        }
+
+        void* ext_phys = pmm_alloc_page();
+        if (!ext_phys) {
+            spinlock_release(&grahafs_lock);
+            return -3;
+        }
+        void* ext_buf = (void*)((uint64_t)ext_phys + g_hhdm_offset);
+
+        // Read existing extended block
+        grahafs_ai_metadata_block_t *ext_meta;
+        if (read_fs_block(inode.ai_metadata_block, ext_buf) != 0) {
+            memset(ext_buf, 0, GRAHAFS_BLOCK_SIZE);
+        }
+        ext_meta = (grahafs_ai_metadata_block_t *)ext_buf;
+
+        // Initialize magic if this is a fresh block
+        if (ext_meta->magic != GRAHAFS_AI_META_MAGIC) {
+            memset(ext_buf, 0, GRAHAFS_BLOCK_SIZE);
+            ext_meta->magic = GRAHAFS_AI_META_MAGIC;
+            ext_meta->version = 1;
+        }
+
+        // Copy full tags to extended block
+        if (meta->flags & GRAHAFS_META_FLAG_TAGS) {
+            size_t tag_len = strlen(meta->tags);
+            size_t copy_len = tag_len > 511 ? 511 : tag_len;
+            memcpy(ext_meta->tags, meta->tags, copy_len);
+            ext_meta->tags[copy_len] = '\0';
+        }
+
+        // Copy summary
+        if (meta->flags & GRAHAFS_META_FLAG_SUMMARY) {
+            size_t sum_len = strlen(meta->summary);
+            size_t copy_len = sum_len > 1023 ? 1023 : sum_len;
+            memcpy(ext_meta->summary, meta->summary, copy_len);
+            ext_meta->summary[copy_len] = '\0';
+            inode.ai_flags |= GRAHAFS_AI_HAS_SUMMARY;
+        }
+
+        // Copy embedding
+        if (meta->flags & GRAHAFS_META_FLAG_EMBEDDING) {
+            uint32_t dim = meta->embedding_dim > 128 ? 128 : meta->embedding_dim;
+            memcpy(ext_meta->embedding, meta->embedding, dim * sizeof(uint64_t));
+            ext_meta->embedding_dim = dim;
+            inode.ai_flags |= GRAHAFS_AI_HAS_EMBEDDING;
+        }
+
+        write_fs_block(inode.ai_metadata_block, ext_buf);
+        pmm_free_page(ext_phys);
+    }
+
+    // Update AI metadata timestamp (incrementing counter, no RTC available)
+    static uint64_t ai_timestamp = 1;
+    inode.ai_last_modified = ai_timestamp++;
+
+    write_inode(inode_num, &inode);
+
+    if (fs_device && fs_device->device_id >= 0) {
+        ahci_flush_cache(fs_device->device_id);
+    }
+
+    spinlock_release(&grahafs_lock);
+    return 0;
+}
+
+int grahafs_get_ai_metadata(uint32_t inode_num, grahafs_ai_metadata_t *meta) {
+    if (!meta || !fs_mounted) return -1;
+    if (inode_num >= GRAHAFS_MAX_INODES) return -1;
+
+    spinlock_acquire(&grahafs_lock);
+
+    grahafs_inode_t inode;
+    if (read_inode(inode_num, &inode) != 0) {
+        spinlock_release(&grahafs_lock);
+        return -1;
+    }
+
+    if (inode.type == 0) {
+        spinlock_release(&grahafs_lock);
+        return -2;
+    }
+
+    // Zero output struct
+    memset(meta, 0, sizeof(grahafs_ai_metadata_t));
+
+    // Fill from inline fields
+    meta->flags = inode.ai_flags;
+    meta->importance = inode.ai_importance;
+    meta->access_count = inode.ai_access_count;
+    meta->last_modified = inode.ai_last_modified;
+
+    // Copy inline tags
+    size_t tag_len = strlen(inode.ai_tags);
+    if (tag_len > 0) {
+        size_t copy_len = tag_len > 511 ? 511 : tag_len;
+        memcpy(meta->tags, inode.ai_tags, copy_len);
+        meta->tags[copy_len] = '\0';
+    }
+
+    // Read extended block if present
+    if ((inode.ai_flags & GRAHAFS_AI_HAS_EXTENDED) && inode.ai_metadata_block != 0) {
+        void* ext_phys = pmm_alloc_page();
+        if (ext_phys) {
+            void* ext_buf = (void*)((uint64_t)ext_phys + g_hhdm_offset);
+
+            if (read_fs_block(inode.ai_metadata_block, ext_buf) == 0) {
+                grahafs_ai_metadata_block_t *ext_meta = (grahafs_ai_metadata_block_t *)ext_buf;
+
+                if (ext_meta->magic == GRAHAFS_AI_META_MAGIC) {
+                    // Full tags from extended block (overwrite inline copy)
+                    if (ext_meta->tags[0] != '\0') {
+                        memcpy(meta->tags, ext_meta->tags, 511);
+                        meta->tags[511] = '\0';
+                    }
+
+                    // Summary
+                    if (inode.ai_flags & GRAHAFS_AI_HAS_SUMMARY) {
+                        memcpy(meta->summary, ext_meta->summary, 1023);
+                        meta->summary[1023] = '\0';
+                    }
+
+                    // Embedding
+                    if (inode.ai_flags & GRAHAFS_AI_HAS_EMBEDDING) {
+                        memcpy(meta->embedding, ext_meta->embedding, 128 * sizeof(uint64_t));
+                        meta->embedding_dim = ext_meta->embedding_dim;
+                    }
+                }
+            }
+
+            pmm_free_page(ext_phys);
+        }
+    }
+
+    // Increment access counter
+    inode.ai_access_count++;
+    write_inode(inode_num, &inode);
+
+    spinlock_release(&grahafs_lock);
+    return 0;
+}
+
+int grahafs_search_by_tag(const char *tag, grahafs_search_results_t *results, int max_results) {
+    if (!tag || !results || !fs_mounted) return -1;
+    if (max_results <= 0 || max_results > 16) max_results = 16;
+
+    spinlock_acquire(&grahafs_lock);
+
+    memset(results, 0, sizeof(grahafs_search_results_t));
+
+    // Read root inode to get directory block
+    grahafs_inode_t root_inode;
+    if (read_inode(superblock.root_inode, &root_inode) != 0) {
+        spinlock_release(&grahafs_lock);
+        return -1;
+    }
+
+    if (root_inode.direct_blocks[0] == 0) {
+        spinlock_release(&grahafs_lock);
+        return 0;
+    }
+
+    void* dir_phys = pmm_alloc_page();
+    if (!dir_phys) {
+        spinlock_release(&grahafs_lock);
+        return -1;
+    }
+    void* dir_buf = (void*)((uint64_t)dir_phys + g_hhdm_offset);
+
+    if (read_fs_block(root_inode.direct_blocks[0], dir_buf) != 0) {
+        pmm_free_page(dir_phys);
+        spinlock_release(&grahafs_lock);
+        return -1;
+    }
+
+    grahafs_dirent_t* entries = (grahafs_dirent_t*)dir_buf;
+    int max_entries = GRAHAFS_BLOCK_SIZE / sizeof(grahafs_dirent_t);
+    uint32_t count = 0;
+
+    for (int i = 0; i < max_entries && count < (uint32_t)max_results; i++) {
+        if (entries[i].inode_num == 0 || entries[i].name[0] == '\0') continue;
+
+        // Skip . and ..
+        if (entries[i].name[0] == '.' &&
+            (entries[i].name[1] == '\0' ||
+             (entries[i].name[1] == '.' && entries[i].name[2] == '\0')))
+            continue;
+
+        grahafs_inode_t file_inode;
+        if (read_inode(entries[i].inode_num, &file_inode) != 0) continue;
+
+        // Check if this inode has tags
+        if (!(file_inode.ai_flags & GRAHAFS_AI_HAS_TAGS)) continue;
+
+        if (grahafs_strstr(file_inode.ai_tags, tag)) {
+            // Build path "/<name>"
+            results->results[count].path[0] = '/';
+            size_t name_len = strlen(entries[i].name);
+            if (name_len > 254) name_len = 254;
+            memcpy(results->results[count].path + 1, entries[i].name, name_len);
+            results->results[count].path[1 + name_len] = '\0';
+
+            results->results[count].inode_num = entries[i].inode_num;
+            results->results[count].importance = file_inode.ai_importance;
+
+            size_t tag_copy = strlen(file_inode.ai_tags);
+            if (tag_copy > 95) tag_copy = 95;
+            memcpy(results->results[count].tags, file_inode.ai_tags, tag_copy);
+            results->results[count].tags[tag_copy] = '\0';
+
+            count++;
+        }
+    }
+
+    results->count = count;
+
+    pmm_free_page(dir_phys);
+    spinlock_release(&grahafs_lock);
+    return (int)count;
 }

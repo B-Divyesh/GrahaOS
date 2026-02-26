@@ -1,6 +1,7 @@
 // user/gash.c - COMPLETE FILE
 #include "syscalls.h"
 #include "../kernel/state.h"
+#include "../kernel/fs/grahafs.h"
 
 // Helper functions
 int strcmp(const char *s1, const char *s2) {
@@ -795,6 +796,222 @@ void cmd_sysstate(void) {
     print("\n=== End System State ===\n");
 }
 
+// --- Phase 8c: AI Metadata Commands ---
+
+static void zero_mem(void *ptr, size_t n) {
+    uint8_t *p = (uint8_t *)ptr;
+    for (size_t i = 0; i < n; i++) p[i] = 0;
+}
+
+void cmd_tag(const char *path, const char *tags) {
+    if (!path || !tags) {
+        print("tag: usage: tag <path> <tags>\n");
+        return;
+    }
+
+    grahafs_ai_metadata_t meta;
+    zero_mem(&meta, sizeof(meta));
+    meta.flags = GRAHAFS_META_FLAG_TAGS;
+
+    // Copy tags string (max 511 chars)
+    size_t len = strlen(tags);
+    if (len > 511) len = 511;
+    for (size_t i = 0; i < len; i++) meta.tags[i] = tags[i];
+    meta.tags[len] = '\0';
+
+    int ret = syscall_set_ai_metadata(path, &meta);
+    if (ret == 0) {
+        print("Tagged '");
+        print(path);
+        print("' with: ");
+        print(tags);
+        print("\n");
+    } else {
+        print("tag: failed (error=");
+        char buf[12];
+        int_to_string(ret, buf);
+        print(buf);
+        print(")\n");
+    }
+}
+
+void cmd_meta(const char *path) {
+    if (!path) {
+        print("meta: usage: meta <path>\n");
+        return;
+    }
+
+    grahafs_ai_metadata_t meta;
+    zero_mem(&meta, sizeof(meta));
+
+    int ret = syscall_get_ai_metadata(path, &meta);
+    if (ret < 0) {
+        print("meta: failed to get metadata (error=");
+        char buf[12];
+        int_to_string(ret, buf);
+        print(buf);
+        print(")\n");
+        return;
+    }
+
+    char buf[21];
+
+    print("=== AI Metadata: ");
+    print(path);
+    print(" ===\n");
+
+    print("  Importance: ");
+    uint64_to_str(meta.importance, buf);
+    print(buf);
+    print("\n");
+
+    print("  Tags: ");
+    if (meta.tags[0]) {
+        print(meta.tags);
+    } else {
+        print("(none)");
+    }
+    print("\n");
+
+    print("  Access Count: ");
+    uint64_to_str(meta.access_count, buf);
+    print(buf);
+    print("\n");
+
+    if (meta.flags & GRAHAFS_AI_HAS_SUMMARY) {
+        print("  Summary: ");
+        print(meta.summary);
+        print("\n");
+    }
+
+    if (meta.flags & GRAHAFS_AI_HAS_EMBEDDING) {
+        print("  Embedding: ");
+        uint64_to_str(meta.embedding_dim, buf);
+        print(buf);
+        print(" dimensions\n");
+    }
+
+    print("  Flags: 0x");
+    // Simple hex print for flags
+    char hex[9];
+    uint32_t f = meta.flags;
+    for (int i = 7; i >= 0; i--) {
+        hex[i] = "0123456789abcdef"[f & 0xf];
+        f >>= 4;
+    }
+    hex[8] = '\0';
+    print(hex);
+    print("\n");
+}
+
+void cmd_importance(const char *path, const char *score_str) {
+    if (!path || !score_str) {
+        print("importance: usage: importance <path> <0-100>\n");
+        return;
+    }
+
+    // Parse score
+    int score = 0;
+    for (int i = 0; score_str[i]; i++) {
+        if (score_str[i] >= '0' && score_str[i] <= '9') {
+            score = score * 10 + (score_str[i] - '0');
+        }
+    }
+
+    grahafs_ai_metadata_t meta;
+    zero_mem(&meta, sizeof(meta));
+    meta.flags = GRAHAFS_META_FLAG_IMPORTANCE;
+    meta.importance = (uint32_t)score;
+
+    int ret = syscall_set_ai_metadata(path, &meta);
+    if (ret == 0) {
+        print("Set importance of '");
+        print(path);
+        print("' to ");
+        print(score_str);
+        print("\n");
+    } else {
+        print("importance: failed (error=");
+        char buf[12];
+        int_to_string(ret, buf);
+        print(buf);
+        print(")\n");
+    }
+}
+
+void cmd_summary(const char *path, char *argv[], int argc, int start_arg) {
+    if (!path || start_arg >= argc) {
+        print("summary: usage: summary <path> <text...>\n");
+        return;
+    }
+
+    grahafs_ai_metadata_t meta;
+    zero_mem(&meta, sizeof(meta));
+    meta.flags = GRAHAFS_META_FLAG_SUMMARY;
+
+    // Join remaining args into summary string
+    size_t pos = 0;
+    for (int i = start_arg; i < argc && pos < 1023; i++) {
+        size_t len = strlen(argv[i]);
+        if (pos + len + 1 >= 1023) len = 1023 - pos - 1;
+        for (size_t j = 0; j < len; j++) meta.summary[pos++] = argv[i][j];
+        if (i < argc - 1 && pos < 1022) meta.summary[pos++] = ' ';
+    }
+    meta.summary[pos] = '\0';
+
+    int ret = syscall_set_ai_metadata(path, &meta);
+    if (ret == 0) {
+        print("Set summary of '");
+        print(path);
+        print("'\n");
+    } else {
+        print("summary: failed (error=");
+        char buf[12];
+        int_to_string(ret, buf);
+        print(buf);
+        print(")\n");
+    }
+}
+
+void cmd_search(const char *tag) {
+    if (!tag || tag[0] == '\0') {
+        print("search: usage: search <tag>\n");
+        return;
+    }
+
+    grahafs_search_results_t results;
+    zero_mem(&results, sizeof(results));
+
+    int ret = syscall_search_by_tag(tag, &results, 16);
+    if (ret < 0) {
+        print("search: failed (error=");
+        char buf[12];
+        int_to_string(ret, buf);
+        print(buf);
+        print(")\n");
+        return;
+    }
+
+    char buf[21];
+    print("Search results for tag '");
+    print(tag);
+    print("': ");
+    uint64_to_str(results.count, buf);
+    print(buf);
+    print(" match(es)\n");
+
+    for (uint32_t i = 0; i < results.count; i++) {
+        print("  ");
+        print(results.results[i].path);
+        print("  importance=");
+        uint64_to_str(results.results[i].importance, buf);
+        print(buf);
+        print("  tags=");
+        print(results.results[i].tags);
+        print("\n");
+    }
+}
+
 // Helper: spawn and wait for a program
 int run_program(const char *path) {
     int pid = syscall_spawn(path);
@@ -848,6 +1065,11 @@ void _start(void) {
             print("  deactivate <name>   - Deactivate a capability\n");
             print("  why_not <name>      - Explain why cap can't activate\n");
             print("  available           - Show activatable capabilities\n");
+            print("  tag <path> <tags>   - Set AI tags on a file\n");
+            print("  meta <path>         - Show AI metadata for a file\n");
+            print("  importance <p> <n>  - Set importance (0-100)\n");
+            print("  summary <path> <t>  - Set summary text\n");
+            print("  search <tag>        - Search files by tag\n");
             print("  pid                 - Show current process ID\n");
             print("  kill <pid>          - Terminate a process\n");
             print("  sync                - Flush filesystem to disk\n");
@@ -913,6 +1135,41 @@ void _start(void) {
         }
         else if (strcmp(cmd, "available") == 0) {
             cmd_available();
+        }
+        else if (strcmp(cmd, "tag") == 0) {
+            if (argc < 3) {
+                print("tag: usage: tag <path> <tags>\n");
+            } else {
+                cmd_tag(argv[1], argv[2]);
+            }
+        }
+        else if (strcmp(cmd, "meta") == 0) {
+            if (argc < 2) {
+                print("meta: usage: meta <path>\n");
+            } else {
+                cmd_meta(argv[1]);
+            }
+        }
+        else if (strcmp(cmd, "importance") == 0) {
+            if (argc < 3) {
+                print("importance: usage: importance <path> <0-100>\n");
+            } else {
+                cmd_importance(argv[1], argv[2]);
+            }
+        }
+        else if (strcmp(cmd, "summary") == 0) {
+            if (argc < 3) {
+                print("summary: usage: summary <path> <text...>\n");
+            } else {
+                cmd_summary(argv[1], argv, argc, 2);
+            }
+        }
+        else if (strcmp(cmd, "search") == 0) {
+            if (argc < 2) {
+                print("search: usage: search <tag>\n");
+            } else {
+                cmd_search(argv[1]);
+            }
         }
         else if (strcmp(cmd, "pid") == 0) {
             int current_pid = syscall_getpid();

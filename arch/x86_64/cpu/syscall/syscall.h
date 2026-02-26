@@ -47,6 +47,11 @@
 #define SYS_CAP_REGISTER   1033
 #define SYS_CAP_UNREGISTER 1034
 
+// Phase 8c: AI Metadata in GrahaFS
+#define SYS_SET_AI_METADATA 1035
+#define SYS_GET_AI_METADATA 1036
+#define SYS_SEARCH_BY_TAG   1037
+
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);
 

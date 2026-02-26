@@ -70,6 +70,7 @@ int main(int argc, char* argv[]) {
     grahafs_superblock_t sb;
     memset(&sb, 0, sizeof(sb));
     sb.magic = GRAHAFS_MAGIC;
+    sb.version = GRAHAFS_VERSION;
     sb.total_blocks = total_blocks;
     sb.bitmap_start_block = 1;
     
@@ -195,7 +196,7 @@ int main(int argc, char* argv[]) {
         close(fd);
         return 1;
     }
-    printf("  ✓ Superblock verified (magic: 0x%lX)\n", verify_sb.magic);
+    printf("  ✓ Superblock verified (magic: 0x%lX, version: %u)\n", verify_sb.magic, verify_sb.version);
     printf("  ✓ Root inode number: %u\n", verify_sb.root_inode);
     
     // Read back root inode (now at index 1)
@@ -223,7 +224,9 @@ int main(int argc, char* argv[]) {
     free(verify_root_dir);
 
     printf("\n✓ GrahaFS filesystem created successfully!\n");
+    printf("  Version: %u\n", sb.version);
     printf("  Total blocks: %u\n", total_blocks);
+    printf("  Inode size: %zu bytes\n", sizeof(grahafs_inode_t));
     printf("  Free blocks: %u\n", sb.free_blocks);
     printf("  Free inodes: %u\n", sb.free_inodes);
 

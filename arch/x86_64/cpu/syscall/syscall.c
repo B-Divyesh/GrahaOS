@@ -13,6 +13,7 @@
 #include "../../drivers/serial/serial.h"
 #include "../../../../kernel/state.h"
 #include "../../../../kernel/capability.h"
+#include "../../../../kernel/fs/grahafs.h"
 #include <stdbool.h>
 
 // Forward declarations for state collection (kernel/state.c)
@@ -836,6 +837,107 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             }
 
             frame->rax = (uint64_t)(long)cap_unregister(id);
+            break;
+        }
+
+        // Phase 8c: AI Metadata syscalls
+        case SYS_SET_AI_METADATA: {
+            // RDI=path, RSI=metadata_ptr
+            char kpath[256];
+            if (copy_string_from_user((const char *)frame->rdi, kpath, 256) <= 0) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+
+            if (!is_user_pointer((const void *)frame->rsi, sizeof(grahafs_ai_metadata_t))) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+
+            // Resolve path to inode number
+            vfs_node_t *node = vfs_path_to_node(kpath);
+            if (!node) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+            uint32_t ino = node->inode;
+            vfs_destroy_node(node);
+
+            // Copy metadata from user space to kernel stack
+            grahafs_ai_metadata_t kmeta;
+            const uint8_t *usrc = (const uint8_t *)frame->rsi;
+            uint8_t *kdst = (uint8_t *)&kmeta;
+            for (size_t i = 0; i < sizeof(grahafs_ai_metadata_t); i++)
+                kdst[i] = usrc[i];
+
+            frame->rax = (uint64_t)(long)grahafs_set_ai_metadata(ino, &kmeta);
+            break;
+        }
+
+        case SYS_GET_AI_METADATA: {
+            // RDI=path, RSI=out_buf
+            char kpath[256];
+            if (copy_string_from_user((const char *)frame->rdi, kpath, 256) <= 0) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+
+            if (!is_user_pointer((const void *)frame->rsi, sizeof(grahafs_ai_metadata_t))) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+
+            // Resolve path to inode number
+            vfs_node_t *node = vfs_path_to_node(kpath);
+            if (!node) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+            uint32_t ino = node->inode;
+            vfs_destroy_node(node);
+
+            grahafs_ai_metadata_t kmeta;
+            int ret = grahafs_get_ai_metadata(ino, &kmeta);
+            if (ret == 0) {
+                // Copy result to user space
+                uint8_t *udst = (uint8_t *)frame->rsi;
+                const uint8_t *ksrc = (const uint8_t *)&kmeta;
+                for (size_t i = 0; i < sizeof(grahafs_ai_metadata_t); i++)
+                    udst[i] = ksrc[i];
+            }
+
+            frame->rax = (uint64_t)(long)ret;
+            break;
+        }
+
+        case SYS_SEARCH_BY_TAG: {
+            // RDI=tag_str, RSI=results_buf, RDX=max_results
+            char ktag[96];
+            if (copy_string_from_user((const char *)frame->rdi, ktag, 96) <= 0) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+
+            if (!is_user_pointer((const void *)frame->rsi, sizeof(grahafs_search_results_t))) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+
+            int max = (int)frame->rdx;
+            if (max <= 0 || max > 16) max = 16;
+
+            grahafs_search_results_t kresults;
+            int ret = grahafs_search_by_tag(ktag, &kresults, max);
+
+            if (ret >= 0) {
+                // Copy results to user space
+                uint8_t *udst = (uint8_t *)frame->rsi;
+                const uint8_t *ksrc = (const uint8_t *)&kresults;
+                for (size_t i = 0; i < sizeof(grahafs_search_results_t); i++)
+                    udst[i] = ksrc[i];
+            }
+
+            frame->rax = (uint64_t)(long)ret;
             break;
         }
 

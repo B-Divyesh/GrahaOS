@@ -26,7 +26,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest
 
 .PHONY: all clean libc
 
@@ -71,6 +71,11 @@ spawntest: spawntest.o $(LIBC)
 cantest: cantest.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
 	@$(LD) $(LDFLAGS) -o $@ cantest.o $(LIBC)
+
+# Build AI Metadata test (Phase 8c, with libc)
+metatest: metatest.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ metatest.o $(LIBC)
 
 %.o: %.c
 	@echo "Compiling user C: $<"
