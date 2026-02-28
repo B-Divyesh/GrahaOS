@@ -50,7 +50,11 @@ void sched_init(void) {
     for (int i = 0; i < MAX_SIGNALS; i++) {
         tasks[0].signal_handlers[i] = SIG_DFL;
     }
-    
+    tasks[0].event_head = 0;
+    tasks[0].event_tail = 0;
+    tasks[0].event_count = 0;
+    tasks[0].event_waiting = 0;
+
     // Get current stack pointer
     uint64_t current_rsp;
     asm volatile("mov %%rsp, %0" : "=r"(current_rsp));
@@ -122,6 +126,10 @@ int sched_create_task(void (*entry_point)(void)) {
     for (int s = 0; s < MAX_SIGNALS; s++) {
         tasks[id].signal_handlers[s] = SIG_DFL;
     }
+    tasks[id].event_head = 0;
+    tasks[id].event_tail = 0;
+    tasks[id].event_count = 0;
+    tasks[id].event_waiting = 0;
 
     spinlock_release(&sched_lock);
 
@@ -199,6 +207,10 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     for (int s = 0; s < MAX_SIGNALS; s++) {
         tasks[id].signal_handlers[s] = SIG_DFL;
     }
+    tasks[id].event_head = 0;
+    tasks[id].event_tail = 0;
+    tasks[id].event_count = 0;
+    tasks[id].event_waiting = 0;
 
     asm volatile("push %0; popfq" : : "r"(flags));
     spinlock_release(&sched_lock);
@@ -824,4 +836,68 @@ int sched_snapshot_processes(state_process_t *out, int max_count) {
 
     spinlock_release(&sched_lock);
     return count;
+}
+
+// Phase 8d: Enqueue a CAN event to a process's event queue
+void sched_enqueue_cap_event(int32_t pid, const state_cap_event_t *event) {
+    if (!event) return;
+    if (pid < 0 || pid >= next_task_id || pid >= MAX_TASKS) return;
+
+    spinlock_acquire(&sched_lock);
+
+    task_t *task = &tasks[pid];
+
+    // Don't deliver to zombie/dead tasks
+    if (task->state == TASK_STATE_ZOMBIE) {
+        spinlock_release(&sched_lock);
+        return;
+    }
+
+    // Write event to circular buffer
+    task->event_queue[task->event_tail] = *event;
+    task->event_tail = (task->event_tail + 1) % STATE_CAP_EVENT_QUEUE_SIZE;
+
+    if (task->event_count < STATE_CAP_EVENT_QUEUE_SIZE) {
+        task->event_count++;
+    } else {
+        // Queue full — overwrite oldest by advancing head
+        task->event_head = (task->event_head + 1) % STATE_CAP_EVENT_QUEUE_SIZE;
+    }
+
+    // Wake up if blocked waiting for events
+    if (task->event_waiting && task->state == TASK_STATE_BLOCKED) {
+        task->state = TASK_STATE_READY;
+        task->event_waiting = 0;
+    }
+
+    spinlock_release(&sched_lock);
+}
+
+// Phase 8d: Dequeue one CAN event from a process's event queue
+// Returns 1 if an event was dequeued, 0 if queue is empty
+int sched_dequeue_cap_event(int task_id, state_cap_event_t *out) {
+    if (!out) return 0;
+    if (task_id < 0 || task_id >= next_task_id || task_id >= MAX_TASKS) return 0;
+
+    spinlock_acquire(&sched_lock);
+
+    task_t *task = &tasks[task_id];
+
+    if (task->event_count == 0) {
+        spinlock_release(&sched_lock);
+        return 0;
+    }
+
+    *out = task->event_queue[task->event_head];
+    task->event_head = (task->event_head + 1) % STATE_CAP_EVENT_QUEUE_SIZE;
+    task->event_count--;
+
+    spinlock_release(&sched_lock);
+    return 1;
+}
+
+// Phase 8d: Get pending event count for a process
+int sched_pending_event_count(int task_id) {
+    if (task_id < 0 || task_id >= next_task_id || task_id >= MAX_TASKS) return 0;
+    return (int)tasks[task_id].event_count;
 }

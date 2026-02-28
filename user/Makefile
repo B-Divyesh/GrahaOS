@@ -26,7 +26,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest
 
 .PHONY: all clean libc
 
@@ -76,6 +76,11 @@ cantest: cantest.o $(LIBC)
 metatest: metatest.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
 	@$(LD) $(LDFLAGS) -o $@ metatest.o $(LIBC)
+
+# Build CAN Event test (Phase 8d, with libc)
+eventtest: eventtest.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ eventtest.o $(LIBC)
 
 %.o: %.c
 	@echo "Compiling user C: $<"

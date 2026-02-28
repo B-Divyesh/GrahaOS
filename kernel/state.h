@@ -157,6 +157,22 @@ typedef struct {
     state_cap_entry_t caps[STATE_MAX_CAPS];
 } state_cap_list_t;
 
+// --- Phase 8d: CAN Event Types ---
+#define STATE_CAP_EVENT_ACTIVATED    1
+#define STATE_CAP_EVENT_DEACTIVATED  2
+#define STATE_CAP_EVENT_ERROR        3
+
+#define STATE_CAP_EVENT_QUEUE_SIZE  16
+
+// CAN event structure (48 bytes, shared between kernel and user-space)
+typedef struct {
+    uint32_t type;               // STATE_CAP_EVENT_*
+    uint32_t cap_id;             // Capability index that changed
+    uint32_t old_state;          // Previous CAP_STATE_*
+    uint32_t new_state;          // New CAP_STATE_*
+    char     cap_name[32];       // Name of capability (for user convenience)
+} __attribute__((packed)) state_cap_event_t;
+
 // --- Combined full snapshot ---
 typedef struct {
     uint32_t version;

@@ -4,6 +4,7 @@
 #include "capability.h"
 #include "sync/spinlock.h"
 #include "../arch/x86_64/drivers/serial/serial.h"
+#include "../arch/x86_64/cpu/sched/sched.h"
 
 // --- Static string helpers (kernel has no libc) ---
 
@@ -42,6 +43,155 @@ void cap_op_set(cap_op_t *op, const char *name, uint32_t param_count, uint32_t f
     cap_strcpy(op->name, name, CAP_OP_NAME_LEN);
     op->param_count = param_count;
     op->flags = flags;
+}
+
+// --- Phase 8d: Internal notification helper ---
+// Snapshots watcher list under g_cap_lock, then enqueues events (lock-free).
+// This avoids holding g_cap_lock while calling into sched_enqueue_cap_event.
+static void cap_notify_watchers(int cap_id, uint32_t old_state, uint32_t new_state) {
+    if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return;
+
+    capability_t *cap = &g_caps[cap_id];
+    if (cap->watcher_count == 0) return;
+
+    // Build event on stack
+    state_cap_event_t event;
+    cap_memset(&event, 0, sizeof(event));
+
+    // Determine event type
+    if (new_state == CAP_STATE_ON)
+        event.type = STATE_CAP_EVENT_ACTIVATED;
+    else if (new_state == CAP_STATE_OFF)
+        event.type = STATE_CAP_EVENT_DEACTIVATED;
+    else if (new_state == CAP_STATE_ERROR)
+        event.type = STATE_CAP_EVENT_ERROR;
+    else
+        return;  // Unknown transition, skip
+
+    event.cap_id = (uint32_t)cap_id;
+    event.old_state = old_state;
+    event.new_state = new_state;
+    cap_strcpy(event.cap_name, cap->name, 32);
+
+    // Snapshot watcher PIDs under lock
+    int32_t pids[8];
+    uint32_t count;
+
+    spinlock_acquire(&g_cap_lock);
+    count = cap->watcher_count;
+    for (uint32_t i = 0; i < count && i < 8; i++) {
+        pids[i] = cap->watcher_pids[i];
+    }
+    spinlock_release(&g_cap_lock);
+
+    // Deliver events (no CAN lock held)
+    for (uint32_t i = 0; i < count; i++) {
+        sched_enqueue_cap_event(pids[i], &event);
+    }
+}
+
+// --- Phase 8d: Watch/Unwatch API ---
+
+int cap_watch(int cap_id, int32_t pid) {
+    if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return CAP_ERR_NOT_FOUND;
+
+    spinlock_acquire(&g_cap_lock);
+    capability_t *cap = &g_caps[cap_id];
+
+    if (cap->deleted) {
+        spinlock_release(&g_cap_lock);
+        return CAP_ERR_DELETED;
+    }
+
+    // Check for duplicate
+    for (uint32_t i = 0; i < cap->watcher_count; i++) {
+        if (cap->watcher_pids[i] == pid) {
+            spinlock_release(&g_cap_lock);
+            return CAP_ERR_ALREADY_WATCH;
+        }
+    }
+
+    // Check capacity
+    if (cap->watcher_count >= 8) {
+        spinlock_release(&g_cap_lock);
+        return CAP_ERR_WATCH_FULL;
+    }
+
+    cap->watcher_pids[cap->watcher_count] = pid;
+    cap->watcher_count++;
+
+    serial_write("[CAN] Watch: pid=");
+    serial_write_dec(pid);
+    serial_write(" -> ");
+    serial_write(cap->name);
+    serial_write("\n");
+
+    spinlock_release(&g_cap_lock);
+    return CAP_OK;
+}
+
+int cap_unwatch(int cap_id, int32_t pid) {
+    if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return CAP_ERR_NOT_FOUND;
+
+    spinlock_acquire(&g_cap_lock);
+    capability_t *cap = &g_caps[cap_id];
+
+    if (cap->deleted) {
+        spinlock_release(&g_cap_lock);
+        return CAP_ERR_DELETED;
+    }
+
+    // Find the watcher
+    int found = -1;
+    for (uint32_t i = 0; i < cap->watcher_count; i++) {
+        if (cap->watcher_pids[i] == pid) {
+            found = (int)i;
+            break;
+        }
+    }
+
+    if (found < 0) {
+        spinlock_release(&g_cap_lock);
+        return CAP_ERR_NOT_WATCHING;
+    }
+
+    // Compact: shift remaining entries down
+    for (uint32_t i = (uint32_t)found; i < cap->watcher_count - 1; i++) {
+        cap->watcher_pids[i] = cap->watcher_pids[i + 1];
+    }
+    cap->watcher_count--;
+
+    serial_write("[CAN] Unwatch: pid=");
+    serial_write_dec(pid);
+    serial_write(" -> ");
+    serial_write(cap->name);
+    serial_write("\n");
+
+    spinlock_release(&g_cap_lock);
+    return CAP_OK;
+}
+
+void cap_unwatch_all_for_pid(int32_t pid) {
+    spinlock_acquire(&g_cap_lock);
+
+    for (uint32_t c = 0; c < g_cap_count; c++) {
+        if (g_caps[c].deleted) continue;
+        capability_t *cap = &g_caps[c];
+
+        for (uint32_t i = 0; i < cap->watcher_count; i++) {
+            if (cap->watcher_pids[i] == pid) {
+                // Compact: shift remaining entries down
+                for (uint32_t j = i; j < cap->watcher_count - 1; j++) {
+                    cap->watcher_pids[j] = cap->watcher_pids[j + 1];
+                }
+                cap->watcher_count--;
+                i--;  // Re-check same index after shift
+                break; // Each PID appears at most once per cap
+            }
+        }
+    }
+
+    spinlock_release(&g_cap_lock);
 }
 
 // --- Internal: Layer validation ---
@@ -359,6 +509,8 @@ int cap_activate(int cap_id) {
         if (result != CAP_OK) {
             cap->state = CAP_STATE_ERROR;
             cap->error_dep = cap->dep_indices[i];
+            if (cap->watcher_count > 0)
+                cap_notify_watchers(cap_id, CAP_STATE_STARTING, CAP_STATE_ERROR);
             serial_write("[CAN] Activation failed for '");
             serial_write(cap->name);
             serial_write("': dep '");
@@ -373,6 +525,8 @@ int cap_activate(int cap_id) {
         int result = cap->activate_fn();
         if (result != 0) {
             cap->state = CAP_STATE_ERROR;
+            if (cap->watcher_count > 0)
+                cap_notify_watchers(cap_id, CAP_STATE_STARTING, CAP_STATE_ERROR);
             serial_write("[CAN] Activation callback failed for '");
             serial_write(cap->name);
             serial_write("'\n");
@@ -383,6 +537,9 @@ int cap_activate(int cap_id) {
     // Success
     cap->state = CAP_STATE_ON;
     cap->activation_count++;
+
+    if (cap->watcher_count > 0)
+        cap_notify_watchers(cap_id, CAP_STATE_STARTING, CAP_STATE_ON);
 
     serial_write("[CAN] Activated: ");
     serial_write(cap->name);
@@ -422,7 +579,11 @@ int cap_deactivate(int cap_id) {
         cap->deactivate_fn();
     }
 
+    uint32_t prev_state = cap->state;
     cap->state = CAP_STATE_OFF;
+
+    if (cap->watcher_count > 0)
+        cap_notify_watchers(cap_id, prev_state, CAP_STATE_OFF);
 
     serial_write("[CAN] Deactivated: ");
     serial_write(cap->name);
@@ -456,6 +617,9 @@ int cap_unregister(int cap_id) {
         cap_deactivate(cap_id);
         spinlock_acquire(&g_cap_lock);
     }
+
+    // Clear watcher list before marking deleted
+    cap->watcher_count = 0;
 
     cap->deleted = 1;
     cap->state = CAP_STATE_OFF;

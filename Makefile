@@ -131,6 +131,10 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 		echo "ERROR: user/metatest not found!"; \
 		exit 1; \
 	fi
+	@if [ ! -f user/eventtest ]; then \
+		echo "ERROR: user/eventtest not found!"; \
+		exit 1; \
+	fi
 	@cp user/grahai initrd_root/bin/
 	@cp user/gash initrd_root/bin/
 	@cp user/libctest initrd_root/bin/
@@ -139,6 +143,7 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	@cp user/spawntest initrd_root/bin/
 	@cp user/cantest initrd_root/bin/
 	@cp user/metatest initrd_root/bin/
+	@cp user/eventtest initrd_root/bin/
 	@cp etc/motd.txt initrd_root/etc/
 	@cp etc/plan.json initrd_root/etc/
 	@echo "Contents of initrd_root before tar:"

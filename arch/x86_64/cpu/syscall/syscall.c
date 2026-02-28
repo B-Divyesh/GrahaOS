@@ -520,6 +520,9 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             current->exit_status = status;
             current->state = TASK_STATE_ZOMBIE;
 
+            // Remove all CAN event watchers for this process
+            cap_unwatch_all_for_pid(current->id);
+
             // Unregister all user-owned capabilities for this process
             cap_unregister_by_owner(current->id);
 
@@ -938,6 +941,100 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             }
 
             frame->rax = (uint64_t)(long)ret;
+            break;
+        }
+
+        // Phase 8d: CAN Event Propagation
+        case SYS_CAP_WATCH: {
+            // RDI = capability name to watch
+            char kname[32];
+            if (copy_string_from_user((const char *)frame->rdi, kname, 32) <= 0) {
+                frame->rax = (uint64_t)(long)CAP_ERR_NOT_FOUND;
+                break;
+            }
+            int id = cap_find(kname);
+            if (id < 0) {
+                frame->rax = (uint64_t)(long)CAP_ERR_NOT_FOUND;
+                break;
+            }
+            task_t *current = sched_get_current_task();
+            if (!current) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+            frame->rax = (uint64_t)(long)cap_watch(id, current->id);
+            break;
+        }
+
+        case SYS_CAP_UNWATCH: {
+            // RDI = capability name to unwatch
+            char kname[32];
+            if (copy_string_from_user((const char *)frame->rdi, kname, 32) <= 0) {
+                frame->rax = (uint64_t)(long)CAP_ERR_NOT_FOUND;
+                break;
+            }
+            int id = cap_find(kname);
+            if (id < 0) {
+                frame->rax = (uint64_t)(long)CAP_ERR_NOT_FOUND;
+                break;
+            }
+            task_t *current = sched_get_current_task();
+            if (!current) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+            frame->rax = (uint64_t)(long)cap_unwatch(id, current->id);
+            break;
+        }
+
+        case SYS_CAP_POLL: {
+            // RDI = event buffer pointer, RSI = max events
+            void *user_buf = (void *)frame->rdi;
+            int max_events = (int)frame->rsi;
+
+            task_t *current = sched_get_current_task();
+            if (!current) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+
+            if (max_events <= 0) max_events = 1;
+            if (max_events > STATE_CAP_EVENT_QUEUE_SIZE) max_events = STATE_CAP_EVENT_QUEUE_SIZE;
+
+            int pending = sched_pending_event_count(current->id);
+
+            if (pending == 0) {
+                if (user_buf == NULL) {
+                    // Non-blocking query: just return 0 pending
+                    frame->rax = 0;
+                } else {
+                    // Blocking mode: block and retry
+                    current->event_waiting = 1;
+                    current->state = TASK_STATE_BLOCKED;
+                    frame->rax = (uint64_t)(long)-99;  // Retry signal
+                }
+                break;
+            }
+
+            if (!user_buf || !is_user_pointer(user_buf, max_events * sizeof(state_cap_event_t))) {
+                // Just return the count if buffer is invalid
+                frame->rax = (uint64_t)(long)pending;
+                break;
+            }
+
+            // Dequeue up to max_events
+            state_cap_event_t *out = (state_cap_event_t *)user_buf;
+            int count = 0;
+            state_cap_event_t tmp;
+            while (count < max_events && sched_dequeue_cap_event(current->id, &tmp)) {
+                // Copy event to user buffer
+                uint8_t *dst = (uint8_t *)&out[count];
+                const uint8_t *src = (const uint8_t *)&tmp;
+                for (size_t i = 0; i < sizeof(state_cap_event_t); i++)
+                    dst[i] = src[i];
+                count++;
+            }
+            frame->rax = (uint64_t)(long)count;
             break;
         }
 

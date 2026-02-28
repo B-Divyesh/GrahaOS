@@ -76,6 +76,9 @@
 #define CAP_ERR_CYCLE         -11
 #define CAP_ERR_KERNEL_OWNED  -12
 #define CAP_ERR_DELETED       -14
+#define CAP_ERR_WATCH_FULL    -15   // Watcher list full (8 max)
+#define CAP_ERR_ALREADY_WATCH -16   // Already watching this cap
+#define CAP_ERR_NOT_WATCHING  -17   // Not watching this cap
 
 // --- Operation Descriptor ---
 typedef struct {
@@ -111,6 +114,10 @@ typedef struct {
     uint32_t compiled;           // 1=passed all compilation passes
     uint32_t subtype;            // CAP_SUBTYPE_* for DRIVER/SERVICE caps, 0 otherwise
     uint32_t deleted;            // 1=slot marked deleted by cap_unregister
+
+    // Phase 8d: Event watchers
+    int32_t  watcher_pids[8];    // PIDs watching this capability
+    uint32_t watcher_count;      // Number of active watchers (slots 0..watcher_count-1)
 } capability_t;
 
 // --- Registration API ---
@@ -177,6 +184,17 @@ int32_t cap_get_owner(int cap_id);
 // Iterates DRIVER/SERVICE caps, calls get_stats_fn for live stats.
 // Returns: number of entries written.
 int cap_snapshot_drivers(state_driver_info_t *out, int max);
+
+// --- Phase 8d: Event Watching ---
+
+// Watch a capability for state changes. Events delivered to process event queue.
+int cap_watch(int cap_id, int32_t pid);
+
+// Stop watching a capability.
+int cap_unwatch(int cap_id, int32_t pid);
+
+// Remove all watchers owned by a process. Called from SYS_EXIT.
+void cap_unwatch_all_for_pid(int32_t pid);
 
 // --- Helper ---
 

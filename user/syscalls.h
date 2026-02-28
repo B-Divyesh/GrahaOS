@@ -36,6 +36,9 @@ typedef long ssize_t;
 #define SYS_SET_AI_METADATA  1035
 #define SYS_GET_AI_METADATA  1036
 #define SYS_SEARCH_BY_TAG    1037
+#define SYS_CAP_WATCH        1038
+#define SYS_CAP_UNWATCH      1039
+#define SYS_CAP_POLL         1040
 
 // Directory entry structure for user space
 typedef struct {
@@ -248,5 +251,50 @@ static inline int syscall_search_by_tag(const char *tag, void *results, int max)
     asm volatile("syscall" : "=a"(ret)
         : "a"(SYS_SEARCH_BY_TAG), "D"(tag), "S"(results), "d"(max)
         : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 8d: Watch a capability for state change events
+static inline int syscall_cap_watch(const char *name) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_CAP_WATCH), "D"(name)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 8d: Stop watching a capability
+static inline int syscall_cap_unwatch(const char *name) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_CAP_UNWATCH), "D"(name)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 8d: Poll for CAN events (blocking with -99 retry)
+// events: buffer for state_cap_event_t array
+// max_events: max number of events to dequeue
+// Returns: number of events dequeued, or -99 (retry/block)
+static inline int syscall_cap_poll(void *events, int max_events) {
+    long ret;
+    do {
+        asm volatile("syscall" : "=a"(ret)
+            : "a"(SYS_CAP_POLL), "D"(events), "S"(max_events)
+            : "rcx", "r11", "memory");
+        if (ret == -99) continue;
+        break;
+    } while (1);
+    return (int)ret;
+}
+
+// Phase 8d: Non-blocking poll for CAN events (returns immediately)
+// Returns: number of events dequeued, 0 if none pending
+static inline int syscall_cap_poll_nonblock(void *events, int max_events) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_CAP_POLL), "D"(events), "S"(max_events)
+        : "rcx", "r11", "memory");
+    // Don't retry on -99, just return it (caller handles)
     return (int)ret;
 }

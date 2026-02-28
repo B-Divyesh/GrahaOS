@@ -59,6 +59,13 @@ typedef struct {
     int pgid;                               // Process group ID
     uint32_t pending_signals;               // Bitmask of pending signals
     void (*signal_handlers[MAX_SIGNALS])(int); // Signal handler function pointers
+
+    // Phase 8d: CAN event queue (circular buffer)
+    state_cap_event_t event_queue[STATE_CAP_EVENT_QUEUE_SIZE];
+    uint32_t event_head;            // Next read position
+    uint32_t event_tail;            // Next write position
+    uint32_t event_count;           // Current events in queue
+    uint32_t event_waiting;         // 1=blocked waiting for events
 } task_t;
 
 /**
@@ -169,6 +176,11 @@ task_t* sched_get_task_any(int id);
  * @return Current task index
  */
 int sched_get_current_task_index(void);
+
+// Phase 8d: CAN event queue operations
+void sched_enqueue_cap_event(int32_t pid, const state_cap_event_t *event);
+int sched_dequeue_cap_event(int task_id, state_cap_event_t *out);
+int sched_pending_event_count(int task_id);
 
 // Phase 8a: Scheduler statistics (read-only, volatile)
 extern volatile uint32_t schedule_count;

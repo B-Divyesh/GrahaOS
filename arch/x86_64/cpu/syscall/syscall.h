@@ -52,6 +52,11 @@
 #define SYS_GET_AI_METADATA 1036
 #define SYS_SEARCH_BY_TAG   1037
 
+// Phase 8d: CAN Event Propagation
+#define SYS_CAP_WATCH   1038
+#define SYS_CAP_UNWATCH 1039
+#define SYS_CAP_POLL    1040
+
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);
 

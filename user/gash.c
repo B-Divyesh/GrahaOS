@@ -1012,6 +1012,96 @@ void cmd_search(const char *tag) {
     }
 }
 
+// --- Phase 8d: CAN Event Commands ---
+
+void cmd_watch(const char *name) {
+    if (!name || name[0] == '\0') {
+        print("watch: usage: watch <capability_name>\n");
+        return;
+    }
+    int ret = syscall_cap_watch(name);
+    if (ret == 0) {
+        print("Watching: ");
+        print(name);
+        print("\n");
+    } else {
+        print("watch: failed (error=");
+        char buf[12];
+        int_to_string(ret, buf);
+        print(buf);
+        print(")\n");
+    }
+}
+
+void cmd_unwatch(const char *name) {
+    if (!name || name[0] == '\0') {
+        print("unwatch: usage: unwatch <capability_name>\n");
+        return;
+    }
+    int ret = syscall_cap_unwatch(name);
+    if (ret == 0) {
+        print("Unwatched: ");
+        print(name);
+        print("\n");
+    } else {
+        print("unwatch: failed (error=");
+        char buf[12];
+        int_to_string(ret, buf);
+        print(buf);
+        print(")\n");
+    }
+}
+
+static const char *event_type_str(uint32_t type) {
+    switch (type) {
+        case STATE_CAP_EVENT_ACTIVATED:   return "ACTIVATED";
+        case STATE_CAP_EVENT_DEACTIVATED: return "DEACTIVATED";
+        case STATE_CAP_EVENT_ERROR:       return "ERROR";
+        default:                          return "UNKNOWN";
+    }
+}
+
+void cmd_events(void) {
+    // Non-blocking poll: get pending events without blocking
+    state_cap_event_t events[16];
+    int ret = syscall_cap_poll_nonblock(events, 16);
+
+    if (ret == -99 || ret == 0) {
+        print("No pending events.\n");
+        return;
+    }
+
+    if (ret < 0) {
+        print("events: poll failed (error=");
+        char buf[12];
+        int_to_string(ret, buf);
+        print(buf);
+        print(")\n");
+        return;
+    }
+
+    char buf[21];
+    print("=== CAN Events (");
+    int_to_string(ret, buf);
+    print(buf);
+    print(" pending) ===\n");
+
+    for (int i = 0; i < ret; i++) {
+        print("  [");
+        int_to_string(i, buf);
+        print(buf);
+        print("] ");
+        print(events[i].cap_name);
+        print(": ");
+        print(event_type_str(events[i].type));
+        print(" (");
+        print(cap_state_str(events[i].old_state));
+        print(" -> ");
+        print(cap_state_str(events[i].new_state));
+        print(")\n");
+    }
+}
+
 // Helper: spawn and wait for a program
 int run_program(const char *path) {
     int pid = syscall_spawn(path);
@@ -1070,6 +1160,9 @@ void _start(void) {
             print("  importance <p> <n>  - Set importance (0-100)\n");
             print("  summary <path> <t>  - Set summary text\n");
             print("  search <tag>        - Search files by tag\n");
+            print("  watch <cap>         - Watch capability state changes\n");
+            print("  unwatch <cap>       - Stop watching a capability\n");
+            print("  events              - Show pending CAN events\n");
             print("  pid                 - Show current process ID\n");
             print("  kill <pid>          - Terminate a process\n");
             print("  sync                - Flush filesystem to disk\n");
@@ -1170,6 +1263,15 @@ void _start(void) {
             } else {
                 cmd_search(argv[1]);
             }
+        }
+        else if (strcmp(cmd, "watch") == 0) {
+            cmd_watch(argc > 1 ? argv[1] : "");
+        }
+        else if (strcmp(cmd, "unwatch") == 0) {
+            cmd_unwatch(argc > 1 ? argv[1] : "");
+        }
+        else if (strcmp(cmd, "events") == 0) {
+            cmd_events();
         }
         else if (strcmp(cmd, "pid") == 0) {
             int current_pid = syscall_getpid();
