@@ -47,3 +47,21 @@ int pci_scan_for_device(uint8_t class_code, uint8_t subclass_code, pci_device_t 
     }
     return 0; // Device not found
 }
+
+void pci_write_config(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value) {
+    uint32_t address = (uint32_t)((bus << 16) | (device << 11) | (function << 8) | (offset & 0xFC) | 0x80000000);
+    outl(PCI_CONFIG_ADDRESS, address);
+    outl(PCI_CONFIG_DATA, value);
+}
+
+uint32_t pci_read_bar(uint8_t bus, uint8_t device, uint8_t function, int bar_index) {
+    uint8_t offset = 0x10 + (bar_index * 4);
+    return pci_read_config(bus, device, function, offset);
+}
+
+void pci_enable_bus_mastering(uint8_t bus, uint8_t device, uint8_t function) {
+    uint32_t command = pci_read_config(bus, device, function, 0x04);
+    // Bit 0: I/O Space, Bit 1: Memory Space, Bit 2: Bus Master
+    command |= (1 << 0) | (1 << 1) | (1 << 2);
+    pci_write_config(bus, device, function, 0x04, command);
+}

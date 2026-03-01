@@ -14,6 +14,7 @@
 #include "../../../../kernel/state.h"
 #include "../../../../kernel/capability.h"
 #include "../../../../kernel/fs/grahafs.h"
+#include "../../drivers/e1000/e1000.h"
 #include <stdbool.h>
 
 // Forward declarations for state collection (kernel/state.c)
@@ -1035,6 +1036,30 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 count++;
             }
             frame->rax = (uint64_t)(long)count;
+            break;
+        }
+
+        // Phase 9a: Network ifconfig
+        case SYS_NET_IFCONFIG: {
+            // RDI = user buffer pointer (at least 7 bytes: 6 MAC + 1 link_up)
+            void *user_buf = (void *)frame->rdi;
+            if (!user_buf || !is_user_pointer(user_buf, 7)) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+
+            if (!e1000_is_present()) {
+                frame->rax = (uint64_t)(long)-2;  // No NIC
+                break;
+            }
+
+            uint8_t *out = (uint8_t *)user_buf;
+            uint8_t mac[6];
+            e1000_get_mac(mac);
+            for (int i = 0; i < 6; i++) out[i] = mac[i];
+            out[6] = e1000_link_up() ? 1 : 0;
+
+            frame->rax = 0;
             break;
         }
 

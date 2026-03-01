@@ -22,6 +22,7 @@
 #include "keyboard_task.h"
 #include "../arch/x86_64/drivers/lapic/lapic.h"
 #include "../arch/x86_64/drivers/ahci/ahci.h"
+#include "../arch/x86_64/drivers/e1000/e1000.h"
 #include "fs/grahafs.h"
 #include "../arch/x86_64/drivers/serial/serial.h"
 #include "capability.h"
@@ -279,6 +280,12 @@ void kmain(void) {
     serial_write("About to initialize AHCI...\n");
     ahci_init();
     serial_write("AHCI initialized successfully\n");
+    y_pos += 20;
+
+    // Initialize E1000 NIC driver
+    serial_write("About to initialize E1000 NIC...\n");
+    e1000_init();
+    serial_write("E1000 initialization complete\n");
     y_pos += 20;
 
     // Initialize filesystem AFTER a small delay to let AHCI stabilize

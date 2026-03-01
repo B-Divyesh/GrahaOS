@@ -57,6 +57,9 @@
 #define SYS_CAP_UNWATCH 1039
 #define SYS_CAP_POLL    1040
 
+// Phase 9a: Network
+#define SYS_NET_IFCONFIG 1041
+
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);
 

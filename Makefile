@@ -135,6 +135,10 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 		echo "ERROR: user/eventtest not found!"; \
 		exit 1; \
 	fi
+	@if [ ! -f user/nettest ]; then \
+		echo "ERROR: user/nettest not found!"; \
+		exit 1; \
+	fi
 	@cp user/grahai initrd_root/bin/
 	@cp user/gash initrd_root/bin/
 	@cp user/libctest initrd_root/bin/
@@ -144,6 +148,7 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	@cp user/cantest initrd_root/bin/
 	@cp user/metatest initrd_root/bin/
 	@cp user/eventtest initrd_root/bin/
+	@cp user/nettest initrd_root/bin/
 	@cp etc/motd.txt initrd_root/etc/
 	@cp etc/plan.json initrd_root/etc/
 	@echo "Contents of initrd_root before tar:"
@@ -180,6 +185,7 @@ run: grahaos.iso format-disk-if-needed
 	     -drive file=disk.img,format=raw,if=none,id=mydisk \
 	     -device ich9-ahci,id=ahci \
 	     -device ide-hd,drive=mydisk,bus=ahci.0 \
+	     -netdev user,id=net0 -device e1000,netdev=net0 \
 	     -d int,cpu_reset -D qemu.log
 
 debug: grahaos.iso format-disk-if-needed
@@ -187,7 +193,8 @@ debug: grahaos.iso format-disk-if-needed
 	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 -s -S \
 	     -drive file=disk.img,format=raw,if=none,id=mydisk \
 	     -device ich9-ahci,id=ahci \
-	     -device ide-hd,drive=mydisk,bus=ahci.0
+	     -device ide-hd,drive=mydisk,bus=ahci.0 \
+	     -netdev user,id=net0 -device e1000,netdev=net0
 
 
 debug-monitor: grahaos.iso format-disk

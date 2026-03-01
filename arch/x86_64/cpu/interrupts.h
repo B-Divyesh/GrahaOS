@@ -61,6 +61,9 @@ struct syscall_frame {
     uint64_t user_rsp;  // User stack pointer
 } __attribute__((packed));
 
+// Global timer tick counter (incremented every timer IRQ)
+extern volatile uint64_t g_timer_ticks;
+
 void interrupt_handler(struct interrupt_frame *frame);
 void syscall_dispatcher(struct syscall_frame *frame);
 void irq_init(void);

@@ -39,6 +39,7 @@ typedef long ssize_t;
 #define SYS_CAP_WATCH        1038
 #define SYS_CAP_UNWATCH      1039
 #define SYS_CAP_POLL         1040
+#define SYS_NET_IFCONFIG     1041
 
 // Directory entry structure for user space
 typedef struct {
@@ -296,5 +297,16 @@ static inline int syscall_cap_poll_nonblock(void *events, int max_events) {
         : "a"(SYS_CAP_POLL), "D"(events), "S"(max_events)
         : "rcx", "r11", "memory");
     // Don't retry on -99, just return it (caller handles)
+    return (int)ret;
+}
+
+// Phase 9a: Get network interface info
+// buf: at least 7 bytes (6 MAC + 1 link_up)
+// Returns: 0 on success, -1 bad pointer, -2 no NIC
+static inline int syscall_net_ifconfig(void *buf) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_NET_IFCONFIG), "D"(buf)
+        : "rcx", "r11", "memory");
     return (int)ret;
 }

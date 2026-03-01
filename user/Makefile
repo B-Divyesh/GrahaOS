@@ -26,7 +26,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest
 
 .PHONY: all clean libc
 
@@ -81,6 +81,11 @@ metatest: metatest.o $(LIBC)
 eventtest: eventtest.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
 	@$(LD) $(LDFLAGS) -o $@ eventtest.o $(LIBC)
+
+# Build E1000 NIC test (Phase 9a, with libc)
+nettest: nettest.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ nettest.o $(LIBC)
 
 %.o: %.c
 	@echo "Compiling user C: $<"

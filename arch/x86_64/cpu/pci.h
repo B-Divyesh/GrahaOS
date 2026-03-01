@@ -10,6 +10,9 @@
 #define PCI_CLASS_MASS_STORAGE 0x01
 #define PCI_SUBCLASS_SATA      0x06
 
+#define PCI_CLASS_NETWORK      0x02
+#define PCI_SUBCLASS_ETHERNET  0x00
+
 // Structure to hold information about a found PCI device
 typedef struct {
     uint8_t bus;
@@ -38,3 +41,20 @@ uint32_t pci_read_config(uint8_t bus, uint8_t device, uint8_t function, uint8_t 
  * @return 1 if a device is found, 0 otherwise.
  */
 int pci_scan_for_device(uint8_t class_code, uint8_t subclass_code, pci_device_t *pci_dev);
+
+/**
+ * @brief Writes a 32-bit word to a PCI device's configuration space.
+ */
+void pci_write_config(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value);
+
+/**
+ * @brief Reads a BAR (Base Address Register) from a PCI device.
+ * @param bar_index BAR index 0-5.
+ * @return The raw BAR value.
+ */
+uint32_t pci_read_bar(uint8_t bus, uint8_t device, uint8_t function, int bar_index);
+
+/**
+ * @brief Enables PCI bus mastering and memory space access for a device.
+ */
+void pci_enable_bus_mastering(uint8_t bus, uint8_t device, uint8_t function);

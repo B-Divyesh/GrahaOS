@@ -1102,6 +1102,36 @@ void cmd_events(void) {
     }
 }
 
+// --- Phase 9a: Network Commands ---
+
+void cmd_ifconfig(void) {
+    uint8_t info[7];
+    int ret = syscall_net_ifconfig(info);
+
+    if (ret == -2) {
+        print("ifconfig: no network interface found\n");
+        return;
+    }
+    if (ret < 0) {
+        print("ifconfig: failed\n");
+        return;
+    }
+
+    print("eth0: MAC=");
+    const char *hex = "0123456789abcdef";
+    for (int i = 0; i < 6; i++) {
+        char h[3];
+        h[0] = hex[(info[i] >> 4) & 0xf];
+        h[1] = hex[info[i] & 0xf];
+        h[2] = '\0';
+        print(h);
+        if (i < 5) print(":");
+    }
+    print(" Link=");
+    print(info[6] ? "UP" : "DOWN");
+    print("\n");
+}
+
 // Helper: spawn and wait for a program
 int run_program(const char *path) {
     int pid = syscall_spawn(path);
@@ -1163,6 +1193,7 @@ void _start(void) {
             print("  watch <cap>         - Watch capability state changes\n");
             print("  unwatch <cap>       - Stop watching a capability\n");
             print("  events              - Show pending CAN events\n");
+            print("  ifconfig            - Show network interface info\n");
             print("  pid                 - Show current process ID\n");
             print("  kill <pid>          - Terminate a process\n");
             print("  sync                - Flush filesystem to disk\n");
@@ -1272,6 +1303,9 @@ void _start(void) {
         }
         else if (strcmp(cmd, "events") == 0) {
             cmd_events();
+        }
+        else if (strcmp(cmd, "ifconfig") == 0) {
+            cmd_ifconfig();
         }
         else if (strcmp(cmd, "pid") == 0) {
             int current_pid = syscall_getpid();

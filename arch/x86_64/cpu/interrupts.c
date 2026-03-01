@@ -6,6 +6,9 @@
 #include "../../drivers/lapic/lapic.h"
 #include "../../drivers/serial/serial.h"
 
+// Global timer tick counter
+volatile uint64_t g_timer_ticks = 0;
+
 // PIC (Programmable Interrupt Controller) ports
 #define PIC1_COMMAND 0x20
 #define PIC1_DATA    0x21
@@ -286,6 +289,7 @@ void interrupt_handler(struct interrupt_frame *frame) {
         // Hardware interrupt
         switch (frame->int_no) {
             case 32: // IRQ0: Timer (now from LAPIC timer)
+                g_timer_ticks++;
                 // Note: Minimal logging to avoid slowing down interrupts
                 static volatile uint32_t timer_tick_count = 0;
                 if ((timer_tick_count++ & 0xFF) == 0) {  // Log every 256 ticks
