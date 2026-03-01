@@ -60,6 +60,9 @@
 // Phase 9a: Network
 #define SYS_NET_IFCONFIG 1041
 
+// Phase 9b: Network Status
+#define SYS_NET_STATUS 1042
+
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);
 

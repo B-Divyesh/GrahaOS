@@ -40,6 +40,7 @@ typedef long ssize_t;
 #define SYS_CAP_UNWATCH      1039
 #define SYS_CAP_POLL         1040
 #define SYS_NET_IFCONFIG     1041
+#define SYS_NET_STATUS       1042
 
 // Directory entry structure for user space
 typedef struct {
@@ -307,6 +308,17 @@ static inline int syscall_net_ifconfig(void *buf) {
     long ret;
     asm volatile("syscall" : "=a"(ret)
         : "a"(SYS_NET_IFCONFIG), "D"(buf)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 9b: Get network stack status
+// buf: pointer to net_status_t (21 bytes)
+// Returns: 0 on success, -1 bad pointer
+static inline int syscall_net_status(void *buf) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_NET_STATUS), "D"(buf)
         : "rcx", "r11", "memory");
     return (int)ret;
 }

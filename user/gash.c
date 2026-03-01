@@ -1132,6 +1132,70 @@ void cmd_ifconfig(void) {
     print("\n");
 }
 
+// Phase 9b: Network status
+void cmd_netstat(void) {
+    // net_status_t: stack_running(1) + ip(4) + netmask(4) + gateway(4) + rx_count(4) + tx_count(4) = 21 bytes
+    uint8_t buf[21];
+    for (int i = 0; i < 21; i++) buf[i] = 0;
+    int ret = syscall_net_status(buf);
+    if (ret < 0) {
+        print("netstat: failed to get network status\n");
+        return;
+    }
+
+    print("TCP/IP Stack: ");
+    print(buf[0] ? "RUNNING" : "STOPPED");
+    print("\n");
+
+    // IP address
+    char num[4];
+    print("IP:      ");
+    for (int i = 0; i < 4; i++) {
+        // Convert byte to decimal
+        int val = buf[1 + i];
+        int idx = 0;
+        if (val >= 100) { num[idx++] = '0' + val / 100; val %= 100; }
+        if (val >= 10 || idx > 0) { num[idx++] = '0' + val / 10; val %= 10; }
+        num[idx++] = '0' + val;
+        num[idx] = '\0';
+        print(num);
+        if (i < 3) print(".");
+    }
+    print("\n");
+
+    print("Netmask: ");
+    for (int i = 0; i < 4; i++) {
+        int val = buf[5 + i];
+        int idx = 0;
+        if (val >= 100) { num[idx++] = '0' + val / 100; val %= 100; }
+        if (val >= 10 || idx > 0) { num[idx++] = '0' + val / 10; val %= 10; }
+        num[idx++] = '0' + val;
+        num[idx] = '\0';
+        print(num);
+        if (i < 3) print(".");
+    }
+    print("\n");
+
+    print("Gateway: ");
+    for (int i = 0; i < 4; i++) {
+        int val = buf[9 + i];
+        int idx = 0;
+        if (val >= 100) { num[idx++] = '0' + val / 100; val %= 100; }
+        if (val >= 10 || idx > 0) { num[idx++] = '0' + val / 10; val %= 10; }
+        num[idx++] = '0' + val;
+        num[idx] = '\0';
+        print(num);
+        if (i < 3) print(".");
+    }
+    print("\n");
+
+    // RX/TX counts (uint32_t at offset 13 and 17)
+    uint32_t rx = *(uint32_t *)&buf[13];
+    uint32_t tx = *(uint32_t *)&buf[17];
+    print_u32("RX packets: ", rx);
+    print_u32("TX packets: ", tx);
+}
+
 // Helper: spawn and wait for a program
 int run_program(const char *path) {
     int pid = syscall_spawn(path);
@@ -1194,6 +1258,7 @@ void _start(void) {
             print("  unwatch <cap>       - Stop watching a capability\n");
             print("  events              - Show pending CAN events\n");
             print("  ifconfig            - Show network interface info\n");
+            print("  netstat             - Show TCP/IP stack status\n");
             print("  pid                 - Show current process ID\n");
             print("  kill <pid>          - Terminate a process\n");
             print("  sync                - Flush filesystem to disk\n");
@@ -1306,6 +1371,9 @@ void _start(void) {
         }
         else if (strcmp(cmd, "ifconfig") == 0) {
             cmd_ifconfig();
+        }
+        else if (strcmp(cmd, "netstat") == 0) {
+            cmd_netstat();
         }
         else if (strcmp(cmd, "pid") == 0) {
             int current_pid = syscall_getpid();

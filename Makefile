@@ -15,7 +15,7 @@ LIMINE_DIR := limine
 
 # --- Flags ---
 # ADDED: Include path for the new keyboard driver
-CFLAGS   := -I. -I./arch/x86_64/drivers/keyboard -I./arch/x86_64/drivers/lapic_timer \
+CFLAGS   := -I. -I./arch/x86_64/drivers/keyboard -I./arch/x86_64/drivers/lapic_timer -I./kernel/net \
             -ffreestanding -fno-stack-protector -fno-pie \
             -mno-red-zone -mcmodel=kernel -g -Wall -Wextra \
             -std=gnu11 -fno-stack-check -fno-PIC -m64  \
@@ -139,6 +139,10 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 		echo "ERROR: user/nettest not found!"; \
 		exit 1; \
 	fi
+	@if [ ! -f user/httptest ]; then \
+		echo "ERROR: user/httptest not found!"; \
+		exit 1; \
+	fi
 	@cp user/grahai initrd_root/bin/
 	@cp user/gash initrd_root/bin/
 	@cp user/libctest initrd_root/bin/
@@ -149,6 +153,7 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	@cp user/metatest initrd_root/bin/
 	@cp user/eventtest initrd_root/bin/
 	@cp user/nettest initrd_root/bin/
+	@cp user/httptest initrd_root/bin/
 	@cp etc/motd.txt initrd_root/etc/
 	@cp etc/plan.json initrd_root/etc/
 	@echo "Contents of initrd_root before tar:"
@@ -166,6 +171,12 @@ userland:
 kernel/kernel.elf: $(OBJECTS) linker.ld
 	@echo "Linking kernel with LD..."
 	@$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
+
+# Mongoose: compile with warnings suppressed and SSE2 enabled (has float code)
+kernel/net/mongoose.o: kernel/net/mongoose.c
+	@echo "Compiling C: $< (vendored, warnings suppressed)"
+	@mkdir -p $(dir $@)
+	@$(CC) $(filter-out -mno-80387 -mno-mmx -mno-sse -mno-sse2,$(CFLAGS)) $(CPPFLAGS) -w -c $< -o $@
 
 %.o: %.c
 	@echo "Compiling C: $<"
@@ -185,7 +196,7 @@ run: grahaos.iso format-disk-if-needed
 	     -drive file=disk.img,format=raw,if=none,id=mydisk \
 	     -device ich9-ahci,id=ahci \
 	     -device ide-hd,drive=mydisk,bus=ahci.0 \
-	     -netdev user,id=net0 -device e1000,netdev=net0 \
+	     -netdev user,id=net0,hostfwd=tcp::8080-:80 -device e1000,netdev=net0 \
 	     -d int,cpu_reset -D qemu.log
 
 debug: grahaos.iso format-disk-if-needed
@@ -194,7 +205,7 @@ debug: grahaos.iso format-disk-if-needed
 	     -drive file=disk.img,format=raw,if=none,id=mydisk \
 	     -device ich9-ahci,id=ahci \
 	     -device ide-hd,drive=mydisk,bus=ahci.0 \
-	     -netdev user,id=net0 -device e1000,netdev=net0
+	     -netdev user,id=net0,hostfwd=tcp::8080-:80 -device e1000,netdev=net0
 
 
 debug-monitor: grahaos.iso format-disk

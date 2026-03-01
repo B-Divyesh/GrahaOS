@@ -23,6 +23,8 @@
 #include "../arch/x86_64/drivers/lapic/lapic.h"
 #include "../arch/x86_64/drivers/ahci/ahci.h"
 #include "../arch/x86_64/drivers/e1000/e1000.h"
+#include "net/net.h"
+#include "net/net_task.h"
 #include "fs/grahafs.h"
 #include "../arch/x86_64/drivers/serial/serial.h"
 #include "capability.h"
@@ -288,6 +290,12 @@ void kmain(void) {
     serial_write("E1000 initialization complete\n");
     y_pos += 20;
 
+    // Initialize Mongoose TCP/IP stack
+    serial_write("About to initialize network stack...\n");
+    net_init();
+    serial_write("Network stack initialization complete\n");
+    y_pos += 20;
+
     // Initialize filesystem AFTER a small delay to let AHCI stabilize
     serial_write("Waiting for AHCI to stabilize...\n");
     for (volatile int i = 0; i < 1000000; i++) {
@@ -484,6 +492,26 @@ void kmain(void) {
         id_msg[9] = '0' + kbd_task_id;
         id_msg[10] = '\0';
         framebuffer_draw_string(id_msg, 50, y_pos, COLOR_CYAN, 0x00101828);
+        y_pos += 20;
+    }
+
+    // Create Mongoose polling task
+    serial_write("Creating mongoose poll task...\n");
+    int mg_task_id = sched_create_task(mongoose_poll_task);
+    serial_write("sched_create_task (mongoose) returned: ");
+    serial_write_dec(mg_task_id);
+    serial_write("\n");
+    {
+        task_t *mg_task = sched_get_task(mg_task_id);
+        if (mg_task) {
+            const char *n = "mongoose";
+            int j = 0;
+            while (n[j] && j < 31) { mg_task->name[j] = n[j]; j++; }
+            mg_task->name[j] = '\0';
+        }
+    }
+    if (mg_task_id >= 0) {
+        framebuffer_draw_string("Mongoose task created successfully", 50, y_pos, COLOR_GREEN, 0x00101828);
         y_pos += 20;
     }
 
