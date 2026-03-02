@@ -63,6 +63,10 @@
 // Phase 9b: Network Status
 #define SYS_NET_STATUS 1042
 
+// Phase 9c: DNS + HTTP Client
+#define SYS_HTTP_GET    1043
+#define SYS_DNS_RESOLVE 1044
+
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);
 

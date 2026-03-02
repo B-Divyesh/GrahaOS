@@ -528,6 +528,9 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             // Unregister all user-owned capabilities for this process
             cap_unregister_by_owner(current->id);
 
+            // Clean up any pending network request
+            net_cleanup_task(current->id);
+
             sched_orphan_children(current->id);
             wake_waiting_parent(current->id);
             
@@ -1080,6 +1083,82 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 dst[i] = src[i];
             }
             frame->rax = 0;
+            break;
+        }
+
+        case SYS_HTTP_GET: {
+            const char *url_user = (const char *)frame->rdi;
+            char *resp_buf = (char *)frame->rsi;
+            int max_len = (int)frame->rdx;
+
+            task_t *current = sched_get_current_task();
+            if (!current) { frame->rax = (uint64_t)(long)-1; break; }
+
+            if (!resp_buf || max_len <= 0 || !is_user_pointer(resp_buf, max_len)) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+
+            // Try to collect a completed result first
+            int http_result = net_http_get_check(current->id, resp_buf, max_len);
+            if (http_result != -99) {
+                // Got a final result (success or error)
+                frame->rax = (uint64_t)(long)http_result;
+                break;
+            }
+
+            // No result yet — either start a new request or one is already in flight
+            char url_kernel[512];
+            if (copy_string_from_user(url_user, url_kernel, sizeof(url_kernel)) <= 0) {
+                frame->rax = (uint64_t)(long)NET_ERR_BAD_URL;
+                break;
+            }
+
+            int start_ret = net_http_get_start(current->id, url_kernel);
+            if (start_ret == 0 || start_ret == NET_ERR_BUSY) {
+                // Request in flight — block and retry
+                current->state = TASK_STATE_BLOCKED;
+                frame->rax = (uint64_t)(long)-99;
+            } else {
+                // Couldn't start (no network, OOM, etc.)
+                frame->rax = (uint64_t)(long)start_ret;
+            }
+            break;
+        }
+
+        case SYS_DNS_RESOLVE: {
+            const char *hostname_user = (const char *)frame->rdi;
+            uint8_t *ip_buf = (uint8_t *)frame->rsi;
+
+            task_t *current = sched_get_current_task();
+            if (!current) { frame->rax = (uint64_t)(long)-1; break; }
+
+            if (!ip_buf || !is_user_pointer(ip_buf, 4)) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+
+            // Try to collect a completed result first
+            int dns_result = net_dns_check(current->id, ip_buf);
+            if (dns_result != -99) {
+                frame->rax = (uint64_t)(long)dns_result;
+                break;
+            }
+
+            // No result yet — start or continue
+            char hostname_kernel[256];
+            if (copy_string_from_user(hostname_user, hostname_kernel, sizeof(hostname_kernel)) <= 0) {
+                frame->rax = (uint64_t)(long)NET_ERR_BAD_URL;
+                break;
+            }
+
+            int dns_start_ret = net_dns_start(current->id, hostname_kernel);
+            if (dns_start_ret == 0 || dns_start_ret == NET_ERR_BUSY) {
+                current->state = TASK_STATE_BLOCKED;
+                frame->rax = (uint64_t)(long)-99;
+            } else {
+                frame->rax = (uint64_t)(long)dns_start_ret;
+            }
             break;
         }
 

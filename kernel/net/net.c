@@ -1,6 +1,6 @@
 // kernel/net/net.c
-// Phase 9b: Mongoose TCP/IP stack integration for GrahaOS
-// Provides: mg_millis, mg_random, E1000 driver bridge, HTTP server, poll task
+// Phase 9b/9c: Mongoose TCP/IP stack integration for GrahaOS
+// Provides: mg_millis, mg_random, E1000 driver bridge, HTTP server/client, DNS, poll task
 
 #include "net.h"
 #include "net_task.h"
@@ -10,8 +10,10 @@
 #include "../../arch/x86_64/drivers/e1000/e1000.h"
 #include "../../arch/x86_64/drivers/serial/serial.h"
 #include "../../arch/x86_64/cpu/interrupts.h"
+#include "../../arch/x86_64/cpu/sched/sched.h"
 #include "../../arch/x86_64/mm/pmm.h"
 #include "../capability.h"
+#include "../sync/spinlock.h"
 
 // ===== Mongoose Required Implementations =====
 
@@ -149,6 +151,305 @@ static struct mg_mgr s_mgr;
 static struct mg_tcpip_if s_mif;
 static bool s_net_initialized = false;
 
+// ===== Phase 9c: HTTP Client + DNS Resolve =====
+
+// Request types
+#define NET_REQ_NONE     0
+#define NET_REQ_HTTP_GET 1
+#define NET_REQ_DNS      2
+
+// Request states
+#define NET_STATE_IDLE    0
+#define NET_STATE_PENDING 1
+#define NET_STATE_DONE    2
+#define NET_STATE_ERROR   3
+
+typedef struct {
+    int type;                              // NONE, HTTP_GET, DNS
+    volatile int state;                    // IDLE, PENDING, DONE, ERROR
+    int task_id;                           // Owning task
+    uint64_t start_time_ms;                // For timeout detection
+    int error_code;                        // Error code if state == ERROR
+    int http_status;                       // HTTP status code (200, 404, etc.)
+    char url[512];                         // Kernel copy of URL
+    char response[NET_MAX_RESPONSE_SIZE];  // Response body buffer
+    int response_len;                      // Actual response length
+    uint8_t resolved_ip[4];                // DNS result (IPv4)
+    struct mg_connection *conn;            // Active Mongoose connection
+} net_request_t;
+
+static net_request_t s_requests[MAX_TASKS];
+
+// Forward declarations
+static void http_client_handler(struct mg_connection *c, int ev, void *ev_data);
+static void dns_resolve_handler(struct mg_connection *c, int ev, void *ev_data);
+static void net_wake_task(int task_id);
+
+// Initialize request table (called from net_init)
+static void net_requests_init(void) {
+    extern void *memset(void *, int, size_t);
+    memset(s_requests, 0, sizeof(s_requests));
+}
+
+// Wake a blocked task — callable from mongoose_poll_task context
+static void net_wake_task(int task_id) {
+    extern spinlock_t sched_lock;
+
+    spinlock_acquire(&sched_lock);
+    task_t *task = sched_get_task(task_id);
+    if (task && task->state == TASK_STATE_BLOCKED) {
+        task->state = TASK_STATE_READY;
+    }
+    spinlock_release(&sched_lock);
+}
+
+// ----- HTTP Client Callback -----
+
+static void http_client_handler(struct mg_connection *c, int ev, void *ev_data) {
+    int task_id = (int)(uintptr_t)c->fn_data;
+    if (task_id < 0 || task_id >= MAX_TASKS) return;
+
+    net_request_t *req = &s_requests[task_id];
+
+    if (ev == MG_EV_CONNECT) {
+        // TCP connected — send the HTTP GET request
+        struct mg_str host = mg_url_host(req->url);
+        const char *uri = mg_url_uri(req->url);
+        mg_printf(c,
+                  "GET %s HTTP/1.1\r\n"
+                  "Host: %.*s\r\n"
+                  "Connection: close\r\n"
+                  "\r\n",
+                  uri, (int)host.len, host.buf);
+    } else if (ev == MG_EV_HTTP_MSG) {
+        struct mg_http_message *hm = (struct mg_http_message *)ev_data;
+        extern void *memcpy(void *, const void *, size_t);
+
+        // Copy response body to kernel buffer
+        size_t copy_len = hm->body.len;
+        if (copy_len > NET_MAX_RESPONSE_SIZE - 1)
+            copy_len = NET_MAX_RESPONSE_SIZE - 1;
+
+        memcpy(req->response, hm->body.buf, copy_len);
+        req->response[copy_len] = '\0';
+        req->response_len = (int)copy_len;
+        req->http_status = mg_http_status(hm);
+        req->state = NET_STATE_DONE;
+        req->conn = NULL;
+        c->is_draining = 1;
+
+        net_wake_task(task_id);
+    } else if (ev == MG_EV_ERROR) {
+        const char *err = (const char *)ev_data;
+        serial_write("[NET] HTTP client error: ");
+        if (err) serial_write(err);
+        serial_write("\n");
+
+        req->error_code = NET_ERR_CONNECT;
+        if (err && strstr(err, "DNS")) {
+            req->error_code = NET_ERR_DNS_FAIL;
+        }
+        req->state = NET_STATE_ERROR;
+        req->conn = NULL;
+        net_wake_task(task_id);
+    } else if (ev == MG_EV_CLOSE) {
+        if (req->state == NET_STATE_PENDING) {
+            req->error_code = NET_ERR_CONNECT;
+            req->state = NET_STATE_ERROR;
+            req->conn = NULL;
+            net_wake_task(task_id);
+        }
+    }
+}
+
+// ----- DNS Resolve Callback -----
+
+static void dns_resolve_handler(struct mg_connection *c, int ev, void *ev_data) {
+    (void)ev_data;
+    int task_id = (int)(uintptr_t)c->fn_data;
+    if (task_id < 0 || task_id >= MAX_TASKS) return;
+
+    net_request_t *req = &s_requests[task_id];
+
+    if (ev == MG_EV_RESOLVE) {
+        // DNS resolved — extract IPv4 from c->rem
+        if (!c->rem.is_ip6) {
+            req->resolved_ip[0] = c->rem.ip[0];
+            req->resolved_ip[1] = c->rem.ip[1];
+            req->resolved_ip[2] = c->rem.ip[2];
+            req->resolved_ip[3] = c->rem.ip[3];
+            req->state = NET_STATE_DONE;
+        } else {
+            req->error_code = NET_ERR_DNS_FAIL;
+            req->state = NET_STATE_ERROR;
+        }
+        req->conn = NULL;
+        c->is_closing = 1;
+        net_wake_task(task_id);
+    } else if (ev == MG_EV_ERROR) {
+        req->error_code = NET_ERR_DNS_FAIL;
+        req->state = NET_STATE_ERROR;
+        req->conn = NULL;
+        net_wake_task(task_id);
+    } else if (ev == MG_EV_CLOSE) {
+        if (req->state == NET_STATE_PENDING) {
+            req->error_code = NET_ERR_DNS_FAIL;
+            req->state = NET_STATE_ERROR;
+            req->conn = NULL;
+            net_wake_task(task_id);
+        }
+    }
+}
+
+// ----- Public API: HTTP GET -----
+
+int net_http_get_start(int task_id, const char *url) {
+    if (!s_net_initialized) return NET_ERR_NO_NET;
+    if (task_id < 0 || task_id >= MAX_TASKS) return NET_ERR_BUSY;
+
+    net_request_t *req = &s_requests[task_id];
+    if (req->state == NET_STATE_PENDING) return NET_ERR_BUSY;
+
+    extern void *memset(void *, int, size_t);
+    extern size_t strlen(const char *);
+    memset(req, 0, sizeof(*req));
+    req->type = NET_REQ_HTTP_GET;
+    req->state = NET_STATE_PENDING;
+    req->task_id = task_id;
+    req->start_time_ms = mg_millis();
+
+    // Copy URL to kernel buffer for callback access
+    size_t url_len = strlen(url);
+    if (url_len >= sizeof(req->url)) url_len = sizeof(req->url) - 1;
+    extern void *memcpy(void *, const void *, size_t);
+    memcpy(req->url, url, url_len);
+    req->url[url_len] = '\0';
+
+    struct mg_connection *c = mg_http_connect(
+        &s_mgr, req->url, http_client_handler, (void *)(uintptr_t)task_id);
+
+    if (!c) {
+        req->state = NET_STATE_IDLE;
+        return NET_ERR_NOMEM;
+    }
+
+    req->conn = c;
+    return 0;
+}
+
+int net_http_get_check(int task_id, char *user_buf, int max_len) {
+    if (task_id < 0 || task_id >= MAX_TASKS) return -1;
+
+    net_request_t *req = &s_requests[task_id];
+
+    if (req->state == NET_STATE_DONE) {
+        extern void *memcpy(void *, const void *, size_t);
+        int copy_len = req->response_len;
+        if (copy_len > max_len - 1) copy_len = max_len - 1;
+
+        memcpy(user_buf, req->response, copy_len);
+        user_buf[copy_len] = '\0';
+
+        int result = copy_len;
+        req->state = NET_STATE_IDLE;
+        req->type = NET_REQ_NONE;
+        return result;
+    } else if (req->state == NET_STATE_ERROR) {
+        int err = req->error_code;
+        req->state = NET_STATE_IDLE;
+        req->type = NET_REQ_NONE;
+        return err;
+    }
+
+    // IDLE or PENDING
+    return -99;
+}
+
+// ----- Public API: DNS Resolve -----
+
+int net_dns_start(int task_id, const char *hostname) {
+    if (!s_net_initialized) return NET_ERR_NO_NET;
+    if (task_id < 0 || task_id >= MAX_TASKS) return NET_ERR_BUSY;
+
+    net_request_t *req = &s_requests[task_id];
+    if (req->state == NET_STATE_PENDING) return NET_ERR_BUSY;
+
+    extern void *memset(void *, int, size_t);
+    memset(req, 0, sizeof(*req));
+    req->type = NET_REQ_DNS;
+    req->state = NET_STATE_PENDING;
+    req->task_id = task_id;
+    req->start_time_ms = mg_millis();
+
+    // Build a TCP URL so Mongoose triggers DNS resolution
+    char url[320];
+    snprintf(url, sizeof(url), "tcp://%s:80", hostname);
+
+    struct mg_connection *c = mg_connect(
+        &s_mgr, url, dns_resolve_handler, (void *)(uintptr_t)task_id);
+
+    if (!c) {
+        req->state = NET_STATE_IDLE;
+        return NET_ERR_NOMEM;
+    }
+
+    req->conn = c;
+    return 0;
+}
+
+int net_dns_check(int task_id, uint8_t *ip_buf) {
+    if (task_id < 0 || task_id >= MAX_TASKS) return -1;
+
+    net_request_t *req = &s_requests[task_id];
+
+    if (req->state == NET_STATE_DONE) {
+        extern void *memcpy(void *, const void *, size_t);
+        memcpy(ip_buf, req->resolved_ip, 4);
+        req->state = NET_STATE_IDLE;
+        req->type = NET_REQ_NONE;
+        return 0;
+    } else if (req->state == NET_STATE_ERROR) {
+        int err = req->error_code;
+        req->state = NET_STATE_IDLE;
+        req->type = NET_REQ_NONE;
+        return err;
+    }
+
+    return -99;
+}
+
+// ----- Cleanup + Timeouts -----
+
+void net_cleanup_task(int task_id) {
+    if (task_id < 0 || task_id >= MAX_TASKS) return;
+
+    net_request_t *req = &s_requests[task_id];
+    if (req->state == NET_STATE_PENDING && req->conn) {
+        req->conn->is_closing = 1;
+        req->conn = NULL;
+    }
+    req->state = NET_STATE_IDLE;
+    req->type = NET_REQ_NONE;
+}
+
+void net_check_timeouts(void) {
+    uint64_t now = mg_millis();
+    for (int i = 0; i < MAX_TASKS; i++) {
+        if (s_requests[i].state == NET_STATE_PENDING) {
+            if (now - s_requests[i].start_time_ms > NET_REQUEST_TIMEOUT_MS) {
+                s_requests[i].error_code = NET_ERR_TIMEOUT;
+                s_requests[i].state = NET_STATE_ERROR;
+                if (s_requests[i].conn) {
+                    s_requests[i].conn->is_closing = 1;
+                    s_requests[i].conn = NULL;
+                }
+                net_wake_task(i);
+                serial_write("[NET] Request timed out for task\n");
+            }
+        }
+    }
+}
+
 // ===== Initialization =====
 
 void net_init(void) {
@@ -203,6 +504,9 @@ void net_init(void) {
                  tcp_deps, 1, NULL, NULL, NULL, 0, NULL);
     serial_write("[NET] Registered CAN capability: tcp_ip\n");
 
+    // Initialize HTTP client request table
+    net_requests_init();
+
     s_net_initialized = true;
     serial_write("[NET] Mongoose TCP/IP initialization complete\n");
 }
@@ -230,9 +534,10 @@ void mongoose_poll_task(void) {
         asm volatile("mov %%rsp, %0" : "=r"(rsp));
         if (rsp < 0xFFFF800000000000) break;
 
-        // Poll Mongoose (non-blocking)
+        // Poll Mongoose (non-blocking) and check for timed-out requests
         if (s_net_initialized) {
             mg_mgr_poll(&s_mgr, 0);
+            net_check_timeouts();
         }
 
         // Short delay then yield

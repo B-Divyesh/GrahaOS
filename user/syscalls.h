@@ -41,6 +41,8 @@ typedef long ssize_t;
 #define SYS_CAP_POLL         1040
 #define SYS_NET_IFCONFIG     1041
 #define SYS_NET_STATUS       1042
+#define SYS_HTTP_GET         1043
+#define SYS_DNS_RESOLVE      1044
 
 // Directory entry structure for user space
 typedef struct {
@@ -320,5 +322,38 @@ static inline int syscall_net_status(void *buf) {
     asm volatile("syscall" : "=a"(ret)
         : "a"(SYS_NET_STATUS), "D"(buf)
         : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 9c: HTTP GET (blocking, returns body length or negative error)
+// url: HTTP URL string (e.g. "http://10.0.2.15/")
+// response_buf: buffer for response body
+// max_len: maximum bytes to store in response_buf
+// Returns: body length (>=0) on success, negative error on failure
+static inline int syscall_http_get(const char *url, char *response_buf, int max_len) {
+    long ret;
+    do {
+        asm volatile("syscall" : "=a"(ret)
+            : "a"(SYS_HTTP_GET), "D"(url), "S"(response_buf), "d"(max_len)
+            : "rcx", "r11", "memory");
+        if (ret == -99) continue;
+        break;
+    } while (1);
+    return (int)ret;
+}
+
+// Phase 9c: DNS resolve (blocking, returns 0 or negative error)
+// hostname: hostname to resolve (e.g. "dns.google")
+// ip_buf: buffer for 4-byte IPv4 address result
+// Returns: 0 on success, negative error on failure
+static inline int syscall_dns_resolve(const char *hostname, uint8_t *ip_buf) {
+    long ret;
+    do {
+        asm volatile("syscall" : "=a"(ret)
+            : "a"(SYS_DNS_RESOLVE), "D"(hostname), "S"(ip_buf)
+            : "rcx", "r11", "memory");
+        if (ret == -99) continue;
+        break;
+    } while (1);
     return (int)ret;
 }

@@ -143,6 +143,10 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 		echo "ERROR: user/httptest not found!"; \
 		exit 1; \
 	fi
+	@if [ ! -f user/dnstest ]; then \
+		echo "ERROR: user/dnstest not found!"; \
+		exit 1; \
+	fi
 	@cp user/grahai initrd_root/bin/
 	@cp user/gash initrd_root/bin/
 	@cp user/libctest initrd_root/bin/
@@ -154,6 +158,7 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	@cp user/eventtest initrd_root/bin/
 	@cp user/nettest initrd_root/bin/
 	@cp user/httptest initrd_root/bin/
+	@cp user/dnstest initrd_root/bin/
 	@cp etc/motd.txt initrd_root/etc/
 	@cp etc/plan.json initrd_root/etc/
 	@echo "Contents of initrd_root before tar:"

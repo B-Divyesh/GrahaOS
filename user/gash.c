@@ -1196,6 +1196,82 @@ void cmd_netstat(void) {
     print_u32("TX packets: ", tx);
 }
 
+void cmd_http(const char *url) {
+    if (!url || url[0] == '\0') {
+        print("http: usage: http <url>\n");
+        return;
+    }
+
+    print("Fetching ");
+    print(url);
+    print("...\n");
+
+    char response[4096];
+    int ret = syscall_http_get(url, response, sizeof(response));
+
+    if (ret < 0) {
+        print("http: error ");
+        char num[12];
+        int_to_string(ret, num);
+        print(num);
+        if (ret == -10) print(" (timeout)");
+        else if (ret == -11) print(" (DNS failed)");
+        else if (ret == -12) print(" (connection failed)");
+        else if (ret == -17) print(" (no network)");
+        print("\n");
+        return;
+    }
+
+    print("Response (");
+    char len_str[12];
+    int_to_string(ret, len_str);
+    print(len_str);
+    print(" bytes):\n");
+    // Print response character by character (it's already null-terminated)
+    for (int i = 0; i < ret; i++) {
+        syscall_putc(response[i]);
+    }
+    print("\n");
+}
+
+void cmd_dns(const char *hostname) {
+    if (!hostname || hostname[0] == '\0') {
+        print("dns: usage: dns <hostname>\n");
+        return;
+    }
+
+    print("Resolving ");
+    print(hostname);
+    print("...\n");
+
+    uint8_t ip[4];
+    int ret = syscall_dns_resolve(hostname, ip);
+
+    if (ret < 0) {
+        print("dns: resolution failed (error ");
+        char num[12];
+        int_to_string(ret, num);
+        print(num);
+        print(")\n");
+        return;
+    }
+
+    print(hostname);
+    print(" -> ");
+    for (int i = 0; i < 4; i++) {
+        char num[4];
+        int val = ip[i];
+        int idx = 0;
+        if (val >= 100) { num[idx++] = '0' + val / 100; val %= 100; }
+        if (val >= 10 || idx > 0) { num[idx++] = '0' + val / 10; val %= 10; }
+        num[idx++] = '0' + val;
+        num[idx] = '\0';
+        print(num);
+        if (i < 3) print(".");
+    }
+    print("\n");
+}
+
 // Helper: spawn and wait for a program
 int run_program(const char *path) {
     int pid = syscall_spawn(path);
@@ -1259,12 +1335,25 @@ void _start(void) {
             print("  events              - Show pending CAN events\n");
             print("  ifconfig            - Show network interface info\n");
             print("  netstat             - Show TCP/IP stack status\n");
+            print("  http <url>          - Fetch URL via HTTP GET\n");
+            print("  dns <hostname>      - Resolve hostname to IP address\n");
             print("  pid                 - Show current process ID\n");
             print("  kill <pid>          - Terminate a process\n");
             print("  sync                - Flush filesystem to disk\n");
             print("  test                - Keyboard test\n");
             print("  grahai              - Run GCP interpreter\n");
             print("  exit                - Exit the shell\n");
+            print("\nTest suites (also runnable directly):\n");
+            print("  libctest            - libc/malloc test suite\n");
+            print("  sbrk_test           - sbrk syscall test\n");
+            print("  printf_test         - printf format test\n");
+            print("  spawntest           - spawn/wait test suite\n");
+            print("  cantest             - CAN capability test suite\n");
+            print("  metatest            - AI metadata test suite\n");
+            print("  eventtest           - CAN event test suite\n");
+            print("  nettest             - E1000 NIC test suite\n");
+            print("  httptest            - HTTP server test suite\n");
+            print("  dnstest             - DNS + HTTP client test suite\n");
         }
         else if (strcmp(cmd, "ls") == 0) {
             cmd_ls(argc > 1 ? argv[1] : "/");
@@ -1374,6 +1463,12 @@ void _start(void) {
         }
         else if (strcmp(cmd, "netstat") == 0) {
             cmd_netstat();
+        }
+        else if (strcmp(cmd, "http") == 0) {
+            cmd_http(argc > 1 ? argv[1] : "");
+        }
+        else if (strcmp(cmd, "dns") == 0) {
+            cmd_dns(argc > 1 ? argv[1] : "");
         }
         else if (strcmp(cmd, "pid") == 0) {
             int current_pid = syscall_getpid();

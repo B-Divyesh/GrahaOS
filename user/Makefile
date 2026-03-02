@@ -26,7 +26,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest
 
 .PHONY: all clean libc
 
@@ -91,6 +91,11 @@ nettest: nettest.o $(LIBC)
 httptest: httptest.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
 	@$(LD) $(LDFLAGS) -o $@ httptest.o $(LIBC)
+
+# Build DNS/HTTP client test (Phase 9c, with libc)
+dnstest: dnstest.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ dnstest.o $(LIBC)
 
 %.o: %.c
 	@echo "Compiling user C: $<"
