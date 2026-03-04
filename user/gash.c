@@ -1335,7 +1335,7 @@ void _start(void) {
             print("  events              - Show pending CAN events\n");
             print("  ifconfig            - Show network interface info\n");
             print("  netstat             - Show TCP/IP stack status\n");
-            print("  http <url>          - Fetch URL via HTTP GET\n");
+            print("  http <url>          - Fetch URL via HTTP/HTTPS GET\n");
             print("  dns <hostname>      - Resolve hostname to IP address\n");
             print("  pid                 - Show current process ID\n");
             print("  kill <pid>          - Terminate a process\n");

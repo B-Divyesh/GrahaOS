@@ -3279,13 +3279,12 @@ static void http_cb(struct mg_connection *c, int ev, void *ev_data) {
 
         // Find zero-length chunk (the end of the body)
         while ((cl = skip_chunk(s + o, len - o, &pl, &dl)) > 0 && dl) o += cl;
-        if (cl == 0) break;  // No zero-len chunk, buffer more data
+        if (cl == 0 && ev != MG_EV_CLOSE) break;  // Buffer more data
         if (cl < 0) {
-          mg_error(c, "Invalid chunk");
-          break;
+          if (ev == MG_EV_CLOSE) { cl = 0; } else { mg_error(c, "Invalid chunk"); break; }
         }
 
-        // Zero chunk found. Second pass: strip + relocate
+        // Strip + relocate complete chunks (or all available on close)
         o = 0, hm.body.len = 0, hm.message.len = (size_t) n;
         while ((cl = skip_chunk(s + o, len - o, &pl, &dl)) > 0) {
           memmove(s + hm.body.len, s + o + pl, (size_t) dl);
@@ -6048,8 +6047,15 @@ void mg_mgr_poll(struct mg_mgr *mgr, int ms) {
     MG_VERBOSE(("%lu .. %c%c%c%c%c", c->id, c->is_tls ? 'T' : 't',
                 c->is_connecting ? 'C' : 'c', c->is_tls_hs ? 'H' : 'h',
                 c->is_resolving ? 'R' : 'r', c->is_closing ? 'C' : 'c'));
-    if (c->is_tls && mg_tls_pending(c) > 0)
-      handle_tls_recv(c, (struct mg_iobuf *) &c->rtls);
+    if (c->is_tls && mg_tls_pending(c) > 0) {
+      // Decrypt pending TLS records into c->recv (NOT c->rtls!)
+      // c->rtls holds encrypted data; decrypted output goes to c->recv
+      struct mg_iobuf *rio = &c->recv;
+      size_t need = c->rtls.len > 0 ? c->rtls.len : 256;
+      if (rio->size - rio->len < need)
+        mg_iobuf_resize(rio, rio->len + need);
+      handle_tls_recv(c, rio);
+    }
     if (can_write(c)) write_conn(c);
     if (c->is_draining && c->send.len == 0 && s->ttype != MIP_TTYPE_FIN)
       init_closure(c);
@@ -9519,6 +9525,8 @@ struct tls_data {
   uint8_t session_id[32];  // client session ID between the handshake states
   uint8_t x25519_cli[32];  // client X25519 key between the handshake states
   uint8_t x25519_sec[32];  // x25519 secret between the handshake states
+  uint8_t p256_cli[32];    // client secp256r1 private key (for ECDH)
+  uint8_t is_chacha20;     // 1 if server selected CHACHA20, 0 if AES-128-GCM
 
   int skip_verification;   // perform checks on server certificate?
   int cert_requested;      // client received a CertificateRequest?
@@ -9700,11 +9708,7 @@ static void mg_tls_generate_handshake_keys(struct mg_connection *c) {
   uint8_t hello_hash[32];
   uint8_t server_hs_secret[32];
   uint8_t client_hs_secret[32];
-#if CHACHA20
-  const size_t keysz = 32;
-#else
-  const size_t keysz = 16;
-#endif
+  const size_t keysz = tls->is_chacha20 ? 32 : 16;
 
   mg_hmac_sha256(early_secret, NULL, 0, zeros, sizeof(zeros));
   mg_tls_derive_secret("tls13 derived", early_secret, 32, zeros_sha256_digest,
@@ -9764,11 +9768,7 @@ static void mg_tls_generate_application_keys(struct mg_connection *c) {
   uint8_t master_secret[32];
   uint8_t server_secret[32];
   uint8_t client_secret[32];
-#if CHACHA20
-  const size_t keysz = 32;
-#else
-  const size_t keysz = 16;
-#endif
+  const size_t keysz = tls->is_chacha20 ? 32 : 16;
 
   mg_sha256_ctx sha256;
   memmove(&sha256, &tls->sha256, sizeof(mg_sha256_ctx));
@@ -9828,9 +9828,7 @@ static void mg_tls_encrypt(struct mg_connection *c, const uint8_t *msg,
   uint8_t *iv =
       c->is_client ? tls->enc.client_write_iv : tls->enc.server_write_iv;
 
-#if !CHACHA20
-  mg_gcm_initialize();
-#endif
+  if (!tls->is_chacha20) mg_gcm_initialize();
 
   memmove(nonce, iv, sizeof(nonce));
   nonce[8] ^= (uint8_t) ((seq >> 24) & 255U);
@@ -9844,9 +9842,8 @@ static void mg_tls_encrypt(struct mg_connection *c, const uint8_t *msg,
   tag = wio->buf + wio->len + msgsz + 1;
   memmove(outmsg, msg, msgsz);
   outmsg[msgsz] = msgtype;
-#if CHACHA20
-  (void) tag;  // tag is only used in aes gcm
-  {
+  if (tls->is_chacha20) {
+    (void) tag;
     uint8_t *enc = (uint8_t *) malloc(8192);
     if (enc == NULL) {
       mg_error(c, "TLS OOM");
@@ -9858,11 +9855,10 @@ static void mg_tls_encrypt(struct mg_connection *c, const uint8_t *msg,
       memmove(outmsg, enc, n);
       free(enc);
     }
+  } else {
+    mg_aes_gcm_encrypt(outmsg, outmsg, msgsz + 1, key, 16, nonce, sizeof(nonce),
+                       associated_data, sizeof(associated_data), tag, 16);
   }
-#else
-  mg_aes_gcm_encrypt(outmsg, outmsg, msgsz + 1, key, 16, nonce, sizeof(nonce),
-                     associated_data, sizeof(associated_data), tag, 16);
-#endif
   c->is_client ? tls->enc.cseq++ : tls->enc.sseq++;
   wio->len += encsz;
 }
@@ -9894,18 +9890,33 @@ static int mg_tls_recv_record(struct mg_connection *c) {
     } else if (rio->buf[0] ==
                MG_TLS_CHANGE_CIPHER) {  // Skip ChangeCipher messages
       mg_tls_drop_record(c);
-    } else if (rio->buf[0] == MG_TLS_ALERT) {  // Skip Alerts
-      MG_INFO(("TLS ALERT packet received"));
+    } else if (rio->buf[0] == MG_TLS_ALERT) {  // Handle Alerts
+      if (rio->len >= 7) {
+        uint8_t level = rio->buf[5], desc = rio->buf[6];
+        MG_INFO(("TLS ALERT: level=%d desc=%d (0x%02x) %s", level, desc, desc,
+                 desc == 0 ? "close_notify" : desc == 10 ? "unexpected_message" :
+                 desc == 20 ? "bad_record_mac" : desc == 21 ? "decryption_failed" :
+                 desc == 40 ? "handshake_failure" : desc == 42 ? "bad_certificate" :
+                 desc == 43 ? "unsupported_certificate" : desc == 70 ? "protocol_version" :
+                 desc == 71 ? "insufficient_security" : "unknown"));
+        if (level == 2) {
+          mg_error(c, "TLS fatal alert %d", desc);
+          return -1;
+        }
+      } else {
+        MG_INFO(("TLS ALERT packet received (short)"));
+      }
+      mg_tls_drop_record(c);
+    } else if (rio->buf[0] == MG_TLS_HANDSHAKE) {  // Post-handshake messages
+      MG_INFO(("TLS post-handshake record, dropping"));
       mg_tls_drop_record(c);
     } else {
-      mg_error(c, "unexpected packet");
+      mg_error(c, "unexpected TLS record type: 0x%02x", rio->buf[0]);
       return -1;
     }
   }
 
-#if !CHACHA20
-  mg_gcm_initialize();
-#endif
+  if (!tls->is_chacha20) mg_gcm_initialize();
 
   msgsz = MG_LOAD_BE16(rio->buf + 3);
   msg = rio->buf + 5;
@@ -9914,8 +9925,7 @@ static int mg_tls_recv_record(struct mg_connection *c) {
   nonce[9] ^= (uint8_t) ((seq >> 16) & 255U);
   nonce[10] ^= (uint8_t) ((seq >> 8) & 255U);
   nonce[11] ^= (uint8_t) ((seq) &255U);
-#if CHACHA20
-  {
+  if (tls->is_chacha20) {
     uint8_t *dec = (uint8_t *) malloc(msgsz);
     size_t n;
     if (dec == NULL) {
@@ -9925,14 +9935,13 @@ static int mg_tls_recv_record(struct mg_connection *c) {
     n = mg_chacha20_poly1305_decrypt(dec, key, nonce, msg, msgsz);
     memmove(msg, dec, n);
     free(dec);
+  } else {
+    if (msgsz < 16) {
+      mg_error(c, "wrong size");
+      return -1;
+    }
+    mg_aes_gcm_decrypt(msg, msg, msgsz - 16, key, 16, nonce, sizeof(nonce));
   }
-#else
-  if (msgsz < 16) {
-    mg_error(c, "wrong size");
-    return -1;
-  }
-  mg_aes_gcm_decrypt(msg, msg, msgsz - 16, key, 16, nonce, sizeof(nonce));
-#endif
   r = msgsz - 16 - 1;
   tls->content_type = msg[msgsz - 16 - 1];
   tls->recv_offset = (size_t) msg - (size_t) rio->buf;
@@ -10235,38 +10244,63 @@ static void mg_tls_client_send_hello(struct mg_connection *c) {
       0x08, 0x05, 0x08, 0x06, 0x04, 0x01, 0x05, 0x01, 0x06, 0x01};
   uint8_t server_name_ext[9] = {0x00, 0x00, 0x00, 0xfe, 0x00,
                                 0xfe, 0x00, 0x00, 0xfe};
+  // ALPN extension: advertise http/1.1 to prevent HTTP/2 negotiation
+  uint8_t alpn_ext[15] = {
+      0x00, 0x10,                                     // Extension type: ALPN (16)
+      0x00, 0x0b,                                     // Extension data length: 11
+      0x00, 0x09,                                     // Protocol name list length: 9
+      0x08,                                           // Protocol name length: 8
+      'h', 't', 't', 'p', '/', '1', '.', '1'         // "http/1.1"
+  };
+  size_t alpn_sz = sizeof(alpn_ext);
+  // psk_key_exchange_modes extension (required by some TLS stacks for TLS 1.3)
+  uint8_t psk_ke_ext[6] = {
+      0x00, 0x2d,  // Extension type: psk_key_exchange_modes (45)
+      0x00, 0x02,  // Extension data length: 2
+      0x01,        // Modes length: 1
+      0x01,        // psk_dhe_ke (PSK with (EC)DHE key establishment)
+  };
+  size_t psk_ke_sz = sizeof(psk_ke_ext);
 
   // clang-format off
-  uint8_t msg_client_hello[145] = {
-      // TLS Client Hello header reported as TLS1.2 (5)
-      0x16, 0x03, 0x03, 0x00, 0xfe,
+  uint8_t msg_client_hello[218] = {
+      // TLS Client Hello header — RFC 8446 recommends 0x0301 for compat (5)
+      0x16, 0x03, 0x01, 0x00, 0xfe,
       // client hello, tls 1.2 (6)
       0x01, 0x00, 0x00, 0x8c, 0x03, 0x03,
       // random (32 bytes)
       PLACEHOLDER_32B,
       // session ID length + session ID (32 bytes)
       0x20, PLACEHOLDER_32B, 0x00,
-      0x02,  // size = 2 bytes
-#if defined(CHACHA20) && CHACHA20
-      // TLS_CHACHA20_POLY1305_SHA256
-      0x13, 0x03,
-#else
-      // TLS_AES_128_GCM_SHA256
+      0x04,  // cipher suites size = 4 bytes (2 cipher suites)
+      // TLS_AES_128_GCM_SHA256 (mandatory, most compatible)
       0x13, 0x01,
-#endif
+      // TLS_CHACHA20_POLY1305_SHA256 (fast on non-AES-NI hardware)
+      0x13, 0x03,
       // no compression
       0x01, 0x00,
-      // extensions + keyshare
+      // extensions length (placeholder, patched below)
       0x00, 0xfe,
-      // x25519 keyshare
-      0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20,
-      PLACEHOLDER_32B,
-      // supported groups (x25519)
-      0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d,
+      // key_share extension (x25519 + secp256r1)
+      0x00, 0x33,  // ext type: key_share (51)
+      0x00, 0x6b,  // ext data length: 107 (was 38)
+      0x00, 0x69,  // key shares length: 105 (was 36)
+      // x25519 key share entry
+      0x00, 0x1d,  // group: x25519
+      0x00, 0x20,  // key exchange length: 32
+      PLACEHOLDER_32B,  // x25519 public key (offset +94)
+      // secp256r1 key share entry
+      0x00, 0x17,  // group: secp256r1
+      0x00, 0x41,  // key exchange length: 65
+      0x04,        // uncompressed point prefix
+      PLACEHOLDER_32B,  // P-256 X coordinate (offset +131)
+      PLACEHOLDER_32B,  // P-256 Y coordinate (offset +163)
+      // supported groups (secp256r1 + x25519)
+      0x00, 0x0a, 0x00, 0x06, 0x00, 0x04, 0x00, 0x17, 0x00, 0x1d,
       // supported versions (tls1.3 == 0x304)
       0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04,
       // session ticket (none)
-      0x00, 0x23, 0x00, 0x00, // 144 bytes till here
+      0x00, 0x23, 0x00, 0x00,
 	};
   // clang-format on
   const char *hostname = tls->hostname;
@@ -10276,13 +10310,15 @@ static void mg_tls_client_send_hello(struct mg_connection *c) {
   size_t sig_alg_sz = tls->skip_verification ? sizeof(all_sig_algs)
                                              : sizeof(secp256r1_sig_algs);
 
-  // patch ClientHello with correct hostname ext length (if any)
+  // patch ClientHello with correct lengths (hostname + sig_alg + ALPN + P-256)
+  // Base grew by 71 bytes (69 P-256 key_share + 2 supported_groups entry)
+  // Patching length fields: +2 for dual cipher suites (template grew from 216 to 218)
   MG_STORE_BE16(msg_client_hello + 3,
-                hostname_extsz + 183 - 9 - 34 + sig_alg_sz);
+                hostname_extsz + 256 - 9 - 34 + sig_alg_sz + alpn_sz + psk_ke_sz);
   MG_STORE_BE16(msg_client_hello + 7,
-                hostname_extsz + 179 - 9 - 34 + sig_alg_sz);
-  MG_STORE_BE16(msg_client_hello + 82,
-                hostname_extsz + 104 - 9 - 34 + sig_alg_sz);
+                hostname_extsz + 252 - 9 - 34 + sig_alg_sz + alpn_sz + psk_ke_sz);
+  MG_STORE_BE16(msg_client_hello + 84,
+                hostname_extsz + 175 - 9 - 34 + sig_alg_sz + alpn_sz + psk_ke_sz);
 
   if (hostnamesz > 0) {
     MG_STORE_BE16(server_name_ext + 2, hostnamesz + 5);
@@ -10290,18 +10326,34 @@ static void mg_tls_client_send_hello(struct mg_connection *c) {
     MG_STORE_BE16(server_name_ext + 7, hostnamesz);
   }
 
-  // calculate keyshare
+  // calculate x25519 keyshare
   mg_random(tls->x25519_cli, sizeof(tls->x25519_cli));
   mg_tls_x25519(x25519_pub, tls->x25519_cli, X25519_BASE_POINT, 1);
 
-  // fill in the gaps: random + session ID + keyshare
+  // calculate secp256r1 keyshare
+  uint8_t p256_pub[64];  // X(32) + Y(32)
+  int p256_ok = mg_uecc_make_key(p256_pub, tls->p256_cli, mg_uecc_secp256r1());
+  MG_INFO(("P-256 keygen: %s, pub[0-3]=%02x%02x%02x%02x",
+           p256_ok ? "OK" : "FAIL",
+           p256_pub[0], p256_pub[1], p256_pub[2], p256_pub[3]));
+
+  // fill in the gaps: random + session ID + x25519 key + P-256 key
   mg_random(tls->session_id, sizeof(tls->session_id));
   mg_random(tls->random, sizeof(tls->random));
   memmove(msg_client_hello + 11, tls->random, sizeof(tls->random));
   memmove(msg_client_hello + 44, tls->session_id, sizeof(tls->session_id));
-  memmove(msg_client_hello + 94, x25519_pub, sizeof(x25519_pub));
+  memmove(msg_client_hello + 96, x25519_pub, sizeof(x25519_pub));
+  memmove(msg_client_hello + 133, p256_pub, 64);  // X+Y after 0x04 prefix
 
   // client hello message
+  MG_INFO(("ClientHello: size=%lu, record_len=%d, hs_len=%d, ext_len=%d",
+           sizeof(msg_client_hello),
+           (int)MG_LOAD_BE16(msg_client_hello + 3),
+           (int)MG_LOAD_BE16(msg_client_hello + 7),
+           (int)MG_LOAD_BE16(msg_client_hello + 84)));
+  MG_INFO(("key_share: ext_data=%d, shares=%d",
+           (int)MG_LOAD_BE16(msg_client_hello + 88),
+           (int)MG_LOAD_BE16(msg_client_hello + 90)));
   mg_iobuf_add(wio, wio->len, msg_client_hello, sizeof(msg_client_hello));
   mg_sha256_update(&tls->sha256, msg_client_hello + 5,
                    sizeof(msg_client_hello) - 5);
@@ -10313,6 +10365,12 @@ static void mg_tls_client_send_hello(struct mg_connection *c) {
     mg_sha256_update(&tls->sha256, server_name_ext, sizeof(server_name_ext));
     mg_sha256_update(&tls->sha256, (uint8_t *) hostname, hostnamesz);
   }
+  // ALPN extension: advertise http/1.1
+  mg_iobuf_add(wio, wio->len, alpn_ext, alpn_sz);
+  mg_sha256_update(&tls->sha256, alpn_ext, alpn_sz);
+  // psk_key_exchange_modes extension
+  mg_iobuf_add(wio, wio->len, psk_ke_ext, psk_ke_sz);
+  mg_sha256_update(&tls->sha256, psk_ke_ext, psk_ke_sz);
 
   // change cipher message
   mg_iobuf_add(wio, wio->len, (const char *) "\x14\x03\x03\x00\x01\x01", 6);
@@ -10333,6 +10391,9 @@ static int mg_tls_client_recv_hello(struct mg_connection *c) {
   }
   if (rio->buf[0] != MG_TLS_HANDSHAKE || rio->buf[5] != MG_TLS_SERVER_HELLO) {
     if (rio->buf[0] == MG_TLS_ALERT && rio->len >= 7) {
+      MG_INFO(("TLS Alert: level=%d desc=%d (0x%02x), raw: %02x %02x %02x %02x %02x %02x %02x",
+               rio->buf[5], rio->buf[6], rio->buf[6],
+               rio->buf[0], rio->buf[1], rio->buf[2], rio->buf[3], rio->buf[4], rio->buf[5], rio->buf[6]));
       mg_error(c, "tls alert %d", rio->buf[6]);
       return -1;
     }
@@ -10343,6 +10404,21 @@ static int mg_tls_client_recv_hello(struct mg_connection *c) {
 
   msgsz = MG_LOAD_BE16(rio->buf + 3);
   mg_sha256_update(&tls->sha256, rio->buf + 5, msgsz);
+
+  // Parse cipher suite from ServerHello (offset 76 = 5+4+2+32+1+32)
+  {
+    uint16_t server_cipher = MG_LOAD_BE16(rio->buf + 76);
+    if (server_cipher == 0x1303) {
+      tls->is_chacha20 = 1;
+      MG_INFO(("Server selected CHACHA20_POLY1305"));
+    } else if (server_cipher == 0x1301) {
+      tls->is_chacha20 = 0;
+      MG_INFO(("Server selected AES_128_GCM_SHA256"));
+    } else {
+      mg_error(c, "unsupported cipher 0x%04x", server_cipher);
+      return -1;
+    }
+  }
 
   ext_len = MG_LOAD_BE16(rio->buf + 5 + 39 + 32 + 3);
   ext = rio->buf + 5 + 39 + 32 + 3 + 2;
@@ -10360,17 +10436,30 @@ static int mg_tls_client_recv_hello(struct mg_connection *c) {
       continue;
     }
     group = MG_LOAD_BE16(ext + j + 4);
-    if (group != 0x001d) {
-      mg_error(c, "bad key exchange group");
-      return -1;
-    }
     key_exchange_len = MG_LOAD_BE16(ext + j + 6);
     key_exchange = ext + j + 8;
-    if (key_exchange_len != 32) {
-      mg_error(c, "bad key exchange length");
+    if (group == 0x001d) {
+      // x25519: 32-byte key exchange
+      if (key_exchange_len != 32) {
+        mg_error(c, "bad x25519 key exchange length");
+        return -1;
+      }
+      mg_tls_x25519(tls->x25519_sec, tls->x25519_cli, key_exchange, 1);
+    } else if (group == 0x0017) {
+      // secp256r1: 65-byte key exchange (0x04 + X(32) + Y(32))
+      if (key_exchange_len != 65 || key_exchange[0] != 0x04) {
+        mg_error(c, "bad secp256r1 key exchange");
+        return -1;
+      }
+      if (!mg_uecc_shared_secret(key_exchange + 1, tls->p256_cli,
+                                  tls->x25519_sec, mg_uecc_secp256r1())) {
+        mg_error(c, "ECDH shared secret failed");
+        return -1;
+      }
+    } else {
+      mg_error(c, "unsupported key exchange group");
       return -1;
     }
-    mg_tls_x25519(tls->x25519_sec, tls->x25519_cli, key_exchange, 1);
     mg_tls_hexdump("c x25519 sec", tls->x25519_sec, 32);
     mg_tls_drop_record(c);
     /* generate handshake keys */
@@ -10643,6 +10732,7 @@ static void mg_tls_client_handshake(struct mg_connection *c) {
       }
       tls->state = MG_TLS_STATE_CLIENT_CONNECTED;
       c->is_tls_hs = 0;
+      mg_call(c, MG_EV_TLS_HS, NULL);
       break;
     default:
       mg_error(c, "unexpected client state: %d", tls->state);
@@ -10658,6 +10748,7 @@ static void mg_tls_server_handshake(struct mg_connection *c) {
         return;
       }
       mg_tls_server_send_hello(c);
+      tls->is_chacha20 = CHACHA20;  // server always uses compile-time default
       mg_tls_generate_handshake_keys(c);
       mg_tls_server_send_ext(c);
       mg_tls_server_send_cert(c);
@@ -10672,6 +10763,7 @@ static void mg_tls_server_handshake(struct mg_connection *c) {
       mg_tls_generate_application_keys(c);
       tls->state = MG_TLS_STATE_SERVER_CONNECTED;
       c->is_tls_hs = 0;
+      mg_call(c, MG_EV_TLS_HS, NULL);
       return;
     default:
       mg_error(c, "unexpected server state: %d", tls->state);

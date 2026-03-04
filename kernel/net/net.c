@@ -22,13 +22,50 @@ uint64_t mg_millis(void) {
     return g_timer_ticks * 10;
 }
 
-// Simple xorshift64 PRNG
+// ===== Hardware RNG (RDRAND) =====
+
+static bool s_has_rdrand = false;
+
+static inline bool rdrand_supported(void) {
+    uint32_t ecx;
+    asm volatile("cpuid" : "=c"(ecx) : "a"(1) : "ebx", "edx");
+    return (ecx >> 30) & 1;
+}
+
+static inline bool rdrand64(uint64_t *val) {
+    uint8_t ok;
+    asm volatile("rdrand %0; setc %1" : "=r"(*val), "=qm"(ok));
+    return ok;
+}
+
+// Fallback xorshift64 PRNG (used only when RDRAND unavailable)
 static uint64_t prng_state = 0;
 
 void mg_random(void *buf, size_t len) {
     uint8_t *p = (uint8_t *)buf;
+
+    if (s_has_rdrand) {
+        // Hardware RNG: cryptographically secure
+        size_t i = 0;
+        while (i < len) {
+            uint64_t val;
+            int retries = 10;
+            while (!rdrand64(&val) && retries-- > 0)
+                asm volatile("pause");
+            if (retries < 0) break;  // RDRAND failed, fill rest with PRNG
+            size_t chunk = (len - i < 8) ? (len - i) : 8;
+            extern void *memcpy(void *, const void *, size_t);
+            memcpy(p + i, &val, chunk);
+            i += chunk;
+        }
+        if (i >= len) return;
+        // Fall through to PRNG for any remaining bytes
+        p += i;
+        len -= i;
+    }
+
+    // Software PRNG fallback
     if (prng_state == 0) {
-        // Seed from timer ticks and MAC address
         uint8_t mac[6];
         e1000_get_mac(mac);
         prng_state = g_timer_ticks ^ (((uint64_t)mac[0] << 40) |
@@ -212,7 +249,24 @@ static void http_client_handler(struct mg_connection *c, int ev, void *ev_data) 
     net_request_t *req = &s_requests[task_id];
 
     if (ev == MG_EV_CONNECT) {
-        // TCP connected — send the HTTP GET request
+        // TCP connected — send HTTP GET only for plain HTTP
+        // For HTTPS, wait until TLS handshake completes (MG_EV_TLS_HS)
+        serial_write("[NET] HTTP client: MG_EV_CONNECT\n");
+        if (!c->is_tls) {
+            struct mg_str host = mg_url_host(req->url);
+            const char *uri = mg_url_uri(req->url);
+            mg_printf(c,
+                      "GET %s HTTP/1.1\r\n"
+                      "Host: %.*s\r\n"
+                      "Connection: close\r\n"
+                      "\r\n",
+                      uri, (int)host.len, host.buf);
+        } else {
+            serial_write("[NET] TLS connection — deferring GET to handshake complete\n");
+        }
+    } else if (ev == MG_EV_TLS_HS) {
+        // TLS handshake complete — now send the HTTP GET request
+        serial_write("[NET] HTTP client: MG_EV_TLS_HS — handshake complete!\n");
         struct mg_str host = mg_url_host(req->url);
         const char *uri = mg_url_uri(req->url);
         mg_printf(c,
@@ -221,6 +275,7 @@ static void http_client_handler(struct mg_connection *c, int ev, void *ev_data) 
                   "Connection: close\r\n"
                   "\r\n",
                   uri, (int)host.len, host.buf);
+        serial_write("[NET] HTTP GET sent after TLS handshake\n");
     } else if (ev == MG_EV_HTTP_MSG) {
         struct mg_http_message *hm = (struct mg_http_message *)ev_data;
         extern void *memcpy(void *, const void *, size_t);
@@ -254,6 +309,31 @@ static void http_client_handler(struct mg_connection *c, int ev, void *ev_data) 
         net_wake_task(task_id);
     } else if (ev == MG_EV_CLOSE) {
         if (req->state == NET_STATE_PENDING) {
+            // Connection closed before MG_EV_HTTP_MSG fired.
+            // Try to salvage: parse HTTP headers from recv buffer and extract
+            // whatever body we have (handles chunked/large responses that close
+            // before the final chunk terminator arrives).
+            if (c->recv.len > 0) {
+                struct mg_http_message hm;
+                int n = mg_http_parse((const char *)c->recv.buf, c->recv.len, &hm);
+                if (n > 0 && hm.body.buf != NULL) {
+                    extern void *memcpy(void *, const void *, size_t);
+                    // Body starts at hm.body.buf, available bytes until end of recv
+                    size_t body_avail = c->recv.len - (size_t)(hm.body.buf - (char *)c->recv.buf);
+                    size_t copy_len = body_avail;
+                    if (copy_len > NET_MAX_RESPONSE_SIZE - 1)
+                        copy_len = NET_MAX_RESPONSE_SIZE - 1;
+                    memcpy(req->response, hm.body.buf, copy_len);
+                    req->response[copy_len] = '\0';
+                    req->response_len = (int)copy_len;
+                    req->http_status = mg_http_status(&hm);
+                    req->state = NET_STATE_DONE;
+                    req->conn = NULL;
+                    net_wake_task(task_id);
+                    return;
+                }
+            }
+            serial_write("[NET] HTTP client: connection closed with no data\n");
             req->error_code = NET_ERR_CONNECT;
             req->state = NET_STATE_ERROR;
             req->conn = NULL;
@@ -331,6 +411,15 @@ int net_http_get_start(int task_id, const char *url) {
     if (!c) {
         req->state = NET_STATE_IDLE;
         return NET_ERR_NOMEM;
+    }
+
+    // If HTTPS URL, initialize TLS on the connection
+    if (mg_url_is_ssl(req->url)) {
+        struct mg_tls_opts opts;
+        memset(&opts, 0, sizeof(opts));
+        opts.skip_verification = 1;  // Dev mode: skip cert validation
+        opts.name = mg_url_host(req->url);  // SNI hostname
+        mg_tls_init(c, &opts);
     }
 
     req->conn = c;
@@ -436,7 +525,9 @@ void net_check_timeouts(void) {
     uint64_t now = mg_millis();
     for (int i = 0; i < MAX_TASKS; i++) {
         if (s_requests[i].state == NET_STATE_PENDING) {
-            if (now - s_requests[i].start_time_ms > NET_REQUEST_TIMEOUT_MS) {
+            uint64_t timeout = mg_url_is_ssl(s_requests[i].url)
+                ? NET_REQUEST_TIMEOUT_HTTPS_MS : NET_REQUEST_TIMEOUT_MS;
+            if (now - s_requests[i].start_time_ms > timeout) {
                 s_requests[i].error_code = NET_ERR_TIMEOUT;
                 s_requests[i].state = NET_STATE_ERROR;
                 if (s_requests[i].conn) {
@@ -452,14 +543,32 @@ void net_check_timeouts(void) {
 
 // ===== Initialization =====
 
+// RNG wrapper for micro-ecc P-256 operations
+static int uecc_rng(uint8_t *dest, unsigned size) {
+    mg_random(dest, (size_t)size);
+    return 1;
+}
+
 void net_init(void) {
     if (s_net_initialized) return;
 
     serial_write("[NET] Initializing Mongoose TCP/IP stack...\n");
 
+    // Enable info logging (verbose floods serial port)
+    mg_log_level = MG_LL_INFO;
+
+    // Detect hardware RNG
+    s_has_rdrand = rdrand_supported();
+    serial_write(s_has_rdrand ? "[NET] RDRAND available - using hardware RNG\n"
+                              : "[NET] RDRAND not available - using software PRNG\n");
+
     // Initialize kernel malloc arena
     kmalloc_init();
     serial_write("[NET] Kernel malloc arena ready (2MB)\n");
+
+    // Set up RNG for micro-ecc P-256 operations (ECDH key generation)
+    extern void mg_uecc_set_rng(int (*)(uint8_t *, unsigned));
+    mg_uecc_set_rng(uecc_rng);
 
     // Check E1000 is present
     if (!e1000_is_present()) {
@@ -538,6 +647,7 @@ void mongoose_poll_task(void) {
         if (s_net_initialized) {
             mg_mgr_poll(&s_mgr, 0);
             net_check_timeouts();
+
         }
 
         // Short delay then yield

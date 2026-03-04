@@ -281,6 +281,22 @@ void interrupt_handler(struct interrupt_frame *frame) {
             return;
         } else {
             framebuffer_draw_string("KERNEL MODE crash", 10, 70, COLOR_YELLOW, COLOR_RED);
+
+            // Log kernel crash to serial for debugging
+            serial_write("[KERNEL CRASH] Exception #");
+            serial_write_dec(frame->int_no);
+            if (frame->int_no < 20) {
+                serial_write(" (");
+                serial_write(exception_names[frame->int_no]);
+                serial_write(")");
+            }
+            serial_write(" at RIP=");
+            serial_write_hex(frame->rip);
+            serial_write(" RSP=");
+            serial_write_hex(frame->rsp);
+            serial_write(" ERR=");
+            serial_write_hex(frame->err_code);
+            serial_write("\n");
         }
 
         // Kernel mode exception is still fatal

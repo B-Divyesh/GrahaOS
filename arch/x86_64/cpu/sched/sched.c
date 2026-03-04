@@ -169,7 +169,10 @@ int sched_create_task(void (*entry_point)(void)) {
     tasks[id].regs.ss = 0x10;         // Kernel data segment
     tasks[id].regs.ds = 0x10;         // Data segment
     tasks[id].regs.rflags = 0x202;    // IF=1, Reserved=1
-    tasks[id].regs.rsp = (kstack_top - 128) & ~0xF;  // Stack pointer
+    // ABI: at function entry, (RSP+8) must be 16-byte aligned (RSP%16==8)
+    // because normally a `call` pushes an 8-byte return address.
+    // Since the scheduler jumps directly without `call`, we subtract 8.
+    tasks[id].regs.rsp = ((kstack_top - 128) & ~0xF) - 8;
     tasks[id].regs.rbp = tasks[id].regs.rsp;         // Base pointer
 
     // Use kernel address space

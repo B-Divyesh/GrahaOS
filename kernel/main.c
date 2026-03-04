@@ -176,6 +176,20 @@ void kmain(void) {
         hcf();
     }
 
+    // Enable SSE/SSE2 on BSP (APs do this in ap_start.S)
+    // Required for mongoose.c compiled with SSE2 (TLS crypto, float code)
+    {
+        uint64_t cr0, cr4;
+        asm volatile("mov %%cr0, %0" : "=r"(cr0));
+        cr0 &= ~(1UL << 2);  // Clear CR0.EM (no FPU emulation)
+        cr0 |=  (1UL << 1);  // Set CR0.MP (monitor coprocessor)
+        asm volatile("mov %0, %%cr0" :: "r"(cr0));
+        asm volatile("mov %%cr4, %0" : "=r"(cr4));
+        cr4 |= (1UL << 9);   // Set CR4.OSFXSR (enable SSE)
+        cr4 |= (1UL << 10);  // Set CR4.OSXMMEXCPT (SSE exceptions)
+        asm volatile("mov %0, %%cr4" :: "r"(cr4));
+    }
+
     // Initialize serial port FIRST for logging
     serial_init();
     serial_write("\n=== GrahaOS Boot Log ===\n");

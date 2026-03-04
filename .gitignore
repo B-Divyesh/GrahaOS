@@ -46,3 +46,9 @@ user/libctest
 user/sbrk_test
 user/printf_test
 user/spawntest
+user/cantest
+user/dnstest
+user/eventtest
+user/httptest
+user/metatest
+user/nettest

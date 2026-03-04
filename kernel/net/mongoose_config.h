@@ -37,6 +37,9 @@ static inline int sscanf(const char *str, const char *fmt, ...) {
     (void)str; (void)fmt; return 0;
 }
 
+// Note: TLS crypto code (chacha20-poly1305) includes <assert.h> and <string.h>
+// Stub headers are provided in kernel/net/ (on the include path via -I./kernel/net)
+
 // Architecture
 #define MG_ARCH MG_ARCH_CUSTOM
 
@@ -51,6 +54,9 @@ static inline int sscanf(const char *str, const char *fmt, ...) {
 // Custom implementations
 #define MG_ENABLE_CUSTOM_MILLIS 1
 #define MG_ENABLE_CUSTOM_RANDOM 1
+
+// TLS 1.3 via Mongoose's built-in implementation (no external crypto library)
+#define MG_TLS MG_TLS_BUILTIN
 
 // Disable features not needed / that require filesystem
 #define MG_ENABLE_FATFS 0

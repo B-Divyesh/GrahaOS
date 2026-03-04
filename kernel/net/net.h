@@ -33,7 +33,8 @@ void net_get_status(net_status_t *status);
 #define NET_ERR_NO_NET      -17
 
 #define NET_MAX_RESPONSE_SIZE 4096
-#define NET_REQUEST_TIMEOUT_MS 10000
+#define NET_REQUEST_TIMEOUT_MS      10000
+#define NET_REQUEST_TIMEOUT_HTTPS_MS 15000
 
 // Start an HTTP GET request for a task (non-blocking, returns immediately)
 // Returns: 0 on success, NET_ERR_BUSY if already in flight, other negative on error
