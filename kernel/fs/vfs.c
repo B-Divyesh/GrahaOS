@@ -238,6 +238,7 @@ int vfs_open(const char *pathname) {
         for (int fd = 0; fd < MAX_OPEN_FILES; fd++) {
             if (!open_file_table[fd].in_use) {
                 open_file_table[fd].in_use = true;
+                open_file_table[fd].refcount = 1;
                 open_file_table[fd].file_data = file_data;
                 open_file_table[fd].size = file_size;
                 open_file_table[fd].offset = 0;
@@ -254,6 +255,7 @@ int vfs_open(const char *pathname) {
     for (int fd = 0; fd < MAX_OPEN_FILES; fd++) {
         if (!open_file_table[fd].in_use) {
             open_file_table[fd].in_use = true;
+            open_file_table[fd].refcount = 1;
             open_file_table[fd].node = node;
             open_file_table[fd].offset = 0;
             open_file_table[fd].size = node->size;
@@ -341,17 +343,57 @@ int vfs_close(int fd) {
         spinlock_release(&vfs_lock);
         return -1;
     }
-    
+
     open_file_t *file = &open_file_table[fd];
-    
+
+    // Phase 10c: Refcount-aware close — only free when last reference
+    if (file->refcount > 1) {
+        file->refcount--;
+        spinlock_release(&vfs_lock);
+        return 0;
+    }
+
     if (file->node) {
         vfs_destroy_node(file->node);
     }
-    
+
     open_file_table[fd].in_use = false;
+    open_file_table[fd].refcount = 0;
     open_file_table[fd].node = NULL;
     open_file_table[fd].file_data = NULL;
-    
+
+    spinlock_release(&vfs_lock);
+    return 0;
+}
+
+// Phase 10c: Increment refcount for dup/dup2
+void vfs_ref_inc(int fd) {
+    spinlock_acquire(&vfs_lock);
+    if (fd >= 0 && fd < MAX_OPEN_FILES && open_file_table[fd].in_use) {
+        open_file_table[fd].refcount++;
+    }
+    spinlock_release(&vfs_lock);
+}
+
+// Phase 10c: Truncate file to 0 bytes
+int vfs_truncate(int fd) {
+    spinlock_acquire(&vfs_lock);
+    if (fd < 0 || fd >= MAX_OPEN_FILES || !open_file_table[fd].in_use) {
+        spinlock_release(&vfs_lock);
+        return -1;
+    }
+
+    open_file_t *file = &open_file_table[fd];
+    file->size = 0;
+    file->offset = 0;
+
+    // Update on-disk inode via GrahaFS
+    if (file->node && file->node->inode > 0) {
+        // Import grahafs truncate helper
+        extern int grahafs_truncate_inode(uint32_t inode_num);
+        grahafs_truncate_inode(file->node->inode);
+    }
+
     spinlock_release(&vfs_lock);
     return 0;
 }

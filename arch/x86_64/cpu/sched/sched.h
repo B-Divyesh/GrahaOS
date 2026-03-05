@@ -22,6 +22,21 @@
 #define SIG_DFL  ((void (*)(int))0)   // Default action (terminate)
 #define SIG_IGN  ((void (*)(int))1)   // Ignore signal
 
+// Phase 10a: Per-process file descriptor types
+#define FD_TYPE_UNUSED      0
+#define FD_TYPE_CONSOLE     1   // serial+FB output / keyboard input
+#define FD_TYPE_FILE        2   // VFS file (ref = global open_file_table index)
+#define FD_TYPE_PIPE_READ   3   // Read end of pipe (ref = pipe index)
+#define FD_TYPE_PIPE_WRITE  4   // Write end of pipe (ref = pipe index)
+
+#define PROC_MAX_FDS 16
+
+typedef struct {
+    uint8_t type;     // FD_TYPE_*
+    int16_t ref;      // Index into global file table, pipe table, or 0 for console
+    uint8_t flags;    // Reserved
+} proc_fd_t;
+
 // Task states
 typedef enum {
     TASK_STATE_ZOMBIE,
@@ -66,6 +81,9 @@ typedef struct {
     uint32_t event_tail;            // Next write position
     uint32_t event_count;           // Current events in queue
     uint32_t event_waiting;         // 1=blocked waiting for events
+
+    // Phase 10a: Per-process file descriptor table
+    proc_fd_t fd_table[PROC_MAX_FDS];
 } task_t;
 
 /**

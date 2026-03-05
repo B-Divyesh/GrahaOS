@@ -1611,9 +1611,602 @@ int run_program(const char *path) {
     return exit_status;
 }
 
+// --- Phase 10c: Pipe & Redirect Infrastructure ---
+
+// Spawn a program by name (try bin/ prefix if not absolute path)
+// Returns: child PID on success, -1 on failure (does NOT wait)
+static int spawn_program(const char *name) {
+    char path[128];
+    if (name[0] == '/') {
+        strcpy(path, name);
+    } else {
+        strcpy(path, "bin/");
+        int len = strlen(path);
+        int nlen = strlen(name);
+        if (len + nlen < 127) {
+            strcpy(path + len, name);
+        }
+    }
+    return syscall_spawn(path);
+}
+
+// Execute a built-in command.
+// Returns: 1 if recognized and executed, 0 if not a built-in, -1 for 'exit'
+static int execute_builtin(char *argv[], int argc);
+
+// Process redirect operators (>, >>, <) in argv.
+// Removes redirect tokens and filenames from argv.
+// Sets up FD redirections via dup/dup2.
+// saved_stdout/saved_stdin: set to saved FD numbers (-1 if not redirected)
+// out_file_fd/in_file_fd: set to opened file FD numbers (-1 if none)
+// Returns: new argc, or -1 on error
+static int setup_redirects(char *argv[], int argc,
+                            int *saved_stdout, int *saved_stdin,
+                            int *out_file_fd, int *in_file_fd) {
+    *saved_stdout = -1;
+    *saved_stdin = -1;
+    *out_file_fd = -1;
+    *in_file_fd = -1;
+
+    char *new_argv[32];
+    int new_argc = 0;
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], ">") == 0 && i + 1 < argc) {
+            // Output redirect (overwrite — truncate first)
+            const char *filename = argv[i + 1];
+            syscall_create(filename, 0644);
+            int fd = syscall_open(filename);
+            if (fd < 0) {
+                print("gash: cannot open '");
+                print(filename);
+                print("' for writing\n");
+                return -1;
+            }
+            syscall_truncate(fd);  // Truncate existing content
+            *saved_stdout = syscall_dup(1);
+            syscall_dup2(fd, 1);
+            *out_file_fd = fd;
+            i++; // Skip filename
+        }
+        else if (strcmp(argv[i], ">>") == 0 && i + 1 < argc) {
+            // Output redirect (append)
+            const char *filename = argv[i + 1];
+            syscall_create(filename, 0644);
+            int fd = syscall_open(filename);
+            if (fd < 0) {
+                print("gash: cannot open '");
+                print(filename);
+                print("' for appending\n");
+                return -1;
+            }
+            // Advance file position to EOF by reading through
+            char discard[128];
+            while (syscall_read(fd, discard, sizeof(discard)) > 0) {}
+            *saved_stdout = syscall_dup(1);
+            syscall_dup2(fd, 1);
+            *out_file_fd = fd;
+            i++; // Skip filename
+        }
+        else if (strcmp(argv[i], "<") == 0 && i + 1 < argc) {
+            // Input redirect
+            const char *filename = argv[i + 1];
+            int fd = syscall_open(filename);
+            if (fd < 0) {
+                print("gash: cannot open '");
+                print(filename);
+                print("' for reading\n");
+                return -1;
+            }
+            *saved_stdin = syscall_dup(0);
+            syscall_dup2(fd, 0);
+            *in_file_fd = fd;
+            i++; // Skip filename
+        }
+        else {
+            if (new_argc < 31) {
+                new_argv[new_argc++] = argv[i];
+            }
+        }
+    }
+
+    // Copy filtered argv back
+    for (int i = 0; i < new_argc; i++) {
+        argv[i] = new_argv[i];
+    }
+    argv[new_argc] = ((void*)0);
+
+    return new_argc;
+}
+
+// Restore FDs after redirect
+static void cleanup_redirects(int saved_stdout, int saved_stdin,
+                               int out_file_fd, int in_file_fd) {
+    if (saved_stdout >= 0) {
+        syscall_dup2(saved_stdout, 1);
+        syscall_close(saved_stdout);
+    }
+    if (saved_stdin >= 0) {
+        syscall_dup2(saved_stdin, 0);
+        syscall_close(saved_stdin);
+    }
+    if (out_file_fd >= 0) {
+        syscall_close(out_file_fd);
+    }
+    if (in_file_fd >= 0) {
+        syscall_close(in_file_fd);
+    }
+}
+
+// Execute a pipeline: left_cmd | right_cmd
+static void execute_pipeline(char *left_str, char *right_str) {
+    // Trim leading whitespace
+    while (*left_str == ' ' || *left_str == '\t') left_str++;
+    while (*right_str == ' ' || *right_str == '\t') right_str++;
+
+    char *left_argv[32], *right_argv[32];
+    int left_argc = parse_command(left_str, left_argv, 32);
+    int right_argc = parse_command(right_str, right_argv, 32);
+
+    if (left_argc == 0 || right_argc == 0) {
+        print("gash: syntax error near '|'\n");
+        return;
+    }
+
+    // Create pipe
+    int pipe_fds[2];
+    if (syscall_pipe(pipe_fds) < 0) {
+        print("gash: pipe creation failed\n");
+        return;
+    }
+    // pipe_fds[0] = read end, pipe_fds[1] = write end
+
+    int left_pid = -1, right_pid = -1;
+
+    // Step 1: Spawn right side (reader) with stdin = pipe_read
+    // Do this first so it's ready to consume data
+    {
+        int saved = syscall_dup(0);
+        syscall_dup2(pipe_fds[0], 0);  // FD 0 = pipe_read
+        right_pid = spawn_program(right_argv[0]);
+        syscall_dup2(saved, 0);        // Restore FD 0
+        syscall_close(saved);
+    }
+
+    if (right_pid < 0) {
+        print("gash: failed to spawn '");
+        print(right_argv[0]);
+        print("' for pipe\n");
+        syscall_close(pipe_fds[0]);
+        syscall_close(pipe_fds[1]);
+        return;
+    }
+
+    // Step 2: Execute left side (writer) with stdout = pipe_write
+    {
+        int saved = syscall_dup(1);
+        syscall_dup2(pipe_fds[1], 1);  // FD 1 = pipe_write
+
+        // Check if left side is a built-in
+        int builtin_result = execute_builtin(left_argv, left_argc);
+        if (builtin_result == 0) {
+            // Not a built-in — spawn as external
+            left_pid = spawn_program(left_argv[0]);
+            if (left_pid < 0) {
+                print("gash: unknown command: '");
+                print(left_argv[0]);
+                print("'\n");
+            }
+        }
+
+        syscall_dup2(saved, 1);        // Restore FD 1
+        syscall_close(saved);
+    }
+
+    // Step 3: Close pipe ends in shell
+    // This signals EOF to the reader when all writers are done
+    syscall_close(pipe_fds[0]);
+    syscall_close(pipe_fds[1]);
+
+    // Step 4: Wait for spawned processes
+    if (left_pid > 0) {
+        int status;
+        syscall_wait(&status);
+    }
+    if (right_pid > 0) {
+        int status;
+        syscall_wait(&status);
+    }
+}
+
+// Process a complete command line (handles pipes and redirects)
+static void process_cmdline(char *line) {
+    // Skip empty lines
+    if (line[0] == '\0') return;
+
+    // Check for pipe operator (find first unquoted '|')
+    char *pipe_pos = ((void*)0);
+    for (char *p = line; *p; p++) {
+        if (*p == '|') {
+            pipe_pos = p;
+            break;
+        }
+    }
+
+    if (pipe_pos) {
+        // Split at pipe and execute as pipeline
+        *pipe_pos = '\0';
+        execute_pipeline(line, pipe_pos + 1);
+        return;
+    }
+
+    // No pipe — parse command and handle redirects
+    char *argv[32];
+    int argc = parse_command(line, argv, 32);
+    if (argc == 0) return;
+
+    // Process redirects
+    int saved_stdout = -1, saved_stdin = -1;
+    int out_file_fd = -1, in_file_fd = -1;
+    argc = setup_redirects(argv, argc, &saved_stdout, &saved_stdin,
+                           &out_file_fd, &in_file_fd);
+    if (argc < 0) return; // Redirect error
+
+    if (argc == 0) {
+        cleanup_redirects(saved_stdout, saved_stdin, out_file_fd, in_file_fd);
+        return;
+    }
+
+    // Execute command
+    int result = execute_builtin(argv, argc);
+    if (result == 0) {
+        // Not a built-in — try to spawn as external program
+        int pid = spawn_program(argv[0]);
+        if (pid < 0) {
+            print("Unknown command: '");
+            print(argv[0]);
+            print("'\n");
+            print("Type 'help' for available commands.\n");
+        } else {
+            int exit_status;
+            syscall_wait(&exit_status);
+        }
+    }
+
+    // Restore redirects
+    cleanup_redirects(saved_stdout, saved_stdin, out_file_fd, in_file_fd);
+
+    if (result == -1) {
+        // 'exit' command
+        syscall_exit(0);
+    }
+}
+
+// Execute a built-in command.
+// Returns: 1 if recognized and executed, 0 if not a built-in, -1 for 'exit'
+static int execute_builtin(char *argv[], int argc) {
+    char *cmd = argv[0];
+
+    if (strcmp(cmd, "help") == 0) {
+        print("Available commands:\n");
+        print("  help                - Show this message\n");
+        print("  ls [path]           - List directory contents\n");
+        print("  cat <file>          - Display file contents\n");
+        print("  touch <file>        - Create empty file\n");
+        print("  mkdir <dir>         - Create directory\n");
+        print("  echo <text>         - Print text\n");
+        print("  memstate            - Show memory & filesystem state\n");
+        print("  ps                  - List running processes\n");
+        print("  drivers             - List registered drivers\n");
+        print("  sysstate            - Full system state dump\n");
+        print("  caps                - Capability activation map\n");
+        print("  activate <name>     - Activate a capability\n");
+        print("  deactivate <name>   - Deactivate a capability\n");
+        print("  why_not <name>      - Explain why cap can't activate\n");
+        print("  available           - Show activatable capabilities\n");
+        print("  tag <path> <tags>   - Set AI tags on a file\n");
+        print("  meta <path>         - Show AI metadata for a file\n");
+        print("  importance <p> <n>  - Set importance (0-100)\n");
+        print("  summary <path> <t>  - Set summary text\n");
+        print("  search <tag>        - Search files by tag\n");
+        print("  watch <cap>         - Watch capability state changes\n");
+        print("  unwatch <cap>       - Stop watching a capability\n");
+        print("  events              - Show pending CAN events\n");
+        print("  ifconfig            - Show network interface info\n");
+        print("  netstat             - Show TCP/IP stack status\n");
+        print("  http <url>          - Fetch URL via HTTP/HTTPS GET\n");
+        print("  dns <hostname>      - Resolve hostname to IP address\n");
+        print("  ai <prompt...>      - Ask AI (Gemini) with system context\n");
+        print("  agent <prompt...>   - AI agent: plan + validate + execute\n");
+        print("  pid                 - Show current process ID\n");
+        print("  kill <pid>          - Terminate a process\n");
+        print("  sync                - Flush filesystem to disk\n");
+        print("  test                - Keyboard test\n");
+        print("  grahai              - Run GCP interpreter\n");
+        print("  exit                - Exit the shell\n");
+        print("\nPipe & Redirect:\n");
+        print("  cmd > file          - Redirect output to file\n");
+        print("  cmd >> file         - Append output to file\n");
+        print("  cmd < file          - Redirect input from file\n");
+        print("  cmd1 | cmd2         - Pipe output of cmd1 to cmd2\n");
+        print("\nTest suites (also runnable directly):\n");
+        print("  libctest            - libc/malloc test suite\n");
+        print("  sbrk_test           - sbrk syscall test\n");
+        print("  printf_test         - printf format test\n");
+        print("  spawntest           - spawn/wait test suite\n");
+        print("  cantest             - CAN capability test suite\n");
+        print("  metatest            - AI metadata test suite\n");
+        print("  eventtest           - CAN event test suite\n");
+        print("  nettest             - E1000 NIC test suite\n");
+        print("  httptest            - HTTP server test suite\n");
+        print("  dnstest             - DNS + HTTP client test suite\n");
+        print("  aitest              - AI integration test suite\n");
+        print("  fdtest              - FD table test suite\n");
+        print("  pipetest            - Pipe & dup test suite\n");
+        return 1;
+    }
+    else if (strcmp(cmd, "ls") == 0) {
+        cmd_ls(argc > 1 ? argv[1] : "/");
+        return 1;
+    }
+    else if (strcmp(cmd, "cat") == 0) {
+        if (argc < 2) {
+            print("cat: missing operand\n");
+        } else {
+            cmd_cat(argv[1]);
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "touch") == 0) {
+        if (argc < 2) {
+            print("touch: missing operand\n");
+        } else {
+            cmd_touch(argv[1]);
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "mkdir") == 0) {
+        if (argc < 2) {
+            print("mkdir: missing operand\n");
+        } else {
+            cmd_mkdir(argv[1]);
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "echo") == 0) {
+        cmd_echo(argv, argc);
+        return 1;
+    }
+    else if (strcmp(cmd, "sync") == 0) {
+        print("Syncing filesystem to disk...\n");
+        syscall_sync();
+        print("Sync complete.\n");
+        return 1;
+    }
+    else if (strcmp(cmd, "memstate") == 0) {
+        cmd_memstate();
+        return 1;
+    }
+    else if (strcmp(cmd, "ps") == 0) {
+        cmd_ps();
+        return 1;
+    }
+    else if (strcmp(cmd, "drivers") == 0) {
+        cmd_drivers();
+        return 1;
+    }
+    else if (strcmp(cmd, "sysstate") == 0) {
+        cmd_sysstate();
+        return 1;
+    }
+    else if (strcmp(cmd, "caps") == 0) {
+        cmd_caps();
+        return 1;
+    }
+    else if (strcmp(cmd, "activate") == 0) {
+        cmd_activate(argc > 1 ? argv[1] : "");
+        return 1;
+    }
+    else if (strcmp(cmd, "deactivate") == 0) {
+        cmd_deactivate(argc > 1 ? argv[1] : "");
+        return 1;
+    }
+    else if (strcmp(cmd, "why_not") == 0) {
+        cmd_why_not(argc > 1 ? argv[1] : "");
+        return 1;
+    }
+    else if (strcmp(cmd, "available") == 0) {
+        cmd_available();
+        return 1;
+    }
+    else if (strcmp(cmd, "tag") == 0) {
+        if (argc < 3) {
+            print("tag: usage: tag <path> <tags>\n");
+        } else {
+            cmd_tag(argv[1], argv[2]);
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "meta") == 0) {
+        if (argc < 2) {
+            print("meta: usage: meta <path>\n");
+        } else {
+            cmd_meta(argv[1]);
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "importance") == 0) {
+        if (argc < 3) {
+            print("importance: usage: importance <path> <0-100>\n");
+        } else {
+            cmd_importance(argv[1], argv[2]);
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "summary") == 0) {
+        if (argc < 3) {
+            print("summary: usage: summary <path> <text...>\n");
+        } else {
+            cmd_summary(argv[1], argv, argc, 2);
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "search") == 0) {
+        if (argc < 2) {
+            print("search: usage: search <tag>\n");
+        } else {
+            cmd_search(argv[1]);
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "watch") == 0) {
+        cmd_watch(argc > 1 ? argv[1] : "");
+        return 1;
+    }
+    else if (strcmp(cmd, "unwatch") == 0) {
+        cmd_unwatch(argc > 1 ? argv[1] : "");
+        return 1;
+    }
+    else if (strcmp(cmd, "events") == 0) {
+        cmd_events();
+        return 1;
+    }
+    else if (strcmp(cmd, "ifconfig") == 0) {
+        cmd_ifconfig();
+        return 1;
+    }
+    else if (strcmp(cmd, "netstat") == 0) {
+        cmd_netstat();
+        return 1;
+    }
+    else if (strcmp(cmd, "http") == 0) {
+        cmd_http(argc > 1 ? argv[1] : "");
+        return 1;
+    }
+    else if (strcmp(cmd, "dns") == 0) {
+        cmd_dns(argc > 1 ? argv[1] : "");
+        return 1;
+    }
+    else if (strcmp(cmd, "ai") == 0) {
+        cmd_ai(argv, argc);
+        return 1;
+    }
+    else if (strcmp(cmd, "agent") == 0) {
+        if (argc < 2) {
+            print("agent: usage: agent <prompt...>\n");
+            print("  AI agent: generates plan, validates against capabilities, executes.\n");
+        } else {
+            char prompt_buf[512];
+            int pos = 0;
+            for (int i = 1; i < argc && pos < 510; i++) {
+                int slen = strlen(argv[i]);
+                if (pos + slen + 1 >= 510) slen = 510 - pos - 1;
+                for (int j = 0; j < slen && pos < 510; j++)
+                    prompt_buf[pos++] = argv[i][j];
+                if (i < argc - 1 && pos < 510) prompt_buf[pos++] = ' ';
+            }
+            prompt_buf[pos] = '\0';
+
+            syscall_create("ai_prompt.txt", 0);
+            int pfd = syscall_open("ai_prompt.txt");
+            if (pfd < 0) {
+                print("agent: failed to create prompt file\n");
+            } else {
+                syscall_write(pfd, prompt_buf, pos);
+                syscall_close(pfd);
+
+                print("Spawning AI agent...\n");
+                int pid = syscall_spawn("bin/grahai");
+                if (pid < 0) {
+                    print("agent: failed to spawn grahai\n");
+                } else {
+                    int exit_status;
+                    syscall_wait(&exit_status);
+                    print("Agent completed (status=");
+                    char spid[12];
+                    int_to_string(exit_status, spid);
+                    print(spid);
+                    print(")\n");
+                }
+            }
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "pid") == 0) {
+        int current_pid = syscall_getpid();
+        print("PID: ");
+        char buf[12];
+        int_to_string(current_pid, buf);
+        print(buf);
+        print("\n");
+        return 1;
+    }
+    else if (strcmp(cmd, "kill") == 0) {
+        if (argc < 2) {
+            print("kill: usage: kill <pid>\n");
+        } else {
+            int target_pid = 0;
+            for (int i = 0; argv[1][i]; i++) {
+                if (argv[1][i] >= '0' && argv[1][i] <= '9') {
+                    target_pid = target_pid * 10 + (argv[1][i] - '0');
+                }
+            }
+            int result = syscall_kill(target_pid, 1);
+            if (result < 0) {
+                print("kill: failed to kill process ");
+                print(argv[1]);
+                print("\n");
+            } else {
+                print("Signal sent to process ");
+                print(argv[1]);
+                print("\n");
+            }
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "test") == 0) {
+        print("Keyboard test - type 'q' to quit\n");
+        char ch;
+        while ((ch = syscall_getc()) != 'q') {
+            print("You typed: ");
+            syscall_putc(ch);
+            print("\n");
+        }
+        print("Test complete.\n");
+        return 1;
+    }
+    else if (strcmp(cmd, "grahai") == 0) {
+        print("Spawning grahai...\n");
+        int pid = syscall_spawn("bin/grahai");
+        if (pid < 0) {
+            print("ERROR: Failed to spawn 'bin/grahai'\n");
+        } else {
+            print("grahai spawned (pid=");
+            char spid[12];
+            int_to_string(pid, spid);
+            print(spid);
+            print(")\n");
+
+            int exit_status;
+            syscall_wait(&exit_status);
+            print("grahai completed (status=");
+            int_to_string(exit_status, spid);
+            print(spid);
+            print(")\n");
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "exit") == 0) {
+        print("Goodbye!\n");
+        return -1;
+    }
+
+    return 0; // Not a built-in
+}
+
 // Main shell
 void _start(void) {
-    print("=== GrahaOS Shell v2.0 (spawn model) ===\n");
+    print("=== GrahaOS Shell v3.0 (pipes & redirects) ===\n");
     print("Type 'help' for commands.\n\n");
 
     // Display our PID
@@ -1625,321 +2218,10 @@ void _start(void) {
     print("\n\n");
 
     char command_buffer[256];
-    char* argv[32];
 
     while (1) {
         print("gash> ");
         readline(command_buffer, sizeof(command_buffer));
-
-        int argc = parse_command(command_buffer, argv, 32);
-        if (argc == 0) continue;
-
-        char* cmd = argv[0];
-
-        if (strcmp(cmd, "help") == 0) {
-            print("Available commands:\n");
-            print("  help                - Show this message\n");
-            print("  ls [path]           - List directory contents\n");
-            print("  cat <file>          - Display file contents\n");
-            print("  touch <file>        - Create empty file\n");
-            print("  mkdir <dir>         - Create directory\n");
-            print("  echo <text>         - Print text\n");
-            print("  echo <text> > <file> - Write text to file\n");
-            print("  memstate            - Show memory & filesystem state\n");
-            print("  ps                  - List running processes\n");
-            print("  drivers             - List registered drivers\n");
-            print("  sysstate            - Full system state dump\n");
-            print("  caps                - Capability activation map\n");
-            print("  activate <name>     - Activate a capability\n");
-            print("  deactivate <name>   - Deactivate a capability\n");
-            print("  why_not <name>      - Explain why cap can't activate\n");
-            print("  available           - Show activatable capabilities\n");
-            print("  tag <path> <tags>   - Set AI tags on a file\n");
-            print("  meta <path>         - Show AI metadata for a file\n");
-            print("  importance <p> <n>  - Set importance (0-100)\n");
-            print("  summary <path> <t>  - Set summary text\n");
-            print("  search <tag>        - Search files by tag\n");
-            print("  watch <cap>         - Watch capability state changes\n");
-            print("  unwatch <cap>       - Stop watching a capability\n");
-            print("  events              - Show pending CAN events\n");
-            print("  ifconfig            - Show network interface info\n");
-            print("  netstat             - Show TCP/IP stack status\n");
-            print("  http <url>          - Fetch URL via HTTP/HTTPS GET\n");
-            print("  dns <hostname>      - Resolve hostname to IP address\n");
-            print("  ai <prompt...>      - Ask AI (Gemini) with system context\n");
-            print("  agent <prompt...>   - AI agent: plan + validate + execute\n");
-            print("  pid                 - Show current process ID\n");
-            print("  kill <pid>          - Terminate a process\n");
-            print("  sync                - Flush filesystem to disk\n");
-            print("  test                - Keyboard test\n");
-            print("  grahai              - Run GCP interpreter\n");
-            print("  exit                - Exit the shell\n");
-            print("\nTest suites (also runnable directly):\n");
-            print("  libctest            - libc/malloc test suite\n");
-            print("  sbrk_test           - sbrk syscall test\n");
-            print("  printf_test         - printf format test\n");
-            print("  spawntest           - spawn/wait test suite\n");
-            print("  cantest             - CAN capability test suite\n");
-            print("  metatest            - AI metadata test suite\n");
-            print("  eventtest           - CAN event test suite\n");
-            print("  nettest             - E1000 NIC test suite\n");
-            print("  httptest            - HTTP server test suite\n");
-            print("  dnstest             - DNS + HTTP client test suite\n");
-            print("  aitest              - AI integration test suite\n");
-        }
-        else if (strcmp(cmd, "ls") == 0) {
-            cmd_ls(argc > 1 ? argv[1] : "/");
-        }
-        else if (strcmp(cmd, "cat") == 0) {
-            if (argc < 2) {
-                print("cat: missing operand\n");
-            } else {
-                cmd_cat(argv[1]);
-            }
-        }
-        else if (strcmp(cmd, "touch") == 0) {
-            if (argc < 2) {
-                print("touch: missing operand\n");
-            } else {
-                cmd_touch(argv[1]);
-            }
-        }
-        else if (strcmp(cmd, "mkdir") == 0) {
-            if (argc < 2) {
-                print("mkdir: missing operand\n");
-            } else {
-                cmd_mkdir(argv[1]);
-            }
-        }
-        else if (strcmp(cmd, "echo") == 0) {
-            cmd_echo(argv, argc);
-        }
-        else if (strcmp(cmd, "sync") == 0) {
-            print("Syncing filesystem to disk...\n");
-            syscall_sync();
-            print("Sync complete.\n");
-        }
-        else if (strcmp(cmd, "memstate") == 0) {
-            cmd_memstate();
-        }
-        else if (strcmp(cmd, "ps") == 0) {
-            cmd_ps();
-        }
-        else if (strcmp(cmd, "drivers") == 0) {
-            cmd_drivers();
-        }
-        else if (strcmp(cmd, "sysstate") == 0) {
-            cmd_sysstate();
-        }
-        else if (strcmp(cmd, "caps") == 0) {
-            cmd_caps();
-        }
-        else if (strcmp(cmd, "activate") == 0) {
-            cmd_activate(argc > 1 ? argv[1] : "");
-        }
-        else if (strcmp(cmd, "deactivate") == 0) {
-            cmd_deactivate(argc > 1 ? argv[1] : "");
-        }
-        else if (strcmp(cmd, "why_not") == 0) {
-            cmd_why_not(argc > 1 ? argv[1] : "");
-        }
-        else if (strcmp(cmd, "available") == 0) {
-            cmd_available();
-        }
-        else if (strcmp(cmd, "tag") == 0) {
-            if (argc < 3) {
-                print("tag: usage: tag <path> <tags>\n");
-            } else {
-                cmd_tag(argv[1], argv[2]);
-            }
-        }
-        else if (strcmp(cmd, "meta") == 0) {
-            if (argc < 2) {
-                print("meta: usage: meta <path>\n");
-            } else {
-                cmd_meta(argv[1]);
-            }
-        }
-        else if (strcmp(cmd, "importance") == 0) {
-            if (argc < 3) {
-                print("importance: usage: importance <path> <0-100>\n");
-            } else {
-                cmd_importance(argv[1], argv[2]);
-            }
-        }
-        else if (strcmp(cmd, "summary") == 0) {
-            if (argc < 3) {
-                print("summary: usage: summary <path> <text...>\n");
-            } else {
-                cmd_summary(argv[1], argv, argc, 2);
-            }
-        }
-        else if (strcmp(cmd, "search") == 0) {
-            if (argc < 2) {
-                print("search: usage: search <tag>\n");
-            } else {
-                cmd_search(argv[1]);
-            }
-        }
-        else if (strcmp(cmd, "watch") == 0) {
-            cmd_watch(argc > 1 ? argv[1] : "");
-        }
-        else if (strcmp(cmd, "unwatch") == 0) {
-            cmd_unwatch(argc > 1 ? argv[1] : "");
-        }
-        else if (strcmp(cmd, "events") == 0) {
-            cmd_events();
-        }
-        else if (strcmp(cmd, "ifconfig") == 0) {
-            cmd_ifconfig();
-        }
-        else if (strcmp(cmd, "netstat") == 0) {
-            cmd_netstat();
-        }
-        else if (strcmp(cmd, "http") == 0) {
-            cmd_http(argc > 1 ? argv[1] : "");
-        }
-        else if (strcmp(cmd, "dns") == 0) {
-            cmd_dns(argc > 1 ? argv[1] : "");
-        }
-        else if (strcmp(cmd, "ai") == 0) {
-            cmd_ai(argv, argc);
-        }
-        else if (strcmp(cmd, "agent") == 0) {
-            if (argc < 2) {
-                print("agent: usage: agent <prompt...>\n");
-                print("  AI agent: generates plan, validates against capabilities, executes.\n");
-            } else {
-                // Write prompt to ai_prompt.txt for grahai to read
-                char prompt_buf[512];
-                int pos = 0;
-                for (int i = 1; i < argc && pos < 510; i++) {
-                    int slen = strlen(argv[i]);
-                    if (pos + slen + 1 >= 510) slen = 510 - pos - 1;
-                    for (int j = 0; j < slen && pos < 510; j++)
-                        prompt_buf[pos++] = argv[i][j];
-                    if (i < argc - 1 && pos < 510) prompt_buf[pos++] = ' ';
-                }
-                prompt_buf[pos] = '\0';
-
-                // Create and write the prompt file
-                syscall_create("ai_prompt.txt", 0);
-                int pfd = syscall_open("ai_prompt.txt");
-                if (pfd < 0) {
-                    print("agent: failed to create prompt file\n");
-                } else {
-                    syscall_write(pfd, prompt_buf, pos);
-                    syscall_close(pfd);
-
-                    print("Spawning AI agent...\n");
-                    int pid = syscall_spawn("bin/grahai");
-                    if (pid < 0) {
-                        print("agent: failed to spawn grahai\n");
-                    } else {
-                        int exit_status;
-                        syscall_wait(&exit_status);
-                        print("Agent completed (status=");
-                        char spid[12];
-                        int_to_string(exit_status, spid);
-                        print(spid);
-                        print(")\n");
-                    }
-                }
-            }
-        }
-        else if (strcmp(cmd, "pid") == 0) {
-            int current_pid = syscall_getpid();
-            print("PID: ");
-            char buf[12];
-            int_to_string(current_pid, buf);
-            print(buf);
-            print("\n");
-        }
-        else if (strcmp(cmd, "kill") == 0) {
-            if (argc < 2) {
-                print("kill: usage: kill <pid>\n");
-            } else {
-                // Simple string to int conversion
-                int target_pid = 0;
-                for (int i = 0; argv[1][i]; i++) {
-                    if (argv[1][i] >= '0' && argv[1][i] <= '9') {
-                        target_pid = target_pid * 10 + (argv[1][i] - '0');
-                    }
-                }
-                int result = syscall_kill(target_pid, 1); // SIGTERM
-                if (result < 0) {
-                    print("kill: failed to kill process ");
-                    print(argv[1]);
-                    print("\n");
-                } else {
-                    print("Signal sent to process ");
-                    print(argv[1]);
-                    print("\n");
-                }
-            }
-        }
-        else if (strcmp(cmd, "test") == 0) {
-            print("Keyboard test - type 'q' to quit\n");
-            char ch;
-            while ((ch = syscall_getc()) != 'q') {
-                print("You typed: ");
-                syscall_putc(ch);
-                print("\n");
-            }
-            print("Test complete.\n");
-        }
-        else if (strcmp(cmd, "grahai") == 0) {
-            print("Spawning grahai...\n");
-            int pid = syscall_spawn("bin/grahai");
-            if (pid < 0) {
-                print("ERROR: Failed to spawn 'bin/grahai'\n");
-            } else {
-                print("grahai spawned (pid=");
-                char spid[12];
-                int_to_string(pid, spid);
-                print(spid);
-                print(")\n");
-
-                int exit_status;
-                syscall_wait(&exit_status);
-                print("grahai completed (status=");
-                int_to_string(exit_status, spid);
-                print(spid);
-                print(")\n");
-            }
-        }
-        else if (strcmp(cmd, "exit") == 0) {
-            print("Goodbye!\n");
-            syscall_exit(0);
-        }
-        else {
-            // Try to spawn as a program from /bin/
-            char path[128];
-
-            // Check if command starts with /
-            if (cmd[0] == '/') {
-                strcpy(path, cmd);
-            } else {
-                // Try bin/ prefix first
-                strcpy(path, "bin/");
-                int len = strlen(path);
-                int cmd_len = strlen(cmd);
-                if (len + cmd_len < 127) {
-                    strcpy(path + len, cmd);
-                }
-            }
-
-            int pid = syscall_spawn(path);
-            if (pid < 0) {
-                print("Unknown command: '");
-                print(cmd);
-                print("'\n");
-                print("Type 'help' for available commands.\n");
-            } else {
-                // Wait for spawned program to complete
-                int exit_status;
-                syscall_wait(&exit_status);
-            }
-        }
+        process_cmdline(command_buffer);
     }
 }

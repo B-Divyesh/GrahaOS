@@ -16,6 +16,7 @@
 #include "../../../../kernel/fs/grahafs.h"
 #include "../../drivers/e1000/e1000.h"
 #include "../../../../kernel/net/net.h"
+#include "../../../../kernel/fs/pipe.h"
 #include <stdbool.h>
 
 // Forward declarations for state collection (kernel/state.c)
@@ -128,29 +129,48 @@ void syscall_dispatcher(struct syscall_frame *frame) {
     switch (syscall_num) {
         case SYS_PUTC: {
             char c = (char)frame->rdi;
-            // DEBUG: Also output to serial for automated testing
-            serial_putc(c);
-            if (c == '\n') {
-                term_x = 0;
-                term_y += 16;
-            } else if (c == '\b') {
-                if (term_x >= 8) {
-                    term_x -= 8;
-                    framebuffer_draw_rect(term_x, term_y, 8, 16, 0x00101828);
+
+            // Phase 10a: Route through per-process FD 1 (stdout)
+            task_t *putc_task = sched_get_current_task();
+            uint8_t fd1_type = FD_TYPE_CONSOLE; // default fallback
+            int16_t fd1_ref = 0;
+            if (putc_task) {
+                fd1_type = putc_task->fd_table[1].type;
+                fd1_ref = putc_task->fd_table[1].ref;
+            }
+
+            if (fd1_type == FD_TYPE_CONSOLE || fd1_type == FD_TYPE_UNUSED) {
+                // Original console path: serial + framebuffer
+                serial_putc(c);
+                if (c == '\n') {
+                    term_x = 0;
+                    term_y += 16;
+                } else if (c == '\b') {
+                    if (term_x >= 8) {
+                        term_x -= 8;
+                        framebuffer_draw_rect(term_x, term_y, 8, 16, 0x00101828);
+                    }
+                } else {
+                    framebuffer_draw_char(c, term_x, term_y, COLOR_WHITE);
+                    term_x += 8;
                 }
-            } else {
-                framebuffer_draw_char(c, term_x, term_y, COLOR_WHITE);
-                term_x += 8;
+                if (term_x >= framebuffer_get_width() - 20) {
+                    term_x = 0;
+                    term_y += 16;
+                }
+                if (term_y >= framebuffer_get_height() - 20) {
+                    framebuffer_clear(0x00101828);
+                    term_x = 0;
+                    term_y = 0;
+                }
+            } else if (fd1_type == FD_TYPE_FILE) {
+                // Redirected to file: write single char
+                vfs_write(fd1_ref, &c, 1);
+            } else if (fd1_type == FD_TYPE_PIPE_WRITE) {
+                // Phase 10b: Write to pipe
+                pipe_write(fd1_ref, &c, 1);
             }
-            if (term_x >= framebuffer_get_width() - 20) {
-                term_x = 0;
-                term_y += 16;
-            }
-            if (term_y >= framebuffer_get_height() - 20) {
-                framebuffer_clear(0x00101828);
-                term_x = 0;
-                term_y = 0;
-            }
+
             frame->rax = 0;
             break;
         }
@@ -158,11 +178,43 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         case SYS_OPEN: {
             const char *pathname_user = (const char *)frame->rdi;
             char pathname_kernel[256];
-            if (copy_string_from_user(pathname_user, pathname_kernel, sizeof(pathname_kernel)) > 0) {
-                frame->rax = vfs_open(pathname_kernel);
-            } else {
+            if (copy_string_from_user(pathname_user, pathname_kernel, sizeof(pathname_kernel)) <= 0) {
                 frame->rax = -1;
+                break;
             }
+
+            // Phase 10a: Allocate per-process FD wrapping global file table entry
+            int global_fd = vfs_open(pathname_kernel);
+            if (global_fd < 0) {
+                frame->rax = -1;
+                break;
+            }
+
+            task_t *open_task = sched_get_current_task();
+            if (!open_task) {
+                vfs_close(global_fd);
+                frame->rax = -1;
+                break;
+            }
+
+            // Find free per-process FD slot
+            int proc_fd = -1;
+            for (int f = 0; f < PROC_MAX_FDS; f++) {
+                if (open_task->fd_table[f].type == FD_TYPE_UNUSED) {
+                    proc_fd = f;
+                    break;
+                }
+            }
+            if (proc_fd < 0) {
+                vfs_close(global_fd);
+                frame->rax = -1; // Too many open files
+                break;
+            }
+
+            open_task->fd_table[proc_fd].type = FD_TYPE_FILE;
+            open_task->fd_table[proc_fd].ref = (int16_t)global_fd;
+            open_task->fd_table[proc_fd].flags = 0;
+            frame->rax = proc_fd;
             break;
         }
 
@@ -174,13 +226,56 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = -1;
                 break;
             }
-            frame->rax = vfs_read(fd, buffer_user, count);
+
+            // Phase 10a: Resolve per-process FD
+            task_t *read_task = sched_get_current_task();
+            if (!read_task || fd < 0 || fd >= PROC_MAX_FDS) {
+                frame->rax = -1;
+                break;
+            }
+            proc_fd_t *rfd = &read_task->fd_table[fd];
+            if (rfd->type == FD_TYPE_FILE) {
+                frame->rax = vfs_read(rfd->ref, buffer_user, count);
+            } else if (rfd->type == FD_TYPE_CONSOLE) {
+                // Console bulk read not supported (use SYS_GETC)
+                frame->rax = -1;
+            } else if (rfd->type == FD_TYPE_PIPE_READ) {
+                // Phase 10b: Read from pipe
+                frame->rax = pipe_read(rfd->ref, buffer_user, count);
+            } else {
+                // UNUSED or invalid
+                frame->rax = -1;
+            }
             break;
         }
 
         case SYS_CLOSE: {
             int fd = (int)frame->rdi;
-            frame->rax = vfs_close(fd);
+
+            // Phase 10a: Resolve per-process FD
+            task_t *close_task = sched_get_current_task();
+            if (!close_task || fd < 0 || fd >= PROC_MAX_FDS) {
+                frame->rax = -1;
+                break;
+            }
+            proc_fd_t *cfd = &close_task->fd_table[fd];
+            if (cfd->type == FD_TYPE_FILE) {
+                frame->rax = vfs_close(cfd->ref);
+            } else if (cfd->type == FD_TYPE_CONSOLE) {
+                frame->rax = -1; // Cannot close console FDs
+                break;
+            } else if (cfd->type == FD_TYPE_PIPE_READ || cfd->type == FD_TYPE_PIPE_WRITE) {
+                // Phase 10b: Close pipe end
+                pipe_ref_dec(cfd->ref, cfd->type);
+                frame->rax = 0;
+            } else {
+                // UNUSED
+                frame->rax = -1;
+                break;
+            }
+            cfd->type = FD_TYPE_UNUSED;
+            cfd->ref = -1;
+            cfd->flags = 0;
             break;
         }
 
@@ -192,7 +287,46 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = -1;
                 break;
             }
-            frame->rax = vfs_write(fd, (void*)buffer_user, count);
+
+            // Phase 10a: Resolve per-process FD
+            task_t *write_task = sched_get_current_task();
+            if (!write_task || fd < 0 || fd >= PROC_MAX_FDS) {
+                frame->rax = -1;
+                break;
+            }
+            proc_fd_t *wfd = &write_task->fd_table[fd];
+            if (wfd->type == FD_TYPE_FILE) {
+                frame->rax = vfs_write(wfd->ref, (void*)buffer_user, count);
+            } else if (wfd->type == FD_TYPE_CONSOLE) {
+                // Console write: output each char to serial + framebuffer
+                const char *buf = (const char *)buffer_user;
+                for (size_t i = 0; i < count; i++) {
+                    serial_putc(buf[i]);
+                    if (buf[i] == '\n') {
+                        term_x = 0;
+                        term_y += 16;
+                    } else {
+                        framebuffer_draw_char(buf[i], term_x, term_y, COLOR_WHITE);
+                        term_x += 8;
+                    }
+                    if (term_x >= framebuffer_get_width() - 20) {
+                        term_x = 0;
+                        term_y += 16;
+                    }
+                    if (term_y >= framebuffer_get_height() - 20) {
+                        framebuffer_clear(0x00101828);
+                        term_x = 0;
+                        term_y = 0;
+                    }
+                }
+                frame->rax = count;
+            } else if (wfd->type == FD_TYPE_PIPE_WRITE) {
+                // Phase 10b: Write to pipe
+                frame->rax = pipe_write(wfd->ref, (void*)buffer_user, count);
+            } else {
+                // UNUSED or invalid
+                frame->rax = -1;
+            }
             break;
         }
 
@@ -438,16 +572,35 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_GETC: {
-            char c;
-            asm volatile("sti");
-            
-            while ((c = keyboard_getchar()) == 0) {
-                asm ("hlt");
+            // Phase 10a: Route through per-process FD 0 (stdin)
+            task_t *getc_task = sched_get_current_task();
+            uint8_t fd0_type = FD_TYPE_CONSOLE; // default fallback
+            int16_t fd0_ref = 0;
+            if (getc_task) {
+                fd0_type = getc_task->fd_table[0].type;
+                fd0_ref = getc_task->fd_table[0].ref;
             }
-            
-            asm volatile("cli");
-            
-            frame->rax = c;
+
+            if (fd0_type == FD_TYPE_CONSOLE || fd0_type == FD_TYPE_UNUSED) {
+                // Original keyboard path
+                char c;
+                asm volatile("sti");
+                while ((c = keyboard_getchar()) == 0) {
+                    asm ("hlt");
+                }
+                asm volatile("cli");
+                frame->rax = c;
+            } else if (fd0_type == FD_TYPE_FILE) {
+                // Read one byte from file
+                char c = 0;
+                ssize_t n = vfs_read(fd0_ref, &c, 1);
+                frame->rax = (n > 0) ? (uint64_t)(unsigned char)c : 0;
+            } else if (fd0_type == FD_TYPE_PIPE_READ) {
+                // Phase 10b: Read one byte from pipe
+                frame->rax = pipe_read_char(fd0_ref);
+            } else {
+                frame->rax = 0;
+            }
             break;
         }
 
@@ -521,6 +674,18 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             
             current->exit_status = status;
             current->state = TASK_STATE_ZOMBIE;
+
+            // Phase 10a: Close all open file descriptors
+            for (int f = 0; f < PROC_MAX_FDS; f++) {
+                proc_fd_t *pfd = &current->fd_table[f];
+                if (pfd->type == FD_TYPE_FILE) {
+                    vfs_close(pfd->ref);
+                } else if (pfd->type == FD_TYPE_PIPE_READ || pfd->type == FD_TYPE_PIPE_WRITE) {
+                    pipe_ref_dec(pfd->ref, pfd->type);
+                }
+                pfd->type = FD_TYPE_UNUSED;
+                pfd->ref = -1;
+            }
 
             // Remove all CAN event watchers for this process
             cap_unwatch_all_for_pid(current->id);
@@ -1211,6 +1376,170 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             } else {
                 frame->rax = (uint64_t)(long)dns_start_ret;
             }
+            break;
+        }
+
+        // Phase 10b: Pipe and FD duplication syscalls
+        case SYS_PIPE: {
+            int *fds_user = (int *)frame->rdi;
+            if (!fds_user || !is_user_pointer(fds_user, 2 * sizeof(int))) {
+                frame->rax = -1;
+                break;
+            }
+
+            task_t *pipe_task = sched_get_current_task();
+            if (!pipe_task) {
+                frame->rax = -1;
+                break;
+            }
+
+            // Allocate pipe
+            int pipe_idx = pipe_alloc();
+            if (pipe_idx < 0) {
+                frame->rax = -1;
+                break;
+            }
+
+            // Find two free per-process FD slots
+            int read_fd = -1, write_fd = -1;
+            for (int f = 0; f < PROC_MAX_FDS; f++) {
+                if (pipe_task->fd_table[f].type == FD_TYPE_UNUSED) {
+                    if (read_fd < 0) {
+                        read_fd = f;
+                    } else if (write_fd < 0) {
+                        write_fd = f;
+                        break;
+                    }
+                }
+            }
+
+            if (read_fd < 0 || write_fd < 0) {
+                // Not enough FD slots — free the pipe
+                pipe_ref_dec(pipe_idx, FD_TYPE_PIPE_READ);
+                pipe_ref_dec(pipe_idx, FD_TYPE_PIPE_WRITE);
+                frame->rax = -1;
+                break;
+            }
+
+            pipe_task->fd_table[read_fd].type = FD_TYPE_PIPE_READ;
+            pipe_task->fd_table[read_fd].ref = (int16_t)pipe_idx;
+            pipe_task->fd_table[read_fd].flags = 0;
+
+            pipe_task->fd_table[write_fd].type = FD_TYPE_PIPE_WRITE;
+            pipe_task->fd_table[write_fd].ref = (int16_t)pipe_idx;
+            pipe_task->fd_table[write_fd].flags = 0;
+
+            fds_user[0] = read_fd;
+            fds_user[1] = write_fd;
+            frame->rax = 0;
+            break;
+        }
+
+        case SYS_DUP2: {
+            int old_fd = (int)frame->rdi;
+            int new_fd = (int)frame->rsi;
+
+            task_t *dup2_task = sched_get_current_task();
+            if (!dup2_task || old_fd < 0 || old_fd >= PROC_MAX_FDS ||
+                new_fd < 0 || new_fd >= PROC_MAX_FDS) {
+                frame->rax = -1;
+                break;
+            }
+
+            proc_fd_t *old_pfd = &dup2_task->fd_table[old_fd];
+            if (old_pfd->type == FD_TYPE_UNUSED) {
+                frame->rax = -1; // old_fd not open
+                break;
+            }
+
+            if (old_fd == new_fd) {
+                frame->rax = new_fd; // No-op
+                break;
+            }
+
+            // Close new_fd if it's currently open
+            proc_fd_t *new_pfd = &dup2_task->fd_table[new_fd];
+            if (new_pfd->type == FD_TYPE_FILE) {
+                vfs_close(new_pfd->ref);
+            } else if (new_pfd->type == FD_TYPE_PIPE_READ || new_pfd->type == FD_TYPE_PIPE_WRITE) {
+                pipe_ref_dec(new_pfd->ref, new_pfd->type);
+            }
+
+            // Copy old_fd entry to new_fd
+            *new_pfd = *old_pfd;
+
+            // Increment refcounts for pipe FDs
+            if (new_pfd->type == FD_TYPE_PIPE_READ || new_pfd->type == FD_TYPE_PIPE_WRITE) {
+                pipe_ref_inc(new_pfd->ref, new_pfd->type);
+            }
+            // Increment refcount for FILE FDs
+            if (new_pfd->type == FD_TYPE_FILE) {
+                vfs_ref_inc(new_pfd->ref);
+            }
+
+            frame->rax = new_fd;
+            break;
+        }
+
+        case SYS_DUP: {
+            int old_fd = (int)frame->rdi;
+
+            task_t *dup_task = sched_get_current_task();
+            if (!dup_task || old_fd < 0 || old_fd >= PROC_MAX_FDS) {
+                frame->rax = -1;
+                break;
+            }
+
+            proc_fd_t *old_entry = &dup_task->fd_table[old_fd];
+            if (old_entry->type == FD_TYPE_UNUSED) {
+                frame->rax = -1;
+                break;
+            }
+
+            // Find lowest free FD
+            int free_fd = -1;
+            for (int f = 0; f < PROC_MAX_FDS; f++) {
+                if (dup_task->fd_table[f].type == FD_TYPE_UNUSED) {
+                    free_fd = f;
+                    break;
+                }
+            }
+
+            if (free_fd < 0) {
+                frame->rax = -1; // No free FDs
+                break;
+            }
+
+            // Copy the entry
+            dup_task->fd_table[free_fd] = *old_entry;
+
+            // Increment refcounts for pipe FDs
+            if (old_entry->type == FD_TYPE_PIPE_READ || old_entry->type == FD_TYPE_PIPE_WRITE) {
+                pipe_ref_inc(old_entry->ref, old_entry->type);
+            }
+            // Increment refcount for FILE FDs
+            if (old_entry->type == FD_TYPE_FILE) {
+                vfs_ref_inc(old_entry->ref);
+            }
+
+            frame->rax = free_fd;
+            break;
+        }
+
+        case SYS_TRUNCATE: {
+            // Phase 10c: Truncate file to 0 bytes
+            int trunc_fd = (int)frame->rdi;
+            task_t *trunc_task = sched_get_current_task();
+            if (!trunc_task || trunc_fd < 0 || trunc_fd >= PROC_MAX_FDS) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            proc_fd_t *trunc_pfd = &trunc_task->fd_table[trunc_fd];
+            if (trunc_pfd->type != FD_TYPE_FILE) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            frame->rax = (uint64_t)(long)vfs_truncate(trunc_pfd->ref);
             break;
         }
 

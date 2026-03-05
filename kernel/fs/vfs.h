@@ -83,6 +83,7 @@ typedef struct vfs_filesystem {
 // Represents an open file in the system
 typedef struct {
     bool in_use;
+    int refcount;       // Phase 10c: reference count for dup/dup2
     void *file_data;
     size_t size;
     size_t offset;
@@ -104,6 +105,8 @@ int vfs_open(const char *pathname);
 ssize_t vfs_read(int fd, void *buffer, size_t count);
 ssize_t vfs_write(int fd, void *buffer, size_t count);
 int vfs_close(int fd);
+void vfs_ref_inc(int fd);   // Phase 10c: increment refcount for dup/dup2
+int vfs_truncate(int fd);   // Phase 10c: truncate file to 0 bytes
 
 // Block device operations
 void vfs_register_block_device(int dev_id, size_t block_size, 

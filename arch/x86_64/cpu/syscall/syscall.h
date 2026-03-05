@@ -70,6 +70,12 @@
 // Phase 9e: HTTP POST (for AI API calls)
 #define SYS_HTTP_POST   1045
 
+// Phase 10b: Pipes and FD duplication
+#define SYS_PIPE      1046
+#define SYS_DUP2      1047
+#define SYS_DUP       1048
+#define SYS_TRUNCATE  1049
+
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);
 

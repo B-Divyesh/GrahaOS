@@ -8,6 +8,7 @@
 #include "../../drivers/serial/serial.h"
 #include "../../../../kernel/elf.h"
 #include "../../../../kernel/initrd.h"
+#include "../../../../kernel/fs/pipe.h"
 
 static task_t tasks[MAX_TASKS];
 static int next_task_id = 0;
@@ -54,6 +55,13 @@ void sched_init(void) {
     tasks[0].event_tail = 0;
     tasks[0].event_count = 0;
     tasks[0].event_waiting = 0;
+
+    // Phase 10a: Kernel idle task has no FDs
+    for (int f = 0; f < PROC_MAX_FDS; f++) {
+        tasks[0].fd_table[f].type = FD_TYPE_UNUSED;
+        tasks[0].fd_table[f].ref = -1;
+        tasks[0].fd_table[f].flags = 0;
+    }
 
     // Get current stack pointer
     uint64_t current_rsp;
@@ -130,6 +138,13 @@ int sched_create_task(void (*entry_point)(void)) {
     tasks[id].event_tail = 0;
     tasks[id].event_count = 0;
     tasks[id].event_waiting = 0;
+
+    // Phase 10a: Kernel tasks have no FDs
+    for (int f = 0; f < PROC_MAX_FDS; f++) {
+        tasks[id].fd_table[f].type = FD_TYPE_UNUSED;
+        tasks[id].fd_table[f].ref = -1;
+        tasks[id].fd_table[f].flags = 0;
+    }
 
     spinlock_release(&sched_lock);
 
@@ -214,6 +229,16 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     tasks[id].event_tail = 0;
     tasks[id].event_count = 0;
     tasks[id].event_waiting = 0;
+
+    // Phase 10a: Initialize per-process FD table with stdin/stdout/stderr
+    for (int f = 0; f < PROC_MAX_FDS; f++) {
+        tasks[id].fd_table[f].type = FD_TYPE_UNUSED;
+        tasks[id].fd_table[f].ref = -1;
+        tasks[id].fd_table[f].flags = 0;
+    }
+    tasks[id].fd_table[0] = (proc_fd_t){FD_TYPE_CONSOLE, 0, 0}; // stdin
+    tasks[id].fd_table[1] = (proc_fd_t){FD_TYPE_CONSOLE, 0, 0}; // stdout
+    tasks[id].fd_table[2] = (proc_fd_t){FD_TYPE_CONSOLE, 0, 0}; // stderr
 
     asm volatile("push %0; popfq" : : "r"(flags));
     spinlock_release(&sched_lock);
@@ -640,6 +665,19 @@ int sched_spawn_process(const char *path, int parent_id) {
     tasks[pid].parent_id = parent_id;
     tasks[pid].pgid = parent_id; // Initially same process group as parent
     copy_process_name(tasks[pid].name, path, sizeof(tasks[pid].name));
+
+    // Phase 10c: Only inherit FDs 0-2 (stdin/stdout/stderr)
+    // This prevents pipe FD leaks that would block EOF detection.
+    // Higher FDs (3+) remain UNUSED in the child.
+    for (int f = 0; f < 3; f++) {
+        uint8_t ptype = tasks[parent_id].fd_table[f].type;
+        tasks[pid].fd_table[f] = tasks[parent_id].fd_table[f];
+        if (ptype == FD_TYPE_PIPE_READ || ptype == FD_TYPE_PIPE_WRITE) {
+            pipe_ref_inc(tasks[pid].fd_table[f].ref, ptype);
+        }
+    }
+    // FDs 3-15 remain UNUSED (set by sched_create_user_process)
+
     spinlock_release(&sched_lock);
 
     serial_write("[SPAWN] Process created: pid=");

@@ -6,6 +6,7 @@
 #include "initrd.h"
 #include "elf.h"
 #include "fs/vfs.h"
+#include "fs/pipe.h"
 #include "gcp.h"
 #include "../drivers/video/framebuffer.h"
 #include "../arch/x86_64/cpu/gdt.h"
@@ -289,6 +290,11 @@ void kmain(void) {
     serial_write("About to initialize VFS...\n");
     vfs_init();
     serial_write("VFS initialized successfully\n");
+
+    // Phase 10b: Initialize pipe subsystem
+    pipe_init();
+    serial_write("Pipe subsystem initialized\n");
+
     framebuffer_draw_string("VFS Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 40;
 

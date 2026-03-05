@@ -516,6 +516,32 @@ ssize_t grahafs_write(vfs_node_t* node, uint64_t offset, size_t size, void* buff
     return bytes_written;
 }
 
+// Phase 10c: Truncate file inode to 0 bytes (called from vfs_truncate)
+int grahafs_truncate_inode(uint32_t inode_num) {
+    spinlock_acquire(&grahafs_lock);
+
+    grahafs_inode_t inode;
+    if (read_inode(inode_num, &inode) != 0) {
+        spinlock_release(&grahafs_lock);
+        return -1;
+    }
+
+    if (inode.type != GRAHAFS_INODE_TYPE_FILE) {
+        spinlock_release(&grahafs_lock);
+        return -1;
+    }
+
+    inode.size = 0;
+    write_inode(inode_num, &inode);
+
+    if (fs_device && fs_device->device_id >= 0) {
+        ahci_flush_cache(fs_device->device_id);
+    }
+
+    spinlock_release(&grahafs_lock);
+    return 0;
+}
+
 // Create file or directory - ADD VALIDATION
 int grahafs_create(vfs_node_t* parent, const char* name, uint32_t type) {
     // Validate inputs

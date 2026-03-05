@@ -53,3 +53,5 @@ user/httptest
 user/metatest
 user/nettest
 user/aitest
+user/fdtest
+user/pipetest

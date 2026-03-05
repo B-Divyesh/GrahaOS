@@ -26,7 +26,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest
 
 .PHONY: all clean libc
 
@@ -101,6 +101,16 @@ dnstest: dnstest.o $(LIBC)
 aitest: aitest.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
 	@$(LD) $(LDFLAGS) -o $@ aitest.o $(LIBC)
+
+# Build FD table test (Phase 10a, no libc needed)
+fdtest: fdtest.o
+	@echo "Linking user program: $@ (no libc)"
+	@$(LD) $(LDFLAGS) -o $@ fdtest.o
+
+# Build pipe test (Phase 10b, no libc needed)
+pipetest: pipetest.o
+	@echo "Linking user program: $@ (no libc)"
+	@$(LD) $(LDFLAGS) -o $@ pipetest.o
 
 %.o: %.c
 	@echo "Compiling user C: $<"

@@ -44,6 +44,10 @@ typedef long ssize_t;
 #define SYS_HTTP_GET         1043
 #define SYS_DNS_RESOLVE      1044
 #define SYS_HTTP_POST        1045
+#define SYS_PIPE             1046
+#define SYS_DUP2             1047
+#define SYS_DUP              1048
+#define SYS_TRUNCATE         1049
 
 // Directory entry structure for user space
 typedef struct {
@@ -340,6 +344,47 @@ static inline int syscall_http_get(const char *url, char *response_buf, int max_
         if (ret == -99) continue;
         break;
     } while (1);
+    return (int)ret;
+}
+
+// Phase 10b: Create a pipe
+// fds[0] = read end, fds[1] = write end
+// Returns: 0 on success, -1 on failure
+static inline int syscall_pipe(int fds[2]) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_PIPE), "D"(fds)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 10b: Duplicate file descriptor to specific slot
+// Returns: new_fd on success, -1 on failure
+static inline int syscall_dup2(int old_fd, int new_fd) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_DUP2), "D"(old_fd), "S"(new_fd)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 10b: Duplicate file descriptor to lowest available slot
+// Returns: new fd number on success, -1 on failure
+static inline int syscall_dup(int old_fd) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_DUP), "D"(old_fd)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 10c: Truncate file to 0 bytes
+// Returns: 0 on success, -1 on failure
+static inline int syscall_truncate(int fd) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_TRUNCATE), "D"(fd)
+        : "rcx", "r11", "memory");
     return (int)ret;
 }
 
