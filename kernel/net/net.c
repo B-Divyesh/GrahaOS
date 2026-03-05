@@ -191,9 +191,10 @@ static bool s_net_initialized = false;
 // ===== Phase 9c: HTTP Client + DNS Resolve =====
 
 // Request types
-#define NET_REQ_NONE     0
-#define NET_REQ_HTTP_GET 1
-#define NET_REQ_DNS      2
+#define NET_REQ_NONE      0
+#define NET_REQ_HTTP_GET  1
+#define NET_REQ_DNS       2
+#define NET_REQ_HTTP_POST 3
 
 // Request states
 #define NET_STATE_IDLE    0
@@ -202,7 +203,7 @@ static bool s_net_initialized = false;
 #define NET_STATE_ERROR   3
 
 typedef struct {
-    int type;                              // NONE, HTTP_GET, DNS
+    int type;                              // NONE, HTTP_GET, DNS, HTTP_POST
     volatile int state;                    // IDLE, PENDING, DONE, ERROR
     int task_id;                           // Owning task
     uint64_t start_time_ms;                // For timeout detection
@@ -213,6 +214,8 @@ typedef struct {
     int response_len;                      // Actual response length
     uint8_t resolved_ip[4];                // DNS result (IPv4)
     struct mg_connection *conn;            // Active Mongoose connection
+    char post_body[NET_MAX_POST_BODY_SIZE]; // POST request body
+    int post_body_len;                      // POST body length
 } net_request_t;
 
 static net_request_t s_requests[MAX_TASKS];
@@ -240,6 +243,38 @@ static void net_wake_task(int task_id) {
     spinlock_release(&sched_lock);
 }
 
+// ----- HTTP Client: Send Request Helper -----
+
+static void send_http_request(struct mg_connection *c, net_request_t *req) {
+    struct mg_str host = mg_url_host(req->url);
+    const char *uri = mg_url_uri(req->url);
+    if (req->type == NET_REQ_HTTP_POST) {
+        // Use mg_printf with %.*s body to send headers+body in one call
+        // This ensures the entire request is in the send buffer before TLS encrypts
+        mg_printf(c,
+                  "POST %s HTTP/1.1\r\n"
+                  "Host: %.*s\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Content-Length: %d\r\n"
+                  "Accept: application/json\r\n"
+                  "User-Agent: GrahaOS/1.0\r\n"
+                  "Connection: close\r\n"
+                  "\r\n"
+                  "%.*s",
+                  uri, (int)host.len, host.buf, req->post_body_len,
+                  req->post_body_len, req->post_body);
+        serial_write("[NET] HTTP POST sent\n");
+    } else {
+        mg_printf(c,
+                  "GET %s HTTP/1.1\r\n"
+                  "Host: %.*s\r\n"
+                  "Connection: close\r\n"
+                  "\r\n",
+                  uri, (int)host.len, host.buf);
+        serial_write("[NET] HTTP GET sent\n");
+    }
+}
+
 // ----- HTTP Client Callback -----
 
 static void http_client_handler(struct mg_connection *c, int ev, void *ev_data) {
@@ -248,34 +283,32 @@ static void http_client_handler(struct mg_connection *c, int ev, void *ev_data) 
 
     net_request_t *req = &s_requests[task_id];
 
+    // Guard against stale connections: if a previous request's connection fires
+    // events after a new request has started, ignore them. This prevents the old
+    // connection's MG_EV_CLOSE from corrupting the new request's state.
+    if (req->conn != NULL && req->conn != c) return;
+
     if (ev == MG_EV_CONNECT) {
-        // TCP connected — send HTTP GET only for plain HTTP
-        // For HTTPS, wait until TLS handshake completes (MG_EV_TLS_HS)
-        serial_write("[NET] HTTP client: MG_EV_CONNECT\n");
         if (!c->is_tls) {
-            struct mg_str host = mg_url_host(req->url);
-            const char *uri = mg_url_uri(req->url);
-            mg_printf(c,
-                      "GET %s HTTP/1.1\r\n"
-                      "Host: %.*s\r\n"
-                      "Connection: close\r\n"
-                      "\r\n",
-                      uri, (int)host.len, host.buf);
+            send_http_request(c, req);
         } else {
-            serial_write("[NET] TLS connection — deferring GET to handshake complete\n");
+            serial_write("[NET] TLS connection — deferring to handshake\n");
         }
     } else if (ev == MG_EV_TLS_HS) {
-        // TLS handshake complete — now send the HTTP GET request
-        serial_write("[NET] HTTP client: MG_EV_TLS_HS — handshake complete!\n");
-        struct mg_str host = mg_url_host(req->url);
-        const char *uri = mg_url_uri(req->url);
-        mg_printf(c,
-                  "GET %s HTTP/1.1\r\n"
-                  "Host: %.*s\r\n"
-                  "Connection: close\r\n"
-                  "\r\n",
-                  uri, (int)host.len, host.buf);
-        serial_write("[NET] HTTP GET sent after TLS handshake\n");
+        serial_write("[NET] TLS handshake complete\n");
+        send_http_request(c, req);
+    } else if (ev == MG_EV_READ) {
+        // Save a snapshot of recv data for salvage on close
+        // (Mongoose may clear recv buffer before MG_EV_CLOSE)
+        if (c->recv.len > 0 && req->state == NET_STATE_PENDING) {
+            extern void *memcpy(void *, const void *, size_t);
+            size_t save_len = c->recv.len;
+            if (save_len > NET_MAX_RESPONSE_SIZE - 1)
+                save_len = NET_MAX_RESPONSE_SIZE - 1;
+            memcpy(req->response, c->recv.buf, save_len);
+            req->response[save_len] = '\0';
+            req->response_len = (int)save_len;
+        }
     } else if (ev == MG_EV_HTTP_MSG) {
         struct mg_http_message *hm = (struct mg_http_message *)ev_data;
         extern void *memcpy(void *, const void *, size_t);
@@ -310,25 +343,46 @@ static void http_client_handler(struct mg_connection *c, int ev, void *ev_data) 
     } else if (ev == MG_EV_CLOSE) {
         if (req->state == NET_STATE_PENDING) {
             // Connection closed before MG_EV_HTTP_MSG fired.
-            // Try to salvage: parse HTTP headers from recv buffer and extract
-            // whatever body we have (handles chunked/large responses that close
-            // before the final chunk terminator arrives).
+            // Try to salvage from recv buffer or from snapshot saved in MG_EV_READ
+            const char *buf = NULL;
+            size_t buf_len = 0;
+
             if (c->recv.len > 0) {
+                buf = (const char *)c->recv.buf;
+                buf_len = c->recv.len;
+            } else if (req->response_len > 0) {
+                // Use snapshot saved during MG_EV_READ
+                buf = req->response;
+                buf_len = (size_t)req->response_len;
+            }
+
+            if (buf && buf_len > 0) {
                 struct mg_http_message hm;
-                int n = mg_http_parse((const char *)c->recv.buf, c->recv.len, &hm);
+                int n = mg_http_parse(buf, buf_len, &hm);
                 if (n > 0 && hm.body.buf != NULL) {
                     extern void *memcpy(void *, const void *, size_t);
-                    // Body starts at hm.body.buf, available bytes until end of recv
-                    size_t body_avail = c->recv.len - (size_t)(hm.body.buf - (char *)c->recv.buf);
+                    size_t body_avail = buf_len - (size_t)(hm.body.buf - buf);
                     size_t copy_len = body_avail;
                     if (copy_len > NET_MAX_RESPONSE_SIZE - 1)
                         copy_len = NET_MAX_RESPONSE_SIZE - 1;
-                    memcpy(req->response, hm.body.buf, copy_len);
+
+                    // If salvaging from c->recv, copy to response buf
+                    if (buf == (const char *)c->recv.buf) {
+                        memcpy(req->response, hm.body.buf, copy_len);
+                    } else {
+                        // Data is already in req->response, but body starts mid-buffer
+                        // Move body to start of response buffer
+                        size_t body_offset = (size_t)(hm.body.buf - buf);
+                        for (size_t i = 0; i < copy_len; i++) {
+                            req->response[i] = req->response[body_offset + i];
+                        }
+                    }
                     req->response[copy_len] = '\0';
                     req->response_len = (int)copy_len;
                     req->http_status = mg_http_status(&hm);
                     req->state = NET_STATE_DONE;
                     req->conn = NULL;
+                    serial_write("[NET] HTTP client: salvaged response from close\n");
                     net_wake_task(task_id);
                     return;
                 }
@@ -454,6 +508,62 @@ int net_http_get_check(int task_id, char *user_buf, int max_len) {
     return -99;
 }
 
+// ----- Public API: HTTP POST -----
+
+int net_http_post_start(int task_id, const char *url, const char *body, int body_len) {
+    if (!s_net_initialized) return NET_ERR_NO_NET;
+    if (task_id < 0 || task_id >= MAX_TASKS) return NET_ERR_BUSY;
+    if (!body || body_len <= 0 || body_len > NET_MAX_POST_BODY_SIZE) return NET_ERR_BAD_URL;
+
+    net_request_t *req = &s_requests[task_id];
+    if (req->state == NET_STATE_PENDING) return NET_ERR_BUSY;
+
+    extern void *memset(void *, int, size_t);
+    extern size_t strlen(const char *);
+    extern void *memcpy(void *, const void *, size_t);
+    memset(req, 0, sizeof(*req));
+    req->type = NET_REQ_HTTP_POST;
+    req->state = NET_STATE_PENDING;
+    req->task_id = task_id;
+    req->start_time_ms = mg_millis();
+
+    // Copy URL
+    size_t url_len = strlen(url);
+    if (url_len >= sizeof(req->url)) url_len = sizeof(req->url) - 1;
+    memcpy(req->url, url, url_len);
+    req->url[url_len] = '\0';
+
+    // Copy POST body
+    memcpy(req->post_body, body, body_len);
+    req->post_body_len = body_len;
+
+    struct mg_connection *c = mg_http_connect(
+        &s_mgr, req->url, http_client_handler, (void *)(uintptr_t)task_id);
+
+    if (!c) {
+        req->state = NET_STATE_IDLE;
+        return NET_ERR_NOMEM;
+    }
+
+    // If HTTPS URL, initialize TLS on the connection
+    if (mg_url_is_ssl(req->url)) {
+        struct mg_tls_opts opts;
+        memset(&opts, 0, sizeof(opts));
+        opts.skip_verification = 1;
+        opts.name = mg_url_host(req->url);
+        mg_tls_init(c, &opts);
+    }
+
+    req->conn = c;
+    serial_write("[NET] HTTP POST request started\n");
+    return 0;
+}
+
+int net_http_post_check(int task_id, char *user_buf, int max_len) {
+    // POST response handling is identical to GET
+    return net_http_get_check(task_id, user_buf, max_len);
+}
+
 // ----- Public API: DNS Resolve -----
 
 int net_dns_start(int task_id, const char *hostname) {
@@ -525,9 +635,17 @@ void net_check_timeouts(void) {
     uint64_t now = mg_millis();
     for (int i = 0; i < MAX_TASKS; i++) {
         if (s_requests[i].state == NET_STATE_PENDING) {
-            uint64_t timeout = mg_url_is_ssl(s_requests[i].url)
-                ? NET_REQUEST_TIMEOUT_HTTPS_MS : NET_REQUEST_TIMEOUT_MS;
-            if (now - s_requests[i].start_time_ms > timeout) {
+            uint64_t timeout;
+            if (s_requests[i].type == NET_REQ_HTTP_POST) {
+                timeout = NET_REQUEST_TIMEOUT_POST_MS;
+            } else if (mg_url_is_ssl(s_requests[i].url)) {
+                timeout = NET_REQUEST_TIMEOUT_HTTPS_MS;
+            } else {
+                timeout = NET_REQUEST_TIMEOUT_MS;
+            }
+            uint64_t elapsed = now - s_requests[i].start_time_ms;
+            if (elapsed > timeout) {
+                serial_write("[NET] Request timed out\n");
                 s_requests[i].error_code = NET_ERR_TIMEOUT;
                 s_requests[i].state = NET_STATE_ERROR;
                 if (s_requests[i].conn) {
@@ -535,7 +653,6 @@ void net_check_timeouts(void) {
                     s_requests[i].conn = NULL;
                 }
                 net_wake_task(i);
-                serial_write("[NET] Request timed out for task\n");
             }
         }
     }
@@ -638,6 +755,7 @@ void mongoose_poll_task(void) {
     }
 
     // Main polling loop
+    static uint64_t last_heartbeat = 0;
     while (1) {
         // Validate stack
         asm volatile("mov %%rsp, %0" : "=r"(rsp));
@@ -648,6 +766,12 @@ void mongoose_poll_task(void) {
             mg_mgr_poll(&s_mgr, 0);
             net_check_timeouts();
 
+            // Periodic heartbeat to confirm poll task is alive
+            uint64_t now_hb = mg_millis();
+            if (now_hb - last_heartbeat >= 30000) {
+                last_heartbeat = now_hb;
+                serial_write("[NET] poll task alive\n");
+            }
         }
 
         // Short delay then yield

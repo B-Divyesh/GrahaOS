@@ -147,6 +147,10 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 		echo "ERROR: user/dnstest not found!"; \
 		exit 1; \
 	fi
+	@if [ ! -f user/aitest ]; then \
+		echo "ERROR: user/aitest not found!"; \
+		exit 1; \
+	fi
 	@cp user/grahai initrd_root/bin/
 	@cp user/gash initrd_root/bin/
 	@cp user/libctest initrd_root/bin/
@@ -159,8 +163,12 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	@cp user/nettest initrd_root/bin/
 	@cp user/httptest initrd_root/bin/
 	@cp user/dnstest initrd_root/bin/
+	@cp user/aitest initrd_root/bin/
 	@cp etc/motd.txt initrd_root/etc/
 	@cp etc/plan.json initrd_root/etc/
+	@if [ -f api_keys.md ]; then \
+		grep '^GEMINI_API_KEY=' api_keys.md | sed 's/^GEMINI_API_KEY=//' > initrd_root/etc/ai.conf; \
+	else echo "" > initrd_root/etc/ai.conf; fi
 	@echo "Contents of initrd_root before tar:"
 	@find initrd_root -type f -ls
 	@$(TAR) -cf initrd.tar -C initrd_root bin etc

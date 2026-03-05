@@ -43,6 +43,7 @@ typedef long ssize_t;
 #define SYS_NET_STATUS       1042
 #define SYS_HTTP_GET         1043
 #define SYS_DNS_RESOLVE      1044
+#define SYS_HTTP_POST        1045
 
 // Directory entry structure for user space
 typedef struct {
@@ -351,6 +352,29 @@ static inline int syscall_dns_resolve(const char *hostname, uint8_t *ip_buf) {
     do {
         asm volatile("syscall" : "=a"(ret)
             : "a"(SYS_DNS_RESOLVE), "D"(hostname), "S"(ip_buf)
+            : "rcx", "r11", "memory");
+        if (ret == -99) continue;
+        break;
+    } while (1);
+    return (int)ret;
+}
+
+// Phase 9e: HTTP POST (blocking, returns body length or negative error)
+// url: full URL (http:// or https://)
+// body: POST body data
+// body_len: length of POST body
+// response_buf: buffer for response body
+// max_len: maximum bytes to store in response_buf
+// Returns: body length (>=0) on success, negative error on failure
+static inline int syscall_http_post(const char *url, const char *body, int body_len,
+                                     char *response_buf, int max_len) {
+    long ret;
+    register const char *r10 asm("r10") = response_buf;
+    register long r8 asm("r8") = (long)max_len;
+    do {
+        asm volatile("syscall" : "=a"(ret)
+            : "a"(SYS_HTTP_POST), "D"(url), "S"(body), "d"((long)body_len),
+              "r"(r10), "r"(r8)
             : "rcx", "r11", "memory");
         if (ret == -99) continue;
         break;

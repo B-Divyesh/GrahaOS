@@ -2,6 +2,7 @@
 #include "syscalls.h"
 #include "../kernel/state.h"
 #include "../kernel/fs/grahafs.h"
+#include "json.h"
 
 // Helper functions
 int strcmp(const char *s1, const char *s2) {
@@ -1272,6 +1273,334 @@ void cmd_dns(const char *hostname) {
     print("\n");
 }
 
+// --- Phase 9e: AI Command ---
+
+// JSON-safe string append: escapes special chars for JSON string values
+static int json_append(char *buf, int pos, int max, const char *s) {
+    while (*s && pos < max - 1) {
+        if (*s == '"' || *s == '\\') {
+            if (pos + 2 >= max) break;
+            buf[pos++] = '\\';
+            buf[pos++] = *s;
+        } else if (*s == '\n') {
+            if (pos + 2 >= max) break;
+            buf[pos++] = '\\';
+            buf[pos++] = 'n';
+        } else if (*s == '\r') {
+            if (pos + 2 >= max) break;
+            buf[pos++] = '\\';
+            buf[pos++] = 'r';
+        } else if (*s == '\t') {
+            if (pos + 2 >= max) break;
+            buf[pos++] = '\\';
+            buf[pos++] = 't';
+        } else {
+            buf[pos++] = *s;
+        }
+        s++;
+    }
+    buf[pos] = '\0';
+    return pos;
+}
+
+// Raw string append (no escaping)
+static int str_append(char *buf, int pos, int max, const char *s) {
+    while (*s && pos < max - 1) {
+        buf[pos++] = *s++;
+    }
+    buf[pos] = '\0';
+    return pos;
+}
+
+// Append uint64 as decimal string
+static int num_append(char *buf, int pos, int max, uint64_t num) {
+    char tmp[21];
+    uint64_to_str(num, tmp);
+    return str_append(buf, pos, max, tmp);
+}
+
+// Append int as decimal string
+static int int_append(char *buf, int pos, int max, int num) {
+    char tmp[12];
+    int_to_string(num, tmp);
+    return str_append(buf, pos, max, tmp);
+}
+
+// JSMN helper: compare token string
+static int jsoneq(const char *json, jsmntok_t *tok, const char *s) {
+    if (tok->type == JSMN_STRING &&
+        (int)strlen(s) == tok->end - tok->start &&
+        strncmp(json + tok->start, s, tok->end - tok->start) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+static const char *proc_state_name(uint32_t s) {
+    switch (s) {
+        case 0: return "ZOMBIE";
+        case 1: return "READY";
+        case 2: return "RUNNING";
+        case 3: return "BLOCKED";
+        default: return "UNKNOWN";
+    }
+}
+
+void cmd_ai(char *argv[], int argc) {
+    if (argc < 2) {
+        print("ai: usage: ai <prompt...>\n");
+        print("  Interactive Q&A with Gemini AI, includes GrahaOS system context.\n");
+        return;
+    }
+
+    // 1. Read API key from etc/ai.conf
+    int fd = syscall_open("etc/ai.conf");
+    if (fd < 0) {
+        print("ai: cannot read API key (etc/ai.conf not found)\n");
+        print("    Ensure api_keys.md exists and rebuild.\n");
+        return;
+    }
+    char api_key[128];
+    for (int i = 0; i < 128; i++) api_key[i] = 0;
+    int key_len = syscall_read(fd, api_key, sizeof(api_key) - 1);
+    syscall_close(fd);
+
+    if (key_len <= 0) {
+        print("ai: API key is empty\n");
+        return;
+    }
+    // Trim trailing whitespace/newlines
+    while (key_len > 0 && (api_key[key_len-1] == '\n' || api_key[key_len-1] == '\r' ||
+                            api_key[key_len-1] == ' ')) {
+        api_key[--key_len] = '\0';
+    }
+    if (key_len == 0) {
+        print("ai: API key is empty after trimming\n");
+        return;
+    }
+
+    // 2. Collect system state
+    state_memory_t mem;
+    state_process_list_t procs;
+    state_cap_list_t caps;
+    state_filesystem_t fs;
+    zero_mem(&mem, sizeof(mem));
+    zero_mem(&procs, sizeof(procs));
+    zero_mem(&caps, sizeof(caps));
+    zero_mem(&fs, sizeof(fs));
+    syscall_get_system_state(STATE_CAT_MEMORY, &mem, sizeof(mem));
+    syscall_get_system_state(STATE_CAT_PROCESSES, &procs, sizeof(procs));
+    syscall_get_system_state(STATE_CAT_CAPABILITIES, &caps, sizeof(caps));
+    syscall_get_system_state(STATE_CAT_FILESYSTEM, &fs, sizeof(fs));
+
+    // 3. Build system context prompt
+    // We'll build the prompt in a buffer, then JSON-encode it into the POST body
+    char prompt[3072];
+    int p = 0;
+
+    p = str_append(prompt, p, sizeof(prompt),
+        "You are GrahaOS AI, running inside a custom bare-metal x86_64 operating system. "
+        "Answer concisely based on the system state below.\\n\\n");
+
+    // Memory
+    p = str_append(prompt, p, sizeof(prompt), "MEMORY: total=");
+    p = num_append(prompt, p, sizeof(prompt), mem.total_physical);
+    p = str_append(prompt, p, sizeof(prompt), " free=");
+    p = num_append(prompt, p, sizeof(prompt), mem.free_physical);
+    p = str_append(prompt, p, sizeof(prompt), " used=");
+    p = num_append(prompt, p, sizeof(prompt), mem.used_physical);
+    p = str_append(prompt, p, sizeof(prompt), "\\n");
+
+    // Processes
+    p = str_append(prompt, p, sizeof(prompt), "PROCESSES:");
+    for (uint32_t i = 0; i < procs.count && i < 16; i++) {
+        if (procs.procs[i].pid <= 0) continue;
+        p = str_append(prompt, p, sizeof(prompt), " pid=");
+        p = int_append(prompt, p, sizeof(prompt), procs.procs[i].pid);
+        p = str_append(prompt, p, sizeof(prompt), " name=");
+        p = str_append(prompt, p, sizeof(prompt), procs.procs[i].name);
+        p = str_append(prompt, p, sizeof(prompt), " state=");
+        p = str_append(prompt, p, sizeof(prompt), proc_state_name(procs.procs[i].state));
+        p = str_append(prompt, p, sizeof(prompt), ",");
+    }
+    p = str_append(prompt, p, sizeof(prompt), "\\n");
+
+    // Capabilities with operations manifest
+    p = str_append(prompt, p, sizeof(prompt), "CAPABILITIES (");
+    p = num_append(prompt, p, sizeof(prompt), caps.count);
+    p = str_append(prompt, p, sizeof(prompt), "):\\n");
+    for (uint32_t i = 0; i < caps.count; i++) {
+        state_cap_entry_t *c = &caps.caps[i];
+        if (c->deleted) continue;
+        p = str_append(prompt, p, sizeof(prompt), "  ");
+        p = str_append(prompt, p, sizeof(prompt), c->name);
+        p = str_append(prompt, p, sizeof(prompt), " [");
+        p = str_append(prompt, p, sizeof(prompt), c->state == 2 ? "ON" : "OFF");
+        p = str_append(prompt, p, sizeof(prompt), "] (");
+        switch (c->type) {
+            case 0: p = str_append(prompt, p, sizeof(prompt), "HARDWARE"); break;
+            case 1: p = str_append(prompt, p, sizeof(prompt), "DRIVER"); break;
+            case 2: p = str_append(prompt, p, sizeof(prompt), "SERVICE"); break;
+            case 3: p = str_append(prompt, p, sizeof(prompt), "APPLICATION"); break;
+            case 4: p = str_append(prompt, p, sizeof(prompt), "FEATURE"); break;
+            case 5: p = str_append(prompt, p, sizeof(prompt), "COMPOSITE"); break;
+            default: p = str_append(prompt, p, sizeof(prompt), "UNKNOWN"); break;
+        }
+        p = str_append(prompt, p, sizeof(prompt), ")\\n");
+    }
+
+    // Filesystem
+    p = str_append(prompt, p, sizeof(prompt), "FILESYSTEM: mounted=");
+    p = num_append(prompt, p, sizeof(prompt), fs.grahafs_mounted);
+    p = str_append(prompt, p, sizeof(prompt), " free_blocks=");
+    p = num_append(prompt, p, sizeof(prompt), fs.grahafs_free_blocks);
+    p = str_append(prompt, p, sizeof(prompt), " free_inodes=");
+    p = num_append(prompt, p, sizeof(prompt), fs.grahafs_free_inodes);
+    p = str_append(prompt, p, sizeof(prompt), "\\n\\n");
+
+    // User prompt
+    p = str_append(prompt, p, sizeof(prompt), "User: ");
+    for (int i = 1; i < argc; i++) {
+        p = json_append(prompt, p, sizeof(prompt), argv[i]);
+        if (i < argc - 1) p = str_append(prompt, p, sizeof(prompt), " ");
+    }
+
+    // 4. Build Gemini JSON request body
+    char body[4096];
+    int b = 0;
+    b = str_append(body, b, sizeof(body), "{\"contents\":[{\"parts\":[{\"text\":\"");
+    b = str_append(body, b, sizeof(body), prompt);
+    b = str_append(body, b, sizeof(body), "\"}]}]}");
+
+    // 5. Build URL with API key
+    char url[512];
+    int u = 0;
+    u = str_append(url, u, sizeof(url),
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=");
+    u = str_append(url, u, sizeof(url), api_key);
+
+    print("Thinking...\n");
+
+    // 6. Call HTTP POST
+    char response[8192];
+    for (int i = 0; i < (int)sizeof(response); i++) response[i] = 0;
+
+    int ret = syscall_http_post(url, body, b, response, sizeof(response));
+
+    // Handle 429 rate limit: check response for "429" and retry once
+    if (ret > 0) {
+        // Quick check for rate limiting in response
+        int is_429 = 0;
+        for (int i = 0; i < ret - 2; i++) {
+            if (response[i] == '4' && response[i+1] == '2' && response[i+2] == '9') {
+                is_429 = 1;
+                break;
+            }
+        }
+        if (is_429) {
+            print("Rate limited, retrying in 2s...\n");
+            // Simple delay: busy-wait loop (~2 seconds)
+            for (volatile int d = 0; d < 200000000; d++) {}
+            for (int i = 0; i < (int)sizeof(response); i++) response[i] = 0;
+            ret = syscall_http_post(url, body, b, response, sizeof(response));
+        }
+    }
+
+    if (ret < 0) {
+        print("ai: HTTP POST failed (error ");
+        char num[12];
+        int_to_string(ret, num);
+        print(num);
+        if (ret == -10) print(" timeout");
+        else if (ret == -11) print(" DNS failed");
+        else if (ret == -12) print(" connection failed");
+        else if (ret == -17) print(" no network");
+        print(")\n");
+        return;
+    }
+
+    if (ret == 0) {
+        print("ai: empty response\n");
+        return;
+    }
+
+    // 7. Parse JSON response with JSMN
+    jsmn_parser parser;
+    jsmntok_t tokens[256];
+    jsmn_init(&parser);
+    int tok_count = jsmn_parse(&parser, response, ret, tokens, 256);
+
+    if (tok_count < 0) {
+        print("ai: JSON parse error (");
+        char num[12];
+        int_to_string(tok_count, num);
+        print(num);
+        print(")\n");
+        // Show raw response for debugging
+        print("Raw response (first 512 bytes):\n");
+        for (int i = 0; i < ret && i < 512; i++) {
+            syscall_putc(response[i]);
+        }
+        print("\n");
+        return;
+    }
+
+    // Find candidates[0].content.parts[0].text
+    // Navigate: root object -> "candidates" -> array[0] -> object -> "content" -> object -> "parts" -> array[0] -> object -> "text" -> string
+    int text_found = 0;
+    for (int i = 0; i < tok_count - 1; i++) {
+        if (jsoneq(response, &tokens[i], "text") == 0) {
+            jsmntok_t *val = &tokens[i + 1];
+            if (val->type == JSMN_STRING) {
+                // Print the AI response, handling escape sequences
+                for (int j = val->start; j < val->end; j++) {
+                    if (response[j] == '\\' && j + 1 < val->end) {
+                        char next = response[j + 1];
+                        if (next == 'n') { syscall_putc('\n'); j++; }
+                        else if (next == 't') { syscall_putc('\t'); j++; }
+                        else if (next == '\\') { syscall_putc('\\'); j++; }
+                        else if (next == '"') { syscall_putc('"'); j++; }
+                        else { syscall_putc(response[j]); }
+                    } else {
+                        syscall_putc(response[j]);
+                    }
+                }
+                syscall_putc('\n');
+                text_found = 1;
+                break;
+            }
+        }
+    }
+
+    // Check for error response
+    if (!text_found) {
+        // Look for "error" -> "message" pattern
+        for (int i = 0; i < tok_count - 1; i++) {
+            if (jsoneq(response, &tokens[i], "message") == 0) {
+                jsmntok_t *val = &tokens[i + 1];
+                if (val->type == JSMN_STRING) {
+                    print("ai: API error: ");
+                    for (int j = val->start; j < val->end; j++) {
+                        syscall_putc(response[j]);
+                    }
+                    print("\n");
+                    text_found = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!text_found) {
+        print("ai: could not extract response text\n");
+        print("Raw (first 512 bytes):\n");
+        for (int i = 0; i < ret && i < 512; i++) {
+            syscall_putc(response[i]);
+        }
+        print("\n");
+    }
+}
+
 // Helper: spawn and wait for a program
 int run_program(const char *path) {
     int pid = syscall_spawn(path);
@@ -1337,6 +1666,8 @@ void _start(void) {
             print("  netstat             - Show TCP/IP stack status\n");
             print("  http <url>          - Fetch URL via HTTP/HTTPS GET\n");
             print("  dns <hostname>      - Resolve hostname to IP address\n");
+            print("  ai <prompt...>      - Ask AI (Gemini) with system context\n");
+            print("  agent <prompt...>   - AI agent: plan + validate + execute\n");
             print("  pid                 - Show current process ID\n");
             print("  kill <pid>          - Terminate a process\n");
             print("  sync                - Flush filesystem to disk\n");
@@ -1354,6 +1685,7 @@ void _start(void) {
             print("  nettest             - E1000 NIC test suite\n");
             print("  httptest            - HTTP server test suite\n");
             print("  dnstest             - DNS + HTTP client test suite\n");
+            print("  aitest              - AI integration test suite\n");
         }
         else if (strcmp(cmd, "ls") == 0) {
             cmd_ls(argc > 1 ? argv[1] : "/");
@@ -1469,6 +1801,51 @@ void _start(void) {
         }
         else if (strcmp(cmd, "dns") == 0) {
             cmd_dns(argc > 1 ? argv[1] : "");
+        }
+        else if (strcmp(cmd, "ai") == 0) {
+            cmd_ai(argv, argc);
+        }
+        else if (strcmp(cmd, "agent") == 0) {
+            if (argc < 2) {
+                print("agent: usage: agent <prompt...>\n");
+                print("  AI agent: generates plan, validates against capabilities, executes.\n");
+            } else {
+                // Write prompt to ai_prompt.txt for grahai to read
+                char prompt_buf[512];
+                int pos = 0;
+                for (int i = 1; i < argc && pos < 510; i++) {
+                    int slen = strlen(argv[i]);
+                    if (pos + slen + 1 >= 510) slen = 510 - pos - 1;
+                    for (int j = 0; j < slen && pos < 510; j++)
+                        prompt_buf[pos++] = argv[i][j];
+                    if (i < argc - 1 && pos < 510) prompt_buf[pos++] = ' ';
+                }
+                prompt_buf[pos] = '\0';
+
+                // Create and write the prompt file
+                syscall_create("ai_prompt.txt", 0);
+                int pfd = syscall_open("ai_prompt.txt");
+                if (pfd < 0) {
+                    print("agent: failed to create prompt file\n");
+                } else {
+                    syscall_write(pfd, prompt_buf, pos);
+                    syscall_close(pfd);
+
+                    print("Spawning AI agent...\n");
+                    int pid = syscall_spawn("bin/grahai");
+                    if (pid < 0) {
+                        print("agent: failed to spawn grahai\n");
+                    } else {
+                        int exit_status;
+                        syscall_wait(&exit_status);
+                        print("Agent completed (status=");
+                        char spid[12];
+                        int_to_string(exit_status, spid);
+                        print(spid);
+                        print(")\n");
+                    }
+                }
+            }
         }
         else if (strcmp(cmd, "pid") == 0) {
             int current_pid = syscall_getpid();

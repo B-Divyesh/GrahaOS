@@ -26,7 +26,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest
 
 .PHONY: all clean libc
 
@@ -42,10 +42,10 @@ grahai: grahai.o json.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
 	@$(LD) $(LDFLAGS) -o $@ grahai.o json.o $(LIBC)
 
-# Build gash shell
-gash: gash.o $(LIBC)
+# Build gash shell (with JSON parser for AI command)
+gash: gash.o json.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
-	@$(LD) $(LDFLAGS) -o $@ gash.o $(LIBC)
+	@$(LD) $(LDFLAGS) -o $@ gash.o json.o $(LIBC)
 
 # Build libc test program
 libctest: libctest.o $(LIBC)
@@ -96,6 +96,11 @@ httptest: httptest.o $(LIBC)
 dnstest: dnstest.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
 	@$(LD) $(LDFLAGS) -o $@ dnstest.o $(LIBC)
+
+# Build AI integration test (Phase 9e, with libc)
+aitest: aitest.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ aitest.o $(LIBC)
 
 %.o: %.c
 	@echo "Compiling user C: $<"

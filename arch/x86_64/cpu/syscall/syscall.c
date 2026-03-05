@@ -1126,6 +1126,58 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             break;
         }
 
+        case SYS_HTTP_POST: {
+            // RDI=url, RSI=body, RDX=body_len, R10=response_buf, R8=max_len
+            const char *post_url_user = (const char *)frame->rdi;
+            const char *post_body_user = (const char *)frame->rsi;
+            int post_body_len = (int)frame->rdx;
+            char *post_resp_buf = (char *)frame->r10;
+            int post_max_len = (int)frame->r8;
+
+            task_t *current = sched_get_current_task();
+            if (!current) { frame->rax = (uint64_t)(long)-1; break; }
+
+            if (!post_resp_buf || post_max_len <= 0 || !is_user_pointer(post_resp_buf, post_max_len)) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+            if (!post_body_user || post_body_len <= 0 || post_body_len > NET_MAX_POST_BODY_SIZE ||
+                !is_user_pointer((void *)post_body_user, post_body_len)) {
+                frame->rax = (uint64_t)(long)-1;
+                break;
+            }
+
+            // Try to collect a completed result first
+            int post_result = net_http_post_check(current->id, post_resp_buf, post_max_len);
+            if (post_result != -99) {
+                frame->rax = (uint64_t)(long)post_result;
+                break;
+            }
+
+            // Copy URL from user-space
+            char post_url_kernel[512];
+            if (copy_string_from_user(post_url_user, post_url_kernel, sizeof(post_url_kernel)) <= 0) {
+                frame->rax = (uint64_t)(long)NET_ERR_BAD_URL;
+                break;
+            }
+
+            // Copy POST body from user-space
+            char post_body_kernel[NET_MAX_POST_BODY_SIZE];
+            for (int i = 0; i < post_body_len; i++) {
+                post_body_kernel[i] = post_body_user[i];
+            }
+
+            int post_start_ret = net_http_post_start(current->id, post_url_kernel,
+                                                      post_body_kernel, post_body_len);
+            if (post_start_ret == 0 || post_start_ret == NET_ERR_BUSY) {
+                current->state = TASK_STATE_BLOCKED;
+                frame->rax = (uint64_t)(long)-99;
+            } else {
+                frame->rax = (uint64_t)(long)post_start_ret;
+            }
+            break;
+        }
+
         case SYS_DNS_RESOLVE: {
             const char *hostname_user = (const char *)frame->rdi;
             uint8_t *ip_buf = (uint8_t *)frame->rsi;

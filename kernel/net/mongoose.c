@@ -5562,6 +5562,36 @@ static void read_conn(struct mg_connection *c, struct pkt *pkt) {
   uint32_t seq = mg_ntohl(pkt->tcp->seq);
   uint32_t rem_ip;
   memcpy(&rem_ip, c->rem.ip, sizeof(uint32_t));
+
+  // GrahaOS fix: if segment carries BOTH data AND FIN, deliver data first
+  // before processing the FIN. Without this, FIN+data segments (common with
+  // Connection: close) lose the entire response payload.
+  if ((pkt->tcp->flags & TH_FIN) && pkt->pay.len > 0 && seq == s->ack) {
+    // Deliver the data payload first
+    if (io->size - io->len < pkt->pay.len &&
+        !mg_iobuf_resize(io, io->len + pkt->pay.len)) {
+      mg_error(c, "oom");
+    } else {
+      memcpy(&io->buf[io->len], pkt->pay.buf, pkt->pay.len);
+      io->len += pkt->pay.len;
+      s->ack = (uint32_t) (mg_htonl(pkt->tcp->seq) + pkt->pay.len);
+      if (c->is_tls && c->is_tls_hs) {
+        mg_tls_handshake(c);
+      } else if (c->is_tls) {
+        struct mg_iobuf *dio = &c->recv;
+        if (dio->size - dio->len < pkt->pay.len &&
+            !mg_iobuf_resize(dio, dio->len + pkt->pay.len)) {
+          mg_error(c, "oom");
+        } else {
+          handle_tls_recv(c, dio);
+        }
+      } else {
+        mg_call(c, MG_EV_READ, &pkt->pay.len);
+      }
+    }
+    // Now fall through to handle the FIN
+  }
+
   if (pkt->tcp->flags & TH_FIN) {
     // If we initiated the closure, we reply with ACK upon receiving FIN
     // If we didn't initiate it, we reply with FIN as part of the normal TCP

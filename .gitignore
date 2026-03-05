@@ -52,3 +52,4 @@ user/eventtest
 user/httptest
 user/metatest
 user/nettest
+user/aitest

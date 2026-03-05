@@ -67,6 +67,9 @@
 #define SYS_HTTP_GET    1043
 #define SYS_DNS_RESOLVE 1044
 
+// Phase 9e: HTTP POST (for AI API calls)
+#define SYS_HTTP_POST   1045
+
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);
 
