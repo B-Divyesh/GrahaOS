@@ -91,17 +91,262 @@ void print_u32(const char *label, uint32_t val) {
     print_u64(label, (uint64_t)val);
 }
 
+// --- Command History (Phase 10d) ---
+#define HISTORY_SIZE 32
+#define HISTORY_LINE_MAX 256
+static char history[HISTORY_SIZE][HISTORY_LINE_MAX];
+static int history_count = 0;   // total entries stored
+static int history_write = 0;   // next write slot (ring buffer)
+
+static void history_add(const char *line) {
+    if (line[0] == '\0') return;
+    // Don't add duplicates of last entry
+    if (history_count > 0) {
+        int last = (history_write + HISTORY_SIZE - 1) % HISTORY_SIZE;
+        if (strcmp(history[last], line) == 0) return;
+    }
+    int len = 0;
+    while (line[len] && len < HISTORY_LINE_MAX - 1) {
+        history[history_write][len] = line[len];
+        len++;
+    }
+    history[history_write][len] = '\0';
+    history_write = (history_write + 1) % HISTORY_SIZE;
+    if (history_count < HISTORY_SIZE) history_count++;
+}
+
+static const char* history_get(int index) {
+    // index 0 = most recent, 1 = second most recent, etc.
+    if (index < 0 || index >= history_count) return ((void*)0);
+    int pos = (history_write - 1 - index + HISTORY_SIZE * 2) % HISTORY_SIZE;
+    return history[pos];
+}
+
+// --- Environment Variables (Phase 10d) ---
+#define ENV_MAX 32
+#define ENV_KEY_MAX 64
+#define ENV_VAL_MAX 128
+static char env_keys[ENV_MAX][ENV_KEY_MAX];
+static char env_vals[ENV_MAX][ENV_VAL_MAX];
+static int env_count = 0;
+static int last_exit_status = 0;
+
+static void env_set(const char *key, const char *val) {
+    // Update existing
+    for (int i = 0; i < env_count; i++) {
+        if (strcmp(env_keys[i], key) == 0) {
+            int j = 0;
+            while (val[j] && j < ENV_VAL_MAX - 1) { env_vals[i][j] = val[j]; j++; }
+            env_vals[i][j] = '\0';
+            return;
+        }
+    }
+    // Add new
+    if (env_count < ENV_MAX) {
+        int j = 0;
+        while (key[j] && j < ENV_KEY_MAX - 1) { env_keys[env_count][j] = key[j]; j++; }
+        env_keys[env_count][j] = '\0';
+        j = 0;
+        while (val[j] && j < ENV_VAL_MAX - 1) { env_vals[env_count][j] = val[j]; j++; }
+        env_vals[env_count][j] = '\0';
+        env_count++;
+    }
+}
+
+static const char* env_get(const char *key) {
+    for (int i = 0; i < env_count; i++) {
+        if (strcmp(env_keys[i], key) == 0) return env_vals[i];
+    }
+    return ((void*)0);
+}
+
+// --- Background Jobs (Phase 10d) ---
+#define MAX_BG_JOBS 8
+static int bg_pids[MAX_BG_JOBS];
+static char bg_names[MAX_BG_JOBS][64];
+static int bg_count = 0;
+
+static void bg_add(int pid, const char *name) {
+    if (bg_count >= MAX_BG_JOBS) return;
+    bg_pids[bg_count] = pid;
+    int j = 0;
+    while (name[j] && j < 63) { bg_names[bg_count][j] = name[j]; j++; }
+    bg_names[bg_count][j] = '\0';
+    bg_count++;
+    print("[");
+    char buf[12];
+    int_to_string(bg_count, buf);
+    print(buf);
+    print("] ");
+    int_to_string(pid, buf);
+    print(buf);
+    print("\n");
+}
+
+static void bg_check_completed(void) {
+    // Check for completed background jobs by querying process state
+    // Use system state to check if PIDs are still alive
+    uint8_t state_buf[4096];
+    long ret = syscall_get_system_state(2, state_buf, sizeof(state_buf));
+    if (ret <= 0) return;
+
+    // Parse process list to find which bg PIDs are still running
+    state_process_t *procs = (state_process_t *)state_buf;
+    int nprocs = ret / sizeof(state_process_t);
+
+    for (int i = 0; i < bg_count; i++) {
+        int found = 0;
+        for (int j = 0; j < nprocs; j++) {
+            if ((int)procs[j].pid == bg_pids[i]) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            // Process exited
+            print("[");
+            char buf[12];
+            int_to_string(i + 1, buf);
+            print(buf);
+            print("] Done    ");
+            print(bg_names[i]);
+            print("\n");
+            // Remove from list by shifting
+            for (int k = i; k < bg_count - 1; k++) {
+                bg_pids[k] = bg_pids[k + 1];
+                strcpy(bg_names[k], bg_names[k + 1]);
+            }
+            bg_count--;
+            i--; // Recheck this slot
+        }
+    }
+}
+
+// Expand environment variables in a command line
+// Handles $KEY, $?, $$
+static void expand_variables(char *input, char *output, int max_len) {
+    int oi = 0;
+    for (int ii = 0; input[ii] && oi < max_len - 1; ii++) {
+        if (input[ii] == '$') {
+            ii++;
+            if (input[ii] == '?') {
+                // $? = last exit status
+                char num[12];
+                int_to_string(last_exit_status, num);
+                for (int k = 0; num[k] && oi < max_len - 1; k++)
+                    output[oi++] = num[k];
+            } else if (input[ii] == '$') {
+                // $$ = current PID
+                char num[12];
+                int_to_string(syscall_getpid(), num);
+                for (int k = 0; num[k] && oi < max_len - 1; k++)
+                    output[oi++] = num[k];
+            } else if ((input[ii] >= 'A' && input[ii] <= 'Z') ||
+                       (input[ii] >= 'a' && input[ii] <= 'z') ||
+                       input[ii] == '_') {
+                // Extract variable name
+                char varname[ENV_KEY_MAX];
+                int vi = 0;
+                while ((input[ii] >= 'A' && input[ii] <= 'Z') ||
+                       (input[ii] >= 'a' && input[ii] <= 'z') ||
+                       (input[ii] >= '0' && input[ii] <= '9') ||
+                       input[ii] == '_') {
+                    if (vi < ENV_KEY_MAX - 1) varname[vi++] = input[ii];
+                    ii++;
+                }
+                varname[vi] = '\0';
+                ii--; // Back up since outer loop will advance
+                const char *val = env_get(varname);
+                if (val) {
+                    for (int k = 0; val[k] && oi < max_len - 1; k++)
+                        output[oi++] = val[k];
+                }
+            } else {
+                // Lone $ or $<digit> — output literally
+                output[oi++] = '$';
+                if (input[ii]) output[oi++] = input[ii];
+            }
+        } else {
+            output[oi++] = input[ii];
+        }
+    }
+    output[oi] = '\0';
+}
+
+// Enhanced readline with command history (up/down arrows)
 void readline(char *buffer, int max_len) {
     int i = 0;
+    int hist_pos = -1;  // -1 = current input, 0 = most recent, etc.
+    char saved_input[256];  // save what user was typing before navigating history
+    saved_input[0] = '\0';
+
     while (i < max_len - 1) {
         char c = syscall_getc();
-        
+
         if (c == '\n') {
             break;
         } else if (c == '\b') {
             if (i > 0) {
                 i--;
                 print("\b \b");
+            }
+        } else if (c == '\033') {
+            // Escape sequence — read next two chars
+            char c2 = syscall_getc();
+            if (c2 == '[') {
+                char c3 = syscall_getc();
+                if (c3 == 'A') {
+                    // Up arrow — go back in history
+                    if (hist_pos < history_count - 1) {
+                        if (hist_pos == -1) {
+                            // Save current input
+                            buffer[i] = '\0';
+                            int si = 0;
+                            while (buffer[si]) { saved_input[si] = buffer[si]; si++; }
+                            saved_input[si] = '\0';
+                        }
+                        hist_pos++;
+                        const char *h = history_get(hist_pos);
+                        if (h) {
+                            // Clear current line on screen
+                            while (i > 0) { print("\b \b"); i--; }
+                            // Copy history entry
+                            i = 0;
+                            while (h[i] && i < max_len - 1) {
+                                buffer[i] = h[i];
+                                syscall_putc(h[i]);
+                                i++;
+                            }
+                        }
+                    }
+                } else if (c3 == 'B') {
+                    // Down arrow — go forward in history
+                    if (hist_pos > -1) {
+                        hist_pos--;
+                        // Clear current line on screen
+                        while (i > 0) { print("\b \b"); i--; }
+                        if (hist_pos == -1) {
+                            // Restore saved input
+                            i = 0;
+                            while (saved_input[i] && i < max_len - 1) {
+                                buffer[i] = saved_input[i];
+                                syscall_putc(saved_input[i]);
+                                i++;
+                            }
+                        } else {
+                            const char *h = history_get(hist_pos);
+                            if (h) {
+                                i = 0;
+                                while (h[i] && i < max_len - 1) {
+                                    buffer[i] = h[i];
+                                    syscall_putc(h[i]);
+                                    i++;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Ignore Left/Right arrows for now (C/D)
             }
         } else {
             buffer[i++] = c;
@@ -1013,6 +1258,102 @@ void cmd_search(const char *tag) {
     }
 }
 
+// --- Phase 11a: SimHash Commands ---
+
+void hex64(uint64_t val, char *buf) {
+    const char hex[] = "0123456789abcdef";
+    buf[0] = '0'; buf[1] = 'x';
+    for (int i = 15; i >= 0; i--) {
+        buf[2 + (15 - i)] = hex[(val >> (i * 4)) & 0xF];
+    }
+    buf[18] = '\0';
+}
+
+void cmd_simhash(const char *path) {
+    if (!path || path[0] == '\0') {
+        print("simhash: usage: simhash <file>\n");
+        return;
+    }
+
+    print("Computing SimHash for '");
+    print(path);
+    print("'...\n");
+
+    uint64_t hash = syscall_compute_simhash(path);
+    if (hash == 0) {
+        print("simhash: failed (file not found or empty)\n");
+        return;
+    }
+
+    char hexbuf[20];
+    hex64(hash, hexbuf);
+    print("  SimHash: ");
+    print(hexbuf);
+    print("\n");
+
+    // Show binary representation for visual comparison
+    print("  Binary:  ");
+    for (int i = 63; i >= 0; i--) {
+        syscall_putc((hash & (1ULL << i)) ? '1' : '0');
+        if (i > 0 && i % 8 == 0) syscall_putc(' ');
+    }
+    print("\n");
+}
+
+void cmd_similar(const char *path, int threshold) {
+    if (!path || path[0] == '\0') {
+        print("similar: usage: similar <file> [threshold]\n");
+        return;
+    }
+
+    if (threshold <= 0) threshold = 10; // default
+
+    grahafs_search_results_t results;
+    zero_mem(&results, sizeof(results));
+
+    int ret = syscall_find_similar(path, threshold, &results);
+    if (ret == -2) {
+        print("similar: no SimHash computed for '");
+        print(path);
+        print("' — run 'simhash ");
+        print(path);
+        print("' first\n");
+        return;
+    }
+    if (ret < 0) {
+        print("similar: failed (error=");
+        char buf[12];
+        int_to_string(ret, buf);
+        print(buf);
+        print(")\n");
+        return;
+    }
+
+    print("Files similar to '");
+    print(path);
+    print("' (threshold=");
+    char buf[12];
+    int_to_string(threshold, buf);
+    print(buf);
+    print("): ");
+    uint64_to_str(results.count, buf);
+    print(buf);
+    print(" match(es)\n");
+
+    for (uint32_t i = 0; i < results.count; i++) {
+        print("  ");
+        print(results.results[i].path);
+        print("  distance=");
+        uint64_to_str(results.results[i].importance, buf); // distance stored in importance field
+        print(buf);
+        if (results.results[i].tags[0]) {
+            print("  tags=");
+            print(results.results[i].tags);
+        }
+        print("\n");
+    }
+}
+
 // --- Phase 8d: CAN Event Commands ---
 
 void cmd_watch(const char *name) {
@@ -1819,14 +2160,35 @@ static void execute_pipeline(char *left_str, char *right_str) {
     }
 }
 
-// Process a complete command line (handles pipes and redirects)
+// Process a complete command line (handles pipes, redirects, background, vars)
 static void process_cmdline(char *line) {
     // Skip empty lines
     if (line[0] == '\0') return;
 
-    // Check for pipe operator (find first unquoted '|')
+    // Step 1: Expand environment variables
+    char expanded[512];
+    expand_variables(line, expanded, sizeof(expanded));
+
+    // Step 2: Check for background operator (&)
+    int background = 0;
+    {
+        int len = strlen(expanded);
+        // Trim trailing whitespace
+        while (len > 0 && (expanded[len - 1] == ' ' || expanded[len - 1] == '\t'))
+            len--;
+        if (len > 0 && expanded[len - 1] == '&') {
+            background = 1;
+            expanded[len - 1] = '\0';
+            // Trim again
+            len--;
+            while (len > 0 && (expanded[len - 1] == ' ' || expanded[len - 1] == '\t'))
+                expanded[--len] = '\0';
+        }
+    }
+
+    // Step 3: Check for pipe operator (find first unquoted '|')
     char *pipe_pos = ((void*)0);
-    for (char *p = line; *p; p++) {
+    for (char *p = expanded; *p; p++) {
         if (*p == '|') {
             pipe_pos = p;
             break;
@@ -1836,13 +2198,13 @@ static void process_cmdline(char *line) {
     if (pipe_pos) {
         // Split at pipe and execute as pipeline
         *pipe_pos = '\0';
-        execute_pipeline(line, pipe_pos + 1);
+        execute_pipeline(expanded, pipe_pos + 1);
         return;
     }
 
     // No pipe — parse command and handle redirects
     char *argv[32];
-    int argc = parse_command(line, argv, 32);
+    int argc = parse_command(expanded, argv, 32);
     if (argc == 0) return;
 
     // Process redirects
@@ -1867,9 +2229,13 @@ static void process_cmdline(char *line) {
             print(argv[0]);
             print("'\n");
             print("Type 'help' for available commands.\n");
+        } else if (background) {
+            // Background job — don't wait
+            bg_add(pid, argv[0]);
         } else {
             int exit_status;
             syscall_wait(&exit_status);
+            last_exit_status = exit_status;
         }
     }
 
@@ -1909,6 +2275,8 @@ static int execute_builtin(char *argv[], int argc) {
         print("  importance <p> <n>  - Set importance (0-100)\n");
         print("  summary <path> <t>  - Set summary text\n");
         print("  search <tag>        - Search files by tag\n");
+        print("  simhash <file>      - Compute & show SimHash fingerprint\n");
+        print("  similar <file> [n]  - Find similar files (threshold n)\n");
         print("  watch <cap>         - Watch capability state changes\n");
         print("  unwatch <cap>       - Stop watching a capability\n");
         print("  events              - Show pending CAN events\n");
@@ -1921,6 +2289,10 @@ static int execute_builtin(char *argv[], int argc) {
         print("  pid                 - Show current process ID\n");
         print("  kill <pid>          - Terminate a process\n");
         print("  sync                - Flush filesystem to disk\n");
+        print("  export KEY=VALUE    - Set environment variable\n");
+        print("  env                 - List environment variables\n");
+        print("  history             - Show command history\n");
+        print("  jobs                - List background jobs\n");
         print("  test                - Keyboard test\n");
         print("  grahai              - Run GCP interpreter\n");
         print("  exit                - Exit the shell\n");
@@ -1929,6 +2301,9 @@ static int execute_builtin(char *argv[], int argc) {
         print("  cmd >> file         - Append output to file\n");
         print("  cmd < file          - Redirect input from file\n");
         print("  cmd1 | cmd2         - Pipe output of cmd1 to cmd2\n");
+        print("  cmd &               - Run in background\n");
+        print("  $VAR                - Variable expansion\n");
+        print("  Up/Down arrows      - Command history navigation\n");
         print("\nTest suites (also runnable directly):\n");
         print("  libctest            - libc/malloc test suite\n");
         print("  sbrk_test           - sbrk syscall test\n");
@@ -2056,6 +2431,31 @@ static int execute_builtin(char *argv[], int argc) {
             print("search: usage: search <tag>\n");
         } else {
             cmd_search(argv[1]);
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "simhash") == 0) {
+        if (argc < 2) {
+            print("simhash: usage: simhash <file>\n");
+        } else {
+            cmd_simhash(argv[1]);
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "similar") == 0) {
+        if (argc < 2) {
+            print("similar: usage: similar <file> [threshold]\n");
+        } else {
+            int thr = 10;
+            if (argc >= 3) {
+                thr = 0;
+                for (int si = 0; argv[2][si]; si++) {
+                    if (argv[2][si] >= '0' && argv[2][si] <= '9')
+                        thr = thr * 10 + (argv[2][si] - '0');
+                }
+                if (thr == 0) thr = 10;
+            }
+            cmd_similar(argv[1], thr);
         }
         return 1;
     }
@@ -2196,6 +2596,77 @@ static int execute_builtin(char *argv[], int argc) {
         }
         return 1;
     }
+    else if (strcmp(cmd, "export") == 0) {
+        if (argc < 2) {
+            print("export: usage: export KEY=VALUE\n");
+        } else {
+            // Find '=' in argv[1]
+            char *eq = ((void*)0);
+            for (char *p = argv[1]; *p; p++) {
+                if (*p == '=') { eq = p; break; }
+            }
+            if (eq) {
+                *eq = '\0';
+                env_set(argv[1], eq + 1);
+            } else {
+                print("export: missing '=' in '");
+                print(argv[1]);
+                print("'\n");
+            }
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "env") == 0) {
+        if (env_count == 0) {
+            print("(no environment variables set)\n");
+        } else {
+            for (int i = 0; i < env_count; i++) {
+                print(env_keys[i]);
+                print("=");
+                print(env_vals[i]);
+                print("\n");
+            }
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "history") == 0) {
+        if (history_count == 0) {
+            print("(no history)\n");
+        } else {
+            for (int i = history_count - 1; i >= 0; i--) {
+                const char *h = history_get(i);
+                if (h) {
+                    char buf[12];
+                    int_to_string(history_count - i, buf);
+                    print("  ");
+                    print(buf);
+                    print("  ");
+                    print(h);
+                    print("\n");
+                }
+            }
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "jobs") == 0) {
+        if (bg_count == 0) {
+            print("(no background jobs)\n");
+        } else {
+            for (int i = 0; i < bg_count; i++) {
+                print("[");
+                char buf[12];
+                int_to_string(i + 1, buf);
+                print(buf);
+                print("] Running    ");
+                print(bg_names[i]);
+                print(" (PID ");
+                int_to_string(bg_pids[i], buf);
+                print(buf);
+                print(")\n");
+            }
+        }
+        return 1;
+    }
     else if (strcmp(cmd, "exit") == 0) {
         print("Goodbye!\n");
         return -1;
@@ -2206,7 +2677,7 @@ static int execute_builtin(char *argv[], int argc) {
 
 // Main shell
 void _start(void) {
-    print("=== GrahaOS Shell v3.0 (pipes & redirects) ===\n");
+    print("=== GrahaOS Shell v4.0 ===\n");
     print("Type 'help' for commands.\n\n");
 
     // Display our PID
@@ -2220,8 +2691,17 @@ void _start(void) {
     char command_buffer[256];
 
     while (1) {
+        // Check for completed background jobs
+        if (bg_count > 0) {
+            bg_check_completed();
+        }
+
         print("gash> ");
         readline(command_buffer, sizeof(command_buffer));
+
+        // Add to history before processing
+        history_add(command_buffer);
+
         process_cmdline(command_buffer);
     }
 }

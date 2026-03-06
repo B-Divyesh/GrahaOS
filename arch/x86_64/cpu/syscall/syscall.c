@@ -1543,6 +1543,55 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             break;
         }
 
+        case SYS_COMPUTE_SIMHASH: {
+            // Phase 11a: Compute SimHash for a file
+            // RDI = path string
+            char sh_path[256];
+            if (copy_string_from_user((const char *)frame->rdi, sh_path, 256) <= 0) {
+                frame->rax = 0;
+                break;
+            }
+            vfs_node_t *sh_node = vfs_path_to_node(sh_path);
+            if (!sh_node || sh_node->inode == 0) {
+                frame->rax = 0;
+                break;
+            }
+            frame->rax = grahafs_compute_simhash(sh_node->inode);
+            break;
+        }
+
+        case SYS_FIND_SIMILAR: {
+            // Phase 11a: Find similar files by SimHash Hamming distance
+            // RDI = path, RSI = threshold, RDX = results buffer
+            char sim_path[256];
+            if (copy_string_from_user((const char *)frame->rdi, sim_path, 256) <= 0) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            int sim_threshold = (int)frame->rsi;
+            void *sim_results = (void *)frame->rdx;
+            if (!sim_results) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            vfs_node_t *sim_node = vfs_path_to_node(sim_path);
+            if (!sim_node || sim_node->inode == 0) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            grahafs_search_results_t kresults;
+            int sim_ret = grahafs_find_similar(sim_node->inode, sim_threshold, &kresults, 16);
+            if (sim_ret >= 0) {
+                // Copy results to user-space
+                uint8_t *dst = (uint8_t *)sim_results;
+                uint8_t *src = (uint8_t *)&kresults;
+                for (size_t ci = 0; ci < sizeof(grahafs_search_results_t); ci++)
+                    dst[ci] = src[ci];
+            }
+            frame->rax = (uint64_t)(long)sim_ret;
+            break;
+        }
+
         default:
             frame->rax = (uint64_t)-1;
             break;

@@ -156,3 +156,8 @@ void grahafs_get_stats(uint32_t *mounted, uint32_t *total_blocks,
 int grahafs_set_ai_metadata(uint32_t inode_num, const grahafs_ai_metadata_t *meta);
 int grahafs_get_ai_metadata(uint32_t inode_num, grahafs_ai_metadata_t *meta);
 int grahafs_search_by_tag(const char *tag, grahafs_search_results_t *results, int max_results);
+
+// Phase 11a: SimHash feature extraction
+uint64_t grahafs_compute_simhash(uint32_t inode_num);
+int grahafs_find_similar(uint32_t ref_inode, int threshold,
+                         grahafs_search_results_t *results, int max_results);

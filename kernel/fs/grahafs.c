@@ -1,5 +1,6 @@
 // kernel/fs/grahafs.c - COMPLETE FILE
 #include "grahafs.h"
+#include "simhash.h"
 #include "vfs.h"
 #include "../../arch/x86_64/mm/pmm.h"
 #include "../../arch/x86_64/mm/vmm.h"
@@ -1425,6 +1426,307 @@ int grahafs_search_by_tag(const char *tag, grahafs_search_results_t *results, in
 
     results->count = count;
 
+    pmm_free_page(dir_phys);
+    spinlock_release(&grahafs_lock);
+    return (int)count;
+}
+
+// Phase 11a: Compute SimHash for a file and store in ai_embedding[0]
+// Returns the 64-bit SimHash on success, 0 on failure
+uint64_t grahafs_compute_simhash(uint32_t inode_num) {
+    if (!fs_mounted) return 0;
+    if (inode_num >= GRAHAFS_MAX_INODES) return 0;
+
+    spinlock_acquire(&grahafs_lock);
+
+    grahafs_inode_t inode;
+    if (read_inode(inode_num, &inode) != 0) {
+        spinlock_release(&grahafs_lock);
+        return 0;
+    }
+
+    if (inode.type != GRAHAFS_INODE_TYPE_FILE || inode.size == 0) {
+        spinlock_release(&grahafs_lock);
+        return 0;
+    }
+
+    // Read file data into a temporary buffer (max 48KB = 12 direct blocks)
+    size_t file_size = inode.size;
+    size_t max_read = 12 * GRAHAFS_BLOCK_SIZE; // 48KB limit
+    if (file_size > max_read) file_size = max_read;
+
+    // Allocate pages for file data (up to 12 pages)
+    size_t pages_needed = (file_size + GRAHAFS_BLOCK_SIZE - 1) / GRAHAFS_BLOCK_SIZE;
+    void *data_phys = pmm_alloc_page();
+    if (!data_phys) {
+        spinlock_release(&grahafs_lock);
+        return 0;
+    }
+    void *data_buf = (void *)((uint64_t)data_phys + g_hhdm_offset);
+
+    // Read block by block, compute SimHash incrementally
+    // For simplicity, read into a single page buffer one block at a time
+    // and use a cumulative approach via simhash_auto on each block's data
+
+    // Actually, for best results we need contiguous data for shingle hashing.
+    // Since files are typically small, allocate enough pages.
+    // But we only have pmm_alloc_page (one page at a time).
+    // Solution: read one block at a time, concatenate into data_buf.
+    // For files > 4KB, we need multiple pages.
+
+    // Allocate a contiguous-enough buffer using multiple page allocations
+    // For up to 48KB we need 12 pages
+    void *page_phys[12];
+    void *page_virt[12];
+    size_t actual_pages = pages_needed > 12 ? 12 : pages_needed;
+
+    // We already allocated one page, use it as block 0
+    page_phys[0] = data_phys;
+    page_virt[0] = data_buf;
+    for (size_t p = 1; p < actual_pages; p++) {
+        page_phys[p] = pmm_alloc_page();
+        if (!page_phys[p]) {
+            // Free previously allocated pages
+            for (size_t q = 0; q < p; q++) pmm_free_page(page_phys[q]);
+            spinlock_release(&grahafs_lock);
+            return 0;
+        }
+        page_virt[p] = (void *)((uint64_t)page_phys[p] + g_hhdm_offset);
+    }
+
+    // Read file data block by block
+    size_t bytes_read = 0;
+    for (size_t b = 0; b < actual_pages && b < 12; b++) {
+        if (inode.direct_blocks[b] == 0) break;
+        if (read_fs_block(inode.direct_blocks[b], page_virt[b]) != 0) break;
+        size_t chunk = GRAHAFS_BLOCK_SIZE;
+        if (bytes_read + chunk > file_size) chunk = file_size - bytes_read;
+        bytes_read += chunk;
+    }
+
+    // For SimHash, we need contiguous data. Copy into first pages sequentially.
+    // Each page already has the block data in order, but they're not contiguous.
+    // For files <= 4KB (one page), data is already contiguous.
+    // For larger files, we compute per-block and combine.
+
+    uint64_t hash;
+    if (actual_pages == 1) {
+        // Single page — data is contiguous
+        hash = simhash_auto(page_virt[0], bytes_read);
+    } else {
+        // Multi-page: compute SimHash using accumulator approach
+        // Process each page's data through the same accumulator
+        int32_t v[64];
+        for (int i = 0; i < 64; i++) v[i] = 0;
+
+        for (size_t p = 0; p < actual_pages; p++) {
+            size_t page_bytes = GRAHAFS_BLOCK_SIZE;
+            size_t total_so_far = p * GRAHAFS_BLOCK_SIZE;
+            if (total_so_far + page_bytes > bytes_read)
+                page_bytes = bytes_read - total_so_far;
+            if (page_bytes == 0) break;
+
+            // Determine if text or binary from first page
+            const uint8_t *bytes = (const uint8_t *)page_virt[p];
+
+            // Generate shingle hashes within this page
+            if (page_bytes >= SIMHASH_SHINGLE_SIZE) {
+                size_t num_shingles = page_bytes - SIMHASH_SHINGLE_SIZE + 1;
+                for (size_t s = 0; s < num_shingles; s++) {
+                    uint64_t h = fnv1a_hash64(&bytes[s], SIMHASH_SHINGLE_SIZE);
+                    for (int bit = 0; bit < 64; bit++) {
+                        if (h & (1ULL << bit)) v[bit]++;
+                        else v[bit]--;
+                    }
+                }
+            }
+        }
+
+        hash = 0;
+        for (int bit = 0; bit < 64; bit++) {
+            if (v[bit] > 0) hash |= (1ULL << bit);
+        }
+    }
+
+    // Free data pages
+    for (size_t p = 0; p < actual_pages; p++) {
+        pmm_free_page(page_phys[p]);
+    }
+
+    // Store SimHash in ai_embedding[0] via extended metadata block
+    // Allocate extended block if not yet allocated
+    if (inode.ai_metadata_block == 0) {
+        uint32_t ext_block = allocate_block();
+        if (ext_block == 0) {
+            spinlock_release(&grahafs_lock);
+            return hash; // Return hash but couldn't store it
+        }
+        inode.ai_metadata_block = ext_block;
+        inode.ai_flags |= GRAHAFS_AI_HAS_EXTENDED;
+    }
+
+    // Read/init extended block
+    void *ext_phys = pmm_alloc_page();
+    if (!ext_phys) {
+        spinlock_release(&grahafs_lock);
+        return hash;
+    }
+    void *ext_buf = (void *)((uint64_t)ext_phys + g_hhdm_offset);
+
+    grahafs_ai_metadata_block_t *ext_meta;
+    if (read_fs_block(inode.ai_metadata_block, ext_buf) != 0) {
+        memset(ext_buf, 0, GRAHAFS_BLOCK_SIZE);
+    }
+    ext_meta = (grahafs_ai_metadata_block_t *)ext_buf;
+
+    if (ext_meta->magic != GRAHAFS_AI_META_MAGIC) {
+        memset(ext_buf, 0, GRAHAFS_BLOCK_SIZE);
+        ext_meta->magic = GRAHAFS_AI_META_MAGIC;
+        ext_meta->version = 1;
+    }
+
+    // Store SimHash in embedding[0]
+    ext_meta->embedding[0] = hash;
+    if (ext_meta->embedding_dim < 1) ext_meta->embedding_dim = 1;
+    inode.ai_flags |= GRAHAFS_AI_HAS_EMBEDDING;
+
+    // Write back
+    write_fs_block(inode.ai_metadata_block, ext_buf);
+    pmm_free_page(ext_phys);
+
+    write_inode(inode_num, &inode);
+
+    if (fs_device && fs_device->device_id >= 0) {
+        ahci_flush_cache(fs_device->device_id);
+    }
+
+    spinlock_release(&grahafs_lock);
+    return hash;
+}
+
+// Phase 11a: Find files similar to a given file (by SimHash Hamming distance)
+// Returns number of matches found
+int grahafs_find_similar(uint32_t ref_inode, int threshold,
+                         grahafs_search_results_t *results, int max_results) {
+    if (!results || !fs_mounted) return -1;
+    if (threshold <= 0) threshold = SIMHASH_SIMILAR_THRESHOLD;
+    if (max_results <= 0 || max_results > 16) max_results = 16;
+
+    spinlock_acquire(&grahafs_lock);
+
+    // Get the reference file's SimHash from its embedding
+    grahafs_inode_t ref_in;
+    if (read_inode(ref_inode, &ref_in) != 0) {
+        spinlock_release(&grahafs_lock);
+        return -1;
+    }
+
+    uint64_t ref_hash = 0;
+    if (ref_in.ai_metadata_block != 0) {
+        void *ext_phys = pmm_alloc_page();
+        if (ext_phys) {
+            void *ext_buf = (void *)((uint64_t)ext_phys + g_hhdm_offset);
+            if (read_fs_block(ref_in.ai_metadata_block, ext_buf) == 0) {
+                grahafs_ai_metadata_block_t *ext = (grahafs_ai_metadata_block_t *)ext_buf;
+                if (ext->magic == GRAHAFS_AI_META_MAGIC && ext->embedding_dim >= 1)
+                    ref_hash = ext->embedding[0];
+            }
+            pmm_free_page(ext_phys);
+        }
+    }
+
+    if (ref_hash == 0) {
+        spinlock_release(&grahafs_lock);
+        return -2; // No SimHash computed for reference file
+    }
+
+    memset(results, 0, sizeof(grahafs_search_results_t));
+
+    // Scan all files in root directory
+    grahafs_inode_t root_inode;
+    if (read_inode(superblock.root_inode, &root_inode) != 0) {
+        spinlock_release(&grahafs_lock);
+        return -1;
+    }
+
+    if (root_inode.direct_blocks[0] == 0) {
+        spinlock_release(&grahafs_lock);
+        return 0;
+    }
+
+    void *dir_phys = pmm_alloc_page();
+    if (!dir_phys) {
+        spinlock_release(&grahafs_lock);
+        return -1;
+    }
+    void *dir_buf = (void *)((uint64_t)dir_phys + g_hhdm_offset);
+
+    if (read_fs_block(root_inode.direct_blocks[0], dir_buf) != 0) {
+        pmm_free_page(dir_phys);
+        spinlock_release(&grahafs_lock);
+        return -1;
+    }
+
+    void *ext_page_phys = pmm_alloc_page();
+    if (!ext_page_phys) {
+        pmm_free_page(dir_phys);
+        spinlock_release(&grahafs_lock);
+        return -1;
+    }
+    void *ext_page_buf = (void *)((uint64_t)ext_page_phys + g_hhdm_offset);
+
+    grahafs_dirent_t *entries = (grahafs_dirent_t *)dir_buf;
+    int max_entries = GRAHAFS_BLOCK_SIZE / sizeof(grahafs_dirent_t);
+    uint32_t count = 0;
+
+    for (int i = 0; i < max_entries && count < (uint32_t)max_results; i++) {
+        if (entries[i].inode_num == 0 || entries[i].name[0] == '\0') continue;
+        if (entries[i].inode_num == ref_inode) continue; // Skip self
+
+        // Skip . and ..
+        if (entries[i].name[0] == '.' &&
+            (entries[i].name[1] == '\0' ||
+             (entries[i].name[1] == '.' && entries[i].name[2] == '\0')))
+            continue;
+
+        grahafs_inode_t file_inode;
+        if (read_inode(entries[i].inode_num, &file_inode) != 0) continue;
+        if (file_inode.type != GRAHAFS_INODE_TYPE_FILE) continue;
+
+        // Get this file's SimHash
+        if (file_inode.ai_metadata_block == 0) continue;
+        if (!(file_inode.ai_flags & GRAHAFS_AI_HAS_EMBEDDING)) continue;
+
+        if (read_fs_block(file_inode.ai_metadata_block, ext_page_buf) != 0) continue;
+        grahafs_ai_metadata_block_t *ext = (grahafs_ai_metadata_block_t *)ext_page_buf;
+        if (ext->magic != GRAHAFS_AI_META_MAGIC || ext->embedding_dim < 1) continue;
+
+        uint64_t file_hash = ext->embedding[0];
+        int dist = simhash_hamming_distance(ref_hash, file_hash);
+
+        if (dist <= threshold) {
+            // Match found
+            results->results[count].path[0] = '/';
+            size_t name_len = strlen(entries[i].name);
+            if (name_len > 254) name_len = 254;
+            memcpy(results->results[count].path + 1, entries[i].name, name_len);
+            results->results[count].path[1 + name_len] = '\0';
+
+            results->results[count].inode_num = entries[i].inode_num;
+            results->results[count].importance = (uint32_t)dist; // Store distance in importance field
+
+            size_t tag_copy = strlen(file_inode.ai_tags);
+            if (tag_copy > 95) tag_copy = 95;
+            memcpy(results->results[count].tags, file_inode.ai_tags, tag_copy);
+            results->results[count].tags[tag_copy] = '\0';
+
+            count++;
+        }
+    }
+
+    results->count = count;
+
+    pmm_free_page(ext_page_phys);
     pmm_free_page(dir_phys);
     spinlock_release(&grahafs_lock);
     return (int)count;

@@ -48,6 +48,8 @@ typedef long ssize_t;
 #define SYS_DUP2             1047
 #define SYS_DUP              1048
 #define SYS_TRUNCATE         1049
+#define SYS_COMPUTE_SIMHASH  1050
+#define SYS_FIND_SIMILAR     1051
 
 // Directory entry structure for user space
 typedef struct {
@@ -384,6 +386,28 @@ static inline int syscall_truncate(int fd) {
     long ret;
     asm volatile("syscall" : "=a"(ret)
         : "a"(SYS_TRUNCATE), "D"(fd)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 11a: Compute SimHash for a file
+// Returns 64-bit SimHash on success, 0 on failure
+static inline uint64_t syscall_compute_simhash(const char *path) {
+    uint64_t ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_COMPUTE_SIMHASH), "D"(path)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Phase 11a: Find files similar to path by SimHash Hamming distance
+// threshold: max Hamming distance (0 = use default 10)
+// results: pointer to grahafs_search_results_t
+// Returns: number of matches, negative on error
+static inline int syscall_find_similar(const char *path, int threshold, void *results) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_FIND_SIMILAR), "D"(path), "S"(threshold), "d"(results)
         : "rcx", "r11", "memory");
     return (int)ret;
 }

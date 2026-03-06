@@ -159,6 +159,10 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 		echo "ERROR: user/pipetest not found!"; \
 		exit 1; \
 	fi
+	@if [ ! -f user/simtest ]; then \
+		echo "ERROR: user/simtest not found!"; \
+		exit 1; \
+	fi
 	@cp user/grahai initrd_root/bin/
 	@cp user/gash initrd_root/bin/
 	@cp user/libctest initrd_root/bin/
@@ -174,6 +178,7 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	@cp user/aitest initrd_root/bin/
 	@cp user/fdtest initrd_root/bin/
 	@cp user/pipetest initrd_root/bin/
+	@cp user/simtest initrd_root/bin/
 	@cp etc/motd.txt initrd_root/etc/
 	@cp etc/plan.json initrd_root/etc/
 	@if [ -f api_keys.md ]; then \

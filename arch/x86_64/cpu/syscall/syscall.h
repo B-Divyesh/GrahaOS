@@ -76,6 +76,10 @@
 #define SYS_DUP       1048
 #define SYS_TRUNCATE  1049
 
+// Phase 11a: SimHash feature extraction
+#define SYS_COMPUTE_SIMHASH 1050
+#define SYS_FIND_SIMILAR    1051
+
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);
 

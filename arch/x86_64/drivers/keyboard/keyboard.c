@@ -246,12 +246,33 @@ void keyboard_handle_scancode(uint8_t scancode) {
         return;
     }
     
-    // Clear E0 prefix for normal keys
-    e0_prefix = false;
-    
+    // Handle extended scancodes (arrow keys, etc.)
+    if (e0_prefix) {
+        e0_prefix = false;
+        // Emit ANSI escape sequences for arrow keys
+        // Up=0x48, Down=0x50, Left=0x4B, Right=0x4D
+        const char *seq = ((void*)0);
+        switch (scancode) {
+            case 0x48: seq = "\033[A"; break; // Up
+            case 0x50: seq = "\033[B"; break; // Down
+            case 0x4B: seq = "\033[D"; break; // Left
+            case 0x4D: seq = "\033[C"; break; // Right
+        }
+        if (seq) {
+            for (int si = 0; seq[si]; si++) {
+                size_t next_write = (write_index + 1) % KEYBOARD_BUFFER_SIZE;
+                if (next_write != read_index) {
+                    key_buffer[write_index] = seq[si];
+                    write_index = next_write;
+                }
+            }
+        }
+        return;
+    }
+
     // Convert scancode to ASCII
     char ascii = 0;
-    
+
     if (scancode < 128) {
         // Check if ANY shift key is pressed
         bool shift_pressed = left_shift_pressed || right_shift_pressed;
