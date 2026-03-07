@@ -26,7 +26,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest
 
 .PHONY: all clean libc
 
@@ -116,6 +116,11 @@ pipetest: pipetest.o
 simtest: simtest.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
 	@$(LD) $(LDFLAGS) -o $@ simtest.o $(LIBC)
+
+# Build Cluster test (Phase 11b, with libc)
+clustertest: clustertest.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ clustertest.o $(LIBC)
 
 %.o: %.c
 	@echo "Compiling user C: $<"

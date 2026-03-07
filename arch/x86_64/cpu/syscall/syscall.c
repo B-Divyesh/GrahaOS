@@ -17,6 +17,7 @@
 #include "../../drivers/e1000/e1000.h"
 #include "../../../../kernel/net/net.h"
 #include "../../../../kernel/fs/pipe.h"
+#include "../../../../kernel/fs/cluster.h"
 #include <stdbool.h>
 
 // Forward declarations for state collection (kernel/state.c)
@@ -1589,6 +1590,45 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                     dst[ci] = src[ci];
             }
             frame->rax = (uint64_t)(long)sim_ret;
+            break;
+        }
+
+        case SYS_CLUSTER_LIST: {
+            // Phase 11b: Get list of all clusters
+            // RDI = pointer to cluster_list_t
+            void *cl_buf = (void *)frame->rdi;
+            if (!cl_buf) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            cluster_list_t klist;
+            int cl_ret = cluster_get_list(&klist);
+            // Copy to user
+            uint8_t *cl_dst = (uint8_t *)cl_buf;
+            uint8_t *cl_src = (uint8_t *)&klist;
+            for (size_t ci = 0; ci < sizeof(cluster_list_t); ci++)
+                cl_dst[ci] = cl_src[ci];
+            frame->rax = (uint64_t)(long)cl_ret;
+            break;
+        }
+
+        case SYS_CLUSTER_MEMBERS: {
+            // Phase 11b: Get members of a specific cluster
+            // RDI = cluster_id, RSI = pointer to cluster_members_t
+            uint32_t cm_id = (uint32_t)frame->rdi;
+            void *cm_buf = (void *)frame->rsi;
+            if (!cm_buf || cm_id == 0) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            cluster_members_t kmembers;
+            int cm_ret = cluster_get_members(cm_id, &kmembers);
+            // Copy to user
+            uint8_t *cm_dst = (uint8_t *)cm_buf;
+            uint8_t *cm_src = (uint8_t *)&kmembers;
+            for (size_t ci = 0; ci < sizeof(cluster_members_t); ci++)
+                cm_dst[ci] = cm_src[ci];
+            frame->rax = (uint64_t)(long)cm_ret;
             break;
         }
 

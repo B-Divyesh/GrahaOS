@@ -1,6 +1,7 @@
 // kernel/fs/grahafs.c - COMPLETE FILE
 #include "grahafs.h"
 #include "simhash.h"
+#include "cluster.h"
 #include "vfs.h"
 #include "../../arch/x86_64/mm/pmm.h"
 #include "../../arch/x86_64/mm/vmm.h"
@@ -892,6 +893,9 @@ void grahafs_init(void) {
                  NULL, NULL, gfs_ops, 2, grahafs_get_driver_stats);
 }
 
+// Forward declaration for cluster rebuild (defined below)
+static void grahafs_cluster_rebuild_locked(void);
+
 // Mount function with robust diagnostics
 vfs_node_t* grahafs_mount(block_device_t* device) {
     serial_write("[GrahaFS] mount called\n");
@@ -1109,6 +1113,9 @@ vfs_node_t* grahafs_mount(block_device_t* device) {
     }
     
     vfs_set_root(root);
+
+    // Phase 11b: Rebuild in-memory cluster table from on-disk inodes
+    grahafs_cluster_rebuild_locked();
 
     serial_write("[GrahaFS] Root VFS node created, mount complete\n");
     spinlock_release(&grahafs_lock);
@@ -1594,6 +1601,38 @@ uint64_t grahafs_compute_simhash(uint32_t inode_num) {
     write_fs_block(inode.ai_metadata_block, ext_buf);
     pmm_free_page(ext_phys);
 
+    // Phase 11b: Auto-cluster — look up filename from root dir, then assign
+    {
+        grahafs_inode_t root_in;
+        char found_name[28];
+        found_name[0] = '\0';
+        if (read_inode(superblock.root_inode, &root_in) == 0 &&
+            root_in.direct_blocks[0] != 0) {
+            void *dir_phys = pmm_alloc_page();
+            if (dir_phys) {
+                void *dir_buf = (void *)((uint64_t)dir_phys + g_hhdm_offset);
+                if (read_fs_block(root_in.direct_blocks[0], dir_buf) == 0) {
+                    grahafs_dirent_t *entries = (grahafs_dirent_t *)dir_buf;
+                    int max_ent = GRAHAFS_BLOCK_SIZE / sizeof(grahafs_dirent_t);
+                    for (int i = 0; i < max_ent; i++) {
+                        if (entries[i].inode_num == inode_num) {
+                            strcpy(found_name, entries[i].name);
+                            break;
+                        }
+                    }
+                }
+                pmm_free_page(dir_phys);
+            }
+        }
+        if (found_name[0] != '\0') {
+            uint32_t cid = cluster_assign(inode_num, hash, found_name);
+            if (cid != 0) {
+                // Store cluster_id in ai_reserved[0..3]
+                *(uint32_t *)inode.ai_reserved = cid;
+            }
+        }
+    }
+
     write_inode(inode_num, &inode);
 
     if (fs_device && fs_device->device_id >= 0) {
@@ -1730,4 +1769,144 @@ int grahafs_find_similar(uint32_t ref_inode, int threshold,
     pmm_free_page(dir_phys);
     spinlock_release(&grahafs_lock);
     return (int)count;
+}
+
+// Phase 11b: Rebuild cluster table from on-disk inodes at mount time.
+// Must be called while grahafs_lock IS held (from grahafs_mount).
+static void grahafs_cluster_rebuild_locked(void) {
+    // cluster_init acquires its own lock (cluster_lock), which is fine
+    cluster_init();
+
+    grahafs_inode_t root_in;
+    if (read_inode(superblock.root_inode, &root_in) != 0) return;
+    if (root_in.direct_blocks[0] == 0) return;
+
+    void *dir_phys = pmm_alloc_page();
+    if (!dir_phys) return;
+    void *dir_buf = (void *)((uint64_t)dir_phys + g_hhdm_offset);
+
+    if (read_fs_block(root_in.direct_blocks[0], dir_buf) != 0) {
+        pmm_free_page(dir_phys);
+        return;
+    }
+
+    void *ext_phys = pmm_alloc_page();
+    if (!ext_phys) {
+        pmm_free_page(dir_phys);
+        return;
+    }
+    void *ext_buf = (void *)((uint64_t)ext_phys + g_hhdm_offset);
+
+    grahafs_dirent_t *entries = (grahafs_dirent_t *)dir_buf;
+    int max_ent = GRAHAFS_BLOCK_SIZE / sizeof(grahafs_dirent_t);
+
+    for (int i = 0; i < max_ent; i++) {
+        if (entries[i].inode_num == 0) continue;
+        if (entries[i].name[0] == '.' && (entries[i].name[1] == '\0' ||
+            (entries[i].name[1] == '.' && entries[i].name[2] == '\0')))
+            continue;
+
+        grahafs_inode_t file_inode;
+        if (read_inode(entries[i].inode_num, &file_inode) != 0) continue;
+        if (file_inode.type != GRAHAFS_INODE_TYPE_FILE) continue;
+        if (!(file_inode.ai_flags & GRAHAFS_AI_HAS_EMBEDDING)) continue;
+        if (file_inode.ai_metadata_block == 0) continue;
+
+        // Extract cluster_id from ai_reserved[0..3]
+        uint32_t cluster_id = *(uint32_t *)file_inode.ai_reserved;
+        if (cluster_id == 0) continue;
+
+        // Read extended metadata for SimHash
+        if (read_fs_block(file_inode.ai_metadata_block, ext_buf) != 0) continue;
+        grahafs_ai_metadata_block_t *ext = (grahafs_ai_metadata_block_t *)ext_buf;
+        if (ext->magic != GRAHAFS_AI_META_MAGIC || ext->embedding_dim < 1) continue;
+
+        uint64_t simhash = ext->embedding[0];
+        cluster_rebuild_add(entries[i].inode_num, cluster_id, simhash, entries[i].name);
+    }
+
+    cluster_rebuild_finalize();
+
+    pmm_free_page(ext_phys);
+    pmm_free_page(dir_phys);
+}
+
+// Phase 11b: Background indexer task
+// Periodically scans root directory for files without SimHash and auto-indexes them.
+// Only processes files directly in root (not in subdirectories like /illu/, /bin/, /etc/).
+extern volatile uint64_t g_timer_ticks;
+
+void grahafs_indexer_task(void) {
+    // Initial delay: 5 seconds (500 ticks at 100Hz)
+    uint64_t start = g_timer_ticks;
+    while (g_timer_ticks - start < 500) {
+        asm volatile("hlt");
+    }
+
+    serial_write("[Indexer] Background indexer started\n");
+
+    while (1) {
+        // Sleep 3 seconds (300 ticks)
+        uint64_t sleep_start = g_timer_ticks;
+        while (g_timer_ticks - sleep_start < 300) {
+            asm volatile("hlt");
+        }
+
+        if (!fs_mounted) continue;
+
+        // Scan root dir for first file without HAS_EMBEDDING
+        spinlock_acquire(&grahafs_lock);
+
+        grahafs_inode_t root_in;
+        if (read_inode(superblock.root_inode, &root_in) != 0) {
+            spinlock_release(&grahafs_lock);
+            continue;
+        }
+        if (root_in.direct_blocks[0] == 0) {
+            spinlock_release(&grahafs_lock);
+            continue;
+        }
+
+        void *dir_phys = pmm_alloc_page();
+        if (!dir_phys) {
+            spinlock_release(&grahafs_lock);
+            continue;
+        }
+        void *dir_buf = (void *)((uint64_t)dir_phys + g_hhdm_offset);
+
+        if (read_fs_block(root_in.direct_blocks[0], dir_buf) != 0) {
+            pmm_free_page(dir_phys);
+            spinlock_release(&grahafs_lock);
+            continue;
+        }
+
+        grahafs_dirent_t *entries = (grahafs_dirent_t *)dir_buf;
+        int max_ent = GRAHAFS_BLOCK_SIZE / sizeof(grahafs_dirent_t);
+        uint32_t target_inode = 0;
+
+        for (int i = 0; i < max_ent; i++) {
+            if (entries[i].inode_num == 0) continue;
+            if (entries[i].name[0] == '.' && (entries[i].name[1] == '\0' ||
+                (entries[i].name[1] == '.' && entries[i].name[2] == '\0')))
+                continue;
+
+            grahafs_inode_t fnode;
+            if (read_inode(entries[i].inode_num, &fnode) != 0) continue;
+            // Only index regular files (not directories)
+            if (fnode.type != GRAHAFS_INODE_TYPE_FILE) continue;
+            if (fnode.size == 0) continue;
+            if (fnode.ai_flags & GRAHAFS_AI_HAS_EMBEDDING) continue;
+
+            target_inode = entries[i].inode_num;
+            break;
+        }
+
+        pmm_free_page(dir_phys);
+        spinlock_release(&grahafs_lock);
+
+        if (target_inode != 0) {
+            // Compute SimHash (this also auto-clusters via the hook)
+            grahafs_compute_simhash(target_inode);
+        }
+    }
 }

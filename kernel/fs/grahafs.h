@@ -161,3 +161,6 @@ int grahafs_search_by_tag(const char *tag, grahafs_search_results_t *results, in
 uint64_t grahafs_compute_simhash(uint32_t inode_num);
 int grahafs_find_similar(uint32_t ref_inode, int threshold,
                          grahafs_search_results_t *results, int max_results);
+
+// Phase 11b: Background indexer task (auto-indexes files without SimHash)
+void grahafs_indexer_task(void);

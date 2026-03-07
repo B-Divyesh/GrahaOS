@@ -50,6 +50,8 @@ typedef long ssize_t;
 #define SYS_TRUNCATE         1049
 #define SYS_COMPUTE_SIMHASH  1050
 #define SYS_FIND_SIMILAR     1051
+#define SYS_CLUSTER_LIST     1052
+#define SYS_CLUSTER_MEMBERS  1053
 
 // Directory entry structure for user space
 typedef struct {
@@ -408,6 +410,29 @@ static inline int syscall_find_similar(const char *path, int threshold, void *re
     long ret;
     asm volatile("syscall" : "=a"(ret)
         : "a"(SYS_FIND_SIMILAR), "D"(path), "S"(threshold), "d"(results)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 11b: Get list of all clusters
+// buf: pointer to cluster_list_t
+// Returns: number of clusters, negative on error
+static inline int syscall_cluster_list(void *buf) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_CLUSTER_LIST), "D"(buf)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 11b: Get members of a specific cluster
+// cluster_id: 1-based cluster ID
+// buf: pointer to cluster_members_t
+// Returns: member count on success, negative on error
+static inline int syscall_cluster_members(uint32_t cluster_id, void *buf) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_CLUSTER_MEMBERS), "D"(cluster_id), "S"(buf)
         : "rcx", "r11", "memory");
     return (int)ret;
 }

@@ -56,3 +56,4 @@ user/aitest
 user/fdtest
 user/pipetest
 user/simtest
+user/clustertest

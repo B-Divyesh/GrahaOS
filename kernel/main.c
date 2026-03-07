@@ -535,6 +535,26 @@ void kmain(void) {
         y_pos += 20;
     }
 
+    // Create background indexer task (Phase 11b)
+    serial_write("Creating indexer task...\n");
+    int idx_task_id = sched_create_task(grahafs_indexer_task);
+    serial_write("sched_create_task (indexer) returned: ");
+    serial_write_dec(idx_task_id);
+    serial_write("\n");
+    {
+        task_t *idx_task = sched_get_task(idx_task_id);
+        if (idx_task) {
+            const char *n = "indexer";
+            int j = 0;
+            while (n[j] && j < 31) { idx_task->name[j] = n[j]; j++; }
+            idx_task->name[j] = '\0';
+        }
+    }
+    if (idx_task_id >= 0) {
+        framebuffer_draw_string("Indexer task created successfully", 50, y_pos, COLOR_GREEN, 0x00101828);
+        y_pos += 20;
+    }
+
     // Wait for all CPUs to stabilize
     framebuffer_draw_string("Waiting for all CPUs to stabilize...", 50, y_pos, COLOR_YELLOW, 0x00101828);
     for (volatile int i = 0; i < 1000000; i++) {

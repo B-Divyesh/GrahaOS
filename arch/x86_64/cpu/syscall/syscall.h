@@ -80,6 +80,10 @@
 #define SYS_COMPUTE_SIMHASH 1050
 #define SYS_FIND_SIMILAR    1051
 
+// Phase 11b: Sequential Leader Clustering
+#define SYS_CLUSTER_LIST    1052
+#define SYS_CLUSTER_MEMBERS 1053
+
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);
 

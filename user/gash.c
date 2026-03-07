@@ -2,6 +2,7 @@
 #include "syscalls.h"
 #include "../kernel/state.h"
 #include "../kernel/fs/grahafs.h"
+#include "../kernel/fs/cluster.h"
 #include "json.h"
 
 // Helper functions
@@ -1354,6 +1355,100 @@ void cmd_similar(const char *path, int threshold) {
     }
 }
 
+// --- Phase 11b: Cluster Commands ---
+
+void cmd_clusters(void) {
+    cluster_list_t list;
+    zero_mem(&list, sizeof(list));
+
+    int ret = syscall_cluster_list(&list);
+    if (ret < 0) {
+        print("clusters: failed to get cluster list\n");
+        return;
+    }
+
+    print("Active clusters: ");
+    char buf[12];
+    uint64_to_str(list.count, buf);
+    print(buf);
+    print("\n");
+
+    if (list.count == 0) {
+        print("  (none — run 'simhash <file>' to start clustering)\n");
+        return;
+    }
+
+    for (uint32_t i = 0; i < list.count; i++) {
+        print("  Cluster ");
+        uint64_to_str(list.clusters[i].id, buf);
+        print(buf);
+        print(": leader=");
+        print(list.clusters[i].name);
+        print("  members=");
+        uint64_to_str(list.clusters[i].member_count, buf);
+        print(buf);
+        print("  centroid=");
+        char hbuf[20];
+        hex64(list.clusters[i].centroid, hbuf);
+        print(hbuf);
+        print("\n");
+    }
+}
+
+void cmd_cluster(const char *id_str) {
+    if (!id_str || id_str[0] == '\0') {
+        print("cluster: usage: cluster <id>\n");
+        return;
+    }
+
+    // Parse cluster ID
+    uint32_t cid = 0;
+    for (int i = 0; id_str[i]; i++) {
+        if (id_str[i] >= '0' && id_str[i] <= '9')
+            cid = cid * 10 + (id_str[i] - '0');
+    }
+    if (cid == 0) {
+        print("cluster: invalid cluster ID\n");
+        return;
+    }
+
+    cluster_members_t members;
+    zero_mem(&members, sizeof(members));
+
+    int ret = syscall_cluster_members(cid, &members);
+    if (ret < 0) {
+        print("cluster: cluster ");
+        char buf[12];
+        uint64_to_str(cid, buf);
+        print(buf);
+        print(" not found\n");
+        return;
+    }
+
+    print("Cluster ");
+    char buf[12];
+    uint64_to_str(members.cluster_id, buf);
+    print(buf);
+    print(" (leader: ");
+    print(members.leader_name);
+    print(", ");
+    uint64_to_str(members.count, buf);
+    print(buf);
+    print(" members):\n");
+
+    for (uint32_t i = 0; i < members.count; i++) {
+        print("  ");
+        print(members.members[i].name);
+        print("  distance=");
+        int_to_string(members.members[i].distance, buf);
+        print(buf);
+        if (i == 0 && members.members[i].distance == 0) {
+            print(" (leader)");
+        }
+        print("\n");
+    }
+}
+
 // --- Phase 8d: CAN Event Commands ---
 
 void cmd_watch(const char *name) {
@@ -2277,6 +2372,8 @@ static int execute_builtin(char *argv[], int argc) {
         print("  search <tag>        - Search files by tag\n");
         print("  simhash <file>      - Compute & show SimHash fingerprint\n");
         print("  similar <file> [n]  - Find similar files (threshold n)\n");
+        print("  clusters            - List all file clusters\n");
+        print("  cluster <id>        - Show members of a cluster\n");
         print("  watch <cap>         - Watch capability state changes\n");
         print("  unwatch <cap>       - Stop watching a capability\n");
         print("  events              - Show pending CAN events\n");
@@ -2456,6 +2553,18 @@ static int execute_builtin(char *argv[], int argc) {
                 if (thr == 0) thr = 10;
             }
             cmd_similar(argv[1], thr);
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "clusters") == 0) {
+        cmd_clusters();
+        return 1;
+    }
+    else if (strcmp(cmd, "cluster") == 0) {
+        if (argc < 2) {
+            print("cluster: usage: cluster <id>\n");
+        } else {
+            cmd_cluster(argv[1]);
         }
         return 1;
     }
