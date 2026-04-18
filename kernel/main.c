@@ -29,6 +29,9 @@
 #include "fs/grahafs.h"
 #include "../arch/x86_64/drivers/serial/serial.h"
 #include "capability.h"
+#include "cmdline.h"
+#include "autorun.h"
+#include "log.h"
 
 // --- Limine Requests ---
 __attribute__((used, section(".limine_requests")))
@@ -71,6 +74,15 @@ static volatile struct limine_hhdm_request hhdm_request = {
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_module_request module_request = {
     .id = LIMINE_MODULE_REQUEST,
+    .revision = 0,
+    .response = NULL
+};
+
+// Phase 12: kernel command-line request. Parsed after serial_init so
+// autorun=, quiet=, test_timeout_seconds= are available to boot logic.
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_executable_cmdline_request cmdline_request = {
+    .id = LIMINE_EXECUTABLE_CMDLINE_REQUEST,
     .revision = 0,
     .response = NULL
 };
@@ -193,27 +205,75 @@ void kmain(void) {
 
     // Initialize serial port FIRST for logging
     serial_init();
-    serial_write("\n=== GrahaOS Boot Log ===\n");
-    serial_write("Serial port initialized\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "\n=== GrahaOS Boot Log ===\nSerial port initialized");
+
+    // Phase 12: parse the kernel command line. Populates g_cmdline_flags
+    // so every subsequent boot step can see autorun/quiet/timeout values.
+    {
+        const char *raw = NULL;
+        if (cmdline_request.response && cmdline_request.response->cmdline) {
+            raw = cmdline_request.response->cmdline;
+        }
+        cmdline_parse(raw);
+    }
+
+    // Phase 13 fault injection: optionally emit klog calls BEFORE
+    // klog_init so the early-drop counter has work to do. Each call
+    // bumps g_early_drops; klog_init then surfaces the count via a
+    // retrospective KLOG_WARN entry.
+    if (g_cmdline_flags.inject_klog_preinit) {
+        for (uint32_t i = 0; i < g_cmdline_flags.inject_klog_preinit; i++) {
+            klog(KLOG_INFO, SUBSYS_CORE, "preinit test message %u", i);
+        }
+    }
+
+    // Phase 13: bring up the klog ring. From this point on every
+    // subsystem should log via klog() rather than serial_write().
+    // The mirror-to-serial flag is still on by default so early boot
+    // output keeps flowing through COM1; cmdline `klog_mirror=0`
+    // overrides for boot-time perf measurement (spec exit criterion).
+    klog_init();
+    if (g_cmdline_flags.klog_mirror == 0) {
+        klog_disable_mirror();
+        klog(KLOG_INFO, SUBSYS_CORE, "klog: mirror disabled via cmdline");
+    }
+
+    // Phase 13 fault injection: deliberately wrap the ring. Writing
+    // > 16384 entries forces head to wrap; downstream readers must
+    // see a contiguous tail and notice seq gaps where entries fell
+    // off the front.
+    if (g_cmdline_flags.inject_ring_wrap) {
+        uint32_t target = g_cmdline_flags.inject_ring_wrap;
+        for (uint32_t i = 0; i < target; i++) {
+            klog(KLOG_INFO, SUBSYS_TEST, "ring-wrap probe %u", i);
+        }
+    }
+    klog(KLOG_INFO, SUBSYS_CORE, "GrahaOS boot — build=%s",
+#ifdef GRAHAOS_BUILD_SHA
+         GRAHAOS_BUILD_SHA
+#else
+         "unknown"
+#endif
+    );
 
     // Register hardware base capabilities (always ON, no deps)
     // Must happen after serial_init (for logging) but before driver inits
-    serial_write("Registering hardware capabilities...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Registering hardware capabilities...");
     cap_register("cpu", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
     cap_register("memory", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
     cap_register("interrupt_controller", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
     cap_register("pci_bus", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
     cap_register("framebuffer_hw", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
-    serial_write("Hardware capabilities registered\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Hardware capabilities registered");
 
     // Initialize framebuffer for early output
     if (!framebuffer_init(&framebuffer_request)) {
-        serial_write("ERROR: Framebuffer init failed!\n");
+        klog(KLOG_ERROR, SUBSYS_CORE, "ERROR: Framebuffer init failed!");
         hcf();
     }
 
     framebuffer_clear(0x00101828);
-    serial_write("Framebuffer initialized\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Framebuffer initialized");
 
     // Display boot banner
     framebuffer_draw_rect(50, 50, 600, 140, COLOR_GRAHA_BLUE);
@@ -234,219 +294,218 @@ void kmain(void) {
     // --- CRITICAL: CORRECT INITIALIZATION ORDER ---
     
     // 1. Initialize Physical Memory Manager
-    serial_write("Initializing PMM...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Initializing PMM...");
     pmm_init(memmap_request.response);
     framebuffer_draw_string("PMM Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    serial_write("PMM initialized successfully\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "PMM initialized successfully");
     y_pos += 20;
 
     // 2. Initialize Virtual Memory Manager and enable paging
-    serial_write("Initializing VMM...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Initializing VMM...");
     vmm_init(memmap_request.response, framebuffer_request.response,
              kernel_phys_base, kernel_virt_base, hhdm_offset);
     framebuffer_init(&framebuffer_request);  // Reinitialize after paging
     framebuffer_draw_string("VMM Initialized. Paging is now active!", 50, y_pos, COLOR_GREEN, 0x00101828);
-    serial_write("VMM initialized, paging active\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "VMM initialized, paging active");
     y_pos += 20;
     
     // 3. CRITICAL: Initialize SMP FIRST (sets up GDT/TSS for BSP and starts APs)
     // This also initializes LAPIC and LAPIC timer for all CPUs
-    serial_write("About to initialize SMP...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "About to initialize SMP...");
     #if LIMINE_API_REVISION >= 1
-        serial_write("Calling smp_init (mp_request)...\n");
+        klog(KLOG_INFO, SUBSYS_CORE, "Calling smp_init (mp_request)...");
         smp_init(&mp_request);
     #else
-        serial_write("Calling smp_init (smp_request)...\n");
+        klog(KLOG_INFO, SUBSYS_CORE, "Calling smp_init (smp_request)...");
         smp_init(&smp_request);
     #endif
-    serial_write("SMP initialized successfully\n");
-    serial_write("Drawing framebuffer message...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "SMP initialized successfully\nDrawing framebuffer message...");
     framebuffer_draw_string("SMP Initialized - All CPUs online!", 50, y_pos, COLOR_GREEN, 0x00101828);
-    serial_write("Framebuffer drawn OK\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Framebuffer drawn OK");
     y_pos += 20;
 
     // 4. NOW we can initialize IDT (after GDT is set up)
-    serial_write("About to initialize IDT...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "About to initialize IDT...");
     idt_init();
-    serial_write("IDT initialized successfully\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "IDT initialized successfully");
     framebuffer_draw_string("IDT Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
     // 5. Initialize scheduler (after per-CPU structures exist)
-    serial_write("About to initialize scheduler...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "About to initialize scheduler...");
     sched_init();
-    serial_write("Scheduler initialized successfully\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Scheduler initialized successfully");
     framebuffer_draw_string("Scheduler Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
     
     // 6. Initialize syscall interface (after per-CPU structures exist)
-    serial_write("About to initialize syscalls...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "About to initialize syscalls...");
     syscall_init();
-    serial_write("Syscalls initialized successfully\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Syscalls initialized successfully");
     framebuffer_draw_string("Syscall Interface Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
     // 7. Initialize Virtual File System
-    serial_write("About to initialize VFS...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "About to initialize VFS...");
     vfs_init();
-    serial_write("VFS initialized successfully\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "VFS initialized successfully");
 
     // Phase 10b: Initialize pipe subsystem
     pipe_init();
-    serial_write("Pipe subsystem initialized\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Pipe subsystem initialized");
 
     framebuffer_draw_string("VFS Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 40;
 
     //adding AHCI
-    serial_write("About to initialize AHCI...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "About to initialize AHCI...");
     ahci_init();
-    serial_write("AHCI initialized successfully\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "AHCI initialized successfully");
     y_pos += 20;
 
     // Initialize E1000 NIC driver
-    serial_write("About to initialize E1000 NIC...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "About to initialize E1000 NIC...");
     e1000_init();
-    serial_write("E1000 initialization complete\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "E1000 initialization complete");
     y_pos += 20;
 
     // Initialize Mongoose TCP/IP stack
-    serial_write("About to initialize network stack...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "About to initialize network stack...");
     net_init();
-    serial_write("Network stack initialization complete\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Network stack initialization complete");
     y_pos += 20;
 
     // Initialize filesystem AFTER a small delay to let AHCI stabilize
-    serial_write("Waiting for AHCI to stabilize...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Waiting for AHCI to stabilize...");
     for (volatile int i = 0; i < 1000000; i++) {
         asm volatile("pause");
     }
-    serial_write("AHCI stabilized\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "AHCI stabilized");
 
     framebuffer_draw_string("Mounting GrahaFS filesystem...", 10, y_pos, COLOR_YELLOW, 0x00101828);
     y_pos += 20;
 
     // Initialize GrahaFS driver
-    serial_write("Initializing GrahaFS driver...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Initializing GrahaFS driver...");
     grahafs_init();
-    serial_write("GrahaFS driver initialized\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "GrahaFS driver initialized");
 
     // Get first block device (disk 0)
-    serial_write("About to call vfs_get_block_device(0)...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "About to call vfs_get_block_device(0)...");
     block_device_t* hdd = vfs_get_block_device(0);
-    serial_write("vfs_get_block_device(0) returned: ");
-    serial_write_hex((uint64_t)hdd);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "vfs_get_block_device(0) returned: 0x%lx", (unsigned long)((uint64_t)hdd));
 
     if (hdd) {
-        serial_write("Block device found, drawing framebuffer msg...\n");
+        klog(KLOG_INFO, SUBSYS_CORE, "Block device found, drawing framebuffer msg...");
         framebuffer_draw_string("Found block device 0", 10, y_pos, COLOR_GREEN, 0x00101828);
-        serial_write("Framebuffer msg drawn\n");
+        klog(KLOG_INFO, SUBSYS_CORE, "Framebuffer msg drawn");
         y_pos += 20;
 
-        serial_write("About to call grahafs_mount...\n");
+        klog(KLOG_INFO, SUBSYS_CORE, "About to call grahafs_mount...");
         vfs_node_t* root = grahafs_mount(hdd);
-        serial_write("grahafs_mount returned: ");
-        serial_write_hex((uint64_t)root);
-        serial_write("\n");
+        klog(KLOG_INFO, SUBSYS_CORE, "grahafs_mount returned: 0x%lx", (unsigned long)((uint64_t)root));
 
         if (root) {
-            serial_write("Mount successful, drawing success msg...\n");
+            klog(KLOG_INFO, SUBSYS_CORE, "Mount successful, drawing success msg...");
             framebuffer_draw_string("GrahaFS mounted successfully on /", 10, y_pos, COLOR_GREEN, 0x00101828);
-            serial_write("Success msg drawn\n");
+            klog(KLOG_INFO, SUBSYS_CORE, "Success msg drawn");
             y_pos += 20;
         } else {
-            serial_write("Mount failed, drawing error msgs...\n");
+            klog(KLOG_ERROR, SUBSYS_CORE, "Mount failed, drawing error msgs...");
             framebuffer_draw_string("Failed to mount GrahaFS!", 10, y_pos, COLOR_RED, 0x00101828);
             framebuffer_draw_string("Disk may need formatting with mkfs.gfs", 10, y_pos + 20, COLOR_YELLOW, 0x00101828);
-            serial_write("Error msgs drawn\n");
+            klog(KLOG_ERROR, SUBSYS_CORE, "Error msgs drawn");
             y_pos += 40;
         }
     } else {
-        serial_write("No block device found, drawing error msg...\n");
+        klog(KLOG_ERROR, SUBSYS_CORE, "No block device found, drawing error msg...");
         framebuffer_draw_string("No block device found!", 10, y_pos, COLOR_RED, 0x00101828);
-        serial_write("Error msg drawn\n");
+        klog(KLOG_ERROR, SUBSYS_CORE, "Error msg drawn");
         y_pos += 20;
     }
 
     // --- USER SPACE INITIALIZATION ---
-    serial_write("=== USER SPACE INITIALIZATION ===\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "=== USER SPACE INITIALIZATION ===");
     framebuffer_draw_string("=== Loading Interactive Shell ===", 50, y_pos, COLOR_WHITE, 0x00101828);
     y_pos += 30;
 
     // Initialize Initial RAM Disk
-    serial_write("Initializing initrd...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Initializing initrd...");
     initrd_init(&module_request);
-    serial_write("Initrd initialized\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Initrd initialized");
     framebuffer_draw_string("Initrd initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
-    // Locate shell binary in initrd
-    serial_write("Looking up bin/gash in initrd...\n");
+    // Phase 12: init-process selection. autorun_decide() returns either
+    // "bin/gash" (default) or "bin/<name>" if the kernel command line
+    // supplied autorun=<name>.
+    const char *init_path = autorun_decide();
+    klog(KLOG_INFO, SUBSYS_CORE, "Looking up %s in initrd...", init_path);
     size_t gash_size;
-    void *gash_data = initrd_lookup("bin/gash", &gash_size);
+    void *gash_data = initrd_lookup(init_path, &gash_size);
     if (!gash_data) {
-        serial_write("FATAL: Could not find bin/gash in initrd!\n");
-        framebuffer_draw_string("FATAL: Could not find bin/gash in initrd!", 50, y_pos, COLOR_RED, 0x00101828);
+        klog(KLOG_FATAL, SUBSYS_CORE, "FATAL: Could not find init binary in initrd: %s", init_path);
+        klog(KLOG_INFO, SUBSYS_CORE, "");
+        framebuffer_draw_string("FATAL: Could not find init binary in initrd!", 50, y_pos, COLOR_RED, 0x00101828);
         hcf();
     }
-    serial_write("Found bin/gash, size=");
-    serial_write_dec(gash_size);
-    serial_write("\n");
-    framebuffer_draw_string("Found bin/gash (shell) in initrd.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    klog(KLOG_INFO, SUBSYS_CORE, "Found init binary, size=%lu", (unsigned long)(gash_size));
+    framebuffer_draw_string("Found init binary in initrd.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
     // Load shell ELF binary
-    serial_write("About to call elf_load for gash...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "About to call elf_load for init...");
     uint64_t entry_point, cr3;
     if (!elf_load(gash_data, &entry_point, &cr3)) {
-        serial_write("FATAL: elf_load failed!\n");
+        klog(KLOG_FATAL, SUBSYS_CORE, "FATAL: elf_load failed!");
         framebuffer_draw_string("FATAL: Failed to load shell ELF file!", 50, y_pos, COLOR_RED, 0x00101828);
         hcf();
     }
-    serial_write("elf_load succeeded! entry_point=");
-    serial_write_hex(entry_point);
-    serial_write(" cr3=");
-    serial_write_hex(cr3);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "elf_load succeeded! entry_point=0x%lx cr3=0x%lx", (unsigned long)(entry_point), (unsigned long)(cr3));
 
-    serial_write("Drawing 'Shell loaded' message...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Drawing 'Shell loaded' message...");
     framebuffer_draw_string("Shell loaded successfully into memory.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    serial_write("Message drawn\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Message drawn");
     y_pos += 20;
 
     // Create shell process
-    serial_write("Creating shell process...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Creating shell process...");
     int process_id = sched_create_user_process(entry_point, cr3);
     if (process_id < 0) {
-        serial_write("ERROR: Failed to create shell process!\n");
+        klog(KLOG_ERROR, SUBSYS_CORE, "ERROR: Failed to create shell process!");
         framebuffer_draw_string("FATAL: Failed to create shell process!", 50, y_pos, COLOR_RED, 0x00101828);
         hcf();
     }
-    serial_write("Shell process created, ID=");
-    serial_write_dec(process_id);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Shell process created, ID=%lu", (unsigned long)(process_id));
 
-    // Set process name for the shell
+    // Phase 12: remember the init PID so SYS_EXIT can trigger shutdown
+    // when autorun is active.
+    autorun_register_init_pid(process_id);
+
+    // Set process name for the shell. Use the last '/'-separated
+    // component of init_path so `autorun=ktest` shows up as "ktest".
     {
         task_t *shell_task = sched_get_task(process_id);
         if (shell_task) {
-            const char *n = "gash";
+            const char *base = init_path;
+            for (const char *p = init_path; *p; p++) {
+                if (*p == '/') base = p + 1;
+            }
             int j = 0;
-            while (n[j] && j < 31) { shell_task->name[j] = n[j]; j++; }
+            while (base[j] && j < 31) { shell_task->name[j] = base[j]; j++; }
             shell_task->name[j] = '\0';
         }
     }
 
-    serial_write("Drawing 'Shell process created' message...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Drawing 'Shell process created' message...");
     framebuffer_draw_string("Shell process created.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    serial_write("Message drawn\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Message drawn");
     y_pos += 20;
 
     // Initialize keyboard hardware BEFORE creating the polling task
-    serial_write("Initializing keyboard...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Initializing keyboard...");
     keyboard_init();
-    serial_write("Keyboard initialized\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Keyboard initialized");
     framebuffer_draw_string("Keyboard hardware initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
@@ -484,11 +543,9 @@ void kmain(void) {
     void (*task_func)(void) = (void (*)(void))func_addr;
 
     // Create the task with explicit type casting
-    serial_write("Creating keyboard task...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Creating keyboard task...");
     int kbd_task_id = sched_create_task(task_func);
-    serial_write("sched_create_task returned: ");
-    serial_write_dec(kbd_task_id);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "sched_create_task returned: %lu", (unsigned long)(kbd_task_id));
 
     // Set task name for keyboard polling
     {
@@ -516,11 +573,9 @@ void kmain(void) {
     }
 
     // Create Mongoose polling task
-    serial_write("Creating mongoose poll task...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Creating mongoose poll task...");
     int mg_task_id = sched_create_task(mongoose_poll_task);
-    serial_write("sched_create_task (mongoose) returned: ");
-    serial_write_dec(mg_task_id);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "sched_create_task (mongoose) returned: %lu", (unsigned long)(mg_task_id));
     {
         task_t *mg_task = sched_get_task(mg_task_id);
         if (mg_task) {
@@ -536,11 +591,9 @@ void kmain(void) {
     }
 
     // Create background indexer task (Phase 11b)
-    serial_write("Creating indexer task...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Creating indexer task...");
     int idx_task_id = sched_create_task(grahafs_indexer_task);
-    serial_write("sched_create_task (indexer) returned: ");
-    serial_write_dec(idx_task_id);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "sched_create_task (indexer) returned: %lu", (unsigned long)(idx_task_id));
     {
         task_t *idx_task = sched_get_task(idx_task_id);
         if (idx_task) {
@@ -594,35 +647,35 @@ void kmain(void) {
     }
     
     // Enable interrupts FIRST (but no timers running yet)
-    serial_write("About to enable interrupts...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "About to enable interrupts...");
     framebuffer_draw_string("Enabling interrupts...", 10, 50, COLOR_YELLOW, 0x00101828);
     asm volatile("sti");
-    serial_write("Interrupts enabled\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Interrupts enabled");
 
     // Wait to ensure no pending issues
-    serial_write("Waiting after STI...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Waiting after STI...");
     for (volatile int i = 0; i < 1000000; i++) {
         asm volatile("pause");
     }
-    serial_write("Wait complete\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Wait complete");
 
     // NOW start the timer on BSP only
-    serial_write("About to start scheduler timer...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "About to start scheduler timer...");
     framebuffer_draw_string("Starting scheduler timer on BSP...", 10, 70, COLOR_YELLOW, 0x00101828);
     
     // Disable interrupts briefly while starting timer
     asm volatile("cli");
-    serial_write("Calling lapic_timer_init...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Calling lapic_timer_init...");
     lapic_timer_init(100, 32);
-    serial_write("lapic_timer_init returned\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "lapic_timer_init returned");
     asm volatile("sti");
-    serial_write("Re-enabled interrupts after timer init\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Re-enabled interrupts after timer init");
 
     if (!lapic_timer_is_running()) {
-        serial_write("ERROR: Timer failed to start!\n");
+        klog(KLOG_ERROR, SUBSYS_CORE, "ERROR: Timer failed to start!");
         framebuffer_draw_string("ERROR: Timer failed to start!", 10, 90, COLOR_RED, 0x00101828);
     } else {
-        serial_write("Timer is running, system initialized!\n");
+        klog(KLOG_INFO, SUBSYS_CORE, "Timer is running, system initialized!");
         framebuffer_draw_string("System running!", 10, 90, COLOR_GREEN, 0x00101828);
     }
     
@@ -632,7 +685,7 @@ void kmain(void) {
     // For now, only BSP handles scheduling
 
     // Register service and application capabilities
-    serial_write("Registering service/application capabilities...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Registering service/application capabilities...");
     {
         const char *sched_deps[] = {"timer", "memory"};
         cap_register("scheduler", CAP_SERVICE, 0, -1, sched_deps, 2,
@@ -644,14 +697,13 @@ void kmain(void) {
     }
 
     // Activate all registered capabilities
-    serial_write("Activating all capabilities...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "Activating all capabilities...");
     for (int i = 0; i < cap_get_count(); i++) {
         cap_activate(i);
     }
-    serial_write("All capabilities activated\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "All capabilities activated");
 
-    serial_write("\n=== ENTERING IDLE LOOP ===\n");
-    serial_write("System fully initialized, waiting for timer interrupts...\n\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "\n=== ENTERING IDLE LOOP ===\nSystem fully initialized, waiting for timer interrupts...\n");
 
     // Main idle loop
     uint64_t loop_count = 0;

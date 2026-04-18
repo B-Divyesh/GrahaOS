@@ -60,6 +60,8 @@ void state_collect_filesystem(state_filesystem_t *out) {
     out->grahafs_block_size = 4096;  // GRAHAFS_BLOCK_SIZE
 }
 
+extern volatile uint64_t g_timer_ticks;
+
 void state_collect_system(state_system_t *out) {
     if (!out) return;
     state_memset(out, 0, sizeof(*out));
@@ -68,6 +70,8 @@ void state_collect_system(state_system_t *out) {
     out->bsp_lapic_id = g_bsp_lapic_id;
     out->schedule_count = schedule_count;
     out->context_switches = context_switches;
+    // Phase 12: expose LAPIC 100 Hz tick count (divide by 100 for seconds).
+    out->uptime_ticks = g_timer_ticks;
 
     uint32_t entries = g_cpu_count;
     if (entries > STATE_MAX_CPUS) entries = STATE_MAX_CPUS;

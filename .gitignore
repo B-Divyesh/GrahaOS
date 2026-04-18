@@ -34,10 +34,15 @@ claude.md
 *.gdb
 *.exp
 
+# Personal development files (specs, phase problem logs, planning)
+specs/
+problems/
+
 # Build artifacts
 scripts/mkfs.gfs
 initrd_root/
 iso_root/
+build/
 
 # Compiled user programs (not .c source)
 user/gash

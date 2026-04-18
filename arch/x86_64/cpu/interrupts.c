@@ -5,6 +5,10 @@
 #include "../../drivers/keyboard/keyboard.h"
 #include "../../drivers/lapic/lapic.h"
 #include "../../drivers/serial/serial.h"
+#include "../../../kernel/watchdog.h"
+#include "../../../kernel/panic.h"
+#include "../../../kernel/vsnprintf.h"
+#include "../../../kernel/log.h"
 
 // Global timer tick counter
 volatile uint64_t g_timer_ticks = 0;
@@ -194,11 +198,7 @@ void interrupt_handler(struct interrupt_frame *frame) {
             // Kill the user process instead of halting the entire system
             task_t *current = sched_get_current_task();
             if (current) {
-                serial_write("[PF] Killing user process ");
-                serial_write_dec(current->id);
-                serial_write(" (page fault at ");
-                serial_write_hex(fault_addr);
-                serial_write(")\n");
+                klog(KLOG_INFO, SUBSYS_CORE, "[PF] Killing user process %lu (page fault at 0x%lx)", (unsigned long)(current->id), (unsigned long)(fault_addr));
                 current->exit_status = 128 + 14;  // SIGSEGV-like
                 current->state = TASK_STATE_ZOMBIE;
                 sched_orphan_children(current->id);
@@ -208,8 +208,13 @@ void interrupt_handler(struct interrupt_frame *frame) {
             return;
         }
 
-        // Kernel mode page fault is still fatal
-        hcf();
+        // Phase 13: kernel-mode page fault now emits a parseable
+        // ==OOPS== frame via kpanic_at instead of silently halting.
+        char reason[96];
+        ksnprintf(reason, sizeof(reason),
+                  "page fault at 0x%lx err=0x%lx rip=0x%lx",
+                  fault_addr, frame->err_code, frame->rip);
+        kpanic_at(frame, reason);
     }
 
     if (frame->int_no < 32) {
@@ -265,13 +270,7 @@ void interrupt_handler(struct interrupt_frame *frame) {
             // Kill the user process instead of halting the entire system
             task_t *current = sched_get_current_task();
             if (current) {
-                serial_write("[EXCEPTION] Killing user process ");
-                serial_write_dec(current->id);
-                serial_write(" (exception #");
-                serial_write_dec(frame->int_no);
-                serial_write(" at RIP=");
-                serial_write_hex(frame->rip);
-                serial_write(")\n");
+                klog(KLOG_INFO, SUBSYS_CORE, "[EXCEPTION] Killing user process %lu (exception #%lu at RIP=0x%lx)", (unsigned long)(current->id), (unsigned long)(frame->int_no), (unsigned long)(frame->rip));
                 current->exit_status = 128 + frame->int_no;
                 current->state = TASK_STATE_ZOMBIE;
                 sched_orphan_children(current->id);
@@ -283,33 +282,36 @@ void interrupt_handler(struct interrupt_frame *frame) {
             framebuffer_draw_string("KERNEL MODE crash", 10, 70, COLOR_YELLOW, COLOR_RED);
 
             // Log kernel crash to serial for debugging
-            serial_write("[KERNEL CRASH] Exception #");
-            serial_write_dec(frame->int_no);
+            klog(KLOG_INFO, SUBSYS_CORE, "[KERNEL CRASH] Exception #%lu", (unsigned long)(frame->int_no));
             if (frame->int_no < 20) {
-                serial_write(" (");
-                serial_write(exception_names[frame->int_no]);
-                serial_write(")");
+                klog(KLOG_INFO, SUBSYS_CORE, " (%s)", exception_names[frame->int_no]);
             }
-            serial_write(" at RIP=");
-            serial_write_hex(frame->rip);
-            serial_write(" RSP=");
-            serial_write_hex(frame->rsp);
-            serial_write(" ERR=");
-            serial_write_hex(frame->err_code);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_CORE, " at RIP=0x%lx RSP=0x%lx ERR=0x%lx", (unsigned long)(frame->rip), (unsigned long)(frame->rsp), (unsigned long)(frame->err_code));
         }
 
-        // Kernel mode exception is still fatal
-        hcf();
+        // Phase 13: kernel-mode CPU exception → parseable oops frame.
+        // The framebuffer banner above stays for the human watching
+        // QEMU; serial gets the structured ==OOPS== block.
+        char ex_reason[96];
+        const char *exname = (frame->int_no < 20)
+                                 ? exception_names[frame->int_no]
+                                 : "unknown";
+        ksnprintf(ex_reason, sizeof(ex_reason),
+                  "exception #%lu (%s) at rip=0x%lx err=0x%lx",
+                  frame->int_no, exname, frame->rip, frame->err_code);
+        kpanic_at(frame, ex_reason);
     } else if (frame->int_no >= 32 && frame->int_no < 256) {
         // Hardware interrupt
         switch (frame->int_no) {
             case 32: // IRQ0: Timer (now from LAPIC timer)
                 g_timer_ticks++;
+                // Phase 12: TEST_TIMEOUT watchdog piggybacks on the
+                // timer tick. No-op unless armed via watchdog_arm().
+                watchdog_tick(g_timer_ticks);
                 // Note: Minimal logging to avoid slowing down interrupts
                 static volatile uint32_t timer_tick_count = 0;
                 if ((timer_tick_count++ & 0xFF) == 0) {  // Log every 256 ticks
-                    serial_write("[TIMER] Tick\n");
+                    klog(KLOG_INFO, SUBSYS_CORE, "[TIMER] Tick");
                 }
                 schedule(frame);
                 break;

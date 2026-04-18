@@ -9,6 +9,8 @@
 #include "../../../../kernel/elf.h"
 #include "../../../../kernel/initrd.h"
 #include "../../../../kernel/fs/pipe.h"
+#include "../../../../kernel/panic.h"
+#include "../../../../kernel/log.h"
 
 static task_t tasks[MAX_TASKS];
 static int next_task_id = 0;
@@ -354,7 +356,7 @@ void schedule(struct interrupt_frame *frame) {
     // Minimal logging for debugging context switches
     static volatile uint32_t sched_log_count = 0;
     if ((sched_log_count++ & 0xFF) == 0) {  // Log every 256 calls
-        serial_write("[SCHED] schedule() called\n");
+        klog(KLOG_INFO, SUBSYS_SCHED, "[SCHED] schedule() called");
     }
     
     // Validate frame
@@ -431,11 +433,7 @@ void schedule(struct interrupt_frame *frame) {
             static uint8_t task_switched[MAX_TASKS] = {0};
             if (!task_switched[next_index]) {
                 task_switched[next_index] = 1;
-                serial_write("[SCHED] First switch to task ");
-                serial_write_dec(next_index);
-                serial_write(" (id=");
-                serial_write_dec(tasks[next_index].id);
-                serial_write(")\n");
+                klog(KLOG_INFO, SUBSYS_SCHED, "[SCHED] First switch to task %lu (id=%lu)", (unsigned long)(next_index), (unsigned long)(tasks[next_index].id));
             }
             break;
         }
@@ -475,13 +473,17 @@ void schedule(struct interrupt_frame *frame) {
             // The idle task should always exist and never be in zombie state
             current_task_index = 0;
             if (tasks[0].state == TASK_STATE_ZOMBIE) {
-                // Kernel panic - no runnable task at all
-                serial_write("[SCHED] PANIC: No runnable tasks!\n");
+                // Phase 13: route through klog FATAL + kpanic so the
+                // post-mortem ring carries the cause. Release the
+                // sched lock first — kpanic will not try to grab it,
+                // but a stuck lock could complicate cleanup if any
+                // future kpanic helper ever does.
+                klog(KLOG_FATAL, SUBSYS_SCHED,
+                     "no runnable tasks (idle task is zombie)");
                 sched_lock.owner = (uint64_t)-1;
                 sched_lock.count = 0;
                 __atomic_clear(&sched_lock.locked, __ATOMIC_RELEASE);
-                asm volatile("cli; hlt");
-                while(1);
+                kpanic("no runnable tasks");
             }
             tasks[0].state = TASK_STATE_RUNNING;
         }
@@ -498,11 +500,7 @@ void schedule(struct interrupt_frame *frame) {
         static uint8_t task_cr3_switched[MAX_TASKS] = {0};
         if (!task_cr3_switched[current_task_index]) {
             task_cr3_switched[current_task_index] = 1;
-            serial_write("[SCHED] Switching CR3 to 0x");
-            serial_write_hex(tasks[current_task_index].cr3);
-            serial_write(" for task ");
-            serial_write_dec(current_task_index);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_SCHED, "[SCHED] Switching CR3 to 0x0x%lx for task %lu", (unsigned long)(tasks[current_task_index].cr3), (unsigned long)(current_task_index));
         }
         vmm_switch_address_space_phys(tasks[current_task_index].cr3);
     }
@@ -617,45 +615,36 @@ static void copy_process_name(char *dest, const char *path, size_t max_len) {
 // This is the modern replacement for fork+exec
 int sched_spawn_process(const char *path, int parent_id) {
     if (!path) {
-        serial_write("[SPAWN] ERROR: NULL path\n");
+        klog(KLOG_ERROR, SUBSYS_SCHED, "[SPAWN] ERROR: NULL path");
         return -1;
     }
 
-    serial_write("[SPAWN] Spawning: ");
-    serial_write(path);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_SCHED, "[SPAWN] Spawning: %s", path);
 
     // Look up the file in the initrd
     size_t file_size;
     void *file_data = initrd_lookup(path, &file_size);
     if (!file_data) {
-        serial_write("[SPAWN] ERROR: File not found: ");
-        serial_write(path);
-        serial_write("\n");
+        klog(KLOG_ERROR, SUBSYS_SCHED, "[SPAWN] ERROR: File not found: %s", path);
+        klog(KLOG_INFO, SUBSYS_SCHED, "");
         return -1;
     }
 
-    serial_write("[SPAWN] File found, size=");
-    serial_write_dec(file_size);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_SCHED, "[SPAWN] File found, size=%lu", (unsigned long)(file_size));
 
     // Load the ELF binary into a new address space
     uint64_t entry_point, cr3;
     if (!elf_load(file_data, &entry_point, &cr3)) {
-        serial_write("[SPAWN] ERROR: ELF load failed\n");
+        klog(KLOG_ERROR, SUBSYS_SCHED, "[SPAWN] ERROR: ELF load failed");
         return -1;
     }
 
-    serial_write("[SPAWN] ELF loaded: entry=");
-    serial_write_hex(entry_point);
-    serial_write(" cr3=");
-    serial_write_hex(cr3);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_SCHED, "[SPAWN] ELF loaded: entry=0x%lx cr3=0x%lx", (unsigned long)(entry_point), (unsigned long)(cr3));
 
     // Create the user process (uses existing infrastructure)
     int pid = sched_create_user_process(entry_point, cr3);
     if (pid < 0) {
-        serial_write("[SPAWN] ERROR: Process creation failed\n");
+        klog(KLOG_ERROR, SUBSYS_SCHED, "[SPAWN] ERROR: Process creation failed");
         return -1;
     }
 
@@ -680,11 +669,8 @@ int sched_spawn_process(const char *path, int parent_id) {
 
     spinlock_release(&sched_lock);
 
-    serial_write("[SPAWN] Process created: pid=");
-    serial_write_dec(pid);
-    serial_write(" name=");
-    serial_write(tasks[pid].name);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_SCHED, "[SPAWN] Process created: pid=%lu name=", (unsigned long)(pid));
+    klog(KLOG_INFO, SUBSYS_SCHED, "%s", tasks[pid].name);
 
     return pid;
 }
@@ -692,12 +678,12 @@ int sched_spawn_process(const char *path, int parent_id) {
 // Phase 7d: Send a signal to a process
 int sched_send_signal(int pid, int signal) {
     if (signal < 1 || signal >= MAX_SIGNALS) {
-        serial_write("[SIGNAL] ERROR: Invalid signal number\n");
+        klog(KLOG_ERROR, SUBSYS_SCHED, "[SIGNAL] ERROR: Invalid signal number");
         return -1;
     }
 
     if (pid < 0 || pid >= next_task_id || pid >= MAX_TASKS) {
-        serial_write("[SIGNAL] ERROR: Invalid PID\n");
+        klog(KLOG_ERROR, SUBSYS_SCHED, "[SIGNAL] ERROR: Invalid PID");
         return -1;
     }
 
@@ -710,9 +696,7 @@ int sched_send_signal(int pid, int signal) {
 
     // SIGKILL is always fatal and cannot be caught or ignored
     if (signal == SIGKILL) {
-        serial_write("[SIGNAL] SIGKILL sent to pid=");
-        serial_write_dec(pid);
-        serial_write("\n");
+        klog(KLOG_INFO, SUBSYS_SCHED, "[SIGNAL] SIGKILL sent to pid=%lu", (unsigned long)(pid));
 
         spinlock_acquire(&sched_lock);
         target->exit_status = 128 + SIGKILL;
@@ -731,11 +715,7 @@ int sched_send_signal(int pid, int signal) {
     }
     spinlock_release(&sched_lock);
 
-    serial_write("[SIGNAL] Signal ");
-    serial_write_dec(signal);
-    serial_write(" sent to pid=");
-    serial_write_dec(pid);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_SCHED, "[SIGNAL] Signal %lu sent to pid=%lu", (unsigned long)(signal), (unsigned long)(pid));
 
     return 0;
 }
@@ -780,11 +760,7 @@ int sched_deliver_signals(task_t *task) {
 
         if (handler == SIG_DFL) {
             // Default action: terminate the process
-            serial_write("[SIGNAL] Default action (terminate) for signal ");
-            serial_write_dec(sig);
-            serial_write(" on pid=");
-            serial_write_dec(task->id);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_SCHED, "[SIGNAL] Default action (terminate) for signal %lu on pid=%lu", (unsigned long)(sig), (unsigned long)(task->id));
 
             task->exit_status = 128 + sig;
             task->state = TASK_STATE_ZOMBIE;
@@ -797,11 +773,7 @@ int sched_deliver_signals(task_t *task) {
         // For now, we call the handler in kernel context (simplified approach)
         // A full implementation would manipulate the user stack to redirect RIP
         // This is sufficient for basic signal handling
-        serial_write("[SIGNAL] Delivering signal ");
-        serial_write_dec(sig);
-        serial_write(" to handler at ");
-        serial_write_hex((uint64_t)handler);
-        serial_write("\n");
+        klog(KLOG_INFO, SUBSYS_SCHED, "[SIGNAL] Delivering signal %lu to handler at 0x%lx", (unsigned long)(sig), (unsigned long)((uint64_t)handler));
 
         // TODO: Full user-space signal delivery (manipulate user stack frame)
         // For now, treat custom handlers as SIG_IGN (acknowledge but don't crash)

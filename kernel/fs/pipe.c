@@ -2,6 +2,7 @@
 // Phase 10b: Kernel pipe implementation
 #include "pipe.h"
 #include "../../arch/x86_64/drivers/serial/serial.h"
+#include "../log.h"
 
 static pipe_t pipes[MAX_PIPES];
 
@@ -26,13 +27,11 @@ int pipe_alloc(void) {
             pipes[i].count = 0;
             pipes[i].readers = 1;
             pipes[i].writers = 1;
-            serial_write("[PIPE] Allocated pipe ");
-            serial_write_dec(i);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_VFS, "[PIPE] Allocated pipe %lu", (unsigned long)(i));
             return i;
         }
     }
-    serial_write("[PIPE] ERROR: No free pipes\n");
+    klog(KLOG_ERROR, SUBSYS_VFS, "[PIPE] ERROR: No free pipes");
     return -1;
 }
 
@@ -132,9 +131,7 @@ void pipe_ref_dec(int idx, uint8_t fd_type) {
 
     // Free pipe when all ends are closed
     if (pipes[idx].readers == 0 && pipes[idx].writers == 0) {
-        serial_write("[PIPE] Freed pipe ");
-        serial_write_dec(idx);
-        serial_write("\n");
+        klog(KLOG_INFO, SUBSYS_VFS, "[PIPE] Freed pipe %lu", (unsigned long)(idx));
         pipes[idx].in_use = 0;
         pipes[idx].count = 0;
         pipes[idx].read_pos = 0;

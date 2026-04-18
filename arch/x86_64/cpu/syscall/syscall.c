@@ -18,6 +18,8 @@
 #include "../../../../kernel/net/net.h"
 #include "../../../../kernel/fs/pipe.h"
 #include "../../../../kernel/fs/cluster.h"
+#include "../../../../kernel/autorun.h"
+#include "../../../../kernel/log.h"
 #include <stdbool.h>
 
 // Forward declarations for state collection (kernel/state.c)
@@ -120,7 +122,7 @@ extern void wake_waiting_parent(int child_id);
 // The C-level dispatcher
 void syscall_dispatcher(struct syscall_frame *frame) {
     if (!frame) {
-        serial_write("[SYSCALL] ERROR: NULL frame!\n");
+        klog(KLOG_ERROR, SUBSYS_SYSCALL, "[SYSCALL] ERROR: NULL frame!");
         framebuffer_draw_string("PANIC: NULL syscall frame!", 10, 10, COLOR_WHITE, COLOR_RED);
         asm volatile("cli; hlt");
     }
@@ -422,30 +424,22 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             void *addr = (void *)frame->rdi;
             task_t *current = sched_get_current_task();
 
-            serial_write("[SYS_BRK] addr=");
-            serial_write_hex((uint64_t)addr);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_SYSCALL, "[SYS_BRK] addr=0x%lx", (unsigned long)((uint64_t)addr));
 
             if (!current) {
-                serial_write("[SYS_BRK] ERROR: No current process!\n");
+                klog(KLOG_ERROR, SUBSYS_SYSCALL, "[SYS_BRK] ERROR: No current process!");
                 frame->rax = -1;
                 break;
             }
 
             // If addr is NULL, just return current brk
             if (addr == NULL) {
-                serial_write("[SYS_BRK] Return current brk=");
-                serial_write_hex(current->brk);
-                serial_write("\n");
+                klog(KLOG_INFO, SUBSYS_SYSCALL, "[SYS_BRK] Return current brk=0x%lx", (unsigned long)(current->brk));
                 frame->rax = (uint64_t)current->brk;
                 break;
             }
 
-            serial_write("[SYS_BRK] curr_brk=");
-            serial_write_hex(current->brk);
-            serial_write(" heap_start=");
-            serial_write_hex(current->heap_start);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_SYSCALL, "[SYS_BRK] curr_brk=0x%lx heap_start=0x%lx", (unsigned long)(current->brk), (unsigned long)(current->heap_start));
 
             // Validate address bounds
             // Must be >= heap_start and < stack_top with guard space
@@ -503,12 +497,10 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 if (success) {
                     current->brk = (uint64_t)addr;
                     frame->rax = current->brk;
-                    serial_write("[SYS_BRK] SUCCESS: new_brk=");
-                    serial_write_hex(current->brk);
-                    serial_write("\n");
+                    klog(KLOG_INFO, SUBSYS_SYSCALL, "[SYS_BRK] SUCCESS: new_brk=0x%lx", (unsigned long)(current->brk));
                 } else {
                     frame->rax = (uint64_t)-1;  // ENOMEM
-                    serial_write("[SYS_BRK] FAILED: Out of memory or mapping failed\n");
+                    klog(KLOG_ERROR, SUBSYS_SYSCALL, "[SYS_BRK] FAILED: Out of memory or mapping failed");
                 }
             } else if (new_brk_page < old_brk_page) {
                 // Shrinking heap - unmap and free pages
@@ -699,9 +691,17 @@ void syscall_dispatcher(struct syscall_frame *frame) {
 
             sched_orphan_children(current->id);
             wake_waiting_parent(current->id);
-            
+
             framebuffer_draw_string("Process exited", 10, 600, COLOR_YELLOW, 0x00101828);
-            
+
+            // Phase 12: when PID 1 exits, notify the autorun subsystem.
+            // In logging-only mode (work unit 5) it just emits a serial
+            // line. Work unit 6 replaces the body with kernel_shutdown()
+            // gated on autorun_is_active().
+            if (current->id == autorun_get_init_pid()) {
+                autorun_on_init_exit(current->id, status);
+            }
+
             frame->rax = 0;
             break;
         }
@@ -781,14 +781,12 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             char path_kernel[256];
 
             if (copy_string_from_user(path_user, path_kernel, sizeof(path_kernel)) <= 0) {
-                serial_write("[SYS_SPAWN] Bad path\n");
+                klog(KLOG_INFO, SUBSYS_SYSCALL, "[SYS_SPAWN] Bad path");
                 frame->rax = -1;
                 break;
             }
 
-            serial_write("[SYS_SPAWN] Path: ");
-            serial_write(path_kernel);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_SYSCALL, "[SYS_SPAWN] Path: %s", path_kernel);
 
             task_t *current = sched_get_current_task();
             if (!current) {
@@ -798,12 +796,10 @@ void syscall_dispatcher(struct syscall_frame *frame) {
 
             int pid = sched_spawn_process(path_kernel, current->id);
             if (pid < 0) {
-                serial_write("[SYS_SPAWN] Failed\n");
+                klog(KLOG_ERROR, SUBSYS_SYSCALL, "[SYS_SPAWN] Failed");
                 frame->rax = -1;
             } else {
-                serial_write("[SYS_SPAWN] Success: pid=");
-                serial_write_dec(pid);
-                serial_write("\n");
+                klog(KLOG_INFO, SUBSYS_SYSCALL, "[SYS_SPAWN] Success: pid=%lu", (unsigned long)(pid));
                 frame->rax = pid;
             }
             break;
@@ -813,11 +809,7 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             int target_pid = (int)frame->rdi;
             int signal = (int)frame->rsi;
 
-            serial_write("[SYS_KILL] pid=");
-            serial_write_dec(target_pid);
-            serial_write(" sig=");
-            serial_write_dec(signal);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_SYSCALL, "[SYS_KILL] pid=%lu sig=%lu", (unsigned long)(target_pid), (unsigned long)(signal));
 
             frame->rax = sched_send_signal(target_pid, signal);
             break;
@@ -1629,6 +1621,88 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             for (size_t ci = 0; ci < sizeof(cluster_members_t); ci++)
                 cm_dst[ci] = cm_src[ci];
             frame->rax = (uint64_t)(long)cm_ret;
+            break;
+        }
+
+        case SYS_KLOG_WRITE: {
+            // Phase 13: append one user-space entry to the klog ring.
+            // RDI = level (0..5), RSI = subsys id (>= 10), RDX = user
+            // message pointer, R10 = message length in bytes.
+            uint8_t level  = (uint8_t)(frame->rdi & 0xFFu);
+            uint8_t subsys = (uint8_t)(frame->rsi & 0xFFu);
+            const char *user_msg = (const char *)frame->rdx;
+            uint32_t msg_len = (uint32_t)frame->r10;
+
+            // User-space may not emit FATAL (reserved for the kernel
+            // panic path) and must use a user-range subsystem id.
+            if (level >= KLOG_FATAL) { frame->rax = (uint64_t)-1; break; }
+            if (subsys < KLOG_FIRST_USER_SUBSYS) { frame->rax = (uint64_t)-1; break; }
+            if (!user_msg && msg_len > 0)      { frame->rax = (uint64_t)-1; break; }
+
+            // Bound the message copy so a malformed caller can't OOM
+            // the ring. Matches the 192-byte limit the kernel klog()
+            // itself uses via kvsnprintf.
+            char kbuf[192];
+            if (msg_len > sizeof(kbuf) - 1) msg_len = sizeof(kbuf) - 1;
+            for (uint32_t i = 0; i < msg_len; i++) kbuf[i] = user_msg[i];
+            kbuf[msg_len] = '\0';
+
+            task_t *tk = sched_get_current_task();
+            int16_t pid = tk ? (int16_t)tk->id : (int16_t)-1;
+            klog_raw(level, subsys, pid, kbuf, msg_len);
+            frame->rax = (uint64_t)0;
+            break;
+        }
+
+        case SYS_KLOG_READ: {
+            // Phase 13: non-destructive read of the klog ring.
+            // RDI = level_mask (u8 bitmap, 0 = all levels)
+            // RSI = tail_count (0 = everything currently held)
+            // RDX = user buffer (klog_entry_t[] destination)
+            // R10 = buffer capacity in bytes
+            uint8_t level_mask  = (uint8_t)(frame->rdi & 0xFFu);
+            uint32_t tail_count = (uint32_t)frame->rsi;
+            void *user_buf      = (void *)frame->rdx;
+            uint32_t buf_cap    = (uint32_t)frame->r10;
+
+            if (!user_buf) { frame->rax = (uint64_t)-1; break; }
+
+            int n = klog_read_filtered(level_mask, tail_count, user_buf, buf_cap);
+            frame->rax = (uint64_t)(long)n;
+            break;
+        }
+
+        case SYS_DEBUG: {
+            // Phase 13: controlled-panic trigger for gate tests.
+            // Only compiled in when WITH_DEBUG_SYSCALL is defined at
+            // build time; otherwise the handler falls through to -1.
+#ifdef WITH_DEBUG_SYSCALL
+            extern void kpanic(const char *reason);
+            int op = (int)frame->rdi;
+            const char *arg = (const char *)frame->rsi;
+            switch (op) {
+            case DEBUG_PANIC:
+                kpanic(arg ? arg : "SYS_DEBUG panic");
+                // unreachable
+                frame->rax = (uint64_t)0;
+                break;
+            case DEBUG_KERNEL_PF: {
+                // Deliberately dereference an unmapped kernel
+                // address. The page-fault handler becomes the oops
+                // emitter via kpanic_at().
+                volatile uint8_t *bad = (volatile uint8_t *)0xFFFFFFFFDEADBEEFULL;
+                (void)*bad;
+                frame->rax = (uint64_t)0;
+                break;
+            }
+            default:
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+#else
+            (void)frame;
+            frame->rax = (uint64_t)-1;
+#endif
             break;
         }
 

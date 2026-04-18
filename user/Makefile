@@ -26,16 +26,46 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog
+
+# Phase 12: TAP 1.4 test binaries. Each lives at user/tests/NAME.c
+# and is copied to initrd as /bin/tests/NAME.tap by the top-level
+# Makefile. Every TAP test links against libtap.a + libc.a.
+TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
+             tests/libctest tests/simtest tests/clustertest tests/pipetest \
+             tests/fdtest tests/metatest tests/spawntest \
+             tests/cantest tests/eventtest \
+             tests/nettest tests/httptest tests/dnstest \
+             tests/ktest_discovery tests/ktest_capture tests/cmdline_parse \
+             tests/klog_basic tests/klog_stress tests/panic_test tests/kpf_test
+
+# Phase 12 work unit 15: sentinel_fail is only built when the meta-test
+# of the harness is being run. `make test-sentinel-meta` sets this.
+ifeq ($(WITH_SENTINEL_FAIL),1)
+TAP_TESTS += tests/sentinel_fail
+endif
+
+AR := $(PREFIX)/bin/$(TARGET)-ar
+LIBTAP := libtap.a
 
 .PHONY: all clean libc
 
-all: libc $(PROGRAMS)
+all: libc $(LIBTAP) $(PROGRAMS) $(TAP_TESTS)
 
 # Build libc first
 libc:
 	@echo "Building libc..."
 	@$(MAKE) -C ../libc
+
+# Phase 12: TAP producer library. Linked into every tests/*.tap binary.
+$(LIBTAP): libtap.o
+	@echo "Creating $@"
+	@$(AR) rcs $@ $^
+
+# Phase 12: generic rule for tests/NAME: tests/NAME.o libtap.a libc.a
+tests/%: tests/%.o $(LIBTAP) $(LIBC)
+	@echo "Linking TAP test: $@"
+	@$(LD) $(LDFLAGS) -o $@ tests/$*.o $(LIBTAP) $(LIBC)
 
 # Build grahai with its JSON parser
 grahai: grahai.o json.o $(LIBC)
@@ -122,10 +152,20 @@ clustertest: clustertest.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
 	@$(LD) $(LDFLAGS) -o $@ clustertest.o $(LIBC)
 
+# Phase 12: TAP test runner (PID 1 in autorun mode).
+ktest: ktest.o $(LIBTAP) $(LIBC)
+	@echo "Linking user program: $@ (with libtap + libc)"
+	@$(LD) $(LDFLAGS) -o $@ ktest.o $(LIBTAP) $(LIBC)
+
+# Phase 13: standalone /bin/klog reader.
+klog: klog.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ klog.o $(LIBC)
+
 %.o: %.c
 	@echo "Compiling user C: $<"
 	@$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
 	@echo "Cleaning user programs..."
-	@rm -f *.o $(PROGRAMS)
+	@rm -f *.o $(PROGRAMS) $(LIBTAP) tests/*.o $(TAP_TESTS)

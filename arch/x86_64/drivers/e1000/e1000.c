@@ -12,6 +12,7 @@
 #include "../../../../kernel/capability.h"
 #include "../../../../kernel/sync/spinlock.h"
 #include <stddef.h>
+#include "../../../../kernel/log.h"
 
 // HHDM offset for physical-to-virtual conversion
 extern uint64_t g_hhdm_offset;
@@ -73,7 +74,7 @@ static void e1000_read_mac_eeprom(void) {
             mac_addr[3] = (ral >> 24) & 0xFF;
             mac_addr[4] = rah & 0xFF;
             mac_addr[5] = (rah >> 8) & 0xFF;
-            serial_write("[E1000] MAC read from RAL/RAH (EEPROM timeout)\n");
+            klog(KLOG_INFO, SUBSYS_DRV, "[E1000] MAC read from RAL/RAH (EEPROM timeout)");
             return;
         }
 
@@ -82,7 +83,7 @@ static void e1000_read_mac_eeprom(void) {
         mac_addr[i * 2 + 1] = (word >> 8) & 0xFF;
     }
 
-    serial_write("[E1000] MAC read from EEPROM\n");
+    klog(KLOG_INFO, SUBSYS_DRV, "[E1000] MAC read from EEPROM");
 }
 
 // ---- RX ring initialization ----
@@ -91,7 +92,7 @@ static void e1000_init_rx(void) {
     // Allocate descriptor ring (256 * 16 = 4096 = 1 page)
     void *rx_ring_phys = pmm_alloc_page();
     if (!rx_ring_phys) {
-        serial_write("[E1000] ERROR: Failed to allocate RX descriptor ring\n");
+        klog(KLOG_ERROR, SUBSYS_DRV, "[E1000] ERROR: Failed to allocate RX descriptor ring");
         return;
     }
     rx_descs = (e1000_rx_desc_t *)((uint64_t)rx_ring_phys + g_hhdm_offset);
@@ -106,7 +107,7 @@ static void e1000_init_rx(void) {
             // Allocate a new page every 2 buffers
             void *page_phys = pmm_alloc_page();
             if (!page_phys) {
-                serial_write("[E1000] ERROR: Failed to allocate RX buffer\n");
+                klog(KLOG_ERROR, SUBSYS_DRV, "[E1000] ERROR: Failed to allocate RX buffer");
                 return;
             }
             rx_buffers[i] = (uint8_t *)((uint64_t)page_phys + g_hhdm_offset);
@@ -132,7 +133,7 @@ static void e1000_init_rx(void) {
     uint32_t rctl = E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_BSIZE_2K | E1000_RCTL_SECRC;
     e1000_write_reg(E1000_RCTL, rctl);
 
-    serial_write("[E1000] RX ring initialized (256 descriptors)\n");
+    klog(KLOG_INFO, SUBSYS_DRV, "[E1000] RX ring initialized (256 descriptors)");
 }
 
 // ---- TX ring initialization ----
@@ -141,7 +142,7 @@ static void e1000_init_tx(void) {
     // Allocate descriptor ring (256 * 16 = 4096 = 1 page)
     void *tx_ring_phys = pmm_alloc_page();
     if (!tx_ring_phys) {
-        serial_write("[E1000] ERROR: Failed to allocate TX descriptor ring\n");
+        klog(KLOG_ERROR, SUBSYS_DRV, "[E1000] ERROR: Failed to allocate TX descriptor ring");
         return;
     }
     tx_descs = (e1000_tx_desc_t *)((uint64_t)tx_ring_phys + g_hhdm_offset);
@@ -155,7 +156,7 @@ static void e1000_init_tx(void) {
         if ((i & 1) == 0) {
             void *page_phys = pmm_alloc_page();
             if (!page_phys) {
-                serial_write("[E1000] ERROR: Failed to allocate TX buffer\n");
+                klog(KLOG_ERROR, SUBSYS_DRV, "[E1000] ERROR: Failed to allocate TX buffer");
                 return;
             }
             tx_buffers[i] = (uint8_t *)((uint64_t)page_phys + g_hhdm_offset);
@@ -186,7 +187,7 @@ static void e1000_init_tx(void) {
     // IPGT=10, IPGR1=8, IPGR2=6
     e1000_write_reg(E1000_TIPG, 0x0060200A);
 
-    serial_write("[E1000] TX ring initialized (256 descriptors)\n");
+    klog(KLOG_INFO, SUBSYS_DRV, "[E1000] TX ring initialized (256 descriptors)");
 }
 
 // ---- CAN stats callback ----
@@ -214,39 +215,27 @@ void e1000_init(void) {
     // Scan PCI for Ethernet controller
     pci_device_t net_dev;
     if (!pci_scan_for_device(PCI_CLASS_NETWORK, PCI_SUBCLASS_ETHERNET, &net_dev)) {
-        serial_write("[E1000] No Ethernet controller found on PCI bus\n");
+        klog(KLOG_INFO, SUBSYS_DRV, "[E1000] No Ethernet controller found on PCI bus");
         return;
     }
 
     // Verify it's an Intel E1000
     if (net_dev.vendor_id != E1000_VENDOR_ID || net_dev.device_id != E1000_DEVICE_ID) {
-        serial_write("[E1000] Found NIC but not E1000 (vendor=0x");
-        serial_write_hex(net_dev.vendor_id);
-        serial_write(" device=0x");
-        serial_write_hex(net_dev.device_id);
-        serial_write(")\n");
+        klog(KLOG_INFO, SUBSYS_DRV, "[E1000] Found NIC but not E1000 (vendor=0x0x%lx device=0x0x%lx)", (unsigned long)(net_dev.vendor_id), (unsigned long)(net_dev.device_id));
         return;
     }
 
-    serial_write("[E1000] Found at bus=");
-    serial_write_dec(net_dev.bus);
-    serial_write(" dev=");
-    serial_write_dec(net_dev.device);
-    serial_write(" func=");
-    serial_write_dec(net_dev.function);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_DRV, "[E1000] Found at bus=%lu dev=%lu func=%lu", (unsigned long)(net_dev.bus), (unsigned long)(net_dev.device), (unsigned long)(net_dev.function));
 
     // Enable PCI bus mastering (required for DMA)
     pci_enable_bus_mastering(net_dev.bus, net_dev.device, net_dev.function);
-    serial_write("[E1000] Bus mastering enabled\n");
+    klog(KLOG_INFO, SUBSYS_DRV, "[E1000] Bus mastering enabled");
 
     // Read BAR0 (Memory-Mapped I/O base)
     uint32_t bar0 = pci_read_bar(net_dev.bus, net_dev.device, net_dev.function, 0);
     uint64_t bar0_phys = bar0 & 0xFFFFFFF0;  // Mask type bits
 
-    serial_write("[E1000] BAR0 physical: 0x");
-    serial_write_hex(bar0_phys);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_DRV, "[E1000] BAR0 physical: 0x0x%lx", (unsigned long)(bar0_phys));
 
     // Map E1000 MMIO region (128KB = 32 pages)
     for (uint64_t offset = 0; offset < 0x20000; offset += 0x1000) {
@@ -256,9 +245,7 @@ void e1000_init(void) {
                      PTE_PRESENT | PTE_WRITABLE | PTE_CACHEDISABLE | PTE_NX);
     }
     mmio_base = (volatile uint8_t *)(bar0_phys + g_hhdm_offset);
-    serial_write("[E1000] MMIO mapped at virtual 0x");
-    serial_write_hex((uint64_t)mmio_base);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_DRV, "[E1000] MMIO mapped at virtual 0x0x%lx", (unsigned long)((uint64_t)mmio_base));
 
     // Reset the device
     uint32_t ctrl = e1000_read_reg(E1000_CTRL);
@@ -289,12 +276,13 @@ void e1000_init(void) {
     e1000_write_reg(E1000_RAL, ral);
     e1000_write_reg(E1000_RAH, rah);
 
-    serial_write("[E1000] MAC: ");
-    for (int i = 0; i < 6; i++) {
-        if (i > 0) serial_write(":");
-        serial_write_hex(mac_addr[i]);
-    }
-    serial_write("\n");
+    // Format the MAC into one klog message rather than printing each
+    // byte separately (Phase 13 sweep — single-line output).
+    klog(KLOG_INFO, SUBSYS_DRV,
+         "[E1000] MAC: %lx:%lx:%lx:%lx:%lx:%lx",
+         (unsigned long)mac_addr[0], (unsigned long)mac_addr[1],
+         (unsigned long)mac_addr[2], (unsigned long)mac_addr[3],
+         (unsigned long)mac_addr[4], (unsigned long)mac_addr[5]);
 
     // Clear Multicast Table Array (128 entries)
     for (int i = 0; i < 128; i++) {
@@ -308,9 +296,9 @@ void e1000_init(void) {
     // Check link status
     uint32_t status = e1000_read_reg(E1000_STATUS);
     if (status & E1000_STATUS_LU) {
-        serial_write("[E1000] Link UP\n");
+        klog(KLOG_INFO, SUBSYS_DRV, "[E1000] Link UP");
     } else {
-        serial_write("[E1000] Link DOWN (will come up when QEMU network is ready)\n");
+        klog(KLOG_INFO, SUBSYS_DRV, "[E1000] Link DOWN (will come up when QEMU network is ready)");
     }
 
     e1000_found = true;
@@ -323,7 +311,7 @@ void e1000_init(void) {
     cap_register("e1000_nic", CAP_DRIVER, CAP_SUBTYPE_OTHER, -1,
                  e1000_deps, 1, NULL, NULL, e1000_ops, 2, e1000_get_stats);
 
-    serial_write("[E1000] Driver initialized successfully\n");
+    klog(KLOG_INFO, SUBSYS_DRV, "[E1000] Driver initialized successfully");
 }
 
 // ---- Send packet ----

@@ -12,6 +12,7 @@
 #include "sched/sched.h"
 #include "interrupts.h"
 #include "../drivers/serial/serial.h"
+#include "../../../kernel/log.h"
 
 // External assembly function from ap_start.S
 #if LIMINE_API_REVISION >= 1
@@ -148,59 +149,55 @@ void ap_main(struct limine_smp_info *info) {
 
 #if LIMINE_API_REVISION >= 1
 void smp_init(volatile struct limine_mp_request *mp_request) {
-    serial_write("[SMP] Entered smp_init\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[SMP] Entered smp_init");
 
     if (!mp_request || !mp_request->response) {
-        serial_write("[SMP] ERROR: No MP support from bootloader!\n");
+        klog(KLOG_ERROR, SUBSYS_CORE, "[SMP] ERROR: No MP support from bootloader!");
         framebuffer_draw_string("No MP support from bootloader!", 50, 400, COLOR_RED, 0x00101828);
         return;
     }
 
-    serial_write("[SMP] MP request validated\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[SMP] MP request validated");
     struct limine_mp_response *mp_resp = mp_request->response;
 
     // Initialize CPU count and BSP ID
     g_cpu_count = (uint32_t)mp_resp->cpu_count;
     g_bsp_lapic_id = mp_resp->bsp_lapic_id;
 
-    serial_write("[SMP] CPU count: ");
-    serial_write_dec(g_cpu_count);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[SMP] CPU count: %lu", (unsigned long)(g_cpu_count));
     
     if (g_cpu_count > MAX_CPUS) {
         g_cpu_count = MAX_CPUS;
     }
 
     // Initialize all cpu_locals to invalid state
-    serial_write("[SMP] Initializing cpu_locals...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[SMP] Initializing cpu_locals...");
     for (int i = 0; i < MAX_CPUS; i++) {
         g_cpu_locals[i].cpu_id = (uint32_t)-1;
         g_cpu_locals[i].lapic_id = (uint32_t)-1;
     }
 
     // Store kernel PML4 for APs
-    serial_write("[SMP] Getting kernel PML4...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[SMP] Getting kernel PML4...");
     g_kernel_pml4 = vmm_get_pml4_phys(vmm_get_kernel_space());
-    serial_write("[SMP] PML4=");
-    serial_write_hex(g_kernel_pml4);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[SMP] PML4=0x%lx", (unsigned long)(g_kernel_pml4));
 
     // Initialize BSP's per-CPU data FIRST
-    serial_write("[SMP] Init BSP cpu_local...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[SMP] Init BSP cpu_local...");
     g_cpu_locals[0].cpu_id = 0;
     g_cpu_locals[0].lapic_id = g_bsp_lapic_id;
     write_msr(MSR_GS_BASE, (uint64_t)&g_cpu_locals[0]);
-    serial_write("[SMP] BSP GS_BASE set\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[SMP] BSP GS_BASE set");
 
     // Initialize BSP's GDT and TSS (per-CPU version)
-    serial_write("[SMP] Calling gdt_init_for_cpu...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[SMP] Calling gdt_init_for_cpu...");
     gdt_init_for_cpu(0);
-    serial_write("[SMP] GDT init done\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[SMP] GDT init done");
 
     // Initialize BSP's LAPIC
-    serial_write("[SMP] Calling lapic_init...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[SMP] Calling lapic_init...");
     lapic_init();
-    serial_write("[SMP] LAPIC init done\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[SMP] LAPIC init done");
 
 
 

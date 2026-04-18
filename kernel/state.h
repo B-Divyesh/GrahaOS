@@ -103,6 +103,10 @@ typedef struct {
     } cpus[STATE_MAX_CPUS];
     uint32_t cpu_entries;
     uint32_t _pad;
+    // Phase 12: g_timer_ticks snapshot. Exposed to user-space so
+    // tooling like ktest can implement per-test timeouts without a
+    // dedicated SYS_GETTIME syscall. LAPIC timer ticks at 100 Hz.
+    uint64_t uptime_ticks;
 } state_system_t;
 
 // --- Driver operation descriptor ---

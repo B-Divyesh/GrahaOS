@@ -5,6 +5,7 @@
 #include "../arch/x86_64/drivers/serial/serial.h"
 #include <stddef.h> // For NULL
 #include <stdint.h>
+#include "log.h"
 
 static void *elf_memcpy(void *dest, const void *src, size_t n) {
     uint8_t *pdest = (uint8_t *)dest;
@@ -62,73 +63,67 @@ int elf_validate_header(const Elf64_Ehdr *header) {
 }
 
 bool elf_load(void *file_data, uint64_t *entry_point, uint64_t *cr3) {
-    serial_write("[ELF] elf_load called\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] elf_load called");
 
     if (!file_data || !entry_point || !cr3) {
-        serial_write("[ELF] ERROR: Invalid parameters!\n");
+        klog(KLOG_ERROR, SUBSYS_CORE, "[ELF] ERROR: Invalid parameters!");
         framebuffer_draw_string("ELF: Invalid parameters", 10, 400, COLOR_RED, 0x00101828);
         return false;
     }
 
-    serial_write("[ELF] Parameters OK, validating header...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Parameters OK, validating header...");
     Elf64_Ehdr *ehdr = (Elf64_Ehdr *)file_data;
 
     // Validate ELF magic
     if (ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
         ehdr->e_ident[2] != 'L' || ehdr->e_ident[3] != 'F') {
-        serial_write("[ELF] ERROR: Invalid magic!\n");
+        klog(KLOG_ERROR, SUBSYS_CORE, "[ELF] ERROR: Invalid magic!");
         framebuffer_draw_string("ELF: Invalid magic", 10, 420, COLOR_RED, 0x00101828);
         return false;
     }
 
     // Check if it's 64-bit
     if (ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
-        serial_write("[ELF] ERROR: Not 64-bit!\n");
+        klog(KLOG_ERROR, SUBSYS_CORE, "[ELF] ERROR: Not 64-bit!");
         framebuffer_draw_string("ELF: Not 64-bit", 10, 440, COLOR_RED, 0x00101828);
         return false;
     }
 
     // Check if it's executable
     if (ehdr->e_type != ET_EXEC) {
-        serial_write("[ELF] ERROR: Not executable!\n");
+        klog(KLOG_ERROR, SUBSYS_CORE, "[ELF] ERROR: Not executable!");
         framebuffer_draw_string("ELF: Not executable", 10, 460, COLOR_RED, 0x00101828);
         return false;
     }
 
-    serial_write("[ELF] Header validated, drawing framebuffer msg...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Header validated, drawing framebuffer msg...");
     framebuffer_draw_string("ELF: Header validated", 10, 420, COLOR_GREEN, 0x00101828);
-    serial_write("[ELF] Framebuffer msg drawn\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Framebuffer msg drawn");
 
     // Create new address space
-    serial_write("[ELF] Creating address space...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Creating address space...");
     vmm_address_space_t *addr_space = vmm_create_address_space();
     if (!addr_space) {
-        serial_write("[ELF] ERROR: Failed to create address space!\n");
+        klog(KLOG_ERROR, SUBSYS_CORE, "[ELF] ERROR: Failed to create address space!");
         framebuffer_draw_string("ELF: Failed to create address space", 10, 480, COLOR_RED, 0x00101828);
         return false;
     }
-    serial_write("[ELF] Address space created\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Address space created");
 
     // NOTE: User stack is allocated by sched_create_user_process(), not here.
     // elf_load only loads code/data segments into the address space.
 
     // Get program headers
-    serial_write("[ELF] Getting program headers...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Getting program headers...");
     Elf64_Phdr *phdr = (Elf64_Phdr *)((uint8_t *)file_data + ehdr->e_phoff);
-    serial_write("[ELF] Program header count: ");
-    serial_write_dec(ehdr->e_phnum);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Program header count: %lu", (unsigned long)(ehdr->e_phnum));
 
     // Load each program segment
     for (int i = 0; i < ehdr->e_phnum; i++) {
-        serial_write("[ELF] Processing segment ");
-        serial_write_dec(i);
-        serial_write(" type=");
-        serial_write_hex(phdr[i].p_type);
-        serial_write("\n");
+        klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Processing segment %lu type=0x%lx", (unsigned long)(i), (unsigned long)(phdr[i].p_type));
 
         if (phdr[i].p_type != PT_LOAD) {
-            serial_write("[ELF] Skipping non-LOAD segment\n");
+            klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Skipping non-LOAD segment");
             continue;
         }
 
@@ -137,65 +132,49 @@ bool elf_load(void *file_data, uint64_t *entry_point, uint64_t *cr3) {
         uint64_t filesz = phdr[i].p_filesz;
         uint64_t offset = phdr[i].p_offset;
 
-        serial_write("[ELF] Loading segment: vaddr=");
-        serial_write_hex(vaddr);
-        serial_write(" memsz=");
-        serial_write_hex(memsz);
-        serial_write("\n");
+        klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Loading segment: vaddr=0x%lx memsz=0x%lx", (unsigned long)(vaddr), (unsigned long)(memsz));
 
         // Calculate pages needed
         uint64_t start_page = vaddr & ~(PAGE_SIZE - 1);
         uint64_t end_page = (vaddr + memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
         size_t num_pages = (end_page - start_page) / PAGE_SIZE;
 
-        serial_write("[ELF] Segment needs ");
-        serial_write_dec(num_pages);
-        serial_write(" pages\n");
+        klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Segment needs %lu pages", (unsigned long)(num_pages));
 
-        serial_write("[ELF] Drawing framebuffer msg...\n");
+        klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Drawing framebuffer msg...");
         framebuffer_draw_string("ELF: Loading segment", 10, 460 + (i * 20), COLOR_YELLOW, 0x00101828);
-        serial_write("[ELF] Framebuffer msg drawn\n");
+        klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Framebuffer msg drawn");
 
         // Map and load pages
         for (size_t j = 0; j < num_pages; j++) {
-            serial_write("[ELF] Allocating page ");
-            serial_write_dec(j);
-            serial_write("/");
-            serial_write_dec(num_pages);
-            serial_write("...\n");
+            klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Allocating page %lu/%lu...", (unsigned long)(j), (unsigned long)(num_pages));
 
             void *page_phys = pmm_alloc_page();
             if (!page_phys) {
-                serial_write("[ELF] ERROR: Out of memory!\n");
+                klog(KLOG_ERROR, SUBSYS_CORE, "[ELF] ERROR: Out of memory!");
                 framebuffer_draw_string("ELF: Out of memory", 10, 540, COLOR_RED, 0x00101828);
                 return false;
             }
 
-            serial_write("[ELF] Page allocated at ");
-            serial_write_hex((uint64_t)page_phys);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Page allocated at 0x%lx", (unsigned long)((uint64_t)page_phys));
 
             // Get virtual address for copying
             void *page_virt = (void *)((uint64_t)page_phys + g_hhdm_offset);
-            serial_write("[ELF] Page virt addr: ");
-            serial_write_hex((uint64_t)page_virt);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Page virt addr: 0x%lx", (unsigned long)((uint64_t)page_virt));
 
             // Clear the page
-            serial_write("[ELF] Clearing page...\n");
+            klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Clearing page...");
             for (int k = 0; k < PAGE_SIZE; k++) {
                 ((uint8_t *)page_virt)[k] = 0;
             }
-            serial_write("[ELF] Page cleared\n");
+            klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Page cleared");
 
             // Copy segment data
             uint64_t page_vaddr = start_page + (j * PAGE_SIZE);
-            serial_write("[ELF] page_vaddr=");
-            serial_write_hex(page_vaddr);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_CORE, "[ELF] page_vaddr=0x%lx", (unsigned long)(page_vaddr));
 
             if (page_vaddr < vaddr + filesz) {
-                serial_write("[ELF] Copying segment data to page...\n");
+                klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Copying segment data to page...");
                 uint64_t copy_start = (page_vaddr < vaddr) ? vaddr - page_vaddr : 0;
                 uint64_t copy_size = PAGE_SIZE - copy_start;
 
@@ -204,35 +183,25 @@ bool elf_load(void *file_data, uint64_t *entry_point, uint64_t *cr3) {
                 }
 
                 if (copy_size > 0) {
-                    serial_write("[ELF] Copying ");
-                    serial_write_dec(copy_size);
-                    serial_write(" bytes...\n");
+                    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Copying %lu bytes...", (unsigned long)(copy_size));
 
                     uint64_t file_offset = offset + (page_vaddr - vaddr);
                     if (page_vaddr < vaddr) {
                         file_offset = offset;
                     }
 
-                    serial_write("[ELF] file_offset=");
-                    serial_write_hex(file_offset);
-                    serial_write(" copy_start=");
-                    serial_write_hex(copy_start);
-                    serial_write("\n");
+                    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] file_offset=0x%lx copy_start=0x%lx", (unsigned long)(file_offset), (unsigned long)(copy_start));
 
                     uint8_t *src = (uint8_t *)file_data + file_offset;
                     uint8_t *dst = (uint8_t *)page_virt + copy_start;
 
-                    serial_write("[ELF] src=");
-                    serial_write_hex((uint64_t)src);
-                    serial_write(" dst=");
-                    serial_write_hex((uint64_t)dst);
-                    serial_write("\n");
+                    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] src=0x%lx dst=0x%lx", (unsigned long)((uint64_t)src), (unsigned long)((uint64_t)dst));
 
-                    serial_write("[ELF] Starting memcpy loop...\n");
+                    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Starting memcpy loop...");
                     for (size_t k = 0; k < copy_size; k++) {
                         dst[k] = src[k];
                     }
-                    serial_write("[ELF] Copy complete\n");
+                    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Copy complete");
                 }
             }
 
@@ -242,33 +211,27 @@ bool elf_load(void *file_data, uint64_t *entry_point, uint64_t *cr3) {
             if (!(phdr[i].p_flags & PF_X)) flags |= PTE_NX;
 
             // Map the page
-            serial_write("[ELF] Mapping page at vaddr=");
-            serial_write_hex(page_vaddr);
-            serial_write("...\n");
+            klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Mapping page at vaddr=0x%lx...", (unsigned long)(page_vaddr));
 
             if (!vmm_map_page(addr_space, page_vaddr, (uint64_t)page_phys, flags)) {
-                serial_write("[ELF] ERROR: Failed to map page!\n");
+                klog(KLOG_ERROR, SUBSYS_CORE, "[ELF] ERROR: Failed to map page!");
                 framebuffer_draw_string("ELF: Failed to map page", 10, 560, COLOR_RED, 0x00101828);
                 return false;
             }
-            serial_write("[ELF] Page mapped successfully\n");
+            klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Page mapped successfully");
         }
     }
 
-    serial_write("[ELF] All pages loaded, drawing framebuffer msg...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] All pages loaded, drawing framebuffer msg...");
     framebuffer_draw_string("ELF: All segments loaded", 10, 540, COLOR_GREEN, 0x00101828);
-    serial_write("[ELF] Framebuffer msg drawn\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Framebuffer msg drawn");
 
-    serial_write("[ELF] Setting output parameters...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Setting output parameters...");
     *entry_point = ehdr->e_entry;
     *cr3 = vmm_get_pml4_phys(addr_space);
-    serial_write("[ELF] entry_point=");
-    serial_write_hex(*entry_point);
-    serial_write(" cr3=");
-    serial_write_hex(*cr3);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] entry_point=0x%lx cr3=0x%lx", (unsigned long)(*entry_point), (unsigned long)(*cr3));
 
-    serial_write("[ELF] Building entry point message...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Building entry point message...");
     char msg[64] = "ELF: Entry point: 0x";
     for (int i = 0; i < 16; i++) {
         char hex = "0123456789ABCDEF"[(*entry_point >> (60 - i * 4)) & 0xF];
@@ -276,10 +239,10 @@ bool elf_load(void *file_data, uint64_t *entry_point, uint64_t *cr3) {
     }
     msg[36] = '\0';
 
-    serial_write("[ELF] Drawing entry point message...\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Drawing entry point message...");
     framebuffer_draw_string(msg, 10, 560, COLOR_CYAN, 0x00101828);
-    serial_write("[ELF] Entry point message drawn\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] Entry point message drawn");
 
-    serial_write("[ELF] elf_load returning true\n");
+    klog(KLOG_INFO, SUBSYS_CORE, "[ELF] elf_load returning true");
     return true;
 }

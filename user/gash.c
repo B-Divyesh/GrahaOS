@@ -3,12 +3,38 @@
 #include "../kernel/state.h"
 #include "../kernel/fs/grahafs.h"
 #include "../kernel/fs/cluster.h"
+#include "../kernel/log.h"
 #include "json.h"
 
 // Helper functions
 int strcmp(const char *s1, const char *s2) {
     while (*s1 && (*s1 == *s2)) { s1++; s2++; }
     return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
+
+// Phase 13: minimal atoi for the dmesg builtin's --tail / --subsys.
+// libc's stdlib.h isn't included here to keep gash freestanding-ish.
+static int atoi(const char *s) {
+    int v = 0; int sign = 1;
+    if (!s) return 0;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '-') { sign = -1; s++; } else if (*s == '+') { s++; }
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
+    return v * sign;
+}
+
+// Phase 13: case-insensitive strcmp for the dmesg builtin so users
+// can write `dmesg --level WARN` or `--level warn` interchangeably.
+// Not in libc — kept inline here.
+static int strcasecmp(const char *s1, const char *s2) {
+    while (*s1 && *s2) {
+        unsigned char a = (unsigned char)*s1++;
+        unsigned char b = (unsigned char)*s2++;
+        if (a >= 'A' && a <= 'Z') a = (unsigned char)(a + 32);
+        if (b >= 'A' && b <= 'Z') b = (unsigned char)(b + 32);
+        if (a != b) return (int)a - (int)b;
+    }
+    return (int)(unsigned char)*s1 - (int)(unsigned char)*s2;
 }
 
 int strncmp(const char *s1, const char *s2, size_t n) {
@@ -2779,6 +2805,225 @@ static int execute_builtin(char *argv[], int argc) {
     else if (strcmp(cmd, "exit") == 0) {
         print("Goodbye!\n");
         return -1;
+    }
+    // Phase 12: TAP test harness access.
+    //   ktest             — run the full suite via /bin/ktest
+    //   ktest --list      — list test names from bin/tests/manifest.txt
+    //   ktest <name>      — run /bin/tests/<name>.tap directly
+    else if (strcmp(cmd, "ktest") == 0) {
+        if (argc == 1) {
+            int pid = syscall_spawn("bin/ktest");
+            if (pid < 0) {
+                print("ktest: spawn failed — is /bin/ktest present?\n");
+                return 1;
+            }
+            int status = 0;
+            syscall_wait(&status);
+            return 1;
+        }
+
+        // --list
+        if (argc == 2 && strcmp(argv[1], "--list") == 0) {
+            int fd = syscall_open("bin/tests/manifest.txt");
+            if (fd < 0) {
+                print("ktest: cannot open bin/tests/manifest.txt\n");
+                return 1;
+            }
+            static char buf[2048];
+            int n = syscall_read(fd, buf, sizeof(buf) - 1);
+            syscall_close(fd);
+            if (n <= 0) {
+                print("ktest: manifest is empty\n");
+                return 1;
+            }
+            buf[n] = '\0';
+            // Print non-blank, non-comment lines with "  " prefix.
+            int line_start = 0;
+            for (int i = 0; i <= n; i++) {
+                if (buf[i] == '\n' || buf[i] == '\0') {
+                    // Trim leading whitespace.
+                    int s = line_start;
+                    while (s < i && (buf[s] == ' ' || buf[s] == '\t')) s++;
+                    if (s < i && buf[s] != '#') {
+                        // Trim trailing \r.
+                        int e = i;
+                        while (e > s && buf[e - 1] == '\r') e--;
+                        if (e > s) {
+                            print("  ");
+                            for (int k = s; k < e; k++) syscall_putc(buf[k]);
+                            print("\n");
+                        }
+                    }
+                    line_start = i + 1;
+                }
+            }
+            return 1;
+        }
+
+        // ktest <name> — run a single test.
+        if (argc == 2) {
+            char path[96];
+            int pi = 0;
+            const char *pfx = "bin/tests/";
+            while (pfx[pi] && pi < 95) { path[pi] = pfx[pi]; pi++; }
+            int ni = 0;
+            while (argv[1][ni] && pi < 91) { path[pi++] = argv[1][ni++]; }
+            const char *ext = ".tap";
+            int ei = 0;
+            while (ext[ei] && pi < 95) { path[pi++] = ext[ei++]; }
+            path[pi] = '\0';
+
+            print("# TAP BEGIN "); print(argv[1]); print("\n");
+            int pid = syscall_spawn(path);
+            if (pid < 0) {
+                print("# spawn failed: "); print(path); print("\n");
+                print("# TAP END "); print(argv[1]); print("\n");
+                return 1;
+            }
+            int status = 0;
+            syscall_wait(&status);
+            print("# TAP END "); print(argv[1]); print("\n");
+            print("# exit=");
+            char b[12];
+            int_to_string(status, b);
+            print(b);
+            print("\n");
+            return 1;
+        }
+
+        print("ktest: usage: ktest [--list | <name>]\n");
+        return 1;
+    }
+
+    // Phase 13: dmesg builtin — reads SYS_KLOG_READ and formats.
+    //   dmesg              — print all currently-held entries
+    //   dmesg --tail N     — only the last N
+    //   dmesg --level LV   — only LV..FATAL (LV in trace/debug/info/warn/error/fatal)
+    //   dmesg --subsys S   — only matching subsystem (name or numeric)
+    //   dmesg --json       — emit NDJSON instead of human-readable lines
+    else if (strcmp(cmd, "dmesg") == 0) {
+        static const char *lvl_names[] = {
+            "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL",
+        };
+        static const char *kernel_subs[] = {
+            "CORE", "MM", "SCHED", "SYSCALL", "VFS",
+            "FS", "NET", "CAP", "DRV", "TEST",
+        };
+
+        unsigned tail = 0;             // 0 = all
+        unsigned level_mask = 0;       // 0 = all levels
+        int subsys_filter = -1;        // -1 = no filter
+        int as_json = 0;
+
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--tail") == 0 && i + 1 < argc) {
+                tail = (unsigned)atoi(argv[++i]);
+            } else if (strcmp(argv[i], "--level") == 0 && i + 1 < argc) {
+                const char *lv = argv[++i];
+                int idx = -1;
+                for (int j = 0; j < 6; j++) {
+                    if (strcasecmp(lv, lvl_names[j]) == 0) { idx = j; break; }
+                }
+                if (idx < 0) {
+                    print("dmesg: unknown level '"); print(lv); print("'\n");
+                    return 1;
+                }
+                // include idx..FATAL
+                for (int j = idx; j < 6; j++) level_mask |= (1u << j);
+            } else if (strcmp(argv[i], "--subsys") == 0 && i + 1 < argc) {
+                const char *sub = argv[++i];
+                int found = -1;
+                for (int j = 0; j < 10; j++) {
+                    if (strcasecmp(sub, kernel_subs[j]) == 0) { found = j; break; }
+                }
+                if (found < 0) {
+                    found = atoi(sub);
+                    if (found <= 0 && sub[0] != '0') {
+                        print("dmesg: unknown subsystem '"); print(sub); print("'\n");
+                        return 1;
+                    }
+                }
+                subsys_filter = found;
+            } else if (strcmp(argv[i], "--json") == 0) {
+                as_json = 1;
+            } else {
+                print("dmesg: unknown arg '"); print(argv[i]); print("'\n");
+                print("usage: dmesg [--tail N] [--level LV] [--subsys S] [--json]\n");
+                return 1;
+            }
+        }
+
+        // Read up to 64 entries per syscall — matches the test buffer
+        // sizes elsewhere and stays well below the 4 MiB ring.
+        static klog_entry_t buf[64];
+        int n = syscall_klog_read((uint8_t)level_mask,
+                                  (uint32_t)tail, buf, sizeof(buf));
+        if (n < 0) {
+            print("dmesg: SYS_KLOG_READ failed\n");
+            return 1;
+        }
+
+        for (int i = 0; i < n; i++) {
+            klog_entry_t *e = &buf[i];
+            uint8_t lv = (uint8_t)(e->level & 0x0F);
+            const char *lv_name = (lv < 6) ? lvl_names[lv] : "?????";
+            const char *sub_name = (e->subsystem_id < 10)
+                ? kernel_subs[e->subsystem_id]
+                : "USER";
+            if (subsys_filter >= 0 && e->subsystem_id != (uint8_t)subsys_filter) {
+                continue;
+            }
+
+            uint64_t secs = e->ns_timestamp / 1000000000ULL;
+            uint64_t nsec = e->ns_timestamp % 1000000000ULL;
+            char tmp[32];
+
+            if (as_json) {
+                print("{\"seq\":");
+                int_to_string((int)e->seq, tmp); print(tmp);
+                print(",\"ns\":");
+                int_to_string((int)e->ns_timestamp, tmp); print(tmp);
+                print(",\"cpu\":");
+                int_to_string((int)e->cpu_id, tmp); print(tmp);
+                print(",\"pid\":");
+                int_to_string((int)e->pid, tmp); print(tmp);
+                print(",\"level\":\""); print(lv_name); print("\"");
+                print(",\"subsys\":\""); print(sub_name); print("\"");
+                print(",\"msg\":\""); print(e->message); print("\"");
+                print("}\n");
+            } else {
+                print("[");
+                int_to_string((int)secs, tmp); print(tmp);
+                print(".");
+                int_to_string((int)nsec, tmp); print(tmp);
+                print("] ");
+                print(lv_name); print(" ");
+                print(sub_name); print(" ");
+                print(e->message); print("\n");
+            }
+        }
+        return 1;
+    }
+
+    // Phase 13: panic-test builtin — spawn /bin/panic_test which
+    // calls SYS_DEBUG(DEBUG_PANIC). Kernel emits ==OOPS== and resets.
+    else if (strcmp(cmd, "panic-test") == 0) {
+        print("panic-test: spawning /bin/panic_test (kernel will reset)\n");
+        int pid = syscall_spawn("bin/panic_test");
+        if (pid < 0) {
+            print("panic-test: spawn failed — is /bin/panic_test present?\n");
+            return 1;
+        }
+        int status = 0;
+        syscall_wait(&status);
+        // We almost certainly never reach here — the kernel resets
+        // before SYS_WAIT can return. Print a postmortem if we do.
+        print("panic-test: child returned status=");
+        char b[12];
+        int_to_string(status, b);
+        print(b);
+        print(" (expected: kernel reset)\n");
+        return 1;
     }
 
     return 0; // Not a built-in

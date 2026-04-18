@@ -2,6 +2,8 @@
 #include "spinlock.h"
 #include "../../drivers/video/framebuffer.h"
 #include "../../arch/x86_64/cpu/smp.h"
+#include "../panic.h"
+#include "../vsnprintf.h"
 #include <stdarg.h>
 
 // Forward declaration
@@ -16,26 +18,22 @@ static void panic_print(const char *msg) {
 }
 
 void kernel_panic(const char *fmt, ...) {
-    // Disable interrupts
-    asm volatile("cli");
-    
-    // Clear screen with red
-    framebuffer_clear(COLOR_RED);
-    
-    panic_print("KERNEL PANIC: ");
-    panic_print(fmt);
-    
-    // Show which CPU panicked
-    uint64_t cpu_id = get_cpu_id();
-    char cpu_msg[32] = "CPU: ";
-    cpu_msg[5] = '0' + (cpu_id & 0xF);
-    cpu_msg[6] = '\0';
-    framebuffer_draw_string(cpu_msg, 10, 30, COLOR_WHITE, COLOR_RED);
-    
-    // Halt forever
-    for (;;) {
-        asm volatile("hlt");
-    }
+    // Phase 13: route through kpanic so spinlock panics produce a
+    // parseable ==OOPS== frame. fmt is treated as a literal reason
+    // string — callers in this codebase don't pass varargs to it.
+    // If %-formatting is needed in the future, ksnprintf into a
+    // local buffer here before calling kpanic.
+    if (!fmt) fmt = "kernel_panic (no message)";
+
+    // Format with varargs into a stack buffer in case any caller
+    // ever uses format specifiers. kpanic itself does not format.
+    char reason[160];
+    va_list ap;
+    va_start(ap, fmt);
+    kvsnprintf(reason, sizeof(reason), fmt, ap);
+    va_end(ap);
+
+    kpanic(reason);
 }
 
 void spinlock_init(spinlock_t *lock, const char *name) {

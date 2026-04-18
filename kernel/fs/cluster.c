@@ -6,6 +6,7 @@
 #include "simhash.h"
 #include "../sync/spinlock.h"
 #include "../../arch/x86_64/drivers/serial/serial.h"
+#include "../log.h"
 
 // String helpers (kernel freestanding — no libc)
 static void *cl_memset(void *s, int c, size_t n) {
@@ -114,11 +115,8 @@ uint32_t cluster_assign(uint32_t inode_num, uint64_t simhash, const char *filena
     cl_strncpy(g_clusters[slot].members[0].name, filename, 28);
     g_cluster_count++;
 
-    serial_write("[Cluster] New cluster ");
-    serial_write_dec(new_id);
-    serial_write(" created, leader=");
-    serial_write(filename);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_FS, "[Cluster] New cluster %lu created, leader=", (unsigned long)(new_id));
+    klog(KLOG_INFO, SUBSYS_FS, "%s", filename);
 
     spinlock_release(&cluster_lock);
     return new_id;
@@ -190,11 +188,7 @@ void cluster_rebuild_finalize(void) {
         }
     }
 
-    serial_write("[Cluster] Rebuild complete: ");
-    serial_write_dec(g_cluster_count);
-    serial_write(" clusters, next_id=");
-    serial_write_dec(g_next_cluster_id);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_FS, "[Cluster] Rebuild complete: %lu clusters, next_id=%lu", (unsigned long)(g_cluster_count), (unsigned long)(g_next_cluster_id));
 
     spinlock_release(&cluster_lock);
 }

@@ -52,6 +52,22 @@ typedef long ssize_t;
 #define SYS_FIND_SIMILAR     1051
 #define SYS_CLUSTER_LIST     1052
 #define SYS_CLUSTER_MEMBERS  1053
+#define SYS_KLOG_READ        1054
+#define SYS_KLOG_WRITE       1055
+#define SYS_DEBUG            1056
+
+// Phase 13: klog level/subsys constants (mirror of kernel/log.h).
+// Keep these in sync with the kernel-side definitions.
+#define KLOG_TRACE 0
+#define KLOG_DEBUG 1
+#define KLOG_INFO  2
+#define KLOG_WARN  3
+#define KLOG_ERROR 4
+#define KLOG_FATAL 5
+
+// SYS_DEBUG sub-operations (build-gated, test-only).
+#define DEBUG_PANIC      1
+#define DEBUG_KERNEL_PF  2
 
 // Directory entry structure for user space
 typedef struct {
@@ -433,6 +449,49 @@ static inline int syscall_cluster_members(uint32_t cluster_id, void *buf) {
     long ret;
     asm volatile("syscall" : "=a"(ret)
         : "a"(SYS_CLUSTER_MEMBERS), "D"(cluster_id), "S"(buf)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 13: klog write. Emit one entry into the kernel log ring.
+// level must be < KLOG_FATAL (user cannot emit FATAL).
+// subsys must be >= 10 (kernel subsystem ids are reserved).
+// msg may be any bytes; the kernel bounds them to 223 bytes.
+// Returns 0 on success, -1 on validation failure or copy error.
+static inline int syscall_klog_write(uint8_t level, uint8_t subsys,
+                                     const char *msg, uint32_t msg_len) {
+    long ret;
+    register long r10 asm("r10") = (long)msg_len;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_KLOG_WRITE), "D"((long)level), "S"((long)subsys),
+          "d"(msg), "r"(r10)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 13: klog read. Copy the most recent `tail_count` entries (0 =
+// all currently held) matching `level_mask` into `buf`. `level_mask`
+// is a bitmap (bit N = include level N); 0 means "all levels".
+// Returns the number of klog_entry_t records written, or negative
+// on error. Each record is 256 bytes; buf_cap should be a multiple.
+static inline int syscall_klog_read(uint8_t level_mask, uint32_t tail_count,
+                                    void *buf, uint32_t buf_cap) {
+    long ret;
+    register long r10 asm("r10") = (long)buf_cap;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_KLOG_READ), "D"((long)level_mask), "S"((long)tail_count),
+          "d"(buf), "r"(r10)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 13: controlled-panic trigger for gate tests. Build-gated;
+// returns -1 on release builds. op=DEBUG_PANIC takes a reason string
+// in RSI. op=DEBUG_KERNEL_PF takes no args.
+static inline int syscall_debug(int op, const char *arg) {
+    long ret;
+    asm volatile("syscall" : "=a"(ret)
+        : "a"(SYS_DEBUG), "D"((long)op), "S"(arg)
         : "rcx", "r11", "memory");
     return (int)ret;
 }

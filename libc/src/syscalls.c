@@ -30,7 +30,9 @@
 #define SYS_SIGNAL      1019
 #define SYS_GETPID      1020
 #define SYS_GET_SYSTEM_STATE 1021
-#define SYS_DEBUG       9999
+#define SYS_KLOG_READ   1054
+#define SYS_KLOG_WRITE  1055
+#define SYS_DEBUG       1056
 
 // Generic syscall functions
 static inline long syscall0(long n) {

@@ -84,6 +84,22 @@ All with minimal or no manual intervention.
 
 ---
 
+### Design Philosophy
+
+GrahaOS is **not Unix**. It is built on seven non-negotiable principles:
+
+1. **Capabilities are the sole authority** — no ambient authority, no `uid/gid`, no `root`.
+2. **GCP is the only native public interface** — typed channels, structured logs, no POSIX in the kernel (optional `libposix` userspace layer for porting existing programs).
+3. **Foundation before migration** — new primitives ship before consumers migrate to them.
+4. **Failure is auditable, not silent** — structured oops on panic, every capability violation logged.
+5. **Everything is testable by hand** — every spec has a `manual_verification` section with exact commands and outputs.
+6. **Drivers drift outward** — hybrid microkernel; kernel keeps only VMM, scheduler, interrupts, framebuffer, timer, capability/channel primitives.
+7. **Speculation is a first-class AI primitive** — versioned filesystem + COW process snapshots + transactional channels for safe rollback.
+
+See [`ACTIVATION_ARCHITECTURE.md`](./ACTIVATION_ARCHITECTURE.md) for the original CAN (Capability Activation Network) design, [`CLAUDE.md`](./CLAUDE.md) for development workflow, and [`ROADMAP.md`](./ROADMAP.md) for the phase-by-phase plan. All work from Phase 12 onward is driven by YAML specs in [`specs/`](./specs/).
+
+---
+
 ### Technical Roadmap
 
 Moving forward, the key milestones include:

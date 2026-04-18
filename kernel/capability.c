@@ -5,6 +5,7 @@
 #include "sync/spinlock.h"
 #include "../arch/x86_64/drivers/serial/serial.h"
 #include "../arch/x86_64/cpu/sched/sched.h"
+#include "log.h"
 
 // --- Static string helpers (kernel has no libc) ---
 
@@ -120,11 +121,8 @@ int cap_watch(int cap_id, int32_t pid) {
     cap->watcher_pids[cap->watcher_count] = pid;
     cap->watcher_count++;
 
-    serial_write("[CAN] Watch: pid=");
-    serial_write_dec(pid);
-    serial_write(" -> ");
-    serial_write(cap->name);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CAP, "[CAN] Watch: pid=%lu -> ", (unsigned long)(pid));
+    klog(KLOG_INFO, SUBSYS_CAP, "%s", cap->name);
 
     spinlock_release(&g_cap_lock);
     return CAP_OK;
@@ -161,11 +159,8 @@ int cap_unwatch(int cap_id, int32_t pid) {
     }
     cap->watcher_count--;
 
-    serial_write("[CAN] Unwatch: pid=");
-    serial_write_dec(pid);
-    serial_write(" -> ");
-    serial_write(cap->name);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CAP, "[CAN] Unwatch: pid=%lu -> ", (unsigned long)(pid));
+    klog(KLOG_INFO, SUBSYS_CAP, "%s", cap->name);
 
     spinlock_release(&g_cap_lock);
     return CAP_OK;
@@ -245,7 +240,7 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
 
     // Check name is non-NULL and non-empty
     if (!name || name[0] == '\0') {
-        serial_write("[CAN] ERR: empty name\n");
+        klog(KLOG_INFO, SUBSYS_CAP, "[CAN] ERR: empty name");
         spinlock_release(&g_cap_lock);
         return CAP_ERR_NAME_EMPTY;
     }
@@ -254,9 +249,7 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
     for (uint32_t i = 0; i < g_cap_count; i++) {
         if (g_caps[i].deleted) continue;
         if (cap_strcmp(g_caps[i].name, name) == 0) {
-            serial_write("[CAN] ERR: duplicate name: ");
-            serial_write(name);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_CAP, "[CAN] ERR: duplicate name: %s", name);
             spinlock_release(&g_cap_lock);
             return CAP_ERR_NAME_DUPLICATE;
         }
@@ -264,7 +257,7 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
 
     // Check registry capacity
     if (g_cap_count >= MAX_CAPABILITIES) {
-        serial_write("[CAN] ERR: registry full\n");
+        klog(KLOG_INFO, SUBSYS_CAP, "[CAN] ERR: registry full");
         spinlock_release(&g_cap_lock);
         return CAP_ERR_REGISTRY_FULL;
     }
@@ -275,9 +268,7 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
 
     // HARDWARE must have no deps
     if (type == CAP_HARDWARE && dep_count > 0) {
-        serial_write("[CAN] ERR: HARDWARE cap has deps: ");
-        serial_write(name);
-        serial_write("\n");
+        klog(KLOG_INFO, SUBSYS_CAP, "[CAN] ERR: HARDWARE cap has deps: %s", name);
         spinlock_release(&g_cap_lock);
         return CAP_ERR_HW_HAS_DEPS;
     }
@@ -289,18 +280,14 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
 
     for (int i = 0; i < dep_count; i++) {
         if (!dep_names || !dep_names[i] || dep_names[i][0] == '\0') {
-            serial_write("[CAN] ERR: empty dep name for: ");
-            serial_write(name);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_CAP, "[CAN] ERR: empty dep name for: %s", name);
             spinlock_release(&g_cap_lock);
             return CAP_ERR_DEP_UNRESOLVED;
         }
 
         // Self-dependency check
         if (cap_strcmp(dep_names[i], name) == 0) {
-            serial_write("[CAN] ERR: self-dep: ");
-            serial_write(name);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_CAP, "[CAN] ERR: self-dep: %s", name);
             spinlock_release(&g_cap_lock);
             return CAP_ERR_DEP_SELF;
         }
@@ -316,11 +303,8 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
         }
 
         if (found < 0) {
-            serial_write("[CAN] ERR: unresolved dep '");
-            serial_write(dep_names[i]);
-            serial_write("' for: ");
-            serial_write(name);
-            serial_write("\n");
+            klog(KLOG_INFO, SUBSYS_CAP, "[CAN] ERR: unresolved dep '%s' for: ", dep_names[i]);
+            klog(KLOG_INFO, SUBSYS_CAP, "%s", name);
             spinlock_release(&g_cap_lock);
             return CAP_ERR_DEP_UNRESOLVED;
         }
@@ -333,15 +317,10 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
     for (int i = 0; i < dep_count; i++) {
         uint32_t dep_type = g_caps[resolved_deps[i]].type;
         if (!layer_allows_dep(type, dep_type)) {
-            serial_write("[CAN] ERR: layer violation: ");
-            serial_write(name);
-            serial_write(" (type=");
-            serial_write_dec(type);
-            serial_write(") cannot depend on ");
-            serial_write(g_caps[resolved_deps[i]].name);
-            serial_write(" (type=");
-            serial_write_dec(dep_type);
-            serial_write(")\n");
+            klog(KLOG_INFO, SUBSYS_CAP, "[CAN] ERR: layer violation: %s", name);
+            klog(KLOG_INFO, SUBSYS_CAP, " (type=%lu) cannot depend on ", (unsigned long)(type));
+            klog(KLOG_INFO, SUBSYS_CAP, "%s", g_caps[resolved_deps[i]].name);
+            klog(KLOG_INFO, SUBSYS_CAP, " (type=%lu)", (unsigned long)(dep_type));
             spinlock_release(&g_cap_lock);
             return CAP_ERR_LAYER_VIOLATION;
         }
@@ -362,9 +341,7 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
         // but validates the graph structure)
         for (uint32_t i = 0; i < g_cap_count; i++) {
             if (visited[i] && !g_caps[i].deleted && cap_strcmp(g_caps[i].name, name) == 0) {
-                serial_write("[CAN] ERR: cycle detected for: ");
-                serial_write(name);
-                serial_write("\n");
+                klog(KLOG_INFO, SUBSYS_CAP, "[CAN] ERR: cycle detected for: %s", name);
                 spinlock_release(&g_cap_lock);
                 return CAP_ERR_CYCLE;
             }
@@ -388,9 +365,8 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
             }
         }
         if (!has_hw) {
-            serial_write("[CAN] PASS5 WARN: '");
-            serial_write(name);
-            serial_write("' has no path to HARDWARE\n");
+            klog(KLOG_WARN, SUBSYS_CAP, "[CAN] PASS5 WARN: '%s", name);
+            klog(KLOG_INFO, SUBSYS_CAP, "' has no path to HARDWARE");
         }
     }
 
@@ -408,13 +384,9 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
                     dfs_walk(g_caps[resolved_deps[j]].dep_indices[k], visited);
                 }
                 if (visited[resolved_deps[i]]) {
-                    serial_write("[CAN] PASS6 WARN: dep '");
-                    serial_write(dep_names[i]);
-                    serial_write("' in '");
-                    serial_write(name);
-                    serial_write("' transitively redundant via '");
-                    serial_write(dep_names[j]);
-                    serial_write("'\n");
+                    klog(KLOG_WARN, SUBSYS_CAP, "[CAN] PASS6 WARN: dep '%s", dep_names[i]);
+                    klog(KLOG_INFO, SUBSYS_CAP, "' in '%s' transitively redundant via '", name);
+                    klog(KLOG_INFO, SUBSYS_CAP, "%s'", dep_names[j]);
                     break;  // Only warn once per redundant dep
                 }
             }
@@ -467,17 +439,9 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
     g_cap_count++;
 
     // Log
-    serial_write("[CAN] Registered: ");
-    serial_write(name);
-    serial_write(" (type=");
-    serial_write_dec(type);
-    serial_write(", deps=");
-    serial_write_dec(dep_count);
-    serial_write(", ops=");
-    serial_write_dec(cap->op_count);
-    serial_write(", state=");
-    serial_write(cap->state == CAP_STATE_ON ? "ON" : "OFF");
-    serial_write(")\n");
+    klog(KLOG_INFO, SUBSYS_CAP, "[CAN] Registered: %s", name);
+    klog(KLOG_INFO, SUBSYS_CAP, " (type=%lu, deps=%lu, ops=%lu, state=", (unsigned long)(type), (unsigned long)(dep_count), (unsigned long)(cap->op_count));
+    klog(KLOG_INFO, SUBSYS_CAP, "%s)", cap->state == CAP_STATE_ON ? "ON" : "OFF");
 
     spinlock_release(&g_cap_lock);
     return (int)id;
@@ -511,11 +475,9 @@ int cap_activate(int cap_id) {
             cap->error_dep = cap->dep_indices[i];
             if (cap->watcher_count > 0)
                 cap_notify_watchers(cap_id, CAP_STATE_STARTING, CAP_STATE_ERROR);
-            serial_write("[CAN] Activation failed for '");
-            serial_write(cap->name);
-            serial_write("': dep '");
-            serial_write(g_caps[dep_id].name);
-            serial_write("' failed\n");
+            klog(KLOG_ERROR, SUBSYS_CAP, "[CAN] Activation failed for '%s", cap->name);
+            klog(KLOG_INFO, SUBSYS_CAP, "': dep '%s", g_caps[dep_id].name);
+            klog(KLOG_ERROR, SUBSYS_CAP, "' failed");
             return CAP_ERR_DEP_FAILED;
         }
     }
@@ -527,9 +489,8 @@ int cap_activate(int cap_id) {
             cap->state = CAP_STATE_ERROR;
             if (cap->watcher_count > 0)
                 cap_notify_watchers(cap_id, CAP_STATE_STARTING, CAP_STATE_ERROR);
-            serial_write("[CAN] Activation callback failed for '");
-            serial_write(cap->name);
-            serial_write("'\n");
+            klog(KLOG_ERROR, SUBSYS_CAP, "[CAN] Activation callback failed for '%s", cap->name);
+            klog(KLOG_INFO, SUBSYS_CAP, "'");
             return CAP_ERR_ACTIVATE_FAIL;
         }
     }
@@ -541,9 +502,7 @@ int cap_activate(int cap_id) {
     if (cap->watcher_count > 0)
         cap_notify_watchers(cap_id, CAP_STATE_STARTING, CAP_STATE_ON);
 
-    serial_write("[CAN] Activated: ");
-    serial_write(cap->name);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CAP, "[CAN] Activated: %s", cap->name);
 
     return CAP_OK;
 }
@@ -585,9 +544,7 @@ int cap_deactivate(int cap_id) {
     if (cap->watcher_count > 0)
         cap_notify_watchers(cap_id, prev_state, CAP_STATE_OFF);
 
-    serial_write("[CAN] Deactivated: ");
-    serial_write(cap->name);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CAP, "[CAN] Deactivated: %s", cap->name);
 
     return CAP_OK;
 }
@@ -624,9 +581,7 @@ int cap_unregister(int cap_id) {
     cap->deleted = 1;
     cap->state = CAP_STATE_OFF;
 
-    serial_write("[CAN] Unregistered: ");
-    serial_write(cap->name);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_CAP, "[CAN] Unregistered: %s", cap->name);
 
     spinlock_release(&g_cap_lock);
     return CAP_OK;

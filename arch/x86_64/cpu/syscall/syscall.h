@@ -19,8 +19,6 @@
 #define SYS_GETC 1006
 #define SYS_EXEC 1007
 
-#define SYS_DEBUG 9999
-
 #define SYS_EXIT 1008
 
 #define SYS_WAIT 1009
@@ -83,6 +81,20 @@
 // Phase 11b: Sequential Leader Clustering
 #define SYS_CLUSTER_LIST    1052
 #define SYS_CLUSTER_MEMBERS 1053
+
+// Phase 13: Structured logging
+#define SYS_KLOG_READ       1054
+#define SYS_KLOG_WRITE      1055
+
+// Phase 13: controlled-panic / kernel-page-fault trigger for the
+// harness's gate tests. Build-gated — the dispatcher only compiles
+// the handler when WITH_DEBUG_SYSCALL is defined. In release builds
+// the syscall number is reserved but returns -1.
+#define SYS_DEBUG           1056
+
+// SYS_DEBUG sub-operations passed in RDI.
+#define DEBUG_PANIC         1   // RSI = const char *reason
+#define DEBUG_KERNEL_PF     2   // no args; writes to unmapped kernel addr
 
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);

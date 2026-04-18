@@ -14,6 +14,7 @@
 #include "../../arch/x86_64/mm/pmm.h"
 #include "../capability.h"
 #include "../sync/spinlock.h"
+#include "../log.h"
 
 // ===== Mongoose Required Implementations =====
 
@@ -97,7 +98,7 @@ void mg_log_prefix(int level, const char *file, int line, const char *fname) {
     char prefix[128];
     const char *fn = fname ? fname : "?";
     snprintf(prefix, sizeof(prefix), "[NET %s] %s:%d ", lvl_str, fn, line);
-    serial_write(prefix);
+    klog(KLOG_INFO, SUBSYS_NET, "%s", prefix);
 }
 
 void mg_log(const char *fmt, ...) {
@@ -106,8 +107,7 @@ void mg_log(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    serial_write(buf);
-    serial_write("\n");
+    klog(KLOG_INFO, SUBSYS_NET, "%s", buf);
 }
 
 // ===== E1000 Driver Bridge =====
@@ -263,7 +263,7 @@ static void send_http_request(struct mg_connection *c, net_request_t *req) {
                   "%.*s",
                   uri, (int)host.len, host.buf, req->post_body_len,
                   req->post_body_len, req->post_body);
-        serial_write("[NET] HTTP POST sent\n");
+        klog(KLOG_INFO, SUBSYS_NET, "[NET] HTTP POST sent");
     } else {
         mg_printf(c,
                   "GET %s HTTP/1.1\r\n"
@@ -271,7 +271,7 @@ static void send_http_request(struct mg_connection *c, net_request_t *req) {
                   "Connection: close\r\n"
                   "\r\n",
                   uri, (int)host.len, host.buf);
-        serial_write("[NET] HTTP GET sent\n");
+        klog(KLOG_INFO, SUBSYS_NET, "[NET] HTTP GET sent");
     }
 }
 
@@ -292,10 +292,10 @@ static void http_client_handler(struct mg_connection *c, int ev, void *ev_data) 
         if (!c->is_tls) {
             send_http_request(c, req);
         } else {
-            serial_write("[NET] TLS connection — deferring to handshake\n");
+            klog(KLOG_INFO, SUBSYS_NET, "[NET] TLS connection — deferring to handshake");
         }
     } else if (ev == MG_EV_TLS_HS) {
-        serial_write("[NET] TLS handshake complete\n");
+        klog(KLOG_INFO, SUBSYS_NET, "[NET] TLS handshake complete");
         send_http_request(c, req);
     } else if (ev == MG_EV_READ) {
         // Save a snapshot of recv data for salvage on close
@@ -329,9 +329,8 @@ static void http_client_handler(struct mg_connection *c, int ev, void *ev_data) 
         net_wake_task(task_id);
     } else if (ev == MG_EV_ERROR) {
         const char *err = (const char *)ev_data;
-        serial_write("[NET] HTTP client error: ");
-        if (err) serial_write(err);
-        serial_write("\n");
+        klog(KLOG_ERROR, SUBSYS_NET, "[NET] HTTP client error: %s",
+             err ? err : "(no message)");
 
         req->error_code = NET_ERR_CONNECT;
         if (err && strstr(err, "DNS")) {
@@ -382,12 +381,12 @@ static void http_client_handler(struct mg_connection *c, int ev, void *ev_data) 
                     req->http_status = mg_http_status(&hm);
                     req->state = NET_STATE_DONE;
                     req->conn = NULL;
-                    serial_write("[NET] HTTP client: salvaged response from close\n");
+                    klog(KLOG_INFO, SUBSYS_NET, "[NET] HTTP client: salvaged response from close");
                     net_wake_task(task_id);
                     return;
                 }
             }
-            serial_write("[NET] HTTP client: connection closed with no data\n");
+            klog(KLOG_INFO, SUBSYS_NET, "[NET] HTTP client: connection closed with no data");
             req->error_code = NET_ERR_CONNECT;
             req->state = NET_STATE_ERROR;
             req->conn = NULL;
@@ -555,7 +554,7 @@ int net_http_post_start(int task_id, const char *url, const char *body, int body
     }
 
     req->conn = c;
-    serial_write("[NET] HTTP POST request started\n");
+    klog(KLOG_INFO, SUBSYS_NET, "[NET] HTTP POST request started");
     return 0;
 }
 
@@ -645,7 +644,7 @@ void net_check_timeouts(void) {
             }
             uint64_t elapsed = now - s_requests[i].start_time_ms;
             if (elapsed > timeout) {
-                serial_write("[NET] Request timed out\n");
+                klog(KLOG_INFO, SUBSYS_NET, "[NET] Request timed out");
                 s_requests[i].error_code = NET_ERR_TIMEOUT;
                 s_requests[i].state = NET_STATE_ERROR;
                 if (s_requests[i].conn) {
@@ -669,19 +668,20 @@ static int uecc_rng(uint8_t *dest, unsigned size) {
 void net_init(void) {
     if (s_net_initialized) return;
 
-    serial_write("[NET] Initializing Mongoose TCP/IP stack...\n");
+    klog(KLOG_INFO, SUBSYS_NET, "[NET] Initializing Mongoose TCP/IP stack...");
 
     // Enable info logging (verbose floods serial port)
     mg_log_level = MG_LL_INFO;
 
     // Detect hardware RNG
     s_has_rdrand = rdrand_supported();
-    serial_write(s_has_rdrand ? "[NET] RDRAND available - using hardware RNG\n"
-                              : "[NET] RDRAND not available - using software PRNG\n");
+    klog(KLOG_INFO, SUBSYS_NET,
+         s_has_rdrand ? "[NET] RDRAND available - using hardware RNG"
+                      : "[NET] RDRAND not available - using software PRNG");
 
     // Initialize kernel malloc arena
     kmalloc_init();
-    serial_write("[NET] Kernel malloc arena ready (2MB)\n");
+    klog(KLOG_INFO, SUBSYS_NET, "[NET] Kernel malloc arena ready (2MB)");
 
     // Set up RNG for micro-ecc P-256 operations (ECDH key generation)
     extern void mg_uecc_set_rng(int (*)(uint8_t *, unsigned));
@@ -689,7 +689,7 @@ void net_init(void) {
 
     // Check E1000 is present
     if (!e1000_is_present()) {
-        serial_write("[NET] ERROR: E1000 NIC not found, aborting net_init\n");
+        klog(KLOG_ERROR, SUBSYS_NET, "[NET] ERROR: E1000 NIC not found, aborting net_init");
         return;
     }
 
@@ -711,30 +711,30 @@ void net_init(void) {
 
     // Initialize TCP/IP stack
     mg_tcpip_init(&s_mgr, &s_mif);
-    serial_write("[NET] TCP/IP stack initialized\n");
+    klog(KLOG_INFO, SUBSYS_NET, "[NET] TCP/IP stack initialized");
 
     // Log IP configuration
     {
         char ip_msg[64];
         snprintf(ip_msg, sizeof(ip_msg), "[NET] IP: 10.0.2.15, GW: 10.0.2.2\n");
-        serial_write(ip_msg);
+        klog(KLOG_INFO, SUBSYS_NET, "%s", ip_msg);
     }
 
     // Start HTTP server on port 80
     mg_http_listen(&s_mgr, "http://0.0.0.0:80", http_handler, NULL);
-    serial_write("[NET] HTTP server listening on port 80\n");
+    klog(KLOG_INFO, SUBSYS_NET, "[NET] HTTP server listening on port 80");
 
     // Register CAN capability
     const char *tcp_deps[] = {"e1000_nic"};
     cap_register("tcp_ip", CAP_SERVICE, CAP_SUBTYPE_OTHER, -1,
                  tcp_deps, 1, NULL, NULL, NULL, 0, NULL);
-    serial_write("[NET] Registered CAN capability: tcp_ip\n");
+    klog(KLOG_INFO, SUBSYS_NET, "[NET] Registered CAN capability: tcp_ip");
 
     // Initialize HTTP client request table
     net_requests_init();
 
     s_net_initialized = true;
-    serial_write("[NET] Mongoose TCP/IP initialization complete\n");
+    klog(KLOG_INFO, SUBSYS_NET, "[NET] Mongoose TCP/IP initialization complete");
 }
 
 // ===== Poll Task =====
@@ -770,7 +770,7 @@ void mongoose_poll_task(void) {
             uint64_t now_hb = mg_millis();
             if (now_hb - last_heartbeat >= 30000) {
                 last_heartbeat = now_hb;
-                serial_write("[NET] poll task alive\n");
+                klog(KLOG_INFO, SUBSYS_NET, "[NET] poll task alive");
             }
         }
 
