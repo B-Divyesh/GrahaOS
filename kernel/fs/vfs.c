@@ -580,3 +580,56 @@ void vfs_get_stats(uint32_t *open_files, uint32_t *block_devs, uint32_t *mounted
     if (block_devs) *block_devs = bd;
     if (mounted_fs) *mounted_fs = mf;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 18: async entry-point wrappers.
+// ---------------------------------------------------------------------------
+// Both wrappers follow the same pattern: if the node exposes an async hook
+// (e.g., grahafs_async_read), delegate to it. Otherwise call the synchronous
+// node->read / node->write and invoke the caller's completion synchronously.
+// Errors in either path are reported through cb (for dispatched requests) or
+// the return value (for synchronous validation failures).
+
+int vfs_async_read(vfs_node_t *node, uint64_t offset, uint64_t len,
+                   void *dst, vfs_async_completion_t cb, void *user_data) {
+    if (!node || !dst || !cb) return -22 /* -EINVAL */;
+    if (len == 0) {
+        cb(0, user_data);
+        return 0;
+    }
+    if (node->async_read) {
+        return node->async_read(node, offset, len, dst, cb, user_data);
+    }
+    if (!node->read) {
+        cb(-38 /* -ENOSYS */, user_data);
+        return 0;
+    }
+    ssize_t r = node->read(node, offset, (size_t)len, dst);
+    cb((int64_t)r, user_data);
+    return 0;
+}
+
+vfs_node_t *vfs_node_for_file_slot(int slot) {
+    if (slot < 0 || slot >= MAX_OPEN_FILES) return NULL;
+    if (!open_file_table[slot].in_use) return NULL;
+    return open_file_table[slot].node;
+}
+
+int vfs_async_write(vfs_node_t *node, uint64_t offset, uint64_t len,
+                    const void *src, vfs_async_completion_t cb, void *user_data) {
+    if (!node || !src || !cb) return -22 /* -EINVAL */;
+    if (len == 0) {
+        cb(0, user_data);
+        return 0;
+    }
+    if (node->async_write) {
+        return node->async_write(node, offset, len, src, cb, user_data);
+    }
+    if (!node->write) {
+        cb(-38 /* -ENOSYS */, user_data);
+        return 0;
+    }
+    ssize_t r = node->write(node, offset, (size_t)len, (void *)src);
+    cb((int64_t)r, user_data);
+    return 0;
+}

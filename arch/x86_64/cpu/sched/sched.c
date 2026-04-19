@@ -11,8 +11,18 @@
 #include "../../../../kernel/fs/pipe.h"
 #include "../../../../kernel/panic.h"
 #include "../../../../kernel/log.h"
+#include "../../../../kernel/mm/slab.h"
+#include "../../../../kernel/cap/handle_table.h"
+#include "../../../../kernel/cap/object.h"
+#include "../../../../kernel/cap/deprecated.h"
+#include "../../../../kernel/mm/vmo.h"
 
-static task_t tasks[MAX_TASKS];
+// Phase 14: task_t objects now live in task_cache (Bonwick slab). The
+// scheduler still keeps a fixed-size index array for stable task ids
+// and O(1) slot lookup. task_ptrs[i] is NULL when slot i is free, or
+// points to a slab-allocated task_t when occupied.
+static task_t *task_ptrs[MAX_TASKS];
+static kmem_cache_t *task_cache = NULL;
 static int next_task_id = 0;
 static int current_task_index = 0;
 
@@ -35,34 +45,65 @@ static void *memset(void *s, int c, size_t n) {
 void sched_init(void) {
     // Initialize the scheduler lock
     spinlock_init(&sched_lock, "scheduler");
-    
+
+    // Phase 14: lazy-create the task_t slab cache the first time
+    // sched_init runs. Requires kheap/slab to already be initialised
+    // (main.c runs kmem_slab_init + kheap_init before sched_init).
+    if (!task_cache) {
+        task_cache = kmem_cache_create("task_t",
+                                       sizeof(task_t),
+                                       _Alignof(task_t),
+                                       /*ctor=*/NULL,
+                                       SUBSYS_SCHED);
+        if (!task_cache) {
+            kpanic("sched_init: kmem_cache_create(task_cache) failed");
+        }
+    }
+
     spinlock_acquire(&sched_lock);
-    memset(tasks, 0, sizeof(tasks));
+
+    // All slots start empty.
+    for (int i = 0; i < MAX_TASKS; ++i) task_ptrs[i] = NULL;
+
+    // Allocate task 0 (kernel idle task) from the slab.
+    task_ptrs[0] = kmem_cache_alloc(task_cache);
+    if (!task_ptrs[0]) {
+        spinlock_release(&sched_lock);
+        kpanic("sched_init: task_cache alloc failed for task 0");
+    }
 
     // Task 0 is the kernel's idle task
-    tasks[0].id = next_task_id++;
-    tasks[0].state = TASK_STATE_RUNNING;
-    tasks[0].cr3 = vmm_get_pml4_phys(vmm_get_kernel_space());
-    tasks[0].parent_id = -1;
-    tasks[0].waiting_for_child = -1;
-    tasks[0].pgid = 0;
-    tasks[0].pending_signals = 0;
-    tasks[0].name[0] = 'k'; tasks[0].name[1] = 'e'; tasks[0].name[2] = 'r';
-    tasks[0].name[3] = 'n'; tasks[0].name[4] = 'e'; tasks[0].name[5] = 'l';
-    tasks[0].name[6] = '\0';
+    (*task_ptrs[0]).id = next_task_id++;
+    (*task_ptrs[0]).state = TASK_STATE_RUNNING;
+    (*task_ptrs[0]).cr3 = vmm_get_pml4_phys(vmm_get_kernel_space());
+    (*task_ptrs[0]).parent_id = -1;
+    (*task_ptrs[0]).waiting_for_child = -1;
+    (*task_ptrs[0]).pgid = 0;
+    (*task_ptrs[0]).pending_signals = 0;
+    (*task_ptrs[0]).name[0] = 'k'; (*task_ptrs[0]).name[1] = 'e'; (*task_ptrs[0]).name[2] = 'r';
+    (*task_ptrs[0]).name[3] = 'n'; (*task_ptrs[0]).name[4] = 'e'; (*task_ptrs[0]).name[5] = 'l';
+    (*task_ptrs[0]).name[6] = '\0';
     for (int i = 0; i < MAX_SIGNALS; i++) {
-        tasks[0].signal_handlers[i] = SIG_DFL;
+        (*task_ptrs[0]).signal_handlers[i] = SIG_DFL;
     }
-    tasks[0].event_head = 0;
-    tasks[0].event_tail = 0;
-    tasks[0].event_count = 0;
-    tasks[0].event_waiting = 0;
+    (*task_ptrs[0]).event_head = 0;
+    (*task_ptrs[0]).event_tail = 0;
+    (*task_ptrs[0]).event_count = 0;
+    (*task_ptrs[0]).event_waiting = 0;
+
+    // Phase 15a: initialize the handle table for task 0 (kernel).
+    // Non-fatal if this fails — task 0 rarely makes cap syscalls.
+    (void)cap_handle_table_init(&(*task_ptrs[0]).cap_handles);
+
+    // Phase 15b: task 0 gets the full pledge (kernel idle has full authority,
+    // though it does no syscalls). Child tasks inherit via pledge_init below.
+    pledge_init(task_ptrs[0], (pledge_mask_t){.raw = PLEDGE_ALL});
 
     // Phase 10a: Kernel idle task has no FDs
     for (int f = 0; f < PROC_MAX_FDS; f++) {
-        tasks[0].fd_table[f].type = FD_TYPE_UNUSED;
-        tasks[0].fd_table[f].ref = -1;
-        tasks[0].fd_table[f].flags = 0;
+        (*task_ptrs[0]).fd_table[f].type = FD_TYPE_UNUSED;
+        (*task_ptrs[0]).fd_table[f].ref = -1;
+        (*task_ptrs[0]).fd_table[f].flags = 0;
     }
 
     // Get current stack pointer
@@ -70,20 +111,20 @@ void sched_init(void) {
     asm volatile("mov %%rsp, %0" : "=r"(current_rsp));
     
     // Set kernel stack for idle task
-    tasks[0].kernel_stack_top = (current_rsp & ~0xFFF) + 0x4000;
+    (*task_ptrs[0]).kernel_stack_top = (current_rsp & ~0xFFF) + 0x4000;
     
     // Initialize the interrupt frame for idle task
-    memset(&tasks[0].regs, 0, sizeof(struct interrupt_frame));
-    tasks[0].regs.cs = 0x08;      // Kernel code segment
-    tasks[0].regs.ss = 0x10;      // Kernel data segment  
-    tasks[0].regs.ds = 0x10;      // Data segment
-    tasks[0].regs.rflags = 0x202; // IF=1, Reserved=1
-    tasks[0].regs.rsp = current_rsp;
-    tasks[0].regs.rbp = current_rsp;
+    memset(&(*task_ptrs[0]).regs, 0, sizeof(struct interrupt_frame));
+    (*task_ptrs[0]).regs.cs = 0x08;      // Kernel code segment
+    (*task_ptrs[0]).regs.ss = 0x10;      // Kernel data segment  
+    (*task_ptrs[0]).regs.ds = 0x10;      // Data segment
+    (*task_ptrs[0]).regs.rflags = 0x202; // IF=1, Reserved=1
+    (*task_ptrs[0]).regs.rsp = current_rsp;
+    (*task_ptrs[0]).regs.rbp = current_rsp;
     
     // Update the per-CPU TSS
     uint32_t cpu_id = smp_get_current_cpu();
-    g_cpu_locals[cpu_id].tss.rsp0 = tasks[0].kernel_stack_top;
+    g_cpu_locals[cpu_id].tss.rsp0 = (*task_ptrs[0]).kernel_stack_top;
     
     current_task_index = 0;
     
@@ -126,27 +167,46 @@ int sched_create_task(void (*entry_point)(void)) {
     }
 
     int id = next_task_id++;
-    tasks[id].id = id;
-    tasks[id].state = TASK_STATE_BLOCKED;  // BLOCKED until fully initialized
-    tasks[id].parent_id = current_task_index >= 0 ? tasks[current_task_index].id : -1;
-    tasks[id].waiting_for_child = -1;
-    tasks[id].pgid = current_task_index >= 0 ? tasks[current_task_index].pgid : 0;
-    tasks[id].pending_signals = 0;
-    tasks[id].name[0] = '\0';
-    for (int s = 0; s < MAX_SIGNALS; s++) {
-        tasks[id].signal_handlers[s] = SIG_DFL;
+    // Phase 14: allocate task_t from the slab. The cache was created
+    // by sched_init; its existence is an invariant here.
+    task_ptrs[id] = kmem_cache_alloc(task_cache);
+    if (!task_ptrs[id]) {
+        next_task_id--;  // Roll back id allocation on alloc failure.
+        spinlock_release(&sched_lock);
+        klog(KLOG_ERROR, SUBSYS_SCHED,
+             "sched_create_task: task_cache alloc failed");
+        return -1;
     }
-    tasks[id].event_head = 0;
-    tasks[id].event_tail = 0;
-    tasks[id].event_count = 0;
-    tasks[id].event_waiting = 0;
+    (*task_ptrs[id]).id = id;
+    (*task_ptrs[id]).state = TASK_STATE_BLOCKED;  // BLOCKED until fully initialized
+    (*task_ptrs[id]).parent_id = current_task_index >= 0 ? (*task_ptrs[current_task_index]).id : -1;
+    (*task_ptrs[id]).waiting_for_child = -1;
+    (*task_ptrs[id]).pgid = current_task_index >= 0 ? (*task_ptrs[current_task_index]).pgid : 0;
+    (*task_ptrs[id]).pending_signals = 0;
+    (*task_ptrs[id]).name[0] = '\0';
+    for (int s = 0; s < MAX_SIGNALS; s++) {
+        (*task_ptrs[id]).signal_handlers[s] = SIG_DFL;
+    }
+    (*task_ptrs[id]).event_head = 0;
+    (*task_ptrs[id]).event_tail = 0;
+    (*task_ptrs[id]).event_count = 0;
+    (*task_ptrs[id]).event_waiting = 0;
 
     // Phase 10a: Kernel tasks have no FDs
     for (int f = 0; f < PROC_MAX_FDS; f++) {
-        tasks[id].fd_table[f].type = FD_TYPE_UNUSED;
-        tasks[id].fd_table[f].ref = -1;
-        tasks[id].fd_table[f].flags = 0;
+        (*task_ptrs[id]).fd_table[f].type = FD_TYPE_UNUSED;
+        (*task_ptrs[id]).fd_table[f].ref = -1;
+        (*task_ptrs[id]).fd_table[f].flags = 0;
     }
+
+    // Phase 15a: initialize per-process cap handle table. Must happen while
+    // the task_t memory is zeroed (slab NULL-ctor guarantees this).
+    (void)cap_handle_table_init(&(*task_ptrs[id]).cap_handles);
+
+    // Phase 15b: kernel threads default to PLEDGE_ALL. They have full
+    // authority; no need to narrow (flusher, keyboard, indexer etc. touch
+    // every subsystem).
+    pledge_init(task_ptrs[id], (pledge_mask_t){.raw = PLEDGE_ALL});
 
     spinlock_release(&sched_lock);
 
@@ -156,7 +216,7 @@ int sched_create_task(void (*entry_point)(void)) {
     if (!kstack_phys) {
         // Mark task slot as unusable
         spinlock_acquire(&sched_lock);
-        tasks[id].state = TASK_STATE_ZOMBIE;
+        (*task_ptrs[id]).state = TASK_STATE_ZOMBIE;
         spinlock_release(&sched_lock);
         return -1;
     }
@@ -175,28 +235,28 @@ int sched_create_task(void (*entry_point)(void)) {
     spinlock_acquire(&sched_lock);
 
     // Set stack
-    tasks[id].kernel_stack_top = kstack_top;
+    (*task_ptrs[id]).kernel_stack_top = kstack_top;
 
     // Initialize the interrupt frame
-    memset(&tasks[id].regs, 0, sizeof(struct interrupt_frame));
+    memset(&(*task_ptrs[id]).regs, 0, sizeof(struct interrupt_frame));
 
     // Set up initial context
-    tasks[id].regs.rip = entry_addr;  // Use validated address
-    tasks[id].regs.cs = 0x08;         // Kernel code segment
-    tasks[id].regs.ss = 0x10;         // Kernel data segment
-    tasks[id].regs.ds = 0x10;         // Data segment
-    tasks[id].regs.rflags = 0x202;    // IF=1, Reserved=1
+    (*task_ptrs[id]).regs.rip = entry_addr;  // Use validated address
+    (*task_ptrs[id]).regs.cs = 0x08;         // Kernel code segment
+    (*task_ptrs[id]).regs.ss = 0x10;         // Kernel data segment
+    (*task_ptrs[id]).regs.ds = 0x10;         // Data segment
+    (*task_ptrs[id]).regs.rflags = 0x202;    // IF=1, Reserved=1
     // ABI: at function entry, (RSP+8) must be 16-byte aligned (RSP%16==8)
     // because normally a `call` pushes an 8-byte return address.
     // Since the scheduler jumps directly without `call`, we subtract 8.
-    tasks[id].regs.rsp = ((kstack_top - 128) & ~0xF) - 8;
-    tasks[id].regs.rbp = tasks[id].regs.rsp;         // Base pointer
+    (*task_ptrs[id]).regs.rsp = ((kstack_top - 128) & ~0xF) - 8;
+    (*task_ptrs[id]).regs.rbp = (*task_ptrs[id]).regs.rsp;         // Base pointer
 
     // Use kernel address space
-    tasks[id].cr3 = vmm_get_pml4_phys(vmm_get_kernel_space());
+    (*task_ptrs[id]).cr3 = vmm_get_pml4_phys(vmm_get_kernel_space());
 
     // NOW mark as READY - fully initialized, safe for scheduler
-    tasks[id].state = TASK_STATE_READY;
+    (*task_ptrs[id]).state = TASK_STATE_READY;
 
     spinlock_release(&sched_lock);
     
@@ -215,32 +275,53 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     }
     id = next_task_id++;
 
-    tasks[id].id = id;
-    tasks[id].state = TASK_STATE_BLOCKED;  // BLOCKED until fully initialized
-    tasks[id].cr3 = cr3;
-    tasks[id].parent_id = tasks[current_task_index].id;
-    tasks[id].waiting_for_child = -1;
-    tasks[id].exit_status = 0;
-    tasks[id].pgid = tasks[current_task_index].pgid; // Inherit parent's process group
-    tasks[id].pending_signals = 0;
-    tasks[id].name[0] = '\0';
-    for (int s = 0; s < MAX_SIGNALS; s++) {
-        tasks[id].signal_handlers[s] = SIG_DFL;
+    // Phase 14: allocate task_t from the slab.
+    task_ptrs[id] = kmem_cache_alloc(task_cache);
+    if (!task_ptrs[id]) {
+        next_task_id--;
+        asm volatile("push %0; popfq" : : "r"(flags));
+        spinlock_release(&sched_lock);
+        klog(KLOG_ERROR, SUBSYS_SCHED,
+             "sched_create_user_process: task_cache alloc failed");
+        return -1;
     }
-    tasks[id].event_head = 0;
-    tasks[id].event_tail = 0;
-    tasks[id].event_count = 0;
-    tasks[id].event_waiting = 0;
+    (*task_ptrs[id]).id = id;
+    (*task_ptrs[id]).state = TASK_STATE_BLOCKED;  // BLOCKED until fully initialized
+    (*task_ptrs[id]).cr3 = cr3;
+    (*task_ptrs[id]).parent_id = (*task_ptrs[current_task_index]).id;
+    (*task_ptrs[id]).waiting_for_child = -1;
+    (*task_ptrs[id]).exit_status = 0;
+    (*task_ptrs[id]).pgid = (*task_ptrs[current_task_index]).pgid; // Inherit parent's process group
+    (*task_ptrs[id]).pending_signals = 0;
+    (*task_ptrs[id]).name[0] = '\0';
+    for (int s = 0; s < MAX_SIGNALS; s++) {
+        (*task_ptrs[id]).signal_handlers[s] = SIG_DFL;
+    }
+    (*task_ptrs[id]).event_head = 0;
+    (*task_ptrs[id]).event_tail = 0;
+    (*task_ptrs[id]).event_count = 0;
+    (*task_ptrs[id]).event_waiting = 0;
 
     // Phase 10a: Initialize per-process FD table with stdin/stdout/stderr
     for (int f = 0; f < PROC_MAX_FDS; f++) {
-        tasks[id].fd_table[f].type = FD_TYPE_UNUSED;
-        tasks[id].fd_table[f].ref = -1;
-        tasks[id].fd_table[f].flags = 0;
+        (*task_ptrs[id]).fd_table[f].type = FD_TYPE_UNUSED;
+        (*task_ptrs[id]).fd_table[f].ref = -1;
+        (*task_ptrs[id]).fd_table[f].flags = 0;
     }
-    tasks[id].fd_table[0] = (proc_fd_t){FD_TYPE_CONSOLE, 0, 0}; // stdin
-    tasks[id].fd_table[1] = (proc_fd_t){FD_TYPE_CONSOLE, 0, 0}; // stdout
-    tasks[id].fd_table[2] = (proc_fd_t){FD_TYPE_CONSOLE, 0, 0}; // stderr
+    (*task_ptrs[id]).fd_table[0] = (proc_fd_t){FD_TYPE_CONSOLE, 0, 0}; // stdin
+    (*task_ptrs[id]).fd_table[1] = (proc_fd_t){FD_TYPE_CONSOLE, 0, 0}; // stdout
+    (*task_ptrs[id]).fd_table[2] = (proc_fd_t){FD_TYPE_CONSOLE, 0, 0}; // stderr
+
+    // Phase 15a: init handle table. Bootstrap caps are PUBLIC, so child
+    // doesn't need inherited entries — cap_token_resolve bypasses audience
+    // for PUBLIC objects. Non-PUBLIC user-derived handles must be explicitly
+    // granted post-spawn (Phase 17 channels).
+    (void)cap_handle_table_init(&(*task_ptrs[id]).cap_handles);
+
+    // Phase 15b: default user-process pledge is PLEDGE_ALL. sched_spawn_process
+    // will override with parent_mask & attrs.pledge_subset; direct callers of
+    // sched_create_user_process (notably the initial user bootstrap) get ALL.
+    pledge_init(task_ptrs[id], (pledge_mask_t){.raw = PLEDGE_ALL});
 
     asm volatile("push %0; popfq" : : "r"(flags));
     spinlock_release(&sched_lock);
@@ -248,9 +329,9 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     size_t num_pages = KERNEL_STACK_SIZE / PAGE_SIZE;
     void* kstack_phys = pmm_alloc_pages(num_pages);
     if (!kstack_phys) return -1;
-    tasks[id].kernel_stack_top = (uint64_t)kstack_phys + g_hhdm_offset + KERNEL_STACK_SIZE;
+    (*task_ptrs[id]).kernel_stack_top = (uint64_t)kstack_phys + g_hhdm_offset + KERNEL_STACK_SIZE;
     
-    uint64_t kstack_base = tasks[id].kernel_stack_top - KERNEL_STACK_SIZE;
+    uint64_t kstack_base = (*task_ptrs[id]).kernel_stack_top - KERNEL_STACK_SIZE;
     for (size_t i = 0; i < num_pages; i++) {
         uint64_t page_virt = kstack_base + (i * PAGE_SIZE);
         uint64_t page_phys = (uint64_t)kstack_phys + (i * PAGE_SIZE);
@@ -300,22 +381,22 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
 
     spinlock_acquire(&sched_lock);
     
-    memset(&tasks[id].regs, 0, sizeof(struct interrupt_frame));
-    tasks[id].regs.rip = rip;
-    tasks[id].regs.rflags = 0x202;
-    tasks[id].regs.rsp = user_stack_top - 16;  // RSP near top of user stack
-    tasks[id].regs.cs = 0x20 | 3;
-    tasks[id].regs.ss = 0x18 | 3;
+    memset(&(*task_ptrs[id]).regs, 0, sizeof(struct interrupt_frame));
+    (*task_ptrs[id]).regs.rip = rip;
+    (*task_ptrs[id]).regs.rflags = 0x202;
+    (*task_ptrs[id]).regs.rsp = user_stack_top - 16;  // RSP near top of user stack
+    (*task_ptrs[id]).regs.cs = 0x20 | 3;
+    (*task_ptrs[id]).regs.ss = 0x18 | 3;
 
     // Phase 7c: Initialize heap management fields
     // Heap starts at 4GB (0x100000000) in user space
     // This is well above typical code/data sections and below stack
-    tasks[id].heap_start = 0x100000000ULL;
-    tasks[id].brk = tasks[id].heap_start;  // Initially empty heap
-    tasks[id].stack_top = user_stack_top;   // Top of stack for collision detection
+    (*task_ptrs[id]).heap_start = 0x100000000ULL;
+    (*task_ptrs[id]).brk = (*task_ptrs[id]).heap_start;  // Initially empty heap
+    (*task_ptrs[id]).stack_top = user_stack_top;   // Top of stack for collision detection
 
     // NOW mark as READY - fully initialized, safe for scheduler
-    tasks[id].state = TASK_STATE_READY;
+    (*task_ptrs[id]).state = TASK_STATE_READY;
 
     spinlock_release(&sched_lock);
 
@@ -329,20 +410,20 @@ void wake_waiting_parent(int child_id) {
         return;
     }
     
-    int parent_id = tasks[child_id].parent_id;
+    int parent_id = (*task_ptrs[child_id]).parent_id;
     
     if (parent_id < 0 || parent_id >= next_task_id) {
         return;
     }
     
     // Check if parent is waiting for this child or any child
-    if (tasks[parent_id].state == TASK_STATE_BLOCKED &&
-        (tasks[parent_id].waiting_for_child == child_id || 
-         tasks[parent_id].waiting_for_child == -1)) {
+    if ((*task_ptrs[parent_id]).state == TASK_STATE_BLOCKED &&
+        ((*task_ptrs[parent_id]).waiting_for_child == child_id || 
+         (*task_ptrs[parent_id]).waiting_for_child == -1)) {
         
         // Wake up the parent
-        tasks[parent_id].state = TASK_STATE_READY;
-        tasks[parent_id].waiting_for_child = -1;
+        (*task_ptrs[parent_id]).state = TASK_STATE_READY;
+        (*task_ptrs[parent_id]).waiting_for_child = -1;
     }
 }
 
@@ -369,6 +450,24 @@ void schedule(struct interrupt_frame *frame) {
     if (frame_addr < 0xFFFF800000000000) {
         asm volatile("cli; hlt");
         while(1);
+    }
+
+    // Phase 17: per-tick deadline scan. Wake any CHAN_WAIT task whose
+    // deadline has expired. The waker patches state→READY and stamps
+    // -ETIMEDOUT in wait_result. The blocking syscall's spin loop sees
+    // state != CHAN_WAIT on next resume and returns the result.
+    for (int i = 0; i < next_task_id; i++) {
+        if (!task_ptrs[i]) continue;
+        task_t *tk = task_ptrs[i];
+        if (tk->state != TASK_STATE_CHAN_WAIT) continue;
+        if (tk->deadline_tsc == 0) continue;
+        if (g_timer_ticks < tk->deadline_tsc) continue;
+        // Timed out — unlink from whichever waiter list (read/write).
+        // We don't have direct access to the channel struct here, but
+        // wait_channel pointer + linked list maintenance is the
+        // syscall's responsibility. Just flip state + result.
+        tk->wait_result = -110;  // -ETIMEDOUT
+        tk->state = TASK_STATE_READY;
     }
     
     // Check if scheduler is initialized
@@ -410,11 +509,11 @@ void schedule(struct interrupt_frame *frame) {
     }
     
     // Save current task state
-    tasks[current_task_index].regs = *frame;
+    (*task_ptrs[current_task_index]).regs = *frame;
     
     // Update task state
-    if (tasks[current_task_index].state == TASK_STATE_RUNNING) {
-        tasks[current_task_index].state = TASK_STATE_READY;
+    if ((*task_ptrs[current_task_index]).state == TASK_STATE_RUNNING) {
+        (*task_ptrs[current_task_index]).state = TASK_STATE_READY;
     }
 
     // Find next task to run
@@ -424,7 +523,8 @@ void schedule(struct interrupt_frame *frame) {
     
     for (int attempts = 0; attempts < next_task_id; attempts++) {
         next_index = (next_index + 1) % next_task_id;
-        if (tasks[next_index].state == TASK_STATE_READY) {
+        if (!task_ptrs[next_index]) continue;  // reaped slot
+        if ((*task_ptrs[next_index]).state == TASK_STATE_READY) {
             found = true;
             current_task_index = next_index;
             context_switches++;
@@ -433,7 +533,7 @@ void schedule(struct interrupt_frame *frame) {
             static uint8_t task_switched[MAX_TASKS] = {0};
             if (!task_switched[next_index]) {
                 task_switched[next_index] = 1;
-                klog(KLOG_INFO, SUBSYS_SCHED, "[SCHED] First switch to task %lu (id=%lu)", (unsigned long)(next_index), (unsigned long)(tasks[next_index].id));
+                klog(KLOG_INFO, SUBSYS_SCHED, "[SCHED] First switch to task %lu (id=%lu)", (unsigned long)(next_index), (unsigned long)((*task_ptrs[next_index]).id));
             }
             break;
         }
@@ -441,12 +541,13 @@ void schedule(struct interrupt_frame *frame) {
     
     if (!found) {
         // No ready tasks - stay with current
-        if (tasks[start_index].state != TASK_STATE_ZOMBIE) {
+        if (task_ptrs[start_index] && (*task_ptrs[start_index]).state != TASK_STATE_ZOMBIE) {
             current_task_index = start_index;
         } else {
             // Find any non-zombie task
             for (int i = 0; i < next_task_id; i++) {
-                if (tasks[i].state != TASK_STATE_ZOMBIE) {
+                if (!task_ptrs[i]) continue;
+                if ((*task_ptrs[i]).state != TASK_STATE_ZOMBIE) {
                     current_task_index = i;
                     break;
                 }
@@ -454,16 +555,17 @@ void schedule(struct interrupt_frame *frame) {
         }
     }
 
-    tasks[current_task_index].state = TASK_STATE_RUNNING;
+    (*task_ptrs[current_task_index]).state = TASK_STATE_RUNNING;
 
     // Phase 7d: Deliver pending signals before resuming the task
-    if (sched_deliver_signals(&tasks[current_task_index])) {
+    if (sched_deliver_signals(&(*task_ptrs[current_task_index]))) {
         // Task was terminated by a signal - find another runnable task
         bool found_replacement = false;
         for (int i = 0; i < next_task_id; i++) {
-            if (tasks[i].state == TASK_STATE_READY) {
+            if (!task_ptrs[i]) continue;
+            if ((*task_ptrs[i]).state == TASK_STATE_READY) {
                 current_task_index = i;
-                tasks[i].state = TASK_STATE_RUNNING;
+                (*task_ptrs[i]).state = TASK_STATE_RUNNING;
                 found_replacement = true;
                 break;
             }
@@ -472,7 +574,7 @@ void schedule(struct interrupt_frame *frame) {
             // No runnable tasks - fall back to the idle task (task 0)
             // The idle task should always exist and never be in zombie state
             current_task_index = 0;
-            if (tasks[0].state == TASK_STATE_ZOMBIE) {
+            if ((*task_ptrs[0]).state == TASK_STATE_ZOMBIE) {
                 // Phase 13: route through klog FATAL + kpanic so the
                 // post-mortem ring carries the cause. Release the
                 // sched lock first — kpanic will not try to grab it,
@@ -485,24 +587,24 @@ void schedule(struct interrupt_frame *frame) {
                 __atomic_clear(&sched_lock.locked, __ATOMIC_RELEASE);
                 kpanic("no runnable tasks");
             }
-            tasks[0].state = TASK_STATE_RUNNING;
+            (*task_ptrs[0]).state = TASK_STATE_RUNNING;
         }
     }
 
     // Update TSS RSP0
-    g_cpu_locals[cpu_id].tss.rsp0 = tasks[current_task_index].kernel_stack_top;
+    g_cpu_locals[cpu_id].tss.rsp0 = (*task_ptrs[current_task_index]).kernel_stack_top;
 
     // Switch address space if needed
     uint64_t current_cr3;
     asm volatile ("mov %%cr3, %0" : "=r"(current_cr3));
-    if (current_cr3 != tasks[current_task_index].cr3) {
+    if (current_cr3 != (*task_ptrs[current_task_index]).cr3) {
         // Log CR3 switch (only first time per task)
         static uint8_t task_cr3_switched[MAX_TASKS] = {0};
         if (!task_cr3_switched[current_task_index]) {
             task_cr3_switched[current_task_index] = 1;
-            klog(KLOG_INFO, SUBSYS_SCHED, "[SCHED] Switching CR3 to 0x0x%lx for task %lu", (unsigned long)(tasks[current_task_index].cr3), (unsigned long)(current_task_index));
+            klog(KLOG_INFO, SUBSYS_SCHED, "[SCHED] Switching CR3 to 0x0x%lx for task %lu", (unsigned long)((*task_ptrs[current_task_index]).cr3), (unsigned long)(current_task_index));
         }
-        vmm_switch_address_space_phys(tasks[current_task_index].cr3);
+        vmm_switch_address_space_phys((*task_ptrs[current_task_index]).cr3);
     }
 
     // Release the scheduler lock properly
@@ -515,7 +617,7 @@ void schedule(struct interrupt_frame *frame) {
     __atomic_clear(&sched_lock.locked, __ATOMIC_RELEASE);
 
     // Restore new task context
-    *frame = tasks[current_task_index].regs;
+    *frame = (*task_ptrs[current_task_index]).regs;
 }
 
 // These functions are safe - not called from interrupt context
@@ -523,17 +625,18 @@ task_t* sched_get_current_task(void) {
     if (current_task_index >= MAX_TASKS || current_task_index >= next_task_id) {
         return NULL;
     }
-    return &tasks[current_task_index];
+    return task_ptrs[current_task_index];  // may be NULL if slot reaped
 }
 
 task_t* sched_get_task(int id) {
     if (id < 0 || id >= MAX_TASKS || id >= next_task_id) {
         return NULL;
     }
-    if (tasks[id].state == TASK_STATE_ZOMBIE) {
+    if (!task_ptrs[id]) return NULL;
+    if ((*task_ptrs[id]).state == TASK_STATE_ZOMBIE) {
         return NULL;
     }
-    return &tasks[id];
+    return task_ptrs[id];
 }
 
 int sched_check_children(int parent_id, int *status) {
@@ -542,11 +645,12 @@ int sched_check_children(int parent_id, int *status) {
     
     for (int i = 0; i < next_task_id; i++) {
         if (i >= MAX_TASKS) break;
-        
-        if (tasks[i].state == TASK_STATE_ZOMBIE && 
-            tasks[i].parent_id == parent_id) {
+        if (!task_ptrs[i]) continue;
+
+        if ((*task_ptrs[i]).state == TASK_STATE_ZOMBIE &&
+            (*task_ptrs[i]).parent_id == parent_id) {
             if (status) {
-                *status = tasks[i].exit_status;
+                *status = (*task_ptrs[i]).exit_status;
             }
             return i;
         }
@@ -557,31 +661,50 @@ int sched_check_children(int parent_id, int *status) {
 void sched_orphan_children(int parent_id) {
     for (int i = 0; i < next_task_id; i++) {
         if (i >= MAX_TASKS) break;
-        
-        if (tasks[i].parent_id == parent_id && tasks[i].state != TASK_STATE_ZOMBIE) {
-            tasks[i].parent_id = 0; // Reparent to init
+        if (!task_ptrs[i]) continue;
+
+        if ((*task_ptrs[i]).parent_id == parent_id && (*task_ptrs[i]).state != TASK_STATE_ZOMBIE) {
+            (*task_ptrs[i]).parent_id = 0; // Reparent to init
         }
     }
 }
 
 void sched_reap_zombie(int task_id) {
     if (task_id < 0 || task_id >= next_task_id || task_id >= MAX_TASKS) return;
-    if (tasks[task_id].state != TASK_STATE_ZOMBIE) return;
+    if (!task_ptrs[task_id]) return;  // Already reaped / never allocated.
+    if ((*task_ptrs[task_id]).state != TASK_STATE_ZOMBIE) return;
 
     // Free kernel stack
-    uint64_t kstack_base = tasks[task_id].kernel_stack_top - KERNEL_STACK_SIZE;
+    uint64_t kstack_base = (*task_ptrs[task_id]).kernel_stack_top - KERNEL_STACK_SIZE;
     uint64_t kstack_phys = kstack_base - g_hhdm_offset;
     pmm_free_pages((void*)kstack_phys, KERNEL_STACK_SIZE / PAGE_SIZE);
 
     // Free user address space (page tables + all user-mapped physical pages)
     // Only for user processes (cr3 != kernel PML4)
     uint64_t kernel_cr3 = vmm_get_pml4_phys(vmm_get_kernel_space());
-    if (tasks[task_id].cr3 != 0 && tasks[task_id].cr3 != kernel_cr3) {
-        vmm_destroy_address_space_by_cr3(tasks[task_id].cr3);
+    if ((*task_ptrs[task_id]).cr3 != 0 && (*task_ptrs[task_id]).cr3 != kernel_cr3) {
+        vmm_destroy_address_space_by_cr3((*task_ptrs[task_id]).cr3);
     }
 
-    // Clear the task slot
-    memset(&tasks[task_id], 0, sizeof(task_t));
+    // Phase 15a: free the process's handle table (does not revoke the
+    // referenced cap_object_t — that's orphan_collection's job), then
+    // revoke every object owned by the dying process.
+    cap_handle_table_free(&(*task_ptrs[task_id]).cap_handles);
+    (void)revoke_collect_orphans((*task_ptrs[task_id]).id);
+
+    // Phase 16: release any deprecated-syscall tracker slot held by this pid.
+    // Prevents a long-lived tracker leak as pids churn.
+    deprecated_forget_pid((int32_t)(*task_ptrs[task_id]).id);
+
+    // Phase 17: release any VMO mappings the task still held. The
+    // address-space pages are being torn down in vmm_destroy_address_space_by_cr3
+    // already; this call reconciles refcount bookkeeping on the VMO side.
+    vmo_cleanup_task((int32_t)(*task_ptrs[task_id]).id);
+
+    // Phase 14: return the task_t to the slab; slot goes empty.
+    // No need to memset — slab alloc zeroes on next use.
+    kmem_cache_free(task_cache, task_ptrs[task_id]);
+    task_ptrs[task_id] = NULL;
 }
 
 // Get task by ID including zombies (needed for wait/reap operations)
@@ -589,7 +712,7 @@ task_t* sched_get_task_any(int id) {
     if (id < 0 || id >= MAX_TASKS || id >= next_task_id) {
         return NULL;
     }
-    return &tasks[id];
+    return task_ptrs[id];
 }
 
 // Get current task index
@@ -651,18 +774,26 @@ int sched_spawn_process(const char *path, int parent_id) {
     // Override the parent_id set by sched_create_user_process
     // (it defaults to current_task_index, but we want the explicit parent)
     spinlock_acquire(&sched_lock);
-    tasks[pid].parent_id = parent_id;
-    tasks[pid].pgid = parent_id; // Initially same process group as parent
-    copy_process_name(tasks[pid].name, path, sizeof(tasks[pid].name));
+    (*task_ptrs[pid]).parent_id = parent_id;
+    (*task_ptrs[pid]).pgid = parent_id; // Initially same process group as parent
+    copy_process_name((*task_ptrs[pid]).name, path, sizeof((*task_ptrs[pid]).name));
+
+    // Phase 15b: child inherits parent's pledge mask. If the caller wants a
+    // narrower mask, they can pass it via future spawn_attrs; for now the
+    // child simply carries the parent's authority forward. Further narrowing
+    // is always possible post-spawn via SYS_PLEDGE.
+    if (parent_id >= 0 && parent_id < MAX_TASKS && task_ptrs[parent_id]) {
+        (*task_ptrs[pid]).pledge_mask = (*task_ptrs[parent_id]).pledge_mask;
+    }
 
     // Phase 10c: Only inherit FDs 0-2 (stdin/stdout/stderr)
     // This prevents pipe FD leaks that would block EOF detection.
     // Higher FDs (3+) remain UNUSED in the child.
     for (int f = 0; f < 3; f++) {
-        uint8_t ptype = tasks[parent_id].fd_table[f].type;
-        tasks[pid].fd_table[f] = tasks[parent_id].fd_table[f];
+        uint8_t ptype = (*task_ptrs[parent_id]).fd_table[f].type;
+        (*task_ptrs[pid]).fd_table[f] = (*task_ptrs[parent_id]).fd_table[f];
         if (ptype == FD_TYPE_PIPE_READ || ptype == FD_TYPE_PIPE_WRITE) {
-            pipe_ref_inc(tasks[pid].fd_table[f].ref, ptype);
+            pipe_ref_inc((*task_ptrs[pid]).fd_table[f].ref, ptype);
         }
     }
     // FDs 3-15 remain UNUSED (set by sched_create_user_process)
@@ -670,7 +801,7 @@ int sched_spawn_process(const char *path, int parent_id) {
     spinlock_release(&sched_lock);
 
     klog(KLOG_INFO, SUBSYS_SCHED, "[SPAWN] Process created: pid=%lu name=", (unsigned long)(pid));
-    klog(KLOG_INFO, SUBSYS_SCHED, "%s", tasks[pid].name);
+    klog(KLOG_INFO, SUBSYS_SCHED, "%s", (*task_ptrs[pid]).name);
 
     return pid;
 }
@@ -687,7 +818,7 @@ int sched_send_signal(int pid, int signal) {
         return -1;
     }
 
-    task_t *target = &tasks[pid];
+    task_t *target = &(*task_ptrs[pid]);
 
     // Can't signal a zombie or unused task
     if (target->state == TASK_STATE_ZOMBIE) {
@@ -825,25 +956,26 @@ int sched_snapshot_processes(state_process_t *out, int max_count) {
     if (limit > MAX_TASKS) limit = MAX_TASKS;
 
     for (int i = 0; i < limit; i++) {
-        out[count].pid = tasks[i].id;
-        out[count].parent_pid = tasks[i].parent_id;
-        out[count].pgid = tasks[i].pgid;
-        out[count].state = (uint32_t)tasks[i].state;
+        if (!task_ptrs[i]) continue;  // skip reaped slots
+        out[count].pid = (*task_ptrs[i]).id;
+        out[count].parent_pid = (*task_ptrs[i]).parent_id;
+        out[count].pgid = (*task_ptrs[i]).pgid;
+        out[count].state = (uint32_t)(*task_ptrs[i]).state;
 
         // Copy name
         int j;
-        for (j = 0; j < STATE_PROC_NAME_LEN - 1 && tasks[i].name[j]; j++) {
-            out[count].name[j] = tasks[i].name[j];
+        for (j = 0; j < STATE_PROC_NAME_LEN - 1 && (*task_ptrs[i]).name[j]; j++) {
+            out[count].name[j] = (*task_ptrs[i]).name[j];
         }
         out[count].name[j] = '\0';
 
-        out[count].heap_start = tasks[i].heap_start;
-        out[count].brk = tasks[i].brk;
-        out[count].stack_top = tasks[i].stack_top;
-        out[count].heap_used = (tasks[i].brk > tasks[i].heap_start) ?
-                                tasks[i].brk - tasks[i].heap_start : 0;
-        out[count].pending_signals = tasks[i].pending_signals;
-        out[count].exit_status = tasks[i].exit_status;
+        out[count].heap_start = (*task_ptrs[i]).heap_start;
+        out[count].brk = (*task_ptrs[i]).brk;
+        out[count].stack_top = (*task_ptrs[i]).stack_top;
+        out[count].heap_used = ((*task_ptrs[i]).brk > (*task_ptrs[i]).heap_start) ?
+                                (*task_ptrs[i]).brk - (*task_ptrs[i]).heap_start : 0;
+        out[count].pending_signals = (*task_ptrs[i]).pending_signals;
+        out[count].exit_status = (*task_ptrs[i]).exit_status;
         count++;
     }
 
@@ -858,7 +990,7 @@ void sched_enqueue_cap_event(int32_t pid, const state_cap_event_t *event) {
 
     spinlock_acquire(&sched_lock);
 
-    task_t *task = &tasks[pid];
+    task_t *task = &(*task_ptrs[pid]);
 
     // Don't deliver to zombie/dead tasks
     if (task->state == TASK_STATE_ZOMBIE) {
@@ -894,7 +1026,7 @@ int sched_dequeue_cap_event(int task_id, state_cap_event_t *out) {
 
     spinlock_acquire(&sched_lock);
 
-    task_t *task = &tasks[task_id];
+    task_t *task = &(*task_ptrs[task_id]);
 
     if (task->event_count == 0) {
         spinlock_release(&sched_lock);
@@ -912,5 +1044,116 @@ int sched_dequeue_cap_event(int task_id, state_cap_event_t *out) {
 // Phase 8d: Get pending event count for a process
 int sched_pending_event_count(int task_id) {
     if (task_id < 0 || task_id >= next_task_id || task_id >= MAX_TASKS) return 0;
-    return (int)tasks[task_id].event_count;
+    return (int)(*task_ptrs[task_id]).event_count;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 17: channel-wait primitives.
+//
+// Blocking model: the caller transitions its own task from RUNNING to
+// TASK_STATE_CHAN_WAIT, links it into the channel's waiter list, and then
+// loops on `sti; hlt; cli`. A hardware interrupt (timer tick from IRQ0 on
+// legacy PIC or the LAPIC timer) drives the scheduler, which context-
+// switches this task out while its state remains CHAN_WAIT. When another
+// task calls sched_wake_one_on_channel, it sets our state=READY and stores
+// wait_result; the next schedule() picks us up and the hlt loop exits.
+//
+// The timer tick rate is 100 Hz in Phase 13 (10 ms per tick); deadline_tsc
+// is stored in tick units derived from g_timer_ticks. Submillisecond
+// precision is not available without TSC calibration (Phase 20+ territory).
+// ---------------------------------------------------------------------------
+
+extern volatile uint64_t g_timer_ticks;
+
+static uint64_t ns_to_ticks(uint64_t ns) {
+    // 10 ms per tick; round up.
+    return (ns + 9999999ULL) / 10000000ULL;
+}
+
+int sched_block_on_channel(void *channel, uint8_t dir, uint64_t timeout_ns,
+                           struct task_struct **list_head) {
+    task_t *cur = sched_get_current_task();
+    if (!cur || !list_head) return -1;
+
+    uint64_t deadline_tick = 0;
+    if (timeout_ns != 0 && timeout_ns != 0xFFFFFFFFFFFFFFFFULL) {
+        uint64_t dt = ns_to_ticks(timeout_ns);
+        if (dt == 0) dt = 1;
+        deadline_tick = g_timer_ticks + dt;
+    }
+
+    spinlock_acquire(&sched_lock);
+    cur->wait_next     = *list_head;
+    *list_head         = cur;
+    cur->wait_reason   = dir;
+    cur->wait_channel  = channel;
+    cur->wait_result   = 0;
+    cur->deadline_tsc  = deadline_tick;
+    cur->state         = TASK_STATE_CHAN_WAIT;
+    spinlock_release(&sched_lock);
+
+    // Sleep until woken or deadline. sti allows the timer tick to run the
+    // scheduler, which will context-switch us out while state=CHAN_WAIT.
+    // The scheduler's per-tick deadline scan (in schedule()) flips our
+    // state to READY and stamps -ETIMEDOUT in wait_result on timeout.
+    while (cur->state == TASK_STATE_CHAN_WAIT) {
+        asm volatile("sti; hlt" ::: "memory");
+        asm volatile("cli" ::: "memory");
+    }
+
+    // Unlink ourselves from the waiter list (idempotent — sched_wake_one
+    // may have already removed us).
+    spinlock_acquire(&sched_lock);
+    task_t **p = list_head;
+    while (*p && *p != cur) {
+        p = (task_t **)&((*p)->wait_next);
+    }
+    if (*p == cur) *p = (task_t *)cur->wait_next;
+    spinlock_release(&sched_lock);
+
+    int result = cur->wait_result;
+    cur->wait_next    = NULL;
+    cur->wait_channel = NULL;
+    cur->deadline_tsc = 0;
+    return result;
+}
+
+task_t *sched_wake_one_on_channel(struct task_struct **list_head,
+                                  int32_t wait_result) {
+    if (!list_head) return NULL;
+    spinlock_acquire(&sched_lock);
+    task_t *t = *list_head;
+    if (!t) {
+        spinlock_release(&sched_lock);
+        return NULL;
+    }
+    *list_head = (task_t *)t->wait_next;
+    t->wait_next   = NULL;
+    t->wait_result = wait_result;
+    if (t->state == TASK_STATE_CHAN_WAIT) {
+        t->state = TASK_STATE_READY;
+    }
+    spinlock_release(&sched_lock);
+    return t;
+}
+
+int sched_wake_all_on_channel(struct task_struct **list_head,
+                              int32_t wait_result) {
+    if (!list_head) return 0;
+    int count = 0;
+    spinlock_acquire(&sched_lock);
+    task_t *t = *list_head;
+    *list_head = NULL;
+    while (t) {
+        task_t *next = (task_t *)t->wait_next;
+        t->wait_next   = NULL;
+        t->wait_result = wait_result;
+        if (t->state == TASK_STATE_CHAN_WAIT) {
+            t->state = TASK_STATE_READY;
+        }
+        count++;
+        t = next;
+    }
+    spinlock_release(&sched_lock);
+    return count;
 }

@@ -98,3 +98,9 @@ int  e1000_receive(void *buffer, uint16_t max_length);
 void e1000_get_mac(uint8_t mac[6]);
 bool e1000_link_up(void);
 bool e1000_is_present(void);
+
+// Phase 16 CAN callbacks + test hooks.
+int      e1000_activate(void);
+int      e1000_deactivate(void);
+bool     e1000_is_active(void);
+uint32_t e1000_debug_read_reg(uint32_t offset);

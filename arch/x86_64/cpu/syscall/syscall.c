@@ -12,7 +12,10 @@
 #include "../../mm/vmm.h"
 #include "../../drivers/serial/serial.h"
 #include "../../../../kernel/state.h"
-#include "../../../../kernel/capability.h"
+#include "../../../../kernel/cap/can.h"
+#include "../../../../kernel/cap/shim_v1.h"
+#include "../../../../kernel/cap/object.h"
+#include "../../../../kernel/cap/token.h"
 #include "../../../../kernel/fs/grahafs.h"
 #include "../../drivers/e1000/e1000.h"
 #include "../../../../kernel/net/net.h"
@@ -20,7 +23,20 @@
 #include "../../../../kernel/fs/cluster.h"
 #include "../../../../kernel/autorun.h"
 #include "../../../../kernel/log.h"
+#include "../../../../kernel/mm/kheap.h"
+#include "../../../../kernel/percpu.h"
+#include "../../../../kernel/cap/pledge.h"
+#include "../../../../kernel/audit.h"
+#include "../../../../kernel/rtc.h"
+#include "../../../../kernel/cap/deprecated.h"
+#include "../../../../kernel/ipc/channel.h"
+#include "../../../../kernel/mm/vmo.h"
+#include "../../../../kernel/io/stream.h"
+#include "../../drivers/ahci/ahci.h"
+#include "../interrupts.h"
+#include "../../../../kernel/net/klib.h"  // strncmp
 #include <stdbool.h>
+#include <string.h>
 
 // Forward declarations for state collection (kernel/state.c)
 extern int state_get_size(uint32_t category);
@@ -98,6 +114,33 @@ static inline bool is_user_pointer(const void *ptr, size_t size) {
     return true;
 }
 
+// Phase 15b: pledge guard helper. Called at the top of every sensitive
+// syscall handler. If the calling task lacks the named class in its
+// pledge_mask, writes an AUDIT_CAP_VIOLATION entry, stamps -EPLEDGE on
+// the syscall frame, and returns false so the caller can `break` out of
+// the switch arm.
+static bool pledge_check_and_audit(struct syscall_frame *frame,
+                                   uint8_t class_bit,
+                                   const char *detail_msg) {
+    task_t *current = sched_get_current_task();
+    if (!current) {
+        // Syscall from early boot / kernel thread — no pledge to check.
+        return true;
+    }
+    if (pledge_allows(current, class_bit)) {
+        return true;
+    }
+    audit_write_cap_violation(current->id,
+                               /*obj_idx*/ 0xFFFFFFFFu,
+                               CAP_V2_EPLEDGE,
+                               /*rights_required*/ 0,
+                               /*rights_held*/ 0,
+                               detail_msg,
+                               AUDIT_SRC_NATIVE);
+    frame->rax = (uint64_t)(long)CAP_V2_EPLEDGE;
+    return false;
+}
+
 // Helper to safely copy string from user-space
 static int copy_string_from_user(const char *user_src, char *k_dest, size_t max_len) {
     if (user_src == NULL || k_dest == NULL) return -1;
@@ -131,6 +174,7 @@ void syscall_dispatcher(struct syscall_frame *frame) {
     
     switch (syscall_num) {
         case SYS_PUTC: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_COMPUTE, "pledge denied: compute")) break;
             char c = (char)frame->rdi;
 
             // Phase 10a: Route through per-process FD 1 (stdout)
@@ -179,6 +223,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_OPEN: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_FS_READ, "pledge denied: fs_read")) break;
             const char *pathname_user = (const char *)frame->rdi;
             char pathname_kernel[256];
             if (copy_string_from_user(pathname_user, pathname_kernel, sizeof(pathname_kernel)) <= 0) {
@@ -222,6 +268,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_READ: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_FS_READ, "pledge denied: fs_read")) break;
             int fd = (int)frame->rdi;
             void *buffer_user = (void *)frame->rsi;
             size_t count = (size_t)frame->rdx;
@@ -283,6 +331,12 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_WRITE: {
+
+            // Phase 15b: SYS_WRITE's pledge class depends on the target fd
+            // type. Console output (stdout/stderr) never needs FS_WRITE —
+            // a pledged process must still be able to emit diagnostics.
+            // File writes require FS_WRITE; pipe writes require IPC_SEND.
+            // This check moved below the fd-type resolution.
             int fd = (int)frame->rdi;
             const void *buffer_user = (const void *)frame->rsi;
             size_t count = (size_t)frame->rdx;
@@ -299,12 +353,17 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             }
             proc_fd_t *wfd = &write_task->fd_table[fd];
             if (wfd->type == FD_TYPE_FILE) {
+                if (!pledge_check_and_audit(frame, PLEDGE_CLASS_FS_WRITE,
+                                            "pledge denied: fs_write on SYS_WRITE")) break;
                 frame->rax = vfs_write(wfd->ref, (void*)buffer_user, count);
             } else if (wfd->type == FD_TYPE_CONSOLE) {
-                // Console write: output each char to serial + framebuffer
+                // Phase 15b: emit the whole buffer to serial atomically so
+                // concurrent writers (other user processes, klog mirror) can't
+                // interleave byte-by-byte on the UART. Framebuffer draw is
+                // per-char and not TAP-parsed, so it keeps the old loop.
                 const char *buf = (const char *)buffer_user;
+                serial_write_n(buf, count);
                 for (size_t i = 0; i < count; i++) {
-                    serial_putc(buf[i]);
                     if (buf[i] == '\n') {
                         term_x = 0;
                         term_y += 16;
@@ -324,7 +383,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 }
                 frame->rax = count;
             } else if (wfd->type == FD_TYPE_PIPE_WRITE) {
-                // Phase 10b: Write to pipe
+                if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_SEND,
+                                            "pledge denied: ipc_send on SYS_WRITE to pipe")) break;
                 frame->rax = pipe_write(wfd->ref, (void*)buffer_user, count);
             } else {
                 // UNUSED or invalid
@@ -334,11 +394,21 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_CREATE: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_FS_WRITE, "pledge denied: fs_write")) break;
             const char *pathname_user = (const char *)frame->rdi;
             uint32_t mode = (uint32_t)frame->rsi;
             char pathname_kernel[256];
             if (copy_string_from_user(pathname_user, pathname_kernel, sizeof(pathname_kernel)) > 0) {
-                frame->rax = vfs_create(pathname_kernel, mode);
+                int rc = vfs_create(pathname_kernel, mode);
+                frame->rax = (uint64_t)(long)rc;
+                // Phase 15b: audit critical-path writes (/etc/ and /var/).
+                if (rc >= 0 &&
+                    (strncmp(pathname_kernel, "/etc/", 5) == 0 ||
+                     strncmp(pathname_kernel, "/var/", 5) == 0)) {
+                    task_t *wc = sched_get_current_task();
+                    audit_write_fs_write_critical(wc ? wc->id : -1, pathname_kernel);
+                }
             } else {
                 frame->rax = -1;
             }
@@ -346,11 +416,21 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_MKDIR: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_FS_WRITE, "pledge denied: fs_write")) break;
             const char *pathname_user = (const char *)frame->rdi;
             uint32_t mode = (uint32_t)frame->rsi;
             char pathname_kernel[256];
             if (copy_string_from_user(pathname_user, pathname_kernel, sizeof(pathname_kernel)) > 0) {
-                frame->rax = vfs_mkdir(pathname_kernel, mode);
+                int rc = vfs_mkdir(pathname_kernel, mode);
+                frame->rax = (uint64_t)(long)rc;
+                // Phase 15b: audit critical-path mkdirs.
+                if (rc >= 0 &&
+                    (strncmp(pathname_kernel, "/etc/", 5) == 0 ||
+                     strncmp(pathname_kernel, "/var/", 5) == 0)) {
+                    task_t *mc = sched_get_current_task();
+                    audit_write_fs_write_critical(mc ? mc->id : -1, pathname_kernel);
+                }
             } else {
                 frame->rax = -1;
             }
@@ -358,6 +438,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_READDIR: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_FS_READ, "pledge denied: fs_read")) break;
             const char *pathname_user = (const char *)frame->rdi;
             uint32_t index = (uint32_t)frame->rsi;
             void *dirent_buffer = (void *)frame->rdx;
@@ -414,6 +496,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_SYNC: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_FS_WRITE, "pledge denied: fs_write")) break;
             // Flush all pending writes to disk
             vfs_sync();
             frame->rax = 0;
@@ -421,6 +505,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_BRK: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_COMPUTE, "pledge denied: compute")) break;
             void *addr = (void *)frame->rdi;
             task_t *current = sched_get_current_task();
 
@@ -565,6 +651,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_GETC: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_COMPUTE, "pledge denied: compute")) break;
             // Phase 10a: Route through per-process FD 0 (stdin)
             task_t *getc_task = sched_get_current_task();
             uint8_t fd0_type = FD_TYPE_CONSOLE; // default fallback
@@ -598,6 +686,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_EXEC: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SPAWN, "pledge denied: spawn")) break;
             const char *path_user = (const char *)frame->rdi;
             char path_kernel[256];
             
@@ -644,13 +734,15 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = -3;
             } else {
                 framebuffer_draw_string("SYS_EXEC: Success!", 400, 560, COLOR_GREEN, 0x00101828);
+                task_t *ec = sched_get_current_task();
+                audit_write_spawn(ec ? ec->id : -1, pid, path_kernel);
                 frame->rax = pid;
             }
-            
+
             asm volatile("push %0; popfq" : : "r"(flags));
             break;
         }
-        
+
         case SYS_EXIT: {
             int status = (int)frame->rdi;
             
@@ -777,6 +869,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_SPAWN: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SPAWN, "pledge denied: spawn")) break;
             const char *path_user = (const char *)frame->rdi;
             char path_kernel[256];
 
@@ -800,22 +894,30 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = -1;
             } else {
                 klog(KLOG_INFO, SUBSYS_SYSCALL, "[SYS_SPAWN] Success: pid=%lu", (unsigned long)(pid));
+                audit_write_spawn(current->id, pid, path_kernel);
                 frame->rax = pid;
             }
             break;
         }
 
         case SYS_KILL: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL, "pledge denied: sys_control")) break;
             int target_pid = (int)frame->rdi;
             int signal = (int)frame->rsi;
 
             klog(KLOG_INFO, SUBSYS_SYSCALL, "[SYS_KILL] pid=%lu sig=%lu", (unsigned long)(target_pid), (unsigned long)(signal));
 
-            frame->rax = sched_send_signal(target_pid, signal);
+            int kill_rc = sched_send_signal(target_pid, signal);
+            task_t *killer = sched_get_current_task();
+            audit_write_kill(killer ? killer->id : -1, target_pid, signal);
+            frame->rax = (uint64_t)(long)kill_rc;
             break;
         }
 
         case SYS_SIGNAL: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL, "pledge denied: sys_control")) break;
             int signal = (int)frame->rdi;
             void (*handler)(int) = (void (*)(int))frame->rsi;
 
@@ -835,6 +937,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_GET_SYSTEM_STATE: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY, "pledge denied: sys_query")) break;
             uint32_t category = (uint32_t)frame->rdi;
             void *user_buf = (void *)frame->rsi;
             size_t buf_size = (size_t)frame->rdx;
@@ -896,118 +1000,55 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             break;
         }
 
+        // Phase 16: legacy string-name CAN syscalls. All seven return
+        // -EDEPRECATED. The first time each (pid, syscall) pair hits a legacy
+        // number, AUDIT_DEPRECATED_SYSCALL is emitted; subsequent calls from
+        // the same pid for the same number are silent so the audit log
+        // doesn't spam. Pledge is intentionally NOT consulted here — a
+        // deprecated call is equally noteworthy regardless of pledge state.
         case SYS_CAP_ACTIVATE: {
-            // RDI = user string pointer (capability name)
-            char kname[32];
-            if (copy_string_from_user((const char *)frame->rdi, kname, 32) <= 0) {
-                frame->rax = (uint64_t)-1;
-                break;
+            task_t *cur = sched_get_current_task();
+            int32_t pid = cur ? cur->id : -1;
+            if (deprecated_check_and_audit(pid, SYS_CAP_ACTIVATE)) {
+                audit_write_deprecated_syscall(pid, "SYS_CAP_ACTIVATE(1031)");
             }
-            int id = cap_find(kname);
-            if (id < 0) {
-                frame->rax = (uint64_t)-1;
-                break;
-            }
-            frame->rax = (uint64_t)(long)cap_activate(id);
+            frame->rax = (uint64_t)(long)CAP_V2_EDEPRECATED;
             break;
         }
 
         case SYS_CAP_DEACTIVATE: {
-            char kname[32];
-            if (copy_string_from_user((const char *)frame->rdi, kname, 32) <= 0) {
-                frame->rax = (uint64_t)-1;
-                break;
+            task_t *cur = sched_get_current_task();
+            int32_t pid = cur ? cur->id : -1;
+            if (deprecated_check_and_audit(pid, SYS_CAP_DEACTIVATE)) {
+                audit_write_deprecated_syscall(pid, "SYS_CAP_DEACTIVATE(1032)");
             }
-            int id = cap_find(kname);
-            if (id < 0) {
-                frame->rax = (uint64_t)-1;
-                break;
-            }
-            frame->rax = (uint64_t)(long)cap_deactivate(id);
+            frame->rax = (uint64_t)(long)CAP_V2_EDEPRECATED;
             break;
         }
 
         case SYS_CAP_REGISTER: {
-            // RDI=name, RSI=type, RDX=dep_names array, R10=dep_count
-            char kname[32];
-            if (copy_string_from_user((const char *)frame->rdi, kname, 32) <= 0) {
-                frame->rax = (uint64_t)(long)CAP_ERR_NAME_EMPTY;
-                break;
+            task_t *cur = sched_get_current_task();
+            int32_t pid = cur ? cur->id : -1;
+            if (deprecated_check_and_audit(pid, SYS_CAP_REGISTER)) {
+                audit_write_deprecated_syscall(pid, "SYS_CAP_REGISTER(1033)");
             }
-
-            uint32_t cap_type = (uint32_t)frame->rsi;
-
-            // Only APPLICATION, FEATURE, COMPOSITE allowed from user-space
-            if (cap_type < CAP_APPLICATION) {
-                frame->rax = (uint64_t)(long)CAP_ERR_LAYER_VIOLATION;
-                break;
-            }
-
-            int dep_count = (int)frame->r10;
-            if (dep_count < 0 || dep_count > MAX_CAP_DEPS) {
-                frame->rax = (uint64_t)(long)CAP_ERR_DEP_UNRESOLVED;
-                break;
-            }
-
-            // Copy dep names from user-space
-            const char **user_dep_names = (const char **)frame->rdx;
-            const char *k_dep_ptrs[MAX_CAP_DEPS];
-            char k_dep_bufs[MAX_CAP_DEPS][CAP_NAME_LEN];
-
-            for (int i = 0; i < dep_count; i++) {
-                if (!is_user_pointer(user_dep_names, (dep_count) * sizeof(char *))) {
-                    frame->rax = (uint64_t)(long)CAP_ERR_DEP_UNRESOLVED;
-                    goto cap_reg_done;
-                }
-                const char *user_dep = user_dep_names[i];
-                if (copy_string_from_user(user_dep, k_dep_bufs[i], CAP_NAME_LEN) <= 0) {
-                    frame->rax = (uint64_t)(long)CAP_ERR_DEP_UNRESOLVED;
-                    goto cap_reg_done;
-                }
-                k_dep_ptrs[i] = k_dep_bufs[i];
-            }
-
-            {
-                task_t *current = sched_get_current_task();
-                int32_t owner = current ? current->id : -1;
-                int ret = cap_register(kname, cap_type, 0, owner,
-                                       dep_count > 0 ? k_dep_ptrs : NULL, dep_count,
-                                       NULL, NULL, NULL, 0, NULL);
-                frame->rax = (uint64_t)(long)ret;
-            }
-            cap_reg_done:
+            frame->rax = (uint64_t)(long)CAP_V2_EDEPRECATED;
             break;
         }
 
         case SYS_CAP_UNREGISTER: {
-            // RDI=name
-            char kname[32];
-            if (copy_string_from_user((const char *)frame->rdi, kname, 32) <= 0) {
-                frame->rax = (uint64_t)(long)CAP_ERR_NAME_EMPTY;
-                break;
+            task_t *cur = sched_get_current_task();
+            int32_t pid = cur ? cur->id : -1;
+            if (deprecated_check_and_audit(pid, SYS_CAP_UNREGISTER)) {
+                audit_write_deprecated_syscall(pid, "SYS_CAP_UNREGISTER(1034)");
             }
-
-            int id = cap_find(kname);
-            if (id < 0) {
-                frame->rax = (uint64_t)(long)CAP_ERR_NOT_FOUND;
-                break;
-            }
-
-            // Verify caller owns the cap
-            task_t *current = sched_get_current_task();
-            int32_t caller_pid = current ? current->id : -1;
-            int32_t cap_owner = cap_get_owner(id);
-            if (cap_owner == -1 || cap_owner != caller_pid) {
-                frame->rax = (uint64_t)(long)CAP_ERR_KERNEL_OWNED;
-                break;
-            }
-
-            frame->rax = (uint64_t)(long)cap_unregister(id);
+            frame->rax = (uint64_t)(long)CAP_V2_EDEPRECATED;
             break;
         }
 
         // Phase 8c: AI Metadata syscalls
         case SYS_SET_AI_METADATA: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_AI_CALL, "pledge denied: ai_call")) break;
             // RDI=path, RSI=metadata_ptr
             char kpath[256];
             if (copy_string_from_user((const char *)frame->rdi, kpath, 256) <= 0) {
@@ -1036,11 +1077,18 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             for (size_t i = 0; i < sizeof(grahafs_ai_metadata_t); i++)
                 kdst[i] = usrc[i];
 
-            frame->rax = (uint64_t)(long)grahafs_set_ai_metadata(ino, &kmeta);
+            int aim_rc = grahafs_set_ai_metadata(ino, &kmeta);
+            frame->rax = (uint64_t)(long)aim_rc;
+            if (aim_rc >= 0) {
+                task_t *aic = sched_get_current_task();
+                audit_write_ai_invoke(aic ? aic->id : -1, kpath);
+            }
             break;
         }
 
         case SYS_GET_AI_METADATA: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_AI_CALL, "pledge denied: ai_call")) break;
             // RDI=path, RSI=out_buf
             char kpath[256];
             if (copy_string_from_user((const char *)frame->rdi, kpath, 256) <= 0) {
@@ -1077,6 +1125,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_SEARCH_BY_TAG: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY, "pledge denied: sys_query")) break;
             // RDI=tag_str, RSI=results_buf, RDX=max_results
             char ktag[96];
             if (copy_string_from_user((const char *)frame->rdi, ktag, 96) <= 0) {
@@ -1107,102 +1157,40 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             break;
         }
 
-        // Phase 8d: CAN Event Propagation
+        // Phase 8d: CAN Event Propagation — deprecated in Phase 16.
         case SYS_CAP_WATCH: {
-            // RDI = capability name to watch
-            char kname[32];
-            if (copy_string_from_user((const char *)frame->rdi, kname, 32) <= 0) {
-                frame->rax = (uint64_t)(long)CAP_ERR_NOT_FOUND;
-                break;
+            task_t *cur = sched_get_current_task();
+            int32_t pid = cur ? cur->id : -1;
+            if (deprecated_check_and_audit(pid, SYS_CAP_WATCH)) {
+                audit_write_deprecated_syscall(pid, "SYS_CAP_WATCH(1038)");
             }
-            int id = cap_find(kname);
-            if (id < 0) {
-                frame->rax = (uint64_t)(long)CAP_ERR_NOT_FOUND;
-                break;
-            }
-            task_t *current = sched_get_current_task();
-            if (!current) {
-                frame->rax = (uint64_t)(long)-1;
-                break;
-            }
-            frame->rax = (uint64_t)(long)cap_watch(id, current->id);
+            frame->rax = (uint64_t)(long)CAP_V2_EDEPRECATED;
             break;
         }
 
         case SYS_CAP_UNWATCH: {
-            // RDI = capability name to unwatch
-            char kname[32];
-            if (copy_string_from_user((const char *)frame->rdi, kname, 32) <= 0) {
-                frame->rax = (uint64_t)(long)CAP_ERR_NOT_FOUND;
-                break;
+            task_t *cur = sched_get_current_task();
+            int32_t pid = cur ? cur->id : -1;
+            if (deprecated_check_and_audit(pid, SYS_CAP_UNWATCH)) {
+                audit_write_deprecated_syscall(pid, "SYS_CAP_UNWATCH(1039)");
             }
-            int id = cap_find(kname);
-            if (id < 0) {
-                frame->rax = (uint64_t)(long)CAP_ERR_NOT_FOUND;
-                break;
-            }
-            task_t *current = sched_get_current_task();
-            if (!current) {
-                frame->rax = (uint64_t)(long)-1;
-                break;
-            }
-            frame->rax = (uint64_t)(long)cap_unwatch(id, current->id);
+            frame->rax = (uint64_t)(long)CAP_V2_EDEPRECATED;
             break;
         }
 
         case SYS_CAP_POLL: {
-            // RDI = event buffer pointer, RSI = max events
-            void *user_buf = (void *)frame->rdi;
-            int max_events = (int)frame->rsi;
-
-            task_t *current = sched_get_current_task();
-            if (!current) {
-                frame->rax = (uint64_t)(long)-1;
-                break;
+            task_t *cur = sched_get_current_task();
+            int32_t pid = cur ? cur->id : -1;
+            if (deprecated_check_and_audit(pid, SYS_CAP_POLL)) {
+                audit_write_deprecated_syscall(pid, "SYS_CAP_POLL(1040)");
             }
-
-            if (max_events <= 0) max_events = 1;
-            if (max_events > STATE_CAP_EVENT_QUEUE_SIZE) max_events = STATE_CAP_EVENT_QUEUE_SIZE;
-
-            int pending = sched_pending_event_count(current->id);
-
-            if (pending == 0) {
-                if (user_buf == NULL) {
-                    // Non-blocking query: just return 0 pending
-                    frame->rax = 0;
-                } else {
-                    // Blocking mode: block and retry
-                    current->event_waiting = 1;
-                    current->state = TASK_STATE_BLOCKED;
-                    frame->rax = (uint64_t)(long)-99;  // Retry signal
-                }
-                break;
-            }
-
-            if (!user_buf || !is_user_pointer(user_buf, max_events * sizeof(state_cap_event_t))) {
-                // Just return the count if buffer is invalid
-                frame->rax = (uint64_t)(long)pending;
-                break;
-            }
-
-            // Dequeue up to max_events
-            state_cap_event_t *out = (state_cap_event_t *)user_buf;
-            int count = 0;
-            state_cap_event_t tmp;
-            while (count < max_events && sched_dequeue_cap_event(current->id, &tmp)) {
-                // Copy event to user buffer
-                uint8_t *dst = (uint8_t *)&out[count];
-                const uint8_t *src = (const uint8_t *)&tmp;
-                for (size_t i = 0; i < sizeof(state_cap_event_t); i++)
-                    dst[i] = src[i];
-                count++;
-            }
-            frame->rax = (uint64_t)(long)count;
+            frame->rax = (uint64_t)(long)CAP_V2_EDEPRECATED;
             break;
         }
 
         // Phase 9a: Network ifconfig
         case SYS_NET_IFCONFIG: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_NET_SERVER, "pledge denied: net_server")) break;
             // RDI = user buffer pointer (at least 7 bytes: 6 MAC + 1 link_up)
             void *user_buf = (void *)frame->rdi;
             if (!user_buf || !is_user_pointer(user_buf, 7)) {
@@ -1227,6 +1215,7 @@ void syscall_dispatcher(struct syscall_frame *frame) {
 
         // Phase 9b: Network stack status
         case SYS_NET_STATUS: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_NET_SERVER, "pledge denied: net_server")) break;
             void *user_buf = (void *)frame->rdi;
             if (!user_buf || !is_user_pointer(user_buf, sizeof(net_status_t))) {
                 frame->rax = (uint64_t)(long)-1;
@@ -1245,6 +1234,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_HTTP_GET: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_NET_CLIENT, "pledge denied: net_client")) break;
             const char *url_user = (const char *)frame->rdi;
             char *resp_buf = (char *)frame->rsi;
             int max_len = (int)frame->rdx;
@@ -1277,6 +1268,7 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 // Request in flight — block and retry
                 current->state = TASK_STATE_BLOCKED;
                 frame->rax = (uint64_t)(long)-99;
+                audit_write_net_bind(current->id, url_kernel);
             } else {
                 // Couldn't start (no network, OOM, etc.)
                 frame->rax = (uint64_t)(long)start_ret;
@@ -1285,6 +1277,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_HTTP_POST: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_NET_CLIENT, "pledge denied: net_client")) break;
             // RDI=url, RSI=body, RDX=body_len, R10=response_buf, R8=max_len
             const char *post_url_user = (const char *)frame->rdi;
             const char *post_body_user = (const char *)frame->rsi;
@@ -1330,6 +1324,7 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             if (post_start_ret == 0 || post_start_ret == NET_ERR_BUSY) {
                 current->state = TASK_STATE_BLOCKED;
                 frame->rax = (uint64_t)(long)-99;
+                audit_write_net_bind(current->id, post_url_kernel);
             } else {
                 frame->rax = (uint64_t)(long)post_start_ret;
             }
@@ -1337,6 +1332,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_DNS_RESOLVE: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_NET_CLIENT, "pledge denied: net_client")) break;
             const char *hostname_user = (const char *)frame->rdi;
             uint8_t *ip_buf = (uint8_t *)frame->rsi;
 
@@ -1374,6 +1371,7 @@ void syscall_dispatcher(struct syscall_frame *frame) {
 
         // Phase 10b: Pipe and FD duplication syscalls
         case SYS_PIPE: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_SEND, "pledge denied: ipc_send")) break;
             int *fds_user = (int *)frame->rdi;
             if (!fds_user || !is_user_pointer(fds_user, 2 * sizeof(int))) {
                 frame->rax = -1;
@@ -1429,6 +1427,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_DUP2: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_SEND, "pledge denied: ipc_send")) break;
             int old_fd = (int)frame->rdi;
             int new_fd = (int)frame->rsi;
 
@@ -1475,6 +1475,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_DUP: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_SEND, "pledge denied: ipc_send")) break;
             int old_fd = (int)frame->rdi;
 
             task_t *dup_task = sched_get_current_task();
@@ -1520,6 +1522,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_TRUNCATE: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_FS_WRITE, "pledge denied: fs_write")) break;
             // Phase 10c: Truncate file to 0 bytes
             int trunc_fd = (int)frame->rdi;
             task_t *trunc_task = sched_get_current_task();
@@ -1537,6 +1541,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_COMPUTE_SIMHASH: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_AI_CALL, "pledge denied: ai_call")) break;
             // Phase 11a: Compute SimHash for a file
             // RDI = path string
             char sh_path[256];
@@ -1554,6 +1560,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_FIND_SIMILAR: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY, "pledge denied: sys_query")) break;
             // Phase 11a: Find similar files by SimHash Hamming distance
             // RDI = path, RSI = threshold, RDX = results buffer
             char sim_path[256];
@@ -1586,6 +1594,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_CLUSTER_LIST: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY, "pledge denied: sys_query")) break;
             // Phase 11b: Get list of all clusters
             // RDI = pointer to cluster_list_t
             void *cl_buf = (void *)frame->rdi;
@@ -1605,6 +1615,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_CLUSTER_MEMBERS: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY, "pledge denied: sys_query")) break;
             // Phase 11b: Get members of a specific cluster
             // RDI = cluster_id, RSI = pointer to cluster_members_t
             uint32_t cm_id = (uint32_t)frame->rdi;
@@ -1625,6 +1637,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_KLOG_WRITE: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL, "pledge denied: sys_control")) break;
             // Phase 13: append one user-space entry to the klog ring.
             // RDI = level (0..5), RSI = subsys id (>= 10), RDX = user
             // message pointer, R10 = message length in bytes.
@@ -1655,6 +1669,8 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_KLOG_READ: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY, "pledge denied: sys_query")) break;
             // Phase 13: non-destructive read of the klog ring.
             // RDI = level_mask (u8 bitmap, 0 = all levels)
             // RSI = tail_count (0 = everything currently held)
@@ -1673,9 +1689,11 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         case SYS_DEBUG: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL, "pledge denied: sys_control")) break;
             // Phase 13: controlled-panic trigger for gate tests.
-            // Only compiled in when WITH_DEBUG_SYSCALL is defined at
-            // build time; otherwise the handler falls through to -1.
+            // Phase 14: allocator / per-CPU test-assist hooks.
+            // Only compiled in when WITH_DEBUG_SYSCALL is defined.
 #ifdef WITH_DEBUG_SYSCALL
             extern void kpanic(const char *reason);
             int op = (int)frame->rdi;
@@ -1695,6 +1713,116 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = (uint64_t)0;
                 break;
             }
+            case DEBUG_PERCPU_WRITE: {
+                extern void percpu_init(uint32_t);  /* unused forward decl */
+                (void)percpu_init;
+                per_cpu_set(test_slot, (uint64_t)frame->rsi);
+                extern uint32_t smp_get_current_cpu(void);
+                frame->rax = (uint64_t)smp_get_current_cpu();
+                break;
+            }
+            case DEBUG_PERCPU_READ:
+                frame->rax = (uint64_t)per_cpu(test_slot);
+                break;
+            case DEBUG_KMALLOC: {
+                size_t size = (size_t)frame->rsi;
+                uint8_t subsys = (uint8_t)frame->rdx;
+                void *p = kmalloc(size, subsys);
+                frame->rax = (uint64_t)p;
+                break;
+            }
+            case DEBUG_KFREE:
+                kfree((void *)frame->rsi);
+                frame->rax = (uint64_t)0;
+                break;
+            case DEBUG_CAP_LOOKUP: {
+                // RSI = const char *name (user ptr). Returns packed token
+                // {gen, idx, flags=0} for the paired cap_object_t, or 0
+                // if the cap isn't found.
+                char kname[32];
+                if (copy_string_from_user((const char *)frame->rsi, kname, 32) <= 0) {
+                    frame->rax = 0;
+                    break;
+                }
+                int can_id = cap_find(kname);
+                if (can_id < 0) { frame->rax = 0; break; }
+                // The paired cap_object idx is stored in the can_entry.
+                // Since can_entry_t is slab-allocated and we don't have a
+                // direct getter by id exported, use an internal helper.
+                // For Phase 15a we expose it through a new accessor.
+                extern uint32_t cap_get_object_idx(int can_id);
+                uint32_t obj_idx = cap_get_object_idx(can_id);
+                if (obj_idx == CAP_OBJECT_IDX_NONE) { frame->rax = 0; break; }
+                cap_object_t *obj = cap_object_get(obj_idx);
+                if (!obj) { frame->rax = 0; break; }
+                uint32_t gen = __atomic_load_n(&obj->generation, __ATOMIC_ACQUIRE);
+                cap_token_t t = cap_token_pack(gen, obj_idx, 0);
+                frame->rax = t.raw;
+                break;
+            }
+            case DEBUG_READ_PLEDGE: {
+                // No args; returns current->pledge_mask.raw.
+                task_t *dc = sched_get_current_task();
+                frame->rax = dc ? (uint64_t)dc->pledge_mask.raw : 0;
+                break;
+            }
+            case DEBUG_SET_WALL: {
+                // RSI = int64_t new g_boot_wall_seconds. Returns old value.
+                extern int64_t g_boot_wall_seconds;
+                int64_t old = g_boot_wall_seconds;
+                g_boot_wall_seconds = (int64_t)frame->rsi;
+                frame->rax = (uint64_t)old;
+                break;
+            }
+            // Phase 16 test-assist hooks.
+            case DEBUG_PIC_READ_MASK: {
+                // RSI = uint8_t line (0..15). Returns 1 if masked, 0 if not.
+                uint8_t line = (uint8_t)frame->rsi;
+                // Direct PIC data-port read is fine here — run with WITH_DEBUG_SYSCALL only.
+                uint8_t mask;
+                if (line < 8) {
+                    asm volatile("inb $0x21, %0" : "=a"(mask));
+                    frame->rax = (mask >> line) & 1;
+                } else if (line < 16) {
+                    asm volatile("inb $0xA1, %0" : "=a"(mask));
+                    frame->rax = (mask >> (line - 8)) & 1;
+                } else {
+                    frame->rax = (uint64_t)-1;
+                }
+                break;
+            }
+            case DEBUG_FB_READ_PIXEL: {
+                // RSI = uint32_t x, RDX = uint32_t y. Returns raw u32 pixel.
+                frame->rax = framebuffer_read_pixel((uint32_t)frame->rsi,
+                                                     (uint32_t)frame->rdx);
+                break;
+            }
+            case DEBUG_AHCI_PORT_CMD: {
+                // RSI = int port_num. Returns port->cmd or 0 if missing.
+                frame->rax = (uint64_t)ahci_debug_port_cmd((int)frame->rsi);
+                break;
+            }
+            case DEBUG_E1000_READ_REG: {
+                // RSI = uint32_t offset. Returns register value.
+                frame->rax = (uint64_t)e1000_debug_read_reg((uint32_t)frame->rsi);
+                break;
+            }
+            case DEBUG_KB_IS_ACTIVE: {
+                frame->rax = keyboard_is_active() ? 1 : 0;
+                break;
+            }
+            case DEBUG_FB_IS_ACTIVE: {
+                frame->rax = framebuffer_is_active() ? 1 : 0;
+                break;
+            }
+            case DEBUG_E1000_IS_ACTIVE: {
+                frame->rax = e1000_is_active() ? 1 : 0;
+                break;
+            }
+            case DEBUG_AHCI_IS_ACTIVE: {
+                frame->rax = ahci_is_active() ? 1 : 0;
+                break;
+            }
             default:
                 frame->rax = (uint64_t)-1;
                 break;
@@ -1703,6 +1831,736 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             (void)frame;
             frame->rax = (uint64_t)-1;
 #endif
+            break;
+        }
+
+        case SYS_KHEAP_STATS: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY, "pledge denied: sys_query")) break;
+            // Phase 14: snapshot allocator state for /bin/memstat.
+            // RDI = user buffer (kheap_stats_entry_t *), RSI = max entries.
+            void *user_buf = (void *)frame->rdi;
+            uint32_t max = (uint32_t)frame->rsi;
+            if (!user_buf || max == 0 || max > 256) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            if (!is_user_pointer(user_buf, max * sizeof(kheap_stats_entry_t))) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            uint32_t n = kheap_stats_snapshot((kheap_stats_entry_t *)user_buf, max);
+            frame->rax = (uint64_t)(long)n;
+            break;
+        }
+
+        // ------------------------------------------------------------------
+        // Phase 15a: Capability Objects v2 syscalls (1058-1061).
+        // ------------------------------------------------------------------
+        case SYS_CAP_DERIVE: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL, "pledge denied: sys_control")) break;
+            // RDI = parent_tok.raw, RSI = rights_subset, RDX = audience user ptr,
+            // R10 = flags_subset. Returns cap_token_t.raw on success (u64) or
+            // negative CAP_V2_* on failure.
+            cap_token_t parent_tok = (cap_token_t){.raw = frame->rdi};
+            uint64_t rights_subset = (uint64_t)frame->rsi;
+            const int32_t *user_aud_ptr = (const int32_t *)frame->rdx;
+            uint8_t flags_subset = (uint8_t)(frame->r10 & 0xFF);
+
+            task_t *cur = sched_get_current_task();
+            int32_t caller_pid = cur ? cur->id : -1;
+            if (!cur) { frame->rax = (uint64_t)(long)CAP_V2_EPERM; break; }
+
+            // Copy audience array from user if provided.
+            int32_t audience_k[CAP_AUDIENCE_MAX];
+            const int32_t *audience_in = NULL;
+            if (user_aud_ptr) {
+                if (!is_user_pointer(user_aud_ptr, sizeof(audience_k))) {
+                    frame->rax = (uint64_t)(long)CAP_V2_EFAULT;
+                    break;
+                }
+                for (int i = 0; i < CAP_AUDIENCE_MAX; i++) {
+                    audience_k[i] = user_aud_ptr[i];
+                }
+                audience_in = audience_k;
+            }
+
+            // Resolve parent for caller under RIGHT_DERIVE.
+            cap_object_t *parent = cap_token_resolve(caller_pid, parent_tok, RIGHT_DERIVE);
+            if (!parent) {
+                // Distinguish revoked vs permission — best-effort without a
+                // second lookup. Phase 15b's audit log separates these.
+                frame->rax = (uint64_t)(long)CAP_V2_EPERM;
+                break;
+            }
+
+            uint32_t parent_idx = cap_token_idx(parent_tok);
+            int new_idx = cap_object_derive(parent_idx, caller_pid,
+                                            rights_subset, audience_in, flags_subset);
+            if (new_idx < 0) {
+                frame->rax = (uint64_t)(long)new_idx;
+                break;
+            }
+
+            // Insert into caller's handle table so process-exit cleans up.
+            uint32_t slot = 0;
+            int gen_or_err = cap_handle_insert(&cur->cap_handles,
+                                               (uint32_t)new_idx, flags_subset, &slot);
+            if (gen_or_err < 0) {
+                cap_object_destroy((uint32_t)new_idx);
+                frame->rax = (uint64_t)(long)CAP_V2_ENOMEM;
+                break;
+            }
+
+            // Build the token with the new object's generation (always 1
+            // for freshly-created objects per cap_object_create).
+            cap_object_t *new_obj = cap_object_get((uint32_t)new_idx);
+            uint32_t obj_gen = new_obj ? __atomic_load_n(&new_obj->generation, __ATOMIC_ACQUIRE) : 1;
+
+            cap_token_t t = cap_token_pack(obj_gen, (uint32_t)new_idx, flags_subset);
+            frame->rax = t.raw;
+            break;
+        }
+
+        case SYS_CAP_REVOKE_V2: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL, "pledge denied: sys_control")) break;
+            // RDI = target_tok.raw. Returns count of invalidated tokens.
+            cap_token_t tok = (cap_token_t){.raw = frame->rdi};
+            task_t *cur = sched_get_current_task();
+            int32_t caller_pid = cur ? cur->id : -1;
+
+            cap_object_t *obj = cap_token_resolve(caller_pid, tok, RIGHT_REVOKE);
+            if (!obj) {
+                // Phase 15b: a failed revoke is worth auditing — it's a
+                // privilege-escalation attempt or a buggy caller.
+                audit_write_cap_violation(caller_pid, cap_token_idx(tok),
+                                           CAP_V2_EPERM, RIGHT_REVOKE, 0,
+                                           "unauthorized revoke", AUDIT_SRC_NATIVE);
+                frame->rax = (uint64_t)(long)CAP_V2_EPERM;
+                break;
+            }
+            int count = cap_object_revoke(cap_token_idx(tok));
+            frame->rax = (uint64_t)(long)count;
+            break;
+        }
+
+        case SYS_CAP_GRANT: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL, "pledge denied: sys_control")) break;
+            // RDI = tok.raw, RSI = target_pid.
+            cap_token_t tok = (cap_token_t){.raw = frame->rdi};
+            int32_t target_pid = (int32_t)(long)frame->rsi;
+
+            task_t *cur = sched_get_current_task();
+            int32_t caller_pid = cur ? cur->id : -1;
+
+            cap_object_t *obj = cap_token_resolve(caller_pid, tok, 0 /* no required right */);
+            if (!obj) {
+                frame->rax = (uint64_t)(long)CAP_V2_EPERM;
+                break;
+            }
+            // Phase 15a constraint: target must already be in audience.
+            if (!cap_token_validate_audience(obj, target_pid)) {
+                frame->rax = (uint64_t)(long)CAP_V2_ENOSYS;
+                break;
+            }
+            task_t *target = sched_get_task(target_pid);
+            if (!target) {
+                frame->rax = (uint64_t)(long)CAP_V2_EPERM;
+                break;
+            }
+            uint32_t slot = 0;
+            int r = cap_handle_insert(&target->cap_handles,
+                                      cap_token_idx(tok), cap_token_flags(tok), &slot);
+            if (r < 0) {
+                frame->rax = (uint64_t)(long)r;
+                break;
+            }
+            audit_write_cap_grant(caller_pid, target_pid, cap_token_idx(tok),
+                                  AUDIT_SRC_NATIVE);
+            frame->rax = (uint64_t)slot;
+            break;
+        }
+
+        case SYS_CAP_INSPECT: {
+
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY, "pledge denied: sys_query")) break;
+            // RDI = tok.raw, RSI = out user pointer.
+            cap_token_t tok = (cap_token_t){.raw = frame->rdi};
+            cap_inspect_result_t *user_out = (cap_inspect_result_t *)frame->rsi;
+            if (!user_out ||
+                !is_user_pointer(user_out, sizeof(*user_out))) {
+                frame->rax = (uint64_t)(long)CAP_V2_EFAULT;
+                break;
+            }
+
+            task_t *cur = sched_get_current_task();
+            int32_t caller_pid = cur ? cur->id : -1;
+
+            // Inspect requires RIGHT_INSPECT.
+            cap_object_t *obj = cap_token_resolve(caller_pid, tok, RIGHT_INSPECT);
+            if (!obj) {
+                // Try without the right to distinguish -EREVOKED from -EPERM.
+                cap_object_t *raw = cap_token_resolve(caller_pid, tok, 0);
+                frame->rax = (uint64_t)(long)(raw ? CAP_V2_EPERM : CAP_V2_EREVOKED);
+                break;
+            }
+
+            cap_inspect_result_t kres;
+            int r = cap_object_inspect(cap_token_idx(tok), caller_pid, &kres);
+            if (r < 0) {
+                frame->rax = (uint64_t)(long)r;
+                break;
+            }
+            // copy_to_user.
+            uint8_t *dst = (uint8_t *)user_out;
+            const uint8_t *src = (const uint8_t *)&kres;
+            for (size_t i = 0; i < sizeof(kres); i++) dst[i] = src[i];
+            frame->rax = 0;
+            break;
+        }
+
+        // -------------------------------------------------------------------
+        // Phase 15b: SYS_PLEDGE — narrow caller's pledge mask.
+        // -------------------------------------------------------------------
+        case SYS_PLEDGE: {
+            // No pledge guard: any process is always free to narrow its own
+            // authority. pledge_narrow validates subset + audits.
+            task_t *cur = sched_get_current_task();
+            if (!cur) {
+                frame->rax = (uint64_t)(long)CAP_V2_EPERM;
+                break;
+            }
+            pledge_mask_t new_mask = (pledge_mask_t){.raw = (uint16_t)frame->rdi};
+            int rc = pledge_narrow(cur, new_mask);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        // -------------------------------------------------------------------
+        // Phase 15b: SYS_AUDIT_QUERY — read audit entries with time + event
+        // filter into a user buffer.
+        // -------------------------------------------------------------------
+        case SYS_AUDIT_QUERY: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY, "pledge denied: sys_query")) break;
+            uint64_t since_ns   = frame->rdi;
+            uint64_t until_ns   = frame->rsi;
+            uint32_t event_mask = (uint32_t)frame->rdx;
+            audit_entry_t *user_buf = (audit_entry_t *)frame->r10;
+            uint32_t max = (uint32_t)frame->r8;
+
+            if (max == 0 || max > 1024) {
+                frame->rax = (uint64_t)(long)CAP_V2_EINVAL;
+                break;
+            }
+            if (until_ns != 0 && until_ns < since_ns) {
+                frame->rax = (uint64_t)(long)CAP_V2_EINVAL;
+                break;
+            }
+            if (!is_user_pointer(user_buf, (size_t)max * sizeof(audit_entry_t))) {
+                frame->rax = (uint64_t)(long)CAP_V2_EFAULT;
+                break;
+            }
+
+            // Allocate a kernel staging buffer for the max-worst case is 256
+            // KiB; we chunk smaller. 64 entries = 16 KiB per kmalloc is fine.
+            uint32_t chunk = (max > 64) ? 64 : max;
+            audit_entry_t *kbuf = (audit_entry_t *)kmalloc(
+                (size_t)chunk * sizeof(audit_entry_t), SUBSYS_AUDIT);
+            if (!kbuf) {
+                frame->rax = (uint64_t)(long)CAP_V2_ENOMEM;
+                break;
+            }
+
+            uint32_t total = 0;
+            uint64_t cur_since = since_ns;
+            while (total < max) {
+                uint32_t want = max - total;
+                if (want > chunk) want = chunk;
+                int written = audit_query(cur_since, until_ns, event_mask, kbuf, want);
+                if (written <= 0) break;
+                // Copy to user buffer.
+                audit_entry_t *dst = &user_buf[total];
+                for (int i = 0; i < written; i++) dst[i] = kbuf[i];
+                total += (uint32_t)written;
+                if ((uint32_t)written < want) break;
+                // Continue from the last entry's ns_timestamp + 1 to avoid
+                // re-reading it.
+                cur_since = kbuf[written - 1].ns_timestamp + 1;
+            }
+            kfree(kbuf);
+            frame->rax = (uint64_t)total;
+            break;
+        }
+
+        case SYS_CAN_ACTIVATE_T: {
+            // Phase 16: token-taking CAN activate. Resolves the token, checks
+            // kind/rights/pledge, derives can_id, invokes cap_activate. The
+            // cap_activate path itself emits AUDIT_CAP_ACTIVATE internally
+            // (with our task's pid via sched_get_current_task).
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                         "pledge denied: sys_control")) break;
+            cap_token_t tok = (cap_token_t){.raw = frame->rdi};
+            task_t *cur = sched_get_current_task();
+            int32_t caller_pid = cur ? cur->id : -1;
+
+            cap_object_t *obj = cap_token_resolve(caller_pid, tok, RIGHT_ACTIVATE);
+            if (!obj) {
+                audit_write_cap_violation(caller_pid, cap_token_idx(tok),
+                                           CAP_V2_EPERM, RIGHT_ACTIVATE, 0,
+                                           "can_activate: resolve failed",
+                                           AUDIT_SRC_NATIVE);
+                frame->rax = (uint64_t)(long)CAP_V2_EPERM;
+                break;
+            }
+            if (obj->kind != CAP_KIND_CAN) {
+                audit_write_cap_violation(caller_pid, cap_token_idx(tok),
+                                           CAP_V2_EPERM, RIGHT_ACTIVATE, 0,
+                                           "can_activate: not a CAN token",
+                                           AUDIT_SRC_NATIVE);
+                frame->rax = (uint64_t)(long)CAP_V2_EPERM;
+                break;
+            }
+            int can_id = cap_can_by_object_idx(cap_token_idx(tok));
+            if (can_id < 0) {
+                frame->rax = (uint64_t)(long)CAP_V2_EINVAL;
+                break;
+            }
+            int rc = cap_activate(can_id);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        case SYS_CAN_DEACTIVATE_T: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                         "pledge denied: sys_control")) break;
+            cap_token_t tok = (cap_token_t){.raw = frame->rdi};
+            task_t *cur = sched_get_current_task();
+            int32_t caller_pid = cur ? cur->id : -1;
+
+            cap_object_t *obj = cap_token_resolve(caller_pid, tok, RIGHT_DEACTIVATE);
+            if (!obj) {
+                audit_write_cap_violation(caller_pid, cap_token_idx(tok),
+                                           CAP_V2_EPERM, RIGHT_DEACTIVATE, 0,
+                                           "can_deactivate: resolve failed",
+                                           AUDIT_SRC_NATIVE);
+                frame->rax = (uint64_t)(long)CAP_V2_EPERM;
+                break;
+            }
+            if (obj->kind != CAP_KIND_CAN) {
+                audit_write_cap_violation(caller_pid, cap_token_idx(tok),
+                                           CAP_V2_EPERM, RIGHT_DEACTIVATE, 0,
+                                           "can_deactivate: not a CAN token",
+                                           AUDIT_SRC_NATIVE);
+                frame->rax = (uint64_t)(long)CAP_V2_EPERM;
+                break;
+            }
+            int can_id = cap_can_by_object_idx(cap_token_idx(tok));
+            if (can_id < 0) {
+                frame->rax = (uint64_t)(long)CAP_V2_EINVAL;
+                break;
+            }
+            uint32_t count = 0;
+            int rc = cap_deactivate_count(can_id, &count);
+            if (rc != CAP_OK) {
+                frame->rax = (uint64_t)(long)rc;
+            } else {
+                frame->rax = (uint64_t)count;
+            }
+            break;
+        }
+
+        case SYS_CAN_LOOKUP: {
+            // Public lookup: no pledge gate (can-ctl list must work from any
+            // pledge). Returns 0 on not-found. The returned token is resolvable
+            // by any process since CAN caps are CAP_FLAG_PUBLIC + RIGHTS_ALL.
+            const char *user_name = (const char *)frame->rdi;
+            size_t name_len = (size_t)frame->rsi;
+            if (name_len == 0 || name_len > 64) {
+                frame->rax = 0;
+                break;
+            }
+            if (!is_user_pointer((void *)user_name, name_len)) {
+                frame->rax = 0;
+                break;
+            }
+            // Copy the name into a kernel-local buffer (trimmed to 64 B + NUL).
+            char kname[65];
+            for (size_t i = 0; i < name_len && i < 64; i++) kname[i] = user_name[i];
+            kname[name_len < 64 ? name_len : 64] = '\0';
+
+            int can_id = cap_find(kname);
+            if (can_id < 0) { frame->rax = 0; break; }
+            uint32_t obj_idx = cap_get_object_idx(can_id);
+            if (obj_idx == CAP_OBJECT_IDX_NONE) { frame->rax = 0; break; }
+            cap_object_t *obj = cap_object_get(obj_idx);
+            if (!obj) { frame->rax = 0; break; }
+            uint32_t gen = __atomic_load_n(&obj->generation, __ATOMIC_ACQUIRE);
+            cap_token_t t = cap_token_pack(gen, obj_idx, (uint8_t)(obj->flags & 0xFF));
+            frame->rax = t.raw;
+            break;
+        }
+
+        // ============================================================
+        // Phase 17: Channels + VMOs
+        // ============================================================
+
+        case SYS_CHAN_CREATE: {
+            // ABI: rdi=type_hash, rsi=wr_out_ptr, rdx=(mode|(capacity<<32)).
+            // Avoids the unreliable R10 binding for an output pointer.
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_SEND, "pledge denied: ipc_send")) break;
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_RECV, "pledge denied: ipc_recv")) break;
+            uint64_t type_hash = frame->rdi;
+            cap_token_t *wr_out_user = (cap_token_t *)frame->rsi;
+            uint32_t mode      = (uint32_t)(frame->rdx & 0xFFFFFFFFu);
+            uint32_t capacity  = (uint32_t)(frame->rdx >> 32);
+            if (!is_user_pointer(wr_out_user, sizeof(cap_token_t))) {
+                frame->rax = (uint64_t)(long)CAP_V2_EFAULT;
+                break;
+            }
+            task_t *cur = sched_get_current_task();
+            if (!cur) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+
+            cap_token_t rd_tok = CAP_TOKEN_NULL, wr_tok = CAP_TOKEN_NULL;
+            int rc = chan_create(type_hash, mode, capacity, cur->id,
+                                 &rd_tok, &wr_tok);
+            if (rc < 0) {
+                frame->rax = (uint64_t)(long)rc;
+                break;
+            }
+            *wr_out_user = wr_tok;
+            frame->rax = rd_tok.raw;
+            break;
+        }
+
+        case SYS_CHAN_SEND: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_SEND, "pledge denied: ipc_send")) break;
+            cap_token_t tok = { .raw = frame->rdi };
+            chan_msg_user_t *user_msg = (chan_msg_user_t *)frame->rsi;
+            uint64_t timeout = frame->rdx;
+            if (!is_user_pointer(user_msg, sizeof(chan_msg_user_t))) {
+                frame->rax = (uint64_t)(long)CAP_V2_EFAULT;
+                break;
+            }
+            task_t *cur = sched_get_current_task();
+            if (!cur) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+            channel_t *c = NULL;
+            uint32_t obj_idx = 0;
+            int rc = chan_resolve_endpoint(cur->id, tok, CHAN_ENDPOINT_WRITE,
+                                            RIGHT_SEND, &c, &obj_idx);
+            if (rc < 0) {
+                audit_write_chan_send(cur->id, 0, rc, "resolve failed");
+                frame->rax = (uint64_t)(long)rc;
+                break;
+            }
+            // Copy user msg into kernel-local buffer, then into a staged slot.
+            chan_msg_user_t kmsg;
+            memcpy(&kmsg, user_msg, sizeof(kmsg));
+            channel_msg_t staged;
+            rc = chan_marshal_send(cur, &kmsg, &staged);
+            if (rc < 0) {
+                audit_write_chan_send(cur->id, obj_idx, rc, "marshal failed");
+                frame->rax = (uint64_t)(long)rc;
+                break;
+            }
+            rc = chan_send(c, cur, &staged, timeout);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        case SYS_CHAN_RECV: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_RECV, "pledge denied: ipc_recv")) break;
+            cap_token_t tok = { .raw = frame->rdi };
+            chan_msg_user_t *user_msg = (chan_msg_user_t *)frame->rsi;
+            uint64_t timeout = frame->rdx;
+            if (!is_user_pointer(user_msg, sizeof(chan_msg_user_t))) {
+                frame->rax = (uint64_t)(long)CAP_V2_EFAULT;
+                break;
+            }
+            task_t *cur = sched_get_current_task();
+            if (!cur) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+            channel_t *c = NULL;
+            uint32_t obj_idx = 0;
+            int rc = chan_resolve_endpoint(cur->id, tok, CHAN_ENDPOINT_READ,
+                                            RIGHT_RECV, &c, &obj_idx);
+            if (rc < 0) {
+                audit_write_chan_recv(cur->id, 0, rc, "resolve failed");
+                frame->rax = (uint64_t)(long)rc;
+                break;
+            }
+            channel_msg_t slot;
+            int bytes = chan_recv(c, cur, &slot, timeout);
+            if (bytes < 0) {
+                frame->rax = (uint64_t)(long)bytes;
+                break;
+            }
+            rc = chan_marshal_recv(cur, &slot, user_msg);
+            if (rc < 0) {
+                frame->rax = (uint64_t)(long)rc;
+                break;
+            }
+            frame->rax = (uint64_t)(long)bytes;
+            break;
+        }
+
+        case SYS_CHAN_POLL: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_RECV, "pledge denied: ipc_recv")) break;
+            // Phase 17 MVP: probe-only (no blocking). Userspace builds an
+            // event loop by calling in a short tick-level poll. Blocking
+            // poll lands with Phase 18 streams.
+            void *polls_user = (void *)frame->rdi;
+            uint32_t npolls = (uint32_t)frame->rsi;
+            if (npolls == 0 || npolls > 64) {
+                frame->rax = (uint64_t)(long)CAP_V2_EINVAL;
+                break;
+            }
+            // Probe each: user provides {cap_token_t handle; uint32_t wanted; uint32_t revents}
+            struct poll_entry { uint64_t handle_raw; uint32_t wanted; uint32_t revents; };
+            if (!is_user_pointer(polls_user, sizeof(struct poll_entry) * npolls)) {
+                frame->rax = (uint64_t)(long)CAP_V2_EFAULT;
+                break;
+            }
+            task_t *cur = sched_get_current_task();
+            if (!cur) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+            struct poll_entry *p = (struct poll_entry *)polls_user;
+            uint32_t ready = 0;
+            for (uint32_t i = 0; i < npolls; i++) {
+                cap_token_t tok = { .raw = p[i].handle_raw };
+                cap_object_t *obj = cap_token_resolve(cur->id, tok, RIGHT_INSPECT);
+                if (!obj || obj->kind != CAP_KIND_CHANNEL) {
+                    p[i].revents = 0;
+                    continue;
+                }
+                chan_endpoint_t *ep = (chan_endpoint_t *)obj->kind_data;
+                if (!ep) { p[i].revents = 0; continue; }
+                uint32_t rv = chan_poll_probe(ep->channel) & p[i].wanted;
+                p[i].revents = rv;
+                if (rv) ready++;
+            }
+            frame->rax = (uint64_t)ready;
+            break;
+        }
+
+        case SYS_VMO_CREATE: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_COMPUTE, "pledge denied: compute")) break;
+            uint64_t size = frame->rdi;
+            uint32_t flags = (uint32_t)frame->rsi;
+            task_t *cur = sched_get_current_task();
+            if (!cur) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+
+            vmo_t *v = vmo_create(size, flags, cur->id, cur->id);
+            if (!v) { frame->rax = (uint64_t)(long)CAP_V2_ENOMEM; break; }
+            // Wrap in cap_object.
+            int32_t audience[CAP_AUDIENCE_MAX + 1];
+            audience[0] = cur->id;
+            audience[1] = PID_NONE;
+            int idx = cap_object_create(CAP_KIND_VMO,
+                                        RIGHT_READ | RIGHT_WRITE | RIGHT_EXEC |
+                                            RIGHT_INSPECT | RIGHT_DERIVE | RIGHT_REVOKE,
+                                        audience, 0,
+                                        (uintptr_t)v, cur->id,
+                                        CAP_OBJECT_IDX_NONE);
+            if (idx < 0) {
+                vmo_free(v);
+                frame->rax = (uint64_t)(long)idx;
+                break;
+            }
+            v->cap_object_idx = (uint32_t)idx;
+            uint32_t slot = 0;
+            int rc_ins = cap_handle_insert(&cur->cap_handles, (uint32_t)idx, 0, &slot);
+            if (rc_ins < 0) {
+                cap_object_destroy((uint32_t)idx);
+                frame->rax = (uint64_t)(long)rc_ins;
+                break;
+            }
+            cap_object_t *vobj = g_cap_object_ptrs[idx];
+            uint32_t vgen = vobj ? __atomic_load_n(&vobj->generation, __ATOMIC_ACQUIRE) : 0;
+            frame->rax = cap_token_pack(vgen, (uint32_t)idx, 0).raw;
+            break;
+        }
+
+        case SYS_VMO_MAP: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_COMPUTE, "pledge denied: compute")) break;
+            cap_token_t tok = { .raw = frame->rdi };
+            uint64_t addr_hint = frame->rsi;
+            uint64_t offset = frame->rdx;
+            uint64_t len = frame->r10;
+            uint32_t prot = (uint32_t)frame->r8;
+
+            // Derive required rights from prot.
+            uint64_t required = 0;
+            if (prot & PROT_READ)  required |= RIGHT_READ;
+            if (prot & PROT_WRITE) required |= RIGHT_WRITE;
+            if (prot & PROT_EXEC)  required |= RIGHT_EXEC;
+            if (required == 0) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+
+            task_t *cur = sched_get_current_task();
+            if (!cur) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+            cap_object_t *obj = cap_token_resolve(cur->id, tok, required);
+            if (!obj) { frame->rax = (uint64_t)(long)CAP_V2_EPERM; break; }
+            if (obj->kind != CAP_KIND_VMO) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+            vmo_t *v = (vmo_t *)obj->kind_data;
+            uint64_t va = vmo_map(v, cur, addr_hint, offset, len, prot);
+            if (va == 0) { frame->rax = (uint64_t)(long)CAP_V2_ENOMEM; break; }
+            frame->rax = va;
+            break;
+        }
+
+        case SYS_VMO_UNMAP: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_COMPUTE, "pledge denied: compute")) break;
+            uint64_t vaddr = frame->rdi;
+            uint64_t len   = frame->rsi;
+            task_t *cur = sched_get_current_task();
+            if (!cur) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+            int rc = vmo_unmap(cur, vaddr, len);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        case SYS_VMO_CLONE: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_COMPUTE, "pledge denied: compute")) break;
+            cap_token_t tok = { .raw = frame->rdi };
+            // uint32_t flags = (uint32_t)frame->rsi;  // unused; only COW supported
+            task_t *cur = sched_get_current_task();
+            if (!cur) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+            cap_object_t *obj = cap_token_resolve(cur->id, tok, RIGHT_READ);
+            if (!obj) { frame->rax = (uint64_t)(long)CAP_V2_EPERM; break; }
+            if (obj->kind != CAP_KIND_VMO) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+            vmo_t *src = (vmo_t *)obj->kind_data;
+            vmo_t *child = vmo_clone_cow(src, cur->id);
+            if (!child) { frame->rax = (uint64_t)(long)CAP_V2_ENOMEM; break; }
+
+            int32_t audience[CAP_AUDIENCE_MAX + 1];
+            audience[0] = cur->id;
+            audience[1] = PID_NONE;
+            int idx = cap_object_create(CAP_KIND_VMO,
+                                        RIGHT_READ | RIGHT_WRITE | RIGHT_INSPECT |
+                                            RIGHT_DERIVE | RIGHT_REVOKE,
+                                        audience, 0,
+                                        (uintptr_t)child, cur->id,
+                                        CAP_OBJECT_IDX_NONE);
+            if (idx < 0) {
+                vmo_free(child);
+                frame->rax = (uint64_t)(long)idx;
+                break;
+            }
+            child->cap_object_idx = (uint32_t)idx;
+            uint32_t slot = 0;
+            int rc_ins = cap_handle_insert(&cur->cap_handles, (uint32_t)idx, 0, &slot);
+            if (rc_ins < 0) {
+                cap_object_destroy((uint32_t)idx);
+                frame->rax = (uint64_t)(long)rc_ins;
+                break;
+            }
+            cap_object_t *cobj = g_cap_object_ptrs[idx];
+            uint32_t cgen = cobj ? __atomic_load_n(&cobj->generation, __ATOMIC_ACQUIRE) : 0;
+            frame->rax = cap_token_pack(cgen, (uint32_t)idx, 0).raw;
+            break;
+        }
+
+        // ============================================================
+        // Phase 18: Submission Streams (Async I/O).
+        // ============================================================
+
+        case SYS_STREAM_CREATE: {
+            // ABI mirrors Phase 17's CHAN_CREATE to avoid the unreliable
+            // `register asm("r10")` output-pointer binding (P17.4):
+            //   rdi = type_hash
+            //   rsi = stream_handles_t *out  (user pointer)
+            //   rdx = (sq_entries | (cq_entries << 32))
+            //   r8  = notify_wr_handle_raw (0 = no notify)
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_COMPUTE,
+                                        "pledge denied: compute")) break;
+            uint64_t type_hash = frame->rdi;
+            stream_handles_t *out_user = (stream_handles_t *)frame->rsi;
+            uint32_t sq_entries = (uint32_t)(frame->rdx & 0xFFFFFFFFu);
+            uint32_t cq_entries = (uint32_t)(frame->rdx >> 32);
+            uint64_t notify_raw = frame->r8;
+            if (!is_user_pointer(out_user, sizeof(stream_handles_t))) {
+                frame->rax = (uint64_t)(long)CAP_V2_EFAULT;
+                break;
+            }
+            task_t *cur = sched_get_current_task();
+            if (!cur) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+
+            stream_handles_t handles;
+            memset(&handles, 0, sizeof(handles));
+            int rc = stream_create(type_hash, sq_entries, cq_entries,
+                                   cur->id, notify_raw, &handles);
+            if (rc < 0) {
+                frame->rax = (uint64_t)(long)rc;
+                break;
+            }
+            *out_user = handles;
+            frame->rax = 0;
+            break;
+        }
+
+        case SYS_STREAM_SUBMIT: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_COMPUTE,
+                                        "pledge denied: compute")) break;
+            cap_token_t tok = { .raw = frame->rdi };
+            uint32_t n_to_submit = (uint32_t)frame->rsi;
+            task_t *cur = sched_get_current_task();
+            if (!cur) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+            cap_object_t *obj = cap_token_resolve(cur->id, tok, RIGHT_WRITE);
+            if (!obj || obj->kind != CAP_KIND_STREAM) {
+                frame->rax = (uint64_t)(long)CAP_V2_EBADF;
+                break;
+            }
+            stream_endpoint_t *ep = (stream_endpoint_t *)obj->kind_data;
+            if (!ep || !ep->stream) {
+                frame->rax = (uint64_t)(long)CAP_V2_EBADF;
+                break;
+            }
+            int rc = stream_submit_batch(ep->stream, n_to_submit, cur->id);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        case SYS_STREAM_REAP: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_COMPUTE,
+                                        "pledge denied: compute")) break;
+            cap_token_t tok = { .raw = frame->rdi };
+            uint32_t min_complete = (uint32_t)frame->rsi;
+            uint64_t timeout_ns = frame->rdx;
+            task_t *cur = sched_get_current_task();
+            if (!cur) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+            cap_object_t *obj = cap_token_resolve(cur->id, tok, RIGHT_READ);
+            if (!obj || obj->kind != CAP_KIND_STREAM) {
+                frame->rax = (uint64_t)(long)CAP_V2_EBADF;
+                break;
+            }
+            stream_endpoint_t *ep = (stream_endpoint_t *)obj->kind_data;
+            if (!ep || !ep->stream) {
+                frame->rax = (uint64_t)(long)CAP_V2_EBADF;
+                break;
+            }
+            int rc = stream_reap(ep->stream, min_complete, timeout_ns);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        case SYS_STREAM_DESTROY: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_COMPUTE,
+                                        "pledge denied: compute")) break;
+            cap_token_t tok = { .raw = frame->rdi };
+            task_t *cur = sched_get_current_task();
+            if (!cur) { frame->rax = (uint64_t)(long)CAP_V2_EINVAL; break; }
+            cap_object_t *obj = cap_token_resolve(cur->id, tok,
+                                                  RIGHT_REVOKE);
+            if (!obj || obj->kind != CAP_KIND_STREAM) {
+                frame->rax = (uint64_t)(long)CAP_V2_EBADF;
+                break;
+            }
+            stream_endpoint_t *ep = (stream_endpoint_t *)obj->kind_data;
+            if (!ep || !ep->stream) {
+                frame->rax = (uint64_t)(long)CAP_V2_EBADF;
+                break;
+            }
+            stream_destroy(ep->stream);
+            frame->rax = 0;
             break;
         }
 

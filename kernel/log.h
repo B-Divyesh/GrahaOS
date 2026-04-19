@@ -47,9 +47,11 @@
 #define SUBSYS_CAP        7
 #define SUBSYS_DRV        8
 #define SUBSYS_TEST       9
+// Phase 15b: dedicated subsystem for persistent audit log (separate from klog).
+#define SUBSYS_AUDIT     10
 
 #define KLOG_MAX_SUBSYS       256
-#define KLOG_FIRST_USER_SUBSYS 10
+#define KLOG_FIRST_USER_SUBSYS 11
 
 // --- Record layout ----------------------------------------------------
 // 256 bytes exactly. Fields are laid out for natural alignment and

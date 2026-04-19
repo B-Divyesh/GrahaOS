@@ -71,6 +71,7 @@ static const char *const g_kernel_subsys_names[] = {
     [SUBSYS_CAP]     = "CAP",
     [SUBSYS_DRV]     = "DRV",
     [SUBSYS_TEST]    = "TEST",
+    [SUBSYS_AUDIT]   = "AUDIT",
 };
 
 static const char *const g_level_names[6] = {
@@ -99,64 +100,82 @@ static uint16_t current_cpu(void) {
     return (uint16_t)smp_get_current_cpu();
 }
 
-// Emit a numeric value to serial in decimal. Small helper used only
-// by the mirror fast-path where we don't want to reinvoke kvsnprintf.
-static void emit_dec_padded(uint64_t v, int width) {
-    char buf[24];
-    int n = 0;
-    if (v == 0) buf[n++] = '0';
-    while (v > 0 && n < 24) { buf[n++] = '0' + (char)(v % 10); v /= 10; }
-    int pad = width - n;
-    while (pad-- > 0) serial_putc('0');
-    while (n > 0) serial_putc(buf[--n]);
-}
+// emit_dec_padded was folded into mirror_entry_to_serial's local line
+// buffer as part of the Phase 15b console-atomicity fix. Left intentionally
+// removed; if panic/oops path needs it, re-introduce with a local buffer.
 
 // Mirror the entry to serial. Format matches what parse_tap_py and
 // dmesg readers expect:
 //   [  T.TTTTTTTTT] LEVEL SUBSYS msg\n
 // Timestamp is seconds.nanoseconds, always 9 fractional digits.
-// Kept simple — no kvsnprintf involvement so mirror is safe even if
-// we are mid-oops.
+//
+// Phase 15b: build the full line in a local buffer then emit via
+// serial_write_n in one locked burst. Without this, concurrent klog
+// mirrors and user SYS_WRITE console output interleave byte-by-byte on
+// the UART, which corrupted TAP parser input (~10% test flake rate).
+// Local buffer is generously sized so every line fits.
 static void mirror_entry_to_serial(const klog_entry_t *e) {
+    // Max length: "[NNNNNNNN.NNNNNNNNN] LEVEL SUBSYS<msg>\n"
+    //           = 1 + 8 + 1 + 9 + 1 + 1 + 5 + 1 + 7 + 1 + KLOG_MSG_LEN + 1
+    //          ~= 256 + message body. Use 512 for margin.
+    char line[512];
+    size_t off = 0;
+
+    #define PUT_CHAR(ch) do { if (off + 1 < sizeof(line)) line[off++] = (char)(ch); } while (0)
+    #define PUT_STR(s, n) do { \
+        for (size_t _i = 0; _i < (size_t)(n) && off + 1 < sizeof(line); _i++) \
+            line[off++] = (s)[_i]; \
+    } while (0)
+
     uint64_t ns = e->ns_timestamp;
     uint64_t secs = ns / 1000000000ULL;
     uint64_t nsec = ns % 1000000000ULL;
 
-    serial_putc('[');
-    // Left-pad seconds to 4 chars for easier visual alignment on boot.
+    PUT_CHAR('[');
+    // Left-pad seconds to 4 chars for visual alignment.
     {
         char tmp[16]; int n = 0; uint64_t v = secs;
         if (v == 0) tmp[n++] = '0';
         while (v > 0 && n < 16) { tmp[n++] = '0' + (char)(v % 10); v /= 10; }
-        for (int i = n; i < 4; i++) serial_putc(' ');
-        while (n > 0) serial_putc(tmp[--n]);
+        for (int i = n; i < 4; i++) PUT_CHAR(' ');
+        while (n > 0) PUT_CHAR(tmp[--n]);
     }
-    serial_putc('.');
-    emit_dec_padded(nsec, 9);
-    serial_putc(']');
-    serial_putc(' ');
+    PUT_CHAR('.');
+    // nsec, zero-padded to 9 digits.
+    {
+        char tmp[16]; int n = 0; uint64_t v = nsec;
+        if (v == 0) tmp[n++] = '0';
+        while (v > 0 && n < 16) { tmp[n++] = '0' + (char)(v % 10); v /= 10; }
+        int pad = 9 - n;
+        while (pad-- > 0) PUT_CHAR('0');
+        while (n > 0) PUT_CHAR(tmp[--n]);
+    }
+    PUT_CHAR(']');
+    PUT_CHAR(' ');
 
-    // Level column is fixed-width 5 chars ("TRACE", "DEBUG", "INFO ",
-    // "WARN ", "ERROR", "FATAL") so the subsys column aligns.
     const char *lvl = klog_level_name(e->level & KLOG_LEVEL_MASK);
     int lvl_len = 0;
     while (lvl[lvl_len]) lvl_len++;
-    for (int i = 0; i < lvl_len; i++) serial_putc(lvl[i]);
-    for (int i = lvl_len; i < 5; i++) serial_putc(' ');
-    serial_putc(' ');
+    PUT_STR(lvl, lvl_len);
+    for (int i = lvl_len; i < 5; i++) PUT_CHAR(' ');
+    PUT_CHAR(' ');
 
     const char *sub = klog_subsys_name(e->subsystem_id);
     int sub_len = 0;
     while (sub[sub_len]) sub_len++;
-    for (int i = 0; i < sub_len; i++) serial_putc(sub[i]);
-    for (int i = sub_len; i < 7; i++) serial_putc(' ');
-    serial_putc(' ');
+    PUT_STR(sub, sub_len);
+    for (int i = sub_len; i < 7; i++) PUT_CHAR(' ');
+    PUT_CHAR(' ');
 
-    // Message is already null-terminated within 224 bytes.
-    for (int i = 0; i < KLOG_MSG_LEN && e->message[i]; i++) {
-        serial_putc(e->message[i]);
-    }
-    serial_putc('\n');
+    int mlen = 0;
+    while (mlen < KLOG_MSG_LEN && e->message[mlen]) mlen++;
+    PUT_STR(e->message, mlen);
+    PUT_CHAR('\n');
+
+    serial_write_n(line, off);
+
+    #undef PUT_CHAR
+    #undef PUT_STR
 }
 
 // --- Core write path --------------------------------------------------

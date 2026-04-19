@@ -1,11 +1,17 @@
-// kernel/capability.c
+// kernel/cap/can.c
 // Phase 8b: Capability Activation Network (CAN) - Core Engine
+// Phase 15a: renamed from kernel/capability.c; moved into kernel/cap/.
 // 6-pass registration compiler, recursive activation, cascade deactivation.
-#include "capability.h"
-#include "sync/spinlock.h"
-#include "../arch/x86_64/drivers/serial/serial.h"
-#include "../arch/x86_64/cpu/sched/sched.h"
-#include "log.h"
+#include "can.h"
+#include "object.h"
+#include "token.h"
+#include "../sync/spinlock.h"
+#include "../../arch/x86_64/drivers/serial/serial.h"
+#include "../../arch/x86_64/cpu/sched/sched.h"
+#include "../log.h"
+#include "../panic.h"
+#include "../mm/slab.h"
+#include "../audit.h"
 
 // --- Static string helpers (kernel has no libc) ---
 
@@ -33,9 +39,26 @@ static void cap_memset(void *s, int c, uint64_t n) {
 
 // --- Registry ---
 
-static capability_t g_caps[MAX_CAPABILITIES];
-static uint32_t g_cap_count = 0;
-static spinlock_t g_cap_lock = SPINLOCK_INITIALIZER("cap_lock");
+// Phase 14: can_entry_t objects now live in can_entry_cache (Bonwick
+// slab). The registry still indexes by cap_id (0..MAX_CAPABILITIES-1)
+// via g_can_entry_ptrs; slot is NULL when free or deleted.
+static can_entry_t *g_can_entry_ptrs[MAX_CAPABILITIES];
+static kmem_cache_t *can_entry_cache = NULL;
+static uint32_t     g_cap_count = 0;
+static spinlock_t   g_cap_lock = SPINLOCK_INITIALIZER("cap_lock");
+
+// Lazy-init the slab cache on first cap_register call.
+static void can_entry_cache_init_once(void) {
+    if (can_entry_cache) return;
+    can_entry_cache = kmem_cache_create("can_entry_t",
+                                        sizeof(can_entry_t),
+                                        _Alignof(can_entry_t),
+                                        /*ctor=*/NULL,
+                                        SUBSYS_CAP);
+    if (!can_entry_cache) {
+        kpanic("cap/can.c: kmem_cache_create(can_entry_cache) failed");
+    }
+}
 
 // --- Helper: cap_op_set ---
 
@@ -52,7 +75,7 @@ void cap_op_set(cap_op_t *op, const char *name, uint32_t param_count, uint32_t f
 static void cap_notify_watchers(int cap_id, uint32_t old_state, uint32_t new_state) {
     if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return;
 
-    capability_t *cap = &g_caps[cap_id];
+    can_entry_t *cap = &(*g_can_entry_ptrs[cap_id]);
     if (cap->watcher_count == 0) return;
 
     // Build event on stack
@@ -97,7 +120,7 @@ int cap_watch(int cap_id, int32_t pid) {
     if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return CAP_ERR_NOT_FOUND;
 
     spinlock_acquire(&g_cap_lock);
-    capability_t *cap = &g_caps[cap_id];
+    can_entry_t *cap = &(*g_can_entry_ptrs[cap_id]);
 
     if (cap->deleted) {
         spinlock_release(&g_cap_lock);
@@ -132,7 +155,7 @@ int cap_unwatch(int cap_id, int32_t pid) {
     if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return CAP_ERR_NOT_FOUND;
 
     spinlock_acquire(&g_cap_lock);
-    capability_t *cap = &g_caps[cap_id];
+    can_entry_t *cap = &(*g_can_entry_ptrs[cap_id]);
 
     if (cap->deleted) {
         spinlock_release(&g_cap_lock);
@@ -170,8 +193,9 @@ void cap_unwatch_all_for_pid(int32_t pid) {
     spinlock_acquire(&g_cap_lock);
 
     for (uint32_t c = 0; c < g_cap_count; c++) {
-        if (g_caps[c].deleted) continue;
-        capability_t *cap = &g_caps[c];
+        if (!g_can_entry_ptrs[c]) continue;
+        if ((*g_can_entry_ptrs[c]).deleted) continue;
+        can_entry_t *cap = g_can_entry_ptrs[c];
 
         for (uint32_t i = 0; i < cap->watcher_count; i++) {
             if (cap->watcher_pids[i] == pid) {
@@ -218,11 +242,11 @@ static int layer_allows_dep(uint32_t my_type, uint32_t dep_type) {
 // --- Internal: DFS helper for cycle detection and reachability ---
 // Walks transitive deps from `start_id`, sets visited[i]=1 for each reachable cap.
 static void dfs_walk(uint32_t start_id, uint8_t *visited) {
-    if (start_id >= g_cap_count || g_caps[start_id].deleted || visited[start_id])
+    if (start_id >= g_cap_count || (*g_can_entry_ptrs[start_id]).deleted || visited[start_id])
         return;
     visited[start_id] = 1;
-    for (uint32_t i = 0; i < g_caps[start_id].dep_count; i++) {
-        dfs_walk(g_caps[start_id].dep_indices[i], visited);
+    for (uint32_t i = 0; i < (*g_can_entry_ptrs[start_id]).dep_count; i++) {
+        dfs_walk((*g_can_entry_ptrs[start_id]).dep_indices[i], visited);
     }
 }
 
@@ -230,9 +254,13 @@ static void dfs_walk(uint32_t start_id, uint8_t *visited) {
 
 int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owner,
                  const char **dep_names, int dep_count,
-                 int (*activate_fn)(void), void (*deactivate_fn)(void),
+                 int (*activate_fn)(void), int (*deactivate_fn)(void),
                  cap_op_t *ops, int op_count,
                  int (*get_stats)(state_driver_stat_t*, int)) {
+
+    // Phase 14: ensure the slab-backed cap store is ready. Safe to call
+    // from both early-boot (pmm/slab already up) and runtime registrations.
+    can_entry_cache_init_once();
 
     spinlock_acquire(&g_cap_lock);
 
@@ -247,8 +275,9 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
 
     // Check for duplicate name (skip deleted slots)
     for (uint32_t i = 0; i < g_cap_count; i++) {
-        if (g_caps[i].deleted) continue;
-        if (cap_strcmp(g_caps[i].name, name) == 0) {
+        if (!g_can_entry_ptrs[i]) continue;  // Phase 14: freed slot
+        if ((*g_can_entry_ptrs[i]).deleted) continue;
+        if (cap_strcmp((*g_can_entry_ptrs[i]).name, name) == 0) {
             klog(KLOG_INFO, SUBSYS_CAP, "[CAN] ERR: duplicate name: %s", name);
             spinlock_release(&g_cap_lock);
             return CAP_ERR_NAME_DUPLICATE;
@@ -295,8 +324,8 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
         // Resolve name to index (skip deleted slots)
         int found = -1;
         for (uint32_t j = 0; j < g_cap_count; j++) {
-            if (g_caps[j].deleted) continue;
-            if (cap_strcmp(g_caps[j].name, dep_names[i]) == 0) {
+            if ((*g_can_entry_ptrs[j]).deleted) continue;
+            if (cap_strcmp((*g_can_entry_ptrs[j]).name, dep_names[i]) == 0) {
                 found = (int)j;
                 break;
             }
@@ -315,11 +344,11 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
     // --- PASS 3: Layer Checking ---
 
     for (int i = 0; i < dep_count; i++) {
-        uint32_t dep_type = g_caps[resolved_deps[i]].type;
+        uint32_t dep_type = (*g_can_entry_ptrs[resolved_deps[i]]).type;
         if (!layer_allows_dep(type, dep_type)) {
             klog(KLOG_INFO, SUBSYS_CAP, "[CAN] ERR: layer violation: %s", name);
             klog(KLOG_INFO, SUBSYS_CAP, " (type=%lu) cannot depend on ", (unsigned long)(type));
-            klog(KLOG_INFO, SUBSYS_CAP, "%s", g_caps[resolved_deps[i]].name);
+            klog(KLOG_INFO, SUBSYS_CAP, "%s", (*g_can_entry_ptrs[resolved_deps[i]]).name);
             klog(KLOG_INFO, SUBSYS_CAP, " (type=%lu)", (unsigned long)(dep_type));
             spinlock_release(&g_cap_lock);
             return CAP_ERR_LAYER_VIOLATION;
@@ -340,7 +369,8 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
         // has the same name (shouldn't happen since pass 1 rejects duplicates,
         // but validates the graph structure)
         for (uint32_t i = 0; i < g_cap_count; i++) {
-            if (visited[i] && !g_caps[i].deleted && cap_strcmp(g_caps[i].name, name) == 0) {
+            if (!g_can_entry_ptrs[i]) continue;
+            if (visited[i] && !(*g_can_entry_ptrs[i]).deleted && cap_strcmp((*g_can_entry_ptrs[i]).name, name) == 0) {
                 klog(KLOG_INFO, SUBSYS_CAP, "[CAN] ERR: cycle detected for: %s", name);
                 spinlock_release(&g_cap_lock);
                 return CAP_ERR_CYCLE;
@@ -359,7 +389,8 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
         }
         int has_hw = 0;
         for (uint32_t i = 0; i < g_cap_count; i++) {
-            if (visited[i] && g_caps[i].type == CAP_HARDWARE && !g_caps[i].deleted) {
+            if (!g_can_entry_ptrs[i]) continue;
+            if (visited[i] && (*g_can_entry_ptrs[i]).type == CAP_HARDWARE && !(*g_can_entry_ptrs[i]).deleted) {
                 has_hw = 1;
                 break;
             }
@@ -380,8 +411,8 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
                 uint8_t visited[MAX_CAPABILITIES];
                 cap_memset(visited, 0, sizeof(visited));
                 // Walk from dep j's children (not dep j itself)
-                for (uint32_t k = 0; k < g_caps[resolved_deps[j]].dep_count; k++) {
-                    dfs_walk(g_caps[resolved_deps[j]].dep_indices[k], visited);
+                for (uint32_t k = 0; k < (*g_can_entry_ptrs[resolved_deps[j]]).dep_count; k++) {
+                    dfs_walk((*g_can_entry_ptrs[resolved_deps[j]]).dep_indices[k], visited);
                 }
                 if (visited[resolved_deps[i]]) {
                     klog(KLOG_WARN, SUBSYS_CAP, "[CAN] PASS6 WARN: dep '%s", dep_names[i]);
@@ -396,7 +427,18 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
     // --- All passes OK: commit to registry ---
 
     uint32_t id = g_cap_count;
-    capability_t *cap = &g_caps[id];
+
+    // Phase 14: allocate the can_entry_t from the slab. Zero-init is
+    // automatic (NULL ctor path in the slab). Explicit cap_memset is
+    // redundant but kept as a defensive clear.
+    g_can_entry_ptrs[id] = kmem_cache_alloc(can_entry_cache);
+    if (!g_can_entry_ptrs[id]) {
+        spinlock_release(&g_cap_lock);
+        klog(KLOG_ERROR, SUBSYS_CAP,
+             "cap_register: can_entry_cache alloc failed for '%s'", name);
+        return CAP_ERR_REGISTRY_FULL;
+    }
+    can_entry_t *cap = g_can_entry_ptrs[id];
     cap_memset(cap, 0, sizeof(*cap));
 
     cap_strcpy(cap->name, name, CAP_NAME_LEN);
@@ -436,6 +478,7 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
 
     cap->compiled = 1;
     cap->deleted = 0;
+    cap->cap_object_idx = CAP_OBJECT_IDX_NONE;
     g_cap_count++;
 
     // Log
@@ -444,20 +487,57 @@ int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owne
     klog(KLOG_INFO, SUBSYS_CAP, "%s)", cap->state == CAP_STATE_ON ? "ON" : "OFF");
 
     spinlock_release(&g_cap_lock);
+
+    // Phase 15a: pair with a cap_object_t (kind=CAN, IMMORTAL|PUBLIC,
+    // RIGHTS_ALL). Audience = [PID_PUBLIC] advertises the broadcast
+    // intent to anyone inspecting later. Skip pairing until
+    // cap_object_init has been called — on the bring-up path that
+    // runs after kheap_init, before the first cap_register.
+    int32_t public_audience[CAP_AUDIENCE_MAX] = {
+        PID_PUBLIC, PID_NONE, PID_NONE, PID_NONE,
+        PID_NONE,   PID_NONE, PID_NONE, PID_NONE
+    };
+    int obj_idx = cap_object_create(CAP_KIND_CAN,
+                                    RIGHTS_ALL,
+                                    public_audience,
+                                    CAP_FLAG_IMMORTAL | CAP_FLAG_PUBLIC,
+                                    /*kind_data=*/(uintptr_t)cap,
+                                    /*owner_pid=*/PID_KERNEL,
+                                    /*parent_idx=*/CAP_OBJECT_IDX_NONE);
+    if (obj_idx < 0) {
+        klog(KLOG_WARN, SUBSYS_CAP,
+             "cap_register: cap_object_create failed for '%s' (err=%d); CAN entry live but unpaired",
+             name, obj_idx);
+    } else {
+        cap->cap_object_idx = (uint32_t)obj_idx;
+    }
+
+    // Phase 15b: persistent audit record of this registration. obj_idx may
+    // be CAP_OBJECT_IDX_NONE here (pairing failed) but we still want the
+    // event logged with whatever we managed to allocate.
+    audit_write_cap_register(cap->cap_object_idx, name, AUDIT_SRC_NATIVE);
+
     return (int)id;
 }
 
 // --- Activation ---
 
+// Phase 16 helper: grab the currently-running task's pid, or -1 if none
+// (pre-sched_init boot, or detached kernel context).
+static int32_t cap_caller_pid(void) {
+    task_t *t = sched_get_current_task();
+    return t ? (int32_t)t->id : -1;
+}
+
 int cap_activate(int cap_id) {
     if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return CAP_ERR_NOT_FOUND;
 
-    capability_t *cap = &g_caps[cap_id];
+    can_entry_t *cap = &(*g_can_entry_ptrs[cap_id]);
 
     // Deleted caps cannot be activated
     if (cap->deleted) return CAP_ERR_DELETED;
 
-    // Already ON - idempotent
+    // Already ON - idempotent (no audit, no state flip)
     if (cap->state == CAP_STATE_ON) return CAP_OK;
 
     // STARTING means we're in a recursive activation chain - runtime cycle
@@ -476,8 +556,10 @@ int cap_activate(int cap_id) {
             if (cap->watcher_count > 0)
                 cap_notify_watchers(cap_id, CAP_STATE_STARTING, CAP_STATE_ERROR);
             klog(KLOG_ERROR, SUBSYS_CAP, "[CAN] Activation failed for '%s", cap->name);
-            klog(KLOG_INFO, SUBSYS_CAP, "': dep '%s", g_caps[dep_id].name);
+            klog(KLOG_INFO, SUBSYS_CAP, "': dep '%s", (*g_can_entry_ptrs[dep_id]).name);
             klog(KLOG_ERROR, SUBSYS_CAP, "' failed");
+            audit_write_cap_activate(cap_caller_pid(), cap->cap_object_idx,
+                                     CAP_ERR_DEP_FAILED, cap->name, AUDIT_SRC_NATIVE);
             return CAP_ERR_DEP_FAILED;
         }
     }
@@ -491,6 +573,8 @@ int cap_activate(int cap_id) {
                 cap_notify_watchers(cap_id, CAP_STATE_STARTING, CAP_STATE_ERROR);
             klog(KLOG_ERROR, SUBSYS_CAP, "[CAN] Activation callback failed for '%s", cap->name);
             klog(KLOG_INFO, SUBSYS_CAP, "'");
+            audit_write_cap_activate(cap_caller_pid(), cap->cap_object_idx,
+                                     CAP_ERR_ACTIVATE_FAIL, cap->name, AUDIT_SRC_NATIVE);
             return CAP_ERR_ACTIVATE_FAIL;
         }
     }
@@ -503,50 +587,138 @@ int cap_activate(int cap_id) {
         cap_notify_watchers(cap_id, CAP_STATE_STARTING, CAP_STATE_ON);
 
     klog(KLOG_INFO, SUBSYS_CAP, "[CAN] Activated: %s", cap->name);
+    // Phase 16: audit success-path only for user-initiated activations. The
+    // kernel boot path activates every cap with pid=-1 and would otherwise
+    // emit ~14 pre-FS-attach audit entries that each stall on serial mirror,
+    // stretching the activation loop past the first timer tick. Failure and
+    // cascade paths already audit unconditionally since they carry useful
+    // forensic detail regardless of caller.
+    int32_t caller = cap_caller_pid();
+    if (caller != -1) {
+        audit_write_cap_activate(caller, cap->cap_object_idx, 0,
+                                 cap->name, AUDIT_SRC_NATIVE);
+    }
 
     return CAP_OK;
 }
 
 // --- Deactivation ---
 
-int cap_deactivate(int cap_id) {
+// Internal recursive worker. Assumes caller has already validated cap_id.
+// Increments *out_count by the number of caps whose state was genuinely flipped
+// from !OFF to OFF during this call (self + any dependents that were flipped
+// by the cascade). Idempotent re-entries (already-OFF caps) do NOT bump the
+// counter and do NOT emit audit.
+static int cap_deactivate_inner(int cap_id, uint32_t *out_count) {
     if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return CAP_ERR_NOT_FOUND;
+    if (!g_can_entry_ptrs[cap_id]) return CAP_ERR_NOT_FOUND;
 
-    capability_t *cap = &g_caps[cap_id];
+    can_entry_t *cap = &(*g_can_entry_ptrs[cap_id]);
 
-    // Deleted caps
     if (cap->deleted) return CAP_ERR_DELETED;
 
-    // Already OFF - no-op
+    // Already OFF - idempotent, no count, no audit
     if (cap->state == CAP_STATE_OFF) return CAP_OK;
 
-    // First, cascade: deactivate all capabilities that depend on this one
+    // Phase 16: give the driver a chance to refuse. The refuse predicate is
+    // called BEFORE we touch any dependents — so if it refuses, nothing is
+    // altered anywhere in the graph.
+    if (cap->refuse_deactivate_fn) {
+        int refuse = cap->refuse_deactivate_fn();
+        if (refuse != 0) {
+            klog(KLOG_WARN, SUBSYS_CAP,
+                 "[CAN] Deactivate refused for '%s' (rc=%d)", cap->name, refuse);
+            audit_write_cap_deactivate(cap_caller_pid(), cap->cap_object_idx,
+                                       CAP_ERR_BUSY, cap->name, AUDIT_SRC_NATIVE);
+            return CAP_ERR_BUSY;
+        }
+    }
+
+    // Cascade: recursively deactivate everything depending on this cap.
     for (uint32_t i = 0; i < g_cap_count; i++) {
-        if (g_caps[i].deleted) continue;
-        if (g_caps[i].state != CAP_STATE_ON && g_caps[i].state != CAP_STATE_STARTING)
+        if (!g_can_entry_ptrs[i]) continue;  // Phase 14: freed slot
+        if ((*g_can_entry_ptrs[i]).deleted) continue;
+        if ((*g_can_entry_ptrs[i]).state != CAP_STATE_ON && (*g_can_entry_ptrs[i]).state != CAP_STATE_STARTING)
             continue;
-        for (uint32_t j = 0; j < g_caps[i].dep_count; j++) {
-            if (g_caps[i].dep_indices[j] == (uint32_t)cap_id) {
-                cap_deactivate((int)i);
+        for (uint32_t j = 0; j < (*g_can_entry_ptrs[i]).dep_count; j++) {
+            if ((*g_can_entry_ptrs[i]).dep_indices[j] == (uint32_t)cap_id) {
+                // A failed dependent cascade propagates as -EBUSY/-EIO up; the
+                // current cap stays ON so the system remains coherent.
+                int dep_rc = cap_deactivate_inner((int)i, out_count);
+                if (dep_rc != CAP_OK) {
+                    klog(KLOG_WARN, SUBSYS_CAP,
+                         "[CAN] Cascade failed for dependent of '%s' (rc=%d)",
+                         cap->name, dep_rc);
+                    audit_write_cap_deactivate(cap_caller_pid(), cap->cap_object_idx,
+                                               dep_rc, cap->name, AUDIT_SRC_NATIVE);
+                    return dep_rc;
+                }
                 break;
             }
         }
     }
 
-    // Call deactivate function if provided
+    // Call deactivate function if provided. If it signals failure, leave state
+    // ON (we've already returned dependents to OFF — those stay OFF, which is
+    // safe; driver is still usable).
     if (cap->deactivate_fn) {
-        cap->deactivate_fn();
+        int rc = cap->deactivate_fn();
+        if (rc != 0) {
+            klog(KLOG_ERROR, SUBSYS_CAP,
+                 "[CAN] Deactivate fn failed for '%s' (rc=%d); state stays ON",
+                 cap->name, rc);
+            audit_write_cap_deactivate(cap_caller_pid(), cap->cap_object_idx,
+                                       rc, cap->name, AUDIT_SRC_NATIVE);
+            return rc;
+        }
     }
 
     uint32_t prev_state = cap->state;
     cap->state = CAP_STATE_OFF;
+    if (out_count) (*out_count)++;
 
     if (cap->watcher_count > 0)
         cap_notify_watchers(cap_id, prev_state, CAP_STATE_OFF);
 
     klog(KLOG_INFO, SUBSYS_CAP, "[CAN] Deactivated: %s", cap->name);
+    int32_t caller_d = cap_caller_pid();
+    if (caller_d != -1) {
+        audit_write_cap_deactivate(caller_d, cap->cap_object_idx, 0,
+                                   cap->name, AUDIT_SRC_NATIVE);
+    }
 
     return CAP_OK;
+}
+
+int cap_deactivate_count(int cap_id, uint32_t *out_count) {
+    if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return CAP_ERR_NOT_FOUND;
+    uint32_t local_count = 0;
+    int rc = cap_deactivate_inner(cap_id, &local_count);
+    if (out_count) *out_count = local_count;
+    return rc;
+}
+
+int cap_deactivate(int cap_id) {
+    uint32_t discard = 0;
+    return cap_deactivate_count(cap_id, &discard);
+}
+
+int cap_set_refuse_hook(int cap_id, int (*fn)(void)) {
+    if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return CAP_ERR_NOT_FOUND;
+    if (!g_can_entry_ptrs[cap_id]) return CAP_ERR_NOT_FOUND;
+    if (g_can_entry_ptrs[cap_id]->deleted) return CAP_ERR_DELETED;
+    g_can_entry_ptrs[cap_id]->refuse_deactivate_fn = fn;
+    return CAP_OK;
+}
+
+int cap_can_by_object_idx(uint32_t obj_idx) {
+    if (obj_idx == CAP_OBJECT_IDX_NONE) return CAP_ERR_NOT_FOUND;
+    for (uint32_t i = 0; i < g_cap_count; i++) {
+        if (!g_can_entry_ptrs[i]) continue;
+        if (g_can_entry_ptrs[i]->deleted) continue;
+        if (g_can_entry_ptrs[i]->cap_object_idx == obj_idx) return (int)i;
+    }
+    return CAP_ERR_NOT_FOUND;
 }
 
 // --- Unregistration ---
@@ -555,7 +727,7 @@ int cap_unregister(int cap_id) {
     if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return CAP_ERR_NOT_FOUND;
 
     spinlock_acquire(&g_cap_lock);
-    capability_t *cap = &g_caps[cap_id];
+    can_entry_t *cap = &(*g_can_entry_ptrs[cap_id]);
 
     if (cap->deleted) {
         spinlock_release(&g_cap_lock);
@@ -581,24 +753,65 @@ int cap_unregister(int cap_id) {
     cap->deleted = 1;
     cap->state = CAP_STATE_OFF;
 
+    uint32_t paired_obj_idx = cap->cap_object_idx;
+    cap->cap_object_idx = CAP_OBJECT_IDX_NONE;
+
+    // Phase 15b: snapshot the name for the audit entry before the slab frees
+    // the underlying can_entry_t below.
+    char name_snapshot[CAP_NAME_LEN];
+    for (size_t i = 0; i < CAP_NAME_LEN; i++) {
+        name_snapshot[i] = cap->name[i];
+        if (cap->name[i] == '\0') break;
+    }
+    name_snapshot[CAP_NAME_LEN - 1] = '\0';
+
     klog(KLOG_INFO, SUBSYS_CAP, "[CAN] Unregistered: %s", cap->name);
 
+    // Phase 14: return the can_entry_t to the slab so memstat shows the
+    // count drop. The slot stays reserved (id remains stable) but the
+    // backing storage is reclaimed; walkers must treat g_can_entry_ptrs[id]==NULL
+    // as "deleted".
+    kmem_cache_free(can_entry_cache, cap);
+    g_can_entry_ptrs[cap_id] = NULL;
+
     spinlock_release(&g_cap_lock);
+
+    // Phase 15a: drop the paired cap_object. User-owned caps (APPLICATION/
+    // FEATURE/COMPOSITE) are the only ones reaching this path, and those
+    // get non-IMMORTAL object pairings in a later phase. Today all CAN
+    // cap_objects are IMMORTAL so cap_object_revoke returns -EPERM —
+    // bypass the revoke and directly destroy so the slot is reclaimed.
+    if (paired_obj_idx != CAP_OBJECT_IDX_NONE) {
+        cap_object_destroy(paired_obj_idx);
+    }
+
+    // Phase 15b: audit the unregistration. Fired after the lock-released
+    // destroy so audit_enqueue's lock ordering doesn't cross g_cap_lock.
+    audit_write_cap_unregister(paired_obj_idx, name_snapshot, AUDIT_SRC_NATIVE);
+
     return CAP_OK;
 }
 
 void cap_unregister_by_owner(int32_t owner_pid) {
     for (uint32_t i = 0; i < g_cap_count; i++) {
-        if (!g_caps[i].deleted && g_caps[i].owner_pid == owner_pid) {
+        if (!g_can_entry_ptrs[i]) continue;
+        if (!(*g_can_entry_ptrs[i]).deleted && (*g_can_entry_ptrs[i]).owner_pid == owner_pid) {
             cap_unregister((int)i);
         }
     }
 }
 
+uint32_t cap_get_object_idx(int can_id) {
+    if (can_id < 0 || (uint32_t)can_id >= g_cap_count) return CAP_OBJECT_IDX_NONE;
+    if (!g_can_entry_ptrs[can_id]) return CAP_OBJECT_IDX_NONE;
+    if (g_can_entry_ptrs[can_id]->deleted) return CAP_OBJECT_IDX_NONE;
+    return g_can_entry_ptrs[can_id]->cap_object_idx;
+}
+
 int32_t cap_get_owner(int cap_id) {
     if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return -1;
-    if (g_caps[cap_id].deleted) return -1;
-    return g_caps[cap_id].owner_pid;
+    if ((*g_can_entry_ptrs[cap_id]).deleted) return -1;
+    return (*g_can_entry_ptrs[cap_id]).owner_pid;
 }
 
 // --- Query Functions ---
@@ -607,8 +820,9 @@ int cap_find(const char *name) {
     if (!name || name[0] == '\0') return CAP_ERR_NOT_FOUND;
 
     for (uint32_t i = 0; i < g_cap_count; i++) {
-        if (g_caps[i].deleted) continue;
-        if (cap_strcmp(g_caps[i].name, name) == 0) {
+        if (!g_can_entry_ptrs[i]) continue;  // Phase 14: freed slot
+        if ((*g_can_entry_ptrs[i]).deleted) continue;
+        if (cap_strcmp((*g_can_entry_ptrs[i]).name, name) == 0) {
             return (int)i;
         }
     }
@@ -621,7 +835,7 @@ int cap_get_count(void) {
 
 int cap_get_state(int cap_id) {
     if (cap_id < 0 || (uint32_t)cap_id >= g_cap_count) return -1;
-    return (int)g_caps[cap_id].state;
+    return (int)(*g_can_entry_ptrs[cap_id]).state;
 }
 
 int cap_why_not(int cap_id, char *buf, int buflen) {
@@ -630,7 +844,7 @@ int cap_why_not(int cap_id, char *buf, int buflen) {
         return CAP_ERR_NOT_FOUND;
     }
 
-    capability_t *cap = &g_caps[cap_id];
+    can_entry_t *cap = &(*g_can_entry_ptrs[cap_id]);
 
     if (cap->deleted) {
         if (buf && buflen > 0) cap_strcpy(buf, "deleted", buflen);
@@ -649,7 +863,7 @@ int cap_why_not(int cap_id, char *buf, int buflen) {
     for (uint32_t i = 0; i < cap->dep_count; i++) {
         uint32_t dep_id = cap->dep_indices[i];
         if (dep_id >= g_cap_count) continue;
-        if (g_caps[dep_id].deleted || g_caps[dep_id].state != CAP_STATE_ON) {
+        if ((*g_can_entry_ptrs[dep_id]).deleted || (*g_can_entry_ptrs[dep_id]).state != CAP_STATE_ON) {
             if (buf && pos < buflen - 1) {
                 if (found_issue && pos < buflen - 3) {
                     buf[pos++] = ',';
@@ -660,8 +874,8 @@ int cap_why_not(int cap_id, char *buf, int buflen) {
                     for (int k = 0; prefix[k] && pos < buflen - 1; k++)
                         buf[pos++] = prefix[k];
                 }
-                for (int k = 0; g_caps[dep_id].name[k] && pos < buflen - 1; k++)
-                    buf[pos++] = g_caps[dep_id].name[k];
+                for (int k = 0; (*g_can_entry_ptrs[dep_id]).name[k] && pos < buflen - 1; k++)
+                    buf[pos++] = (*g_can_entry_ptrs[dep_id]).name[k];
                 found_issue = 1;
             }
         }
@@ -674,7 +888,7 @@ int cap_why_not(int cap_id, char *buf, int buflen) {
                 if (cap->error_dep < g_cap_count) {
                     cap_strcpy(buf, "dep failed: ", buflen);
                     int l = cap_strlen(buf);
-                    cap_strcpy(buf + l, g_caps[cap->error_dep].name, buflen - l);
+                    cap_strcpy(buf + l, (*g_can_entry_ptrs[cap->error_dep]).name, buflen - l);
                 } else {
                     cap_strcpy(buf, "activation callback failed", buflen);
                 }
@@ -700,18 +914,25 @@ int cap_query_all(state_cap_entry_t *out, int max) {
     if (count > max) count = max;
 
     for (int i = 0; i < count; i++) {
-        cap_strcpy(out[i].name, g_caps[i].name, STATE_CAP_NAME_LEN);
-        out[i].type = g_caps[i].type;
-        out[i].state = g_caps[i].state;
-        out[i].owner_pid = g_caps[i].owner_pid;
-        out[i].dep_count = g_caps[i].dep_count;
-        for (uint32_t j = 0; j < g_caps[i].dep_count && j < STATE_MAX_CAP_DEPS; j++) {
-            out[i].dep_indices[j] = g_caps[i].dep_indices[j];
+        if (!g_can_entry_ptrs[i]) {
+            // Freed (Phase 14) slot — report as a deleted entry so the
+            // caller can still see the stable cap_id → deleted mapping.
+            cap_memset(&out[i], 0, sizeof(out[i]));
+            out[i].deleted = 1;
+            continue;
         }
-        out[i].op_count = g_caps[i].op_count;
-        out[i].activation_count = g_caps[i].activation_count;
-        out[i].deleted = g_caps[i].deleted;
-        out[i].subtype = g_caps[i].subtype;
+        cap_strcpy(out[i].name, (*g_can_entry_ptrs[i]).name, STATE_CAP_NAME_LEN);
+        out[i].type = (*g_can_entry_ptrs[i]).type;
+        out[i].state = (*g_can_entry_ptrs[i]).state;
+        out[i].owner_pid = (*g_can_entry_ptrs[i]).owner_pid;
+        out[i].dep_count = (*g_can_entry_ptrs[i]).dep_count;
+        for (uint32_t j = 0; j < (*g_can_entry_ptrs[i]).dep_count && j < STATE_MAX_CAP_DEPS; j++) {
+            out[i].dep_indices[j] = (*g_can_entry_ptrs[i]).dep_indices[j];
+        }
+        out[i].op_count = (*g_can_entry_ptrs[i]).op_count;
+        out[i].activation_count = (*g_can_entry_ptrs[i]).activation_count;
+        out[i].deleted = (*g_can_entry_ptrs[i]).deleted;
+        out[i].subtype = (*g_can_entry_ptrs[i]).subtype;
     }
 
     spinlock_release(&g_cap_lock);
@@ -728,28 +949,29 @@ int cap_snapshot_drivers(state_driver_info_t *out, int max) {
 
     int written = 0;
     for (uint32_t i = 0; i < g_cap_count && written < max; i++) {
-        if (g_caps[i].deleted) continue;
+        if (!g_can_entry_ptrs[i]) continue;
+        if ((*g_can_entry_ptrs[i]).deleted) continue;
         // Include DRIVER and SERVICE caps (these are the "drivers" in the old sense)
-        if (g_caps[i].type != CAP_DRIVER && g_caps[i].type != CAP_SERVICE) continue;
+        if ((*g_can_entry_ptrs[i]).type != CAP_DRIVER && (*g_can_entry_ptrs[i]).type != CAP_SERVICE) continue;
 
         state_driver_info_t *d = &out[written];
         cap_memset(d, 0, sizeof(*d));
 
-        cap_strcpy(d->name, g_caps[i].name, STATE_DRIVER_NAME_LEN);
-        d->type = g_caps[i].subtype;
-        d->initialized = (g_caps[i].state == CAP_STATE_ON) ? 1 : 0;
+        cap_strcpy(d->name, (*g_can_entry_ptrs[i]).name, STATE_DRIVER_NAME_LEN);
+        d->type = (*g_can_entry_ptrs[i]).subtype;
+        d->initialized = ((*g_can_entry_ptrs[i]).state == CAP_STATE_ON) ? 1 : 0;
 
         // Copy operation descriptors
-        d->op_count = g_caps[i].op_count;
-        for (uint32_t j = 0; j < g_caps[i].op_count && j < STATE_MAX_DRIVER_OPS; j++) {
-            cap_strcpy(d->ops[j].name, g_caps[i].ops[j].name, STATE_OP_NAME_LEN);
-            d->ops[j].param_count = g_caps[i].ops[j].param_count;
-            d->ops[j].flags = g_caps[i].ops[j].flags;
+        d->op_count = (*g_can_entry_ptrs[i]).op_count;
+        for (uint32_t j = 0; j < (*g_can_entry_ptrs[i]).op_count && j < STATE_MAX_DRIVER_OPS; j++) {
+            cap_strcpy(d->ops[j].name, (*g_can_entry_ptrs[i]).ops[j].name, STATE_OP_NAME_LEN);
+            d->ops[j].param_count = (*g_can_entry_ptrs[i]).ops[j].param_count;
+            d->ops[j].flags = (*g_can_entry_ptrs[i]).ops[j].flags;
         }
 
         // Call stats callback for live data
-        if (g_caps[i].get_stats_fn) {
-            d->stat_count = g_caps[i].get_stats_fn(d->stats, STATE_MAX_DRIVER_STATS);
+        if ((*g_can_entry_ptrs[i]).get_stats_fn) {
+            d->stat_count = (*g_can_entry_ptrs[i]).get_stats_fn(d->stats, STATE_MAX_DRIVER_STATS);
         } else {
             d->stat_count = 0;
         }

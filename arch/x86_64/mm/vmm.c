@@ -389,3 +389,81 @@ void vmm_unmap_page_by_cr3(uint64_t cr3, uint64_t virt) {
     pt[pt_index] = 0;
     asm volatile("invlpg (%0)" : : "r" (virt) : "memory");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 17: VA reservation, page protect, page-fault hook.
+// ---------------------------------------------------------------------------
+
+// Return pointer to the PTE for 'virt' in the given CR3, or NULL if any of
+// the intermediate tables is absent. Does not allocate.
+static uint64_t *vmm_walk_pte(uint64_t cr3, uint64_t virt) {
+    uint64_t pml4_index = (virt >> 39) & 0x1FF;
+    uint64_t pdpt_index = (virt >> 30) & 0x1FF;
+    uint64_t pd_index   = (virt >> 21) & 0x1FF;
+    uint64_t pt_index   = (virt >> 12) & 0x1FF;
+
+    uint64_t *pml4 = (uint64_t*)(cr3 + g_hhdm_offset);
+    if (!(pml4[pml4_index] & PTE_PRESENT)) return NULL;
+    uint64_t *pdpt = (uint64_t*)((pml4[pml4_index] & PAGE_MASK) + g_hhdm_offset);
+    if (!(pdpt[pdpt_index] & PTE_PRESENT)) return NULL;
+    uint64_t *pd = (uint64_t*)((pdpt[pdpt_index] & PAGE_MASK) + g_hhdm_offset);
+    if (!(pd[pd_index] & PTE_PRESENT)) return NULL;
+    uint64_t *pt = (uint64_t*)((pd[pd_index] & PAGE_MASK) + g_hhdm_offset);
+    return &pt[pt_index];
+}
+
+// Scan bottom-up from a high-enough offset to avoid the user binary's
+// text/data/brk (typically < 0x1000_0000) and well below the user stack
+// (at 0x7FFF_xxxx_xxxx). VMOs get a dedicated slab of VA in the mid-user
+// region.
+#define VMM_USER_SEARCH_BOTTOM  0x0000100000000000ULL  // 16 TiB
+#define VMM_USER_SEARCH_TOP     0x0000500000000000ULL  // 80 TiB
+
+uint64_t vmm_reserve_va_by_cr3(uint64_t cr3, uint64_t len) {
+    if (len == 0 || (len & (PAGE_SIZE - 1)) != 0) return 0;
+    uint64_t npages = len / PAGE_SIZE;
+
+    // Bottom-up scan. In practice user pages at this region are empty and
+    // the first try succeeds. Max 64K iterations of 4 KiB each = 256 MiB
+    // before we give up, which matches VMO_MAX_SIZE.
+    uint64_t cur = VMM_USER_SEARCH_BOTTOM;
+    uint64_t stop = VMM_USER_SEARCH_TOP - len;
+    while (cur <= stop) {
+        bool clear = true;
+        for (uint64_t p = 0; p < npages; p++) {
+            uint64_t va = cur + p * PAGE_SIZE;
+            uint64_t *pte = vmm_walk_pte(cr3, va);
+            if (pte && (*pte & PTE_PRESENT)) {
+                clear = false;
+                // Jump past the occupied page so we don't rescan.
+                cur = va + PAGE_SIZE;
+                break;
+            }
+        }
+        if (clear) return cur;
+    }
+    return 0;
+}
+
+bool vmm_protect_page_by_cr3(uint64_t cr3, uint64_t virt, uint64_t new_flags) {
+    uint64_t *pte = vmm_walk_pte(cr3, virt);
+    if (!pte || !(*pte & PTE_PRESENT)) return false;
+    uint64_t phys = *pte & PAGE_MASK;
+    *pte = phys | (new_flags & ~PAGE_MASK) | PTE_PRESENT;
+    asm volatile("invlpg (%0)" : : "r" (virt) : "memory");
+    return true;
+}
+
+// Installed page-fault handler (Phase 17). NULL until vmo_init runs.
+static vmm_pf_handler_t g_pf_handler = NULL;
+
+void vmm_install_pf_handler(vmm_pf_handler_t fn) {
+    // Single aligned 8-byte write is atomic on x86_64; no lock needed.
+    g_pf_handler = fn;
+}
+
+int vmm_dispatch_pf(uint64_t fault_va, uint64_t error_code) {
+    vmm_pf_handler_t fn = g_pf_handler;
+    if (!fn) return -1;
+    return fn(fault_va, error_code);
+}

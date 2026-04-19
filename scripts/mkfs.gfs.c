@@ -82,8 +82,9 @@ int main(int argc, char* argv[]) {
     uint32_t inode_table_blocks = (GRAHAFS_MAX_INODES * sizeof(grahafs_inode_t) + GRAHAFS_BLOCK_SIZE - 1) / GRAHAFS_BLOCK_SIZE;
     sb.data_blocks_start_block = sb.inode_table_start_block + inode_table_blocks;
     sb.root_inode = 1;  // CHANGED: Root is now inode 1, not 0
-    sb.free_blocks = total_blocks - sb.data_blocks_start_block - 2; // -2: root dir + /illu/ dir
-    sb.free_inodes = GRAHAFS_MAX_INODES - 3; // -3: reserved (0), root (1), /illu/ (2)
+    // Phase 15b: extra 2 data blocks for /var/ and /var/audit/ and 2 extra inodes.
+    sb.free_blocks = total_blocks - sb.data_blocks_start_block - 4; // -4: root + /illu + /var + /var/audit
+    sb.free_inodes = GRAHAFS_MAX_INODES - 5; // -5: reserved(0), root(1), illu(2), var(3), audit(4)
 
     printf("\nFilesystem Layout:\n");
     printf("  Superblock: block 0\n");
@@ -112,6 +113,9 @@ int main(int argc, char* argv[]) {
     bitmap_set(bitmap, sb.data_blocks_start_block);
     // Mark second data block as used (for /illu/ directory)
     bitmap_set(bitmap, sb.data_blocks_start_block + 1);
+    // Phase 15b: third and fourth blocks hold /var/ and /var/audit/.
+    bitmap_set(bitmap, sb.data_blocks_start_block + 2);
+    bitmap_set(bitmap, sb.data_blocks_start_block + 3);
 
     // --- 3. Prepare Inode Table ---
     grahafs_inode_t* inode_table = calloc(inode_table_blocks, GRAHAFS_BLOCK_SIZE);
@@ -126,8 +130,9 @@ int main(int argc, char* argv[]) {
 
     // Configure root inode (inode 1)  // CHANGED: Now using inode 1
     inode_table[1].type = GRAHAFS_INODE_TYPE_DIRECTORY;
-    inode_table[1].size = sizeof(grahafs_dirent_t) * 3; // ., .., and illu entries
-    inode_table[1].link_count = 3;  // ., .., and illu subdirectory
+    // Phase 15b: root now has four entries: '.', '..', 'illu', 'var'.
+    inode_table[1].size = sizeof(grahafs_dirent_t) * 4;
+    inode_table[1].link_count = 4;  // ., .., illu, var
     inode_table[1].uid = 0;
     inode_table[1].gid = 0;
     inode_table[1].mode = 0755;
@@ -160,6 +165,40 @@ int main(int argc, char* argv[]) {
     inode_table[2].indirect_block = 0;
     inode_table[2].double_indirect = 0;
 
+    // Phase 15b: Configure /var/ inode (inode 3).
+    inode_table[3].type = GRAHAFS_INODE_TYPE_DIRECTORY;
+    inode_table[3].size = sizeof(grahafs_dirent_t) * 3; // ., .., audit
+    inode_table[3].link_count = 3;
+    inode_table[3].uid = 0;
+    inode_table[3].gid = 0;
+    inode_table[3].mode = 0755;
+    inode_table[3].creation_time = time(NULL);
+    inode_table[3].modification_time = inode_table[3].creation_time;
+    inode_table[3].access_time = inode_table[3].creation_time;
+    inode_table[3].direct_blocks[0] = sb.data_blocks_start_block + 2;
+    for (int i = 1; i < 12; i++) {
+        inode_table[3].direct_blocks[i] = 0;
+    }
+    inode_table[3].indirect_block = 0;
+    inode_table[3].double_indirect = 0;
+
+    // Phase 15b: Configure /var/audit/ inode (inode 4).
+    inode_table[4].type = GRAHAFS_INODE_TYPE_DIRECTORY;
+    inode_table[4].size = sizeof(grahafs_dirent_t) * 2; // ., ..
+    inode_table[4].link_count = 2;
+    inode_table[4].uid = 0;
+    inode_table[4].gid = 0;
+    inode_table[4].mode = 0755;
+    inode_table[4].creation_time = time(NULL);
+    inode_table[4].modification_time = inode_table[4].creation_time;
+    inode_table[4].access_time = inode_table[4].creation_time;
+    inode_table[4].direct_blocks[0] = sb.data_blocks_start_block + 3;
+    for (int i = 1; i < 12; i++) {
+        inode_table[4].direct_blocks[i] = 0;
+    }
+    inode_table[4].indirect_block = 0;
+    inode_table[4].double_indirect = 0;
+
     // --- 4. Prepare Root Directory ---
     grahafs_dirent_t* root_dir = calloc(1, GRAHAFS_BLOCK_SIZE);
     if (!root_dir) {
@@ -181,6 +220,10 @@ int main(int argc, char* argv[]) {
     root_dir[2].inode_num = 2;
     strcpy(root_dir[2].name, "illu");
 
+    // Phase 15b: Add /var directory entry
+    root_dir[3].inode_num = 3;
+    strcpy(root_dir[3].name, "var");
+
     // --- 4b. Prepare /illu/ Directory ---
     grahafs_dirent_t* illu_dir = calloc(1, GRAHAFS_BLOCK_SIZE);
     if (!illu_dir) {
@@ -197,6 +240,41 @@ int main(int argc, char* argv[]) {
     strcpy(illu_dir[0].name, ".");
     illu_dir[1].inode_num = 1;
     strcpy(illu_dir[1].name, "..");
+
+    // Phase 15b: Prepare /var/ directory.
+    grahafs_dirent_t* var_dir = calloc(1, GRAHAFS_BLOCK_SIZE);
+    if (!var_dir) {
+        fprintf(stderr, "Failed to allocate memory for /var/ directory\n");
+        free(bitmap);
+        free(inode_table);
+        free(root_dir);
+        free(illu_dir);
+        close(fd);
+        return 1;
+    }
+    var_dir[0].inode_num = 3;
+    strcpy(var_dir[0].name, ".");
+    var_dir[1].inode_num = 1;
+    strcpy(var_dir[1].name, "..");
+    var_dir[2].inode_num = 4;
+    strcpy(var_dir[2].name, "audit");
+
+    // Phase 15b: Prepare /var/audit/ directory (empty except for . and ..).
+    grahafs_dirent_t* audit_dir = calloc(1, GRAHAFS_BLOCK_SIZE);
+    if (!audit_dir) {
+        fprintf(stderr, "Failed to allocate memory for /var/audit/ directory\n");
+        free(bitmap);
+        free(inode_table);
+        free(root_dir);
+        free(illu_dir);
+        free(var_dir);
+        close(fd);
+        return 1;
+    }
+    audit_dir[0].inode_num = 4;
+    strcpy(audit_dir[0].name, ".");
+    audit_dir[1].inode_num = 3;
+    strcpy(audit_dir[1].name, "..");
 
     // --- 5. Write everything to disk ---
     printf("\nWriting filesystem structures...\n");
@@ -225,6 +303,12 @@ int main(int argc, char* argv[]) {
     // Write /illu/ directory data block
     printf("  Writing /illu/ directory...\n");
     write_block(fd, sb.data_blocks_start_block + 1, illu_dir);
+
+    // Phase 15b: Write /var/ and /var/audit/ directory data blocks.
+    printf("  Writing /var/ directory...\n");
+    write_block(fd, sb.data_blocks_start_block + 2, var_dir);
+    printf("  Writing /var/audit/ directory...\n");
+    write_block(fd, sb.data_blocks_start_block + 3, audit_dir);
 
     // --- 6. Verify the filesystem ---
     printf("\nVerifying filesystem...\n");
@@ -266,6 +350,7 @@ int main(int argc, char* argv[]) {
     printf("    - '%s' -> inode %u\n", verify_root_dir[0].name, verify_root_dir[0].inode_num);
     printf("    - '%s' -> inode %u\n", verify_root_dir[1].name, verify_root_dir[1].inode_num);
     printf("    - '%s' -> inode %u\n", verify_root_dir[2].name, verify_root_dir[2].inode_num);
+    printf("    - '%s' -> inode %u\n", verify_root_dir[3].name, verify_root_dir[3].inode_num);
 
     free(verify_inode_table);
     free(verify_root_dir);
@@ -281,6 +366,8 @@ int main(int argc, char* argv[]) {
     free(inode_table);
     free(root_dir);
     free(illu_dir);
+    free(var_dir);
+    free(audit_dir);
     close(fd);
     return 0;
 }

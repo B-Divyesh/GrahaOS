@@ -28,10 +28,20 @@
 #include "net/net_task.h"
 #include "fs/grahafs.h"
 #include "../arch/x86_64/drivers/serial/serial.h"
-#include "capability.h"
+#include "cap/can.h"
+#include "cap/object.h"
 #include "cmdline.h"
 #include "autorun.h"
 #include "log.h"
+#include "percpu.h"
+#include "mm/slab.h"
+#include "mm/kheap.h"
+#include "rtc.h"
+#include "audit.h"
+#include "ipc/manifest.h"
+#include "mm/vmo.h"
+#include "ipc/channel.h"
+#include "io/stream.h"
 
 // --- Limine Requests ---
 __attribute__((used, section(".limine_requests")))
@@ -256,15 +266,11 @@ void kmain(void) {
 #endif
     );
 
-    // Register hardware base capabilities (always ON, no deps)
-    // Must happen after serial_init (for logging) but before driver inits
-    klog(KLOG_INFO, SUBSYS_CORE, "Registering hardware capabilities...");
-    cap_register("cpu", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
-    cap_register("memory", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
-    cap_register("interrupt_controller", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
-    cap_register("pci_bus", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
-    cap_register("framebuffer_hw", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
-    klog(KLOG_INFO, SUBSYS_CORE, "Hardware capabilities registered");
+    // Phase 14: hardware capability registration moved AFTER kheap_init
+    // (further down in this function) because can_entry_t objects now
+    // live in can_entry_cache, which needs the slab allocator ready.
+    // The old comment said "before driver inits" — that's still honored
+    // because driver inits happen well after Phase 14 allocator setup.
 
     // Initialize framebuffer for early output
     if (!framebuffer_init(&framebuffer_request)) {
@@ -324,6 +330,92 @@ void kmain(void) {
     klog(KLOG_INFO, SUBSYS_CORE, "Framebuffer drawn OK");
     y_pos += 20;
 
+    // 3b. Phase 14: per-CPU data + slab + kheap.
+    // percpu_init(0) populates the BSP's Phase 14 extension fields
+    // (magazines, preempt counters, self-pointer). APs run their own
+    // percpu_init in ap_main after they wrmsr GSBASE.
+    // kmem_slab_init + kheap_init must come before any kmem_cache_create
+    // or kmalloc call — which means before anything that migrates to
+    // task_cache/can_entry_cache (sched_init, cap_register beyond the
+    // hardware caps already registered above against the static
+    // capability[] array; those caps' storage will migrate in a later
+    // Phase 14 unit).
+    klog(KLOG_INFO, SUBSYS_CORE, "Phase 14: percpu_init(BSP)...");
+    percpu_init(0);
+    // Phase 15b: read CMOS RTC once, publish g_boot_wall_seconds. Runs
+    // before audit_init so every future audit_write carries a correct
+    // wall_clock_seconds. No dependency on slab/heap.
+    klog(KLOG_INFO, SUBSYS_CORE, "Phase 15b: rtc_init...");
+    rtc_init();
+    klog(KLOG_INFO, SUBSYS_CORE, "Phase 14: kmem_slab_init...");
+    kmem_slab_init();
+    klog(KLOG_INFO, SUBSYS_CORE, "Phase 14: kheap_init...");
+    kheap_init();
+    framebuffer_draw_string("Phase 14 Allocators Ready.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    // 3b-2. Phase 15a: initialize the cap_object registry. Must run after
+    // kheap_init (cap_object_cache is a slab cache) and before the first
+    // cap_register call (cap_register now also creates a paired cap_object_t).
+    klog(KLOG_INFO, SUBSYS_CORE, "Phase 15a: cap_object_init...");
+    cap_object_init();
+    framebuffer_draw_string("Phase 15a Cap Objects Ready.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    // Phase 15b: initialize the audit queue BEFORE the first cap_register
+    // so every bootstrap cap's registration emits an audit entry. The
+    // flusher isn't running yet; entries queue in memory until attach_fs +
+    // the audit flusher kernel thread come up later.
+    klog(KLOG_INFO, SUBSYS_CORE, "Phase 15b: audit_init...");
+    audit_init();
+    framebuffer_draw_string("Phase 15b Audit Queue Ready.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    // Phase 17: manifest type-hash registry. Populates FNV-1a hashes for the
+    // 6 well-known GCP manifest types; consumed by chan_create to accept
+    // channels pinned to those types.
+    klog(KLOG_INFO, SUBSYS_CORE, "Phase 17: manifest_init...");
+    manifest_init();
+    framebuffer_draw_string("Phase 17 Manifest Ready.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    // Phase 17: VMO subsystem. Registers vmo_t slab cache and installs the
+    // page-fault hook for COW dispatch.
+    klog(KLOG_INFO, SUBSYS_CORE, "Phase 17: vmo_init...");
+    vmo_init();
+    framebuffer_draw_string("Phase 17 VMOs Ready.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    // Phase 17: channel subsystem. Registers channel_t + chan_endpoint_t
+    // slab caches. Must run after manifest_init (channels consume type hashes).
+    klog(KLOG_INFO, SUBSYS_CORE, "Phase 17: channel_subsystem_init...");
+    channel_subsystem_init();
+    framebuffer_draw_string("Phase 17 Channels Ready.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
+    // Phase 18: stream_subsystem_init must wait until after sched_init
+    // because it spawns a kernel worker thread via sched_create_task. Its
+    // call site is moved just after sched_init below.
+
+    // 3c. Register hardware base capabilities (always ON, no deps).
+    // Delayed from pre-PMM to here because Phase 14 made can_entry_t
+    // live in can_entry_cache (slab-backed); slab needs pmm + kheap.
+    // Still well before driver inits (AHCI, E1000, etc.) which depend
+    // on these hw caps.
+    klog(KLOG_INFO, SUBSYS_CORE, "Registering hardware capabilities...");
+    cap_register("cpu", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    cap_register("memory", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    cap_register("interrupt_controller", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    cap_register("pci_bus", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    cap_register("framebuffer_hw", CAP_HARDWARE, 0, -1, NULL, 0, NULL, NULL, NULL, 0, NULL);
+    klog(KLOG_INFO, SUBSYS_CORE, "Hardware capabilities registered");
+
+    // Phase 14: now that slab + hw caps are ready, register the deferred
+    // driver caps from serial and framebuffer (their *_init functions ran
+    // before the slab was available).
+    serial_register_cap();
+    framebuffer_register_cap();
+
     // 4. NOW we can initialize IDT (after GDT is set up)
     klog(KLOG_INFO, SUBSYS_CORE, "About to initialize IDT...");
     idt_init();
@@ -336,6 +428,28 @@ void kmain(void) {
     sched_init();
     klog(KLOG_INFO, SUBSYS_CORE, "Scheduler initialized successfully");
     framebuffer_draw_string("Scheduler Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
+
+    // Phase 15b: start the audit flusher kernel thread. It pulls from the
+    // in-memory queue and writes to /var/audit/YYYY-MM-DD.log once
+    // audit_attach_fs runs (post-grahafs_mount).
+    int audit_flusher_pid = sched_create_task(audit_flusher_task_entry);
+    if (audit_flusher_pid >= 0) {
+        g_audit_state.flusher_task_id = audit_flusher_pid;
+        klog(KLOG_INFO, SUBSYS_AUDIT,
+             "audit: flusher task started as pid=%d", audit_flusher_pid);
+    } else {
+        klog(KLOG_WARN, SUBSYS_AUDIT,
+             "audit: flusher task creation failed (rc=%d); remaining in klog-only mode",
+             audit_flusher_pid);
+    }
+
+    // Phase 18: stream subsystem. Depends on VMO + channel subsystems AND
+    // sched_init (worker thread). Registers slab caches and spawns the
+    // kernel worker task.
+    klog(KLOG_INFO, SUBSYS_CORE, "Phase 18: stream_subsystem_init...");
+    stream_subsystem_init();
+    framebuffer_draw_string("Phase 18 Streams Ready.", 50, y_pos, COLOR_GREEN, 0x00101828);
+
     y_pos += 20;
     
     // 6. Initialize syscall interface (after per-CPU structures exist)
@@ -410,6 +524,11 @@ void kmain(void) {
             framebuffer_draw_string("GrahaFS mounted successfully on /", 10, y_pos, COLOR_GREEN, 0x00101828);
             klog(KLOG_INFO, SUBSYS_CORE, "Success msg drawn");
             y_pos += 20;
+
+            // Phase 15b: the FS is now live; attach the audit subsystem so
+            // future entries go to /var/audit and the early-boot entries in
+            // the in-memory queue get flushed to disk.
+            audit_attach_fs();
         } else {
             klog(KLOG_ERROR, SUBSYS_CORE, "Mount failed, drawing error msgs...");
             framebuffer_draw_string("Failed to mount GrahaFS!", 10, y_pos, COLOR_RED, 0x00101828);
@@ -696,11 +815,17 @@ void kmain(void) {
                      NULL, NULL, NULL, 0, NULL);
     }
 
-    // Activate all registered capabilities
+    // Activate all registered capabilities. Phase 16 wires real callbacks into
+    // keyboard/fb/e1000/ahci: these do MMIO + PIC writes, which interleaved
+    // with klog-to-serial pushes the loop past the first timer tick. Disable
+    // interrupts for the duration so we activate every cap atomically before
+    // scheduling kicks in. The caps themselves don't rely on interrupts.
     klog(KLOG_INFO, SUBSYS_CORE, "Activating all capabilities...");
+    asm volatile("cli");
     for (int i = 0; i < cap_get_count(); i++) {
         cap_activate(i);
     }
+    asm volatile("sti");
     klog(KLOG_INFO, SUBSYS_CORE, "All capabilities activated");
 
     klog(KLOG_INFO, SUBSYS_CORE, "\n=== ENTERING IDLE LOOP ===\nSystem fully initialized, waiting for timer interrupts...\n");

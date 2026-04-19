@@ -149,7 +149,7 @@ char *strdup(const char *s) {
     extern size_t strlen(const char *);
     extern void *memcpy(void *, const void *, size_t);
     size_t len = strlen(s) + 1;
-    char *dup = kmalloc(len);
+    char *dup = net_kmalloc(len);
     if (dup) memcpy(dup, s, len);
     return dup;
 }

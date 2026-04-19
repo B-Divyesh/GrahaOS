@@ -1,8 +1,11 @@
 // arch/x86_64/drivers/keyboard/keyboard.c
 #include "keyboard.h"
 #include "../../cpu/ports.h"
+#include "../../cpu/interrupts.h"
 #include "drivers/video/framebuffer.h"
-#include "../../../../kernel/capability.h"
+#include "../../../../kernel/cap/can.h"
+#include "../../../../kernel/log.h"
+#include <stdbool.h>
 #include <stddef.h>
 
 #define KEYBOARD_DATA_PORT 0x60
@@ -68,6 +71,13 @@ static const char scancode_set1_shift_map[128] = {
 static bool left_shift_pressed = false;
 static bool right_shift_pressed = false;
 static bool caps_lock = false;
+
+// Phase 16: CAN-controlled activation flag. Drives the scancode guard and the
+// PIC mask. True at boot because keyboard_init() calls cap_register with type
+// CAP_DRIVER (default state OFF, then activated by boot sequence) — but
+// because the existing keyboard IRQ path works before cap_activate runs, we
+// default true and let deactivate flip it off on demand.
+static bool g_keyboard_active = true;
 
 // Wait for PS/2 controller ready
 static void ps2_wait_write(void) {
@@ -198,10 +208,49 @@ void keyboard_init(void) {
     cap_op_t kbd_ops[1];
     cap_op_set(&kbd_ops[0], "getchar", 0, 0);
     cap_register("keyboard_input", CAP_DRIVER, CAP_SUBTYPE_INPUT, -1, kbd_deps, 1,
-                 NULL, NULL, kbd_ops, 1, keyboard_get_driver_stats);
+                 keyboard_activate, keyboard_deactivate,
+                 kbd_ops, 1, keyboard_get_driver_stats);
 }
 
+// Phase 16: CAN activate callback. Drains any stale scan codes the hardware
+// queued while the driver was off, unmasks IRQ 1 on the PIC (defence in
+// depth — LAPIC/PIC mode is orthogonal; if we ever re-enable PS/2 IRQ
+// delivery in the config byte, this ensures the IRQ is routable), and flips
+// g_keyboard_active back on so keyboard_handle_scancode accepts input. Called
+// by cap_activate from the CAN dispatcher.
+int keyboard_activate(void) {
+    // Drain stale bytes from the 8042 output buffer before we re-arm — the
+    // controller may have captured keystrokes while we were off.
+    int drain_budget = 16;
+    while ((inb(KEYBOARD_STATUS_PORT) & 0x01) && drain_budget-- > 0) {
+        (void)inb(KEYBOARD_DATA_PORT);
+    }
+    pic_unmask_irq(1);
+    g_keyboard_active = true;
+    klog(KLOG_INFO, SUBSYS_CORE, "[KB] activated (IRQ1 unmasked, buffer drained)");
+    return 0;
+}
+
+// Phase 16: CAN deactivate callback. Masks IRQ 1 on the PIC and disables the
+// scancode-processing guard. Returns 0 unconditionally — there is no case in
+// which we refuse to deactivate a keyboard.
+int keyboard_deactivate(void) {
+    pic_mask_irq(1);
+    g_keyboard_active = false;
+    klog(KLOG_INFO, SUBSYS_CORE, "[KB] deactivated (IRQ1 masked, handler guarded)");
+    return 0;
+}
+
+// Test hook: read the current flag from outside the driver. Used by the
+// SYS_DEBUG subcommand that powers cantest_v2's G1 assertion.
+bool keyboard_is_active(void) { return g_keyboard_active; }
+
 void keyboard_handle_scancode(uint8_t scancode) {
+    // Phase 16: refuse to process keys while the CAN cap is off. Defence in
+    // depth: the PIC mask already blocks most events, but the handler is also
+    // reachable from polling paths, so guard here too.
+    if (!g_keyboard_active) return;
+
     // Filter out special responses
     if (scancode >= 0xFA) {
         return; // ACK, RESEND, etc.

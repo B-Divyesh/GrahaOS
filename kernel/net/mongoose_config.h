@@ -78,11 +78,13 @@ static inline int sscanf(const char *str, const char *fmt, ...) {
 // IO buffer size matches E1000 buffer size
 #define MG_IO_SIZE 2048
 
-// Map standard allocators to kernel allocators
-#define malloc(s) kmalloc(s)
-#define free(p) kfree(p)
-#define calloc(n, s) kcalloc(n, s)
-#define realloc(p, s) krealloc(p, s)
+// Map standard allocators to the Mongoose-dedicated arena allocator
+// (Phase 9b). Phase 14 renamed these net_* to free the kmalloc name for
+// the new kernel-wide heap. Mongoose will be torn out entirely in Phase 22.
+#define malloc(s) net_kmalloc(s)
+#define free(p) net_kfree(p)
+#define calloc(n, s) net_kcalloc(n, s)
+#define realloc(p, s) net_krealloc(p, s)
 
 // Provide mg_log_prefix and mg_log implementations (in net.c)
 void serial_write(const char *str);

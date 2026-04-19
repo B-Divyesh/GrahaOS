@@ -48,17 +48,21 @@ static int count_markers(int count, const char *needle) {
 }
 
 static void test_rejections(void) {
-    // INFO to subsys=10 should go through.
-    int r = syscall_klog_write(KLOG_INFO, 10, "KB_REJ_VALID", 12);
-    TAP_ASSERT(r == 0, "valid write accepted (INFO, subsys=10)");
+    // Phase 15b: first user subsys is now 11 (10 is AUDIT).
+    int r = syscall_klog_write(KLOG_INFO, 11, "KB_REJ_VALID", 12);
+    TAP_ASSERT(r == 0, "valid write accepted (INFO, subsys=11)");
 
     // FATAL from userspace must be refused — panics belong to the kernel.
-    r = syscall_klog_write(KLOG_FATAL, 10, "KB_REJ_FATAL", 12);
+    r = syscall_klog_write(KLOG_FATAL, 11, "KB_REJ_FATAL", 12);
     TAP_ASSERT(r == -1, "KLOG_FATAL rejected from userspace");
 
     // Subsys 9 is TEST — reserved for the kernel test subsystem.
     r = syscall_klog_write(KLOG_INFO, 9, "KB_REJ_SUB9", 11);
     TAP_ASSERT(r == -1, "subsys=9 rejected (kernel TEST)");
+
+    // Subsys 10 is AUDIT (Phase 15b) — reserved for the kernel audit subsystem.
+    r = syscall_klog_write(KLOG_INFO, 10, "KB_REJ_SUB10", 12);
+    TAP_ASSERT(r == -1, "subsys=10 rejected (kernel AUDIT)");
 
     // Subsys 0 is CORE — reserved.
     r = syscall_klog_write(KLOG_INFO, 0, "KB_REJ_SUB0", 11);
@@ -155,7 +159,7 @@ void _start(void) {
 
     // 4 rejections + 4 round-trip + 4 level-filter + 2 tail + 3 trunc/empty = 17.
     // Spec mandates ≥10 so we have margin.
-    tap_plan(17);
+    tap_plan(18);
 
     test_rejections();
     test_roundtrip();

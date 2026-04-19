@@ -68,3 +68,13 @@ void interrupt_handler(struct interrupt_frame *frame);
 void syscall_dispatcher(struct syscall_frame *frame);
 void irq_init(void);
 void pic_disable(void);
+
+// Phase 16: per-line PIC mask control. `line` is the IRQ line 0..15 — lines 0..7
+// go to master PIC (PIC1), 8..15 go to slave (PIC2). These are write-through:
+// under LAPIC mode the PIC is globally disabled already, so these calls are
+// safe-but-inert; the real enforcement is in each driver's g_*_active flag.
+// They exist to (1) provide belt-and-suspenders defence once we re-introduce
+// legacy PIC delivery and (2) be renameable to `ioapic_*` when Phase 20/21
+// lands IOAPIC support.
+void pic_mask_irq(uint8_t line);
+void pic_unmask_irq(uint8_t line);

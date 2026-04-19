@@ -2,7 +2,7 @@
 #include "framebuffer.h"
 #include "../../kernel/limine.h"
 #include "../../kernel/sync/spinlock.h"
-#include "../../kernel/capability.h"
+#include "../../kernel/cap/can.h"
 
 // --- Private Variables ---
 static struct limine_framebuffer *fb = NULL;
@@ -12,6 +12,12 @@ static uint32_t fb_width = 0;
 static uint32_t fb_height = 0;
 // Framebuffer spinlock - static initialization
 spinlock_t fb_lock = SPINLOCK_INITIALIZER("framebuffer");
+
+// Phase 16: CAN-controlled activation flag. Every public draw function checks
+// this first; when false, draws are no-ops and the framebuffer stays at its
+// last written state (we memset it to black inside fb_deactivate). Defaults
+// true so the early boot banner is visible before cap_activate("display") runs.
+static bool g_fb_active = true;
 // --- Simple 8x16 Bitmap Font ---
 // Basic ASCII characters (32-126)
 static const uint8_t font_8x16[95][16] = {
@@ -244,23 +250,69 @@ bool framebuffer_init(volatile struct limine_framebuffer_request *fb_request) {
     // Reinitialize the lock (even though it's statically initialized)
     spinlock_init(&fb_lock, "framebuffer");
 
-    // Register with driver framework (only once - framebuffer_init may be called twice)
-    static int fb_registered = 0;
-    if (!fb_registered) {
-        // Register with Capability Activation Network
-        const char *fb_deps[] = {"framebuffer_hw"};
-        cap_op_t fb_ops[4];
-        cap_op_set(&fb_ops[0], "draw_rect",   5, 1);
-        cap_op_set(&fb_ops[1], "draw_string", 5, 1);
-        cap_op_set(&fb_ops[2], "draw_char",   4, 1);
-        cap_op_set(&fb_ops[3], "clear",       1, 1);
-        cap_register("display", CAP_DRIVER, CAP_SUBTYPE_DISPLAY, -1, fb_deps, 1,
-                     NULL, NULL, fb_ops, 4, fb_get_driver_stats);
-
-        fb_registered = 1;
-    }
+    // Phase 14: CAN registration moved to framebuffer_register_cap()
+    // because can_entry_t now lives in a slab that isn't ready at this
+    // point in boot. Main.c calls framebuffer_register_cap after slab
+    // init + hw cap registration.
 
     return true;
+}
+
+void framebuffer_register_cap(void) {
+    static int fb_registered = 0;
+    if (fb_registered) return;
+    // Register with Capability Activation Network
+    const char *fb_deps[] = {"framebuffer_hw"};
+    cap_op_t fb_ops[4];
+    cap_op_set(&fb_ops[0], "draw_rect",   5, 1);
+    cap_op_set(&fb_ops[1], "draw_string", 5, 1);
+    cap_op_set(&fb_ops[2], "draw_char",   4, 1);
+    cap_op_set(&fb_ops[3], "clear",       1, 1);
+    cap_register("display", CAP_DRIVER, CAP_SUBTYPE_DISPLAY, -1, fb_deps, 1,
+                 fb_activate, fb_deactivate, fb_ops, 4, fb_get_driver_stats);
+    fb_registered = 1;
+}
+
+// Phase 16: CAN activate — mark the display live. On the very first activation
+// (boot path) we skip the memset+banner so the early boot banner painted by
+// framebuffer_init remains visible and the boot-time cap_activate loop doesn't
+// burn 3 MB of MMIO writes per pass. Subsequent reactivations (post-deactivate)
+// do perform the clear+banner so the operator sees the transition.
+int fb_activate(void) {
+    static bool s_activated_before = false;
+    g_fb_active = true;
+    if (s_activated_before && fb_addr) {
+        spinlock_acquire(&fb_lock);
+        for (uint32_t i = 0; i < fb_width * fb_height; i++) {
+            fb_addr[i] = 0x00000000;
+        }
+        spinlock_release(&fb_lock);
+        framebuffer_draw_string("GrahaOS reactivated",
+                                 10, 10, COLOR_GREEN, 0x00000000);
+    }
+    s_activated_before = true;
+    return 0;
+}
+
+// Phase 16: CAN deactivate — memset the framebuffer to 0x00 so the screen
+// goes black, then disable the active-flag so subsequent draws are no-ops.
+// The Limine framebuffer mapping stays; Phase 17 may unmap it.
+int fb_deactivate(void) {
+    if (fb_addr) {
+        spinlock_acquire(&fb_lock);
+        for (uint32_t i = 0; i < fb_width * fb_height; i++) {
+            fb_addr[i] = 0x00000000;
+        }
+        spinlock_release(&fb_lock);
+    }
+    g_fb_active = false;
+    return 0;
+}
+
+bool framebuffer_is_active(void) { return g_fb_active; }
+uint32_t framebuffer_read_pixel(uint32_t x, uint32_t y) {
+    if (!fb_addr || x >= fb_width || y >= fb_height) return 0;
+    return fb_addr[y * (fb_pitch / 4) + x];
 }
 
 uint32_t framebuffer_get_width(void) {
@@ -272,12 +324,14 @@ uint32_t framebuffer_get_height(void) {
 }
 
 void framebuffer_draw_pixel(uint32_t x, uint32_t y, uint32_t color) {
+    if (!g_fb_active) return;
     spinlock_acquire(&fb_lock);
     _draw_pixel_unsafe(x, y, color);
     spinlock_release(&fb_lock);
 }
 
 void framebuffer_draw_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t color) {
+    if (!g_fb_active) return;
     if (x >= fb_width || y >= fb_height || width == 0 || height == 0) {
         return;
     }
@@ -296,6 +350,7 @@ void framebuffer_draw_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t heig
 }
 
 void framebuffer_draw_rect_outline(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t color) {
+    if (!g_fb_active) return;
     if (x >= fb_width || y >= fb_height || width == 0 || height == 0) {
         return;
     }
@@ -322,15 +377,17 @@ void framebuffer_draw_rect_outline(uint32_t x, uint32_t y, uint32_t width, uint3
 }
 
 void framebuffer_draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color) {
+    if (!g_fb_active) return;
     spinlock_acquire(&fb_lock);
     _draw_char_unsafe(c, x, y, fg_color);
     spinlock_release(&fb_lock);
 }
 
 // Modified main framebuffer_draw_string function
-void framebuffer_draw_string(const char *str, uint32_t x, uint32_t y, 
+void framebuffer_draw_string(const char *str, uint32_t x, uint32_t y,
                              uint32_t fg_color, uint32_t bg_color) {
     if (!str || !fb_addr) return;
+    if (!g_fb_active) return;
     
     // Check if we're in interrupt context
     if (in_interrupt_context()) {
@@ -378,6 +435,7 @@ void framebuffer_draw_hex(uint64_t value, int x, int y, uint32_t fg_color, uint3
 
 // Clear function with interrupt safety
 void framebuffer_clear(uint32_t color) {
+    if (!g_fb_active) return;
     if (in_interrupt_context()) {
         // Clear without lock
         for (uint32_t i = 0; i < fb_width * fb_height; i++) {
@@ -400,9 +458,10 @@ void framebuffer_draw_rsp_error(uint64_t code) {
 }
 
 // Thread-safe string drawing that doesn't panic on lock issues
-void framebuffer_draw_string_safe(const char *str, uint32_t x, uint32_t y, 
+void framebuffer_draw_string_safe(const char *str, uint32_t x, uint32_t y,
                                   uint32_t fg_color, uint32_t bg_color) {
     if (!str || !fb_addr) return;
+    if (!g_fb_active) return;
     
     // Try to acquire lock with timeout
     int attempts = 1000000;

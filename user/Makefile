@@ -26,7 +26,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl
 
 # Phase 12: TAP 1.4 test binaries. Each lives at user/tests/NAME.c
 # and is copied to initrd as /bin/tests/NAME.tap by the top-level
@@ -34,10 +34,18 @@ PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metates
 TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/libctest tests/simtest tests/clustertest tests/pipetest \
              tests/fdtest tests/metatest tests/spawntest \
-             tests/cantest tests/eventtest \
              tests/nettest tests/httptest tests/dnstest \
              tests/ktest_discovery tests/ktest_capture tests/cmdline_parse \
-             tests/klog_basic tests/klog_stress tests/panic_test tests/kpf_test
+             tests/klog_basic tests/klog_stress tests/panic_test tests/kpf_test \
+             tests/slab_basic tests/kheap_basic tests/percpu_basic tests/mem_stress \
+             tests/captest_v2 tests/pledgetest tests/audittest \
+             tests/cantest_v2 tests/canstress \
+             tests/chantest tests/vmotest tests/streamtest
+# Phase 16: cantest (Phase 8b) and eventtest (Phase 8d) removed — both used
+# SYS_CAP_ACTIVATE / SYS_CAP_WATCH which now return -EDEPRECATED. cantest_v2
+# replaces cantest's coverage using token-taking syscalls; Phase 17 channels
+# supersede eventtest's notification API. canstress cycles the keyboard cap
+# 100× to catch stuck IRQs / state drift.
 
 # Phase 12 work unit 15: sentinel_fail is only built when the meta-test
 # of the harness is being run. `make test-sentinel-meta` sets this.
@@ -161,6 +169,26 @@ ktest: ktest.o $(LIBTAP) $(LIBC)
 klog: klog.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
 	@$(LD) $(LDFLAGS) -o $@ klog.o $(LIBC)
+
+# Phase 14: /bin/memstat — allocator stats reader.
+memstat: memstat.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ memstat.o $(LIBC)
+
+# Phase 15a: /bin/caps — capability inspector.
+caps: caps.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ caps.o $(LIBC)
+
+# Phase 15b: /bin/auditq — audit log reader.
+auditq: auditq.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ auditq.o $(LIBC)
+
+# Phase 16: /bin/can-ctl — capability-network table printer.
+can-ctl: can-ctl.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ can-ctl.o $(LIBC)
 
 %.o: %.c
 	@echo "Compiling user C: $<"

@@ -6,8 +6,10 @@
 #include "../smp.h"
 #include "../../../../kernel/sync/spinlock.h"
 #include "../../../../kernel/state.h"
+#include "../../../../kernel/cap/handle_table.h"
+#include "../../../../kernel/cap/pledge.h"
 
-#define MAX_TASKS 32
+#define MAX_TASKS 64
 #define KERNEL_STACK_SIZE 16384
 
 // Signal definitions (Phase 7d)
@@ -42,18 +44,50 @@ typedef enum {
     TASK_STATE_ZOMBIE,
     TASK_STATE_READY,
     TASK_STATE_RUNNING,
-    TASK_STATE_BLOCKED
+    TASK_STATE_BLOCKED,
+    // Phase 17: blocked on a channel endpoint (read or write waiter list).
+    // Distinct from generic BLOCKED so the scheduler can enumerate IPC-wait
+    // tasks separately and apply deadline-driven wakeups.
+    TASK_STATE_CHAN_WAIT
 } task_state_t;
 
-// Spawn attributes for sys_spawn (Phase 7d)
+// Phase 17: reason a task entered TASK_STATE_CHAN_WAIT.
+#define CHAN_WAIT_READ   1
+#define CHAN_WAIT_WRITE  2
+// Phase 18: stream-specific wait reasons. The state is still CHAN_WAIT so the
+// existing per-tick deadline scan in schedule() handles timeouts uniformly;
+// wait_channel points at the stream or global work queue rather than a
+// channel_t.
+#define WAIT_STREAM_REAP    3   // task blocked in SYS_STREAM_REAP min_complete
+#define WAIT_STREAM_SUBMIT  4   // reserved: blocking submit (Phase 18 does not use)
+#define WAIT_STREAM_WORKER  5   // stream worker kernel thread idle, no jobs
+
+// Spawn attributes for sys_spawn (Phase 7d). Extended in Phase 17 with
+// handle-inheritance and VMO-backed-executable fields. Existing callers
+// that zero-initialize the struct get backward-compatible behavior.
 typedef struct {
     int inherit_fds;      // Whether to inherit parent's file descriptors
     int priority;         // Scheduling priority (reserved for future use)
     uint32_t flags;       // Additional flags (reserved)
+    // Phase 15b: child process will have pledge_mask = parent->pledge_mask &
+    // pledge_subset. Default PLEDGE_ALL means "inherit the parent unchanged".
+    pledge_mask_t pledge_subset;
+    // Phase 17: up to 16 cap_tokens transferred from parent to child at spawn
+    // time. nhandles_to_inherit == 0 means no transfer. Each transferred
+    // token is installed in the child's cap_handle_table; the parent's entry
+    // is removed (all-or-nothing). If nhandles > 0 but exec_vmo is zero the
+    // classic disk-ELF path runs with the transferred handles bolted on.
+    uint64_t handles_to_inherit[16];   // opaque cap_token_t raw values
+    uint8_t  nhandles_to_inherit;
+    // Phase 17: boot the child from an in-memory VMO rather than a disk
+    // path. When nonzero, path= may be NULL and exec_vmo is resolved in the
+    // parent's handle table as a CAP_KIND_VMO. Requires PLEDGE_COMPUTE on
+    // the parent.
+    uint64_t exec_vmo;                 // cap_token_t raw
 } spawn_attrs_t;
 
 // Task structure
-typedef struct {
+typedef struct task_struct {
     int id;
     task_state_t state;
     uint64_t kernel_stack_top;
@@ -84,6 +118,32 @@ typedef struct {
 
     // Phase 10a: Per-process file descriptor table
     proc_fd_t fd_table[PROC_MAX_FDS];
+
+    // Phase 15a: per-process capability handle table. Initialized on
+    // task creation; freed + orphan-revoked on sched_reap_zombie.
+    cap_handle_table_t cap_handles;
+
+    // Phase 15b: pledge mask (monotonic narrow). Every sensitive syscall
+    // entry calls pledge_allows(current, PLEDGE_*). pledge_lock serialises
+    // concurrent SYS_PLEDGE calls against the same task.
+    pledge_mask_t pledge_mask;
+    spinlock_t    pledge_lock;
+
+    // Phase 17: channel-wait plumbing. wait_next links the task into a
+    // channel_t.read_waiters or .write_waiters list when state ==
+    // TASK_STATE_CHAN_WAIT. wait_reason is CHAN_WAIT_READ or CHAN_WAIT_WRITE.
+    // deadline_tsc (0 = infinite) gates the scheduler's per-tick deadline
+    // scan. wait_channel is an opaque pointer to the channel this task is
+    // parked on (needed when sched_reap_zombie yanks the task off).
+    struct task_struct *wait_next;
+    uint8_t             wait_reason;
+    uint64_t            deadline_tsc;
+    void               *wait_channel;
+    // Phase 17: wait_result is set by the waker BEFORE transitioning the
+    // task to READY. The blocking syscall reads this on resume to decide
+    // between "woke on data" (0) and "woke on timeout" (-ETIMEDOUT) or
+    // "woke on channel close" (-EPIPE).
+    int32_t             wait_result;
 } task_t;
 
 /**
@@ -117,6 +177,32 @@ void schedule(struct interrupt_frame *frame);
  * @return Pointer to the current task
  */
 task_t* sched_get_current_task(void);
+
+// ---------------------------------------------------------------------------
+// Phase 17: channel-wait primitives. A task blocks on a channel endpoint
+// (read or write direction) until another task sends/receives, the channel
+// is destroyed (EPIPE wake), or the deadline_tsc expires. The channel
+// struct owns the linked-list head (typed as void* here to avoid pulling
+// in kernel/ipc/channel.h from the scheduler header).
+// ---------------------------------------------------------------------------
+
+// Block current task on channel. dir is CHAN_WAIT_READ or CHAN_WAIT_WRITE;
+// channel holds the matching waiter-list head. Timeout 0 means wait forever;
+// otherwise kernel arms a deadline (nanoseconds from now). Returns after
+// the task is woken: 0 on successful wake-by-data, -ETIMEDOUT on deadline,
+// -EPIPE on channel close.
+int sched_block_on_channel(void *channel, uint8_t dir, uint64_t timeout_ns,
+                           struct task_struct **list_head);
+
+// Wake one task off the given waiter list. Returns the woken task or NULL
+// if the list was empty.
+task_t *sched_wake_one_on_channel(struct task_struct **list_head,
+                                  int32_t wait_result);
+
+// Wake every task on the list (channel teardown / EPIPE). Each gets the
+// given wait_result. Returns the count of woken tasks.
+int sched_wake_all_on_channel(struct task_struct **list_head,
+                              int32_t wait_result);
 
 /**
  * @brief Get a task by ID

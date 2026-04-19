@@ -6,7 +6,8 @@
 #include "../../../../drivers/video/framebuffer.h"
 #include "../../../../kernel/fs/vfs.h"
 #include "../../../../kernel/sync/spinlock.h"
-#include "../../../../kernel/capability.h"
+#include "../../../../kernel/cap/can.h"
+#include "../../../../kernel/log.h"
 
 #define HBA_PORT_DEV_PRESENT 0x3
 #define HBA_PORT_IPM_ACTIVE 0x1
@@ -29,6 +30,16 @@ static ahci_hba_mem_t *hba_mem;
 static ahci_port_t* ports[32];
 static int port_count = 0;
 static spinlock_t ahci_lock = SPINLOCK_INITIALIZER("ahci");
+
+// Phase 16: CAN activation flag (gates the read/write fast paths) and a
+// snapshot of per-port saved-CMD bits so reactivation can restore the same
+// ST+FRE state the port had before deactivation.
+static bool g_ahci_active = true;
+static uint32_t g_ahci_saved_cmd[32];
+// Drain / quiesce timeout limits. Values chosen to match Phase 16 spec.
+#define AHCI_CR_TIMEOUT_ITERS  2000000   // ~1s of pause loops on QEMU.
+#define AHCI_FR_TIMEOUT_ITERS  1000000   // ~500ms of pause loops.
+#define AHCI_CI_DRAIN_ITERS    2000000   // ~1s for in-flight commands to drain.
 
 // Memory barrier for cache coherency
 static inline void memory_barrier(void) {
@@ -258,13 +269,106 @@ void ahci_init(void) {
     cap_op_set(&ahci_ops[0], "read",  3, 0);
     cap_op_set(&ahci_ops[1], "write", 3, 1);
     cap_op_set(&ahci_ops[2], "flush", 1, 1);
-    cap_register("disk", CAP_DRIVER, CAP_SUBTYPE_BLOCK, -1, ahci_deps, 1,
-                 NULL, NULL, ahci_ops, 3, ahci_get_driver_stats);
+    int disk_cap_id = cap_register("disk", CAP_DRIVER, CAP_SUBTYPE_BLOCK, -1,
+                                   ahci_deps, 1, ahci_activate, ahci_deactivate,
+                                   ahci_ops, 3, ahci_get_driver_stats);
+    if (disk_cap_id >= 0) {
+        // Phase 16: refuse to quiesce while commands are in flight.
+        cap_set_refuse_hook(disk_cap_id, ahci_can_refuse_deactivate);
+    }
+}
+
+// Phase 16: refuse predicate. Returns nonzero if any port has unacknowledged
+// command-issue bits set, in which case cap_deactivate returns -CAP_ERR_BUSY
+// without touching any state. Conservative — the read/write paths also
+// respect g_ahci_active, so most callers won't bump the refuse threshold.
+int ahci_can_refuse_deactivate(void) {
+    for (int i = 0; i < 32; i++) {
+        if (!ports[i]) continue;
+        if (ports[i]->ci != 0) return 1;  // refuse
+    }
+    return 0;
+}
+
+// Phase 16: CAN deactivate. Flushes the VFS first to push dirty pages, then
+// per-port: spin for CI==0 (pending commands drain), clear CMD.ST, spin for
+// CR==0, clear CMD.FRE, spin for FR==0. If any spin exceeds its budget, abort
+// with -CAP_ERR_BUSY; partially-stopped ports stay stopped (driver is still
+// coherent, they'll just be reactivated on the next cap_activate("disk")).
+int ahci_deactivate(void) {
+    // Step 0: flush filesystem caches so no dirty pages are left behind when
+    // the disk becomes unresponsive. vfs_sync returns void; we proceed either
+    // way, accepting the risk documented in the Phase 16 plan.
+    vfs_sync();
+
+    int refused = 0;
+    for (int i = 0; i < 32; i++) {
+        if (!ports[i]) continue;
+        ahci_port_t *port = ports[i];
+
+        // Snapshot current CMD for later restore. Only the low bits are
+        // interesting (ST, FRE); rest are HBA-maintained.
+        g_ahci_saved_cmd[i] = port->cmd;
+
+        // Drain any in-flight command-issue bits.
+        int budget = AHCI_CI_DRAIN_ITERS;
+        while (port->ci != 0 && budget-- > 0) asm volatile("pause");
+        if (port->ci != 0) { refused = 1; break; }
+
+        // Clear ST, wait for CR=0.
+        port->cmd &= ~HBA_PxCMD_ST;
+        budget = AHCI_CR_TIMEOUT_ITERS;
+        while ((port->cmd & HBA_PxCMD_CR) && budget-- > 0) asm volatile("pause");
+        if (port->cmd & HBA_PxCMD_CR) { refused = 1; break; }
+
+        // Clear FRE, wait for FR=0.
+        port->cmd &= ~HBA_PxCMD_FRE;
+        budget = AHCI_FR_TIMEOUT_ITERS;
+        while ((port->cmd & HBA_PxCMD_FR) && budget-- > 0) asm volatile("pause");
+        if (port->cmd & HBA_PxCMD_FR) { refused = 1; break; }
+
+        memory_barrier();
+    }
+
+    if (refused) {
+        klog(KLOG_WARN, SUBSYS_DRV,
+             "[AHCI] deactivate timed out; returning -EBUSY, state stays ON");
+        return CAP_ERR_BUSY;
+    }
+
+    g_ahci_active = false;
+    klog(KLOG_INFO, SUBSYS_DRV, "[AHCI] deactivated (all ports quiesced)");
+    return 0;
+}
+
+// Phase 16: CAN activate. Per-port: set FRE, wait for FR ready, set ST.
+int ahci_activate(void) {
+    for (int i = 0; i < 32; i++) {
+        if (!ports[i]) continue;
+        ahci_port_t *port = ports[i];
+
+        // Set FRE, wait until CR is clear (prerequisite to re-enable).
+        int budget = AHCI_CR_TIMEOUT_ITERS;
+        while ((port->cmd & HBA_PxCMD_CR) && budget-- > 0) asm volatile("pause");
+        port->cmd |= HBA_PxCMD_FRE;
+        port->cmd |= HBA_PxCMD_ST;
+        memory_barrier();
+    }
+    g_ahci_active = true;
+    klog(KLOG_INFO, SUBSYS_DRV, "[AHCI] activated (ports reopened)");
+    return 0;
+}
+
+bool     ahci_is_active(void)          { return g_ahci_active; }
+uint32_t ahci_debug_port_cmd(int port_num) {
+    if (port_num < 0 || port_num >= 32 || !ports[port_num]) return 0;
+    return ports[port_num]->cmd;
 }
 
 int ahci_read(int port_num, uint64_t lba, uint16_t count, void *buf) {
     if (port_num >= port_count || !ports[port_num]) return -1;
-    
+    if (!g_ahci_active) return -1;  // Phase 16: fast-reject while deactivated.
+
     spinlock_acquire(&ahci_lock);
     ahci_port_t *port = ports[port_num];
 
@@ -353,7 +457,8 @@ int ahci_read(int port_num, uint64_t lba, uint16_t count, void *buf) {
 
 int ahci_write(int port_num, uint64_t lba, uint16_t count, void *buf) {
     if (port_num >= port_count || !ports[port_num]) return -1;
-    
+    if (!g_ahci_active) return -1;  // Phase 16: fast-reject while deactivated.
+
     spinlock_acquire(&ahci_lock);
     ahci_port_t *port = ports[port_num];
 

@@ -3,7 +3,7 @@
 #include "../lapic/lapic.h"
 #include "../../cpu/ports.h"
 #include "../../../../drivers/video/framebuffer.h"
-#include "../../../../kernel/capability.h"
+#include "../../../../kernel/cap/can.h"
 
 // LAPIC Timer registers (offsets from LAPIC base)
 #define LAPIC_TIMER_LVT         0x320  // LVT Timer Register

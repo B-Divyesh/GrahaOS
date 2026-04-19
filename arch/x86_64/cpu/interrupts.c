@@ -5,6 +5,7 @@
 #include "../../drivers/keyboard/keyboard.h"
 #include "../../drivers/lapic/lapic.h"
 #include "../../drivers/serial/serial.h"
+#include "../mm/vmm.h"
 #include "../../../kernel/watchdog.h"
 #include "../../../kernel/panic.h"
 #include "../../../kernel/vsnprintf.h"
@@ -58,6 +59,30 @@ void pic_disable(void) {
     outb(PIC1_DATA, 0xFF);
     outb(PIC2_DATA, 0xFF);
     using_lapic = true;  // Switch to LAPIC mode
+}
+
+// Phase 16: per-line PIC mask toggles. `line` is 0..15. Each PIC stores an
+// 8-bit mask at its data port; bit N = 1 means "IRQ N masked" (the data port
+// IS the interrupt mask register). Writes must be read-modify-write to avoid
+// clobbering other masked lines.
+void pic_mask_irq(uint8_t line) {
+    if (line < 8) {
+        uint8_t mask = inb(PIC1_DATA);
+        outb(PIC1_DATA, mask | (uint8_t)(1u << line));
+    } else if (line < 16) {
+        uint8_t mask = inb(PIC2_DATA);
+        outb(PIC2_DATA, mask | (uint8_t)(1u << (line - 8)));
+    }
+}
+
+void pic_unmask_irq(uint8_t line) {
+    if (line < 8) {
+        uint8_t mask = inb(PIC1_DATA);
+        outb(PIC1_DATA, mask & (uint8_t)~(1u << line));
+    } else if (line < 16) {
+        uint8_t mask = inb(PIC2_DATA);
+        outb(PIC2_DATA, mask & (uint8_t)~(1u << (line - 8)));
+    }
 }
 
 // Initialize interrupt handling
@@ -162,6 +187,14 @@ void interrupt_handler(struct interrupt_frame *frame) {
     if (frame->int_no == 14) { // Page Fault
         uint64_t fault_addr;
         asm volatile("mov %%cr2, %0" : "=r"(fault_addr)); // Get faulting address from CR2
+
+        // Phase 17: route through the installed handler first (VMO COW,
+        // demand-paging, etc.). If it returns 0 the fault is fully resolved
+        // and we just return to the faulting instruction.
+        int pf_rc = vmm_dispatch_pf(fault_addr, frame->err_code);
+        if (pf_rc == 0) {
+            return;
+        }
 
         // Create a red banner for the error message
         framebuffer_draw_rect(0, 0, framebuffer_get_width(), 120, COLOR_RED);

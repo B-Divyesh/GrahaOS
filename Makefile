@@ -15,7 +15,7 @@ LIMINE_DIR := limine
 
 # --- Flags ---
 # ADDED: Include path for the new keyboard driver
-CFLAGS   := -I. -I./arch/x86_64/drivers/keyboard -I./arch/x86_64/drivers/lapic_timer -I./kernel/net \
+CFLAGS   := -I. -I./kernel -I./arch/x86_64/drivers/keyboard -I./arch/x86_64/drivers/lapic_timer -I./kernel/net \
             -ffreestanding -fno-stack-protector -fno-pie \
             -mno-red-zone -mcmodel=kernel -g -Wall -Wextra \
             -std=gnu11 -fno-stack-check -fno-PIC -m64  \
@@ -154,7 +154,7 @@ grahaos.iso: kernel/kernel.elf initrd.tar limine.conf disk.img
 	@echo "Build complete: grahaos.iso"
 
 # MODIFIED: Package gash, grahai, and libctest into the initrd (Phase 7c)
-initrd.tar: userland etc/motd.txt etc/plan.json
+initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json
 	@echo "Creating initrd..."
 	@rm -rf initrd_root
 	@mkdir -p initrd_root/bin initrd_root/etc
@@ -325,8 +325,15 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	@cp user/tests/fdtest           initrd_root/bin/tests/fdtest.tap
 	@cp user/tests/metatest         initrd_root/bin/tests/metatest.tap
 	@cp user/tests/spawntest        initrd_root/bin/tests/spawntest.tap
+	@# Phase 16: cantest + eventtest retained on disk for historical reference
+	@# but excluded from the TAP manifest below (both use -EDEPRECATED syscalls).
 	@cp user/tests/cantest          initrd_root/bin/tests/cantest.tap
 	@cp user/tests/eventtest        initrd_root/bin/tests/eventtest.tap
+	@cp user/tests/cantest_v2       initrd_root/bin/tests/cantest_v2.tap
+	@cp user/tests/canstress        initrd_root/bin/tests/canstress.tap
+	@cp user/tests/chantest         initrd_root/bin/tests/chantest.tap
+	@cp user/tests/vmotest          initrd_root/bin/tests/vmotest.tap
+	@cp user/tests/streamtest       initrd_root/bin/tests/streamtest.tap
 	@cp user/tests/nettest          initrd_root/bin/tests/nettest.tap
 	@cp user/tests/httptest         initrd_root/bin/tests/httptest.tap
 	@cp user/tests/dnstest          initrd_root/bin/tests/dnstest.tap
@@ -335,6 +342,16 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	@cp user/tests/cmdline_parse    initrd_root/bin/tests/cmdline_parse.tap
 	@cp user/tests/klog_basic       initrd_root/bin/tests/klog_basic.tap
 	@cp user/tests/klog_stress      initrd_root/bin/tests/klog_stress.tap
+	@# Phase 14: allocator tests.
+	@cp user/tests/slab_basic       initrd_root/bin/tests/slab_basic.tap
+	@cp user/tests/kheap_basic      initrd_root/bin/tests/kheap_basic.tap
+	@cp user/tests/percpu_basic     initrd_root/bin/tests/percpu_basic.tap
+	@cp user/tests/mem_stress       initrd_root/bin/tests/mem_stress.tap
+	@# Phase 15a: capability objects v2 tests.
+	@cp user/tests/captest_v2       initrd_root/bin/tests/captest_v2.tap
+	@# Phase 15b: pledge + audit tests.
+	@cp user/tests/pledgetest       initrd_root/bin/tests/pledgetest.tap
+	@cp user/tests/audittest        initrd_root/bin/tests/audittest.tap
 	@# Phase 13: panic_test is NOT a TAP test — it intentionally panics
 	@# the kernel. Copied to bin/ so autorun=panic_test can spawn it.
 	@cp user/tests/panic_test       initrd_root/bin/panic_test
@@ -342,6 +359,14 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	@cp user/ktest                   initrd_root/bin/
 	@# Phase 13: standalone klog reader.
 	@cp user/klog                    initrd_root/bin/klog
+	@# Phase 14: allocator stats reader.
+	@cp user/memstat                 initrd_root/bin/memstat
+	@# Phase 15a: capability inspector.
+	@cp user/caps                    initrd_root/bin/caps
+	@# Phase 15b: audit log reader.
+	@cp user/auditq                  initrd_root/bin/auditq
+	@# Phase 16: CAN capability-table printer.
+	@cp user/can-ctl                 initrd_root/bin/can-ctl
 	@# Phase 12: test manifest — one name per line, loaded by ktest.
 	@# Keep in sync with TAP_TESTS in user/Makefile.
 	@echo "# GrahaOS TAP test manifest (Phase 12) — one test name per line" > initrd_root/bin/tests/manifest.txt
@@ -361,8 +386,9 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	@echo "fdtest" >> initrd_root/bin/tests/manifest.txt
 	@echo "metatest" >> initrd_root/bin/tests/manifest.txt
 	@echo "spawntest" >> initrd_root/bin/tests/manifest.txt
-	@echo "cantest" >> initrd_root/bin/tests/manifest.txt
-	@echo "eventtest" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 16: cantest + eventtest removed — both call deprecated syscalls
+	@# now returning -EDEPRECATED. Their coverage is preserved (and extended)
+	@# by cantest_v2 using token-taking SYS_CAN_* syscalls.
 	@echo "nettest" >> initrd_root/bin/tests/manifest.txt
 	@echo "httptest" >> initrd_root/bin/tests/manifest.txt
 	@echo "dnstest" >> initrd_root/bin/tests/manifest.txt
@@ -372,6 +398,22 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	@# Phase 13: klog syscalls round-trip + stress tests.
 	@echo "klog_basic" >> initrd_root/bin/tests/manifest.txt
 	@echo "klog_stress" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 14: slab + kheap + per-CPU + stress.
+	@echo "slab_basic" >> initrd_root/bin/tests/manifest.txt
+	@echo "kheap_basic" >> initrd_root/bin/tests/manifest.txt
+	@echo "percpu_basic" >> initrd_root/bin/tests/manifest.txt
+	@echo "mem_stress" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 15a: capability objects v2.
+	@echo "captest_v2" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 15b: pledge classes + audit log.
+	@echo "pledgetest" >> initrd_root/bin/tests/manifest.txt
+	@echo "audittest" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 16: CAN callbacks + token-taking activate/deactivate.
+	@echo "cantest_v2" >> initrd_root/bin/tests/manifest.txt
+	@echo "canstress" >> initrd_root/bin/tests/manifest.txt
+	@echo "chantest" >> initrd_root/bin/tests/manifest.txt
+	@echo "vmotest" >> initrd_root/bin/tests/manifest.txt
+	@echo "streamtest" >> initrd_root/bin/tests/manifest.txt
 	@# Work unit 15: sentinel_fail is included ONLY when invoked via
 	@# `make test-sentinel-meta` (which sets WITH_SENTINEL_FAIL=1).
 	@if [ "$$WITH_SENTINEL_FAIL" = "1" ]; then \
@@ -384,6 +426,7 @@ initrd.tar: userland etc/motd.txt etc/plan.json
 	fi
 	@cp etc/motd.txt initrd_root/etc/
 	@cp etc/plan.json initrd_root/etc/
+	@cp etc/gcp.json initrd_root/etc/
 	@if [ -f api_keys.md ]; then \
 		grep '^GEMINI_API_KEY=' api_keys.md | sed 's/^GEMINI_API_KEY=//' > initrd_root/etc/ai.conf; \
 	else echo "" > initrd_root/etc/ai.conf; fi

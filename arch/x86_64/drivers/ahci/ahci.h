@@ -126,3 +126,11 @@ int ahci_read(int port_num, uint64_t lba, uint16_t count, void *buf);
 int ahci_write(int port_num, uint64_t lba, uint16_t count, void *buf);
 
 int ahci_flush_cache(int port_num);
+
+// Phase 16 CAN callbacks + refuse hook + test hooks.
+#include <stdbool.h>
+int      ahci_activate(void);
+int      ahci_deactivate(void);
+int      ahci_can_refuse_deactivate(void);
+bool     ahci_is_active(void);
+uint32_t ahci_debug_port_cmd(int port_num);

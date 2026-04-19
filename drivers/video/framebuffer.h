@@ -30,6 +30,10 @@ struct limine_framebuffer_request;
  */
 bool framebuffer_init(volatile struct limine_framebuffer_request *fb_request);
 
+// Phase 14: deferred CAN registration. Called from kmain after slab
+// and hw caps are ready.
+void framebuffer_register_cap(void);
+
 /**
  * @brief Gets the framebuffer width
  * @return Width in pixels
@@ -100,5 +104,15 @@ void framebuffer_draw_hex(uint64_t value, int x, int y, uint32_t fg_color, uint3
  */
 void framebuffer_clear(uint32_t color);
 
-void framebuffer_draw_string_safe(const char *str, uint32_t x, uint32_t y, 
+void framebuffer_draw_string_safe(const char *str, uint32_t x, uint32_t y,
                                   uint32_t fg_color, uint32_t bg_color);
+
+/**
+ * Phase 16 CAN callbacks. activate reclaims the display and draws a banner;
+ * deactivate memsets to black and gates subsequent draws. is_active + read_pixel
+ * are test hooks surfaced via SYS_DEBUG.
+ */
+int fb_activate(void);
+int fb_deactivate(void);
+bool framebuffer_is_active(void);
+uint32_t framebuffer_read_pixel(uint32_t x, uint32_t y);

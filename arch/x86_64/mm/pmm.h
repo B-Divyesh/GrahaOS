@@ -51,3 +51,18 @@ uint64_t pmm_get_total_memory(void);
  * @return Free memory
  */
 uint64_t pmm_get_free_memory(void);
+
+// ---------------------------------------------------------------------------
+// Phase 17: per-page reference counting (required by VMO COW).
+//
+// Every page starts with refcount=1 when pmm_alloc_page returns it. Callers
+// that share a page between multiple owners (e.g., COW VMO parent & child)
+// call pmm_page_ref() once per additional owner. pmm_free_page() now
+// decrements; the page is returned to the bitmap only when refcount==0.
+//
+// Counts saturate at 255. Freeing a page at refcount==0 is a no-op (the
+// existing bitmap check protects against double-free).
+// ---------------------------------------------------------------------------
+void pmm_page_ref(void *page);
+void pmm_page_unref(void *page);   // alias for pmm_free_page
+uint8_t pmm_page_get_refcount(void *page);

@@ -12,10 +12,17 @@
 #define KERNEL_STACK_SIZE (16 * 1024) // 16KB default
 #endif
 
-// Include GDT definitions
+// Include GDT definitions (needed by percpu.h).
 #include "gdt.h"
 
-// Per-CPU data structure
+// Phase 14: per-CPU data structure is now defined in kernel/percpu.h as
+// percpu_t, with the Phase 7a cpu_local_t layout preserved as its prefix
+// (cpu_id at offset 0, tss.rsp0 at gs:68, syscall_scratch at gs:168).
+// A typedef alias `cpu_local_t` is kept so existing callers compile.
+#include "../../../kernel/percpu.h"
+
+// Per-CPU system information (separate from percpu_t; used by the SMP
+// bring-up code, not hot paths).
 typedef struct {
     uint32_t lapic_id;
     uint32_t cpu_id;        // Linear CPU ID (0, 1, 2, ...)
@@ -23,18 +30,6 @@ typedef struct {
     uint64_t kernel_stack;
     // Add more per-CPU data as needed
 } cpu_info_t;
-
-// Per-CPU local data (stored in GS segment)
-// This structure now includes the GDT and TSS for each CPU
-typedef struct {
-    uint32_t cpu_id;        // Linear CPU ID (must be first field!)
-    uint32_t lapic_id;
-    // Per-CPU GDT and TSS
-    struct gdt_entry gdt[7];  // 7 entries as per your GDT_ENTRIES
-    struct tss tss;
-    // Per-CPU scratch for syscall entry (R10 save area)
-    uint64_t syscall_scratch;   // offset = 4+4+56+104 = 168
-} __attribute__((packed)) cpu_local_t;
 
 // Global CPU information array
 extern cpu_info_t g_cpu_info[MAX_CPUS];

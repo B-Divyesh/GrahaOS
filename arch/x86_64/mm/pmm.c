@@ -10,6 +10,13 @@ static uint64_t used_pages = 0;
 static uint64_t usable_memory = 0;
 static uint64_t last_used_index = 0;
 
+// Phase 17: per-page refcount array. One byte per 4 KiB physical frame.
+// Indexed by page number (pa / 4096). refcounts[i] == 0 means "not a live
+// page"; live pages are 1..255. Any attempt to increment beyond 255 is
+// saturating (not an error). Allocated from the same usable region as the
+// bitmap during pmm_init. Sized exactly to total_pages bytes.
+static uint8_t *pp_refcounts = NULL;
+
 // PMM spinlock with static initialization
 spinlock_t pmm_lock = SPINLOCK_INITIALIZER("pmm");
 
@@ -52,14 +59,19 @@ void pmm_init(volatile struct limine_memmap_response *memmap_response) {
         }
     }
 
-    // Calculate total pages and bitmap size
+    // Calculate total pages and bitmap size. Phase 17 extends the PMM
+    // bookkeeping with a parallel refcount array (1 byte per page). Lay out
+    // [bitmap][refcounts] in the same usable chunk so one find-space loop
+    // suffices; both sized to total_pages' worth of storage.
     total_pages = highest_addr / PAGE_SIZE;
     uint64_t bitmap_size = (total_pages + 7) / 8;
+    uint64_t refcount_size = total_pages;  // 1 byte per page
+    uint64_t meta_size = bitmap_size + refcount_size;
 
-    // Find space for bitmap in usable memory
+    // Find space for both in one usable chunk.
     for (uint64_t i = 0; i < entry_count; i++) {
         if (entries[i]->type == LIMINE_MEMMAP_USABLE &&
-            entries[i]->length >= bitmap_size) {
+            entries[i]->length >= meta_size) {
             bitmap = (uint8_t *)(entries[i]->base + 0xFFFF800000000000ULL);
             break;
         }
@@ -69,16 +81,22 @@ void pmm_init(volatile struct limine_memmap_response *memmap_response) {
         // Fallback: use direct mapping
         for (uint64_t i = 0; i < entry_count; i++) {
             if (entries[i]->type == LIMINE_MEMMAP_USABLE &&
-                entries[i]->length >= bitmap_size) {
+                entries[i]->length >= meta_size) {
                 bitmap = (uint8_t *)entries[i]->base;
                 break;
             }
         }
     }
 
+    pp_refcounts = bitmap + bitmap_size;
+
     // Initialize bitmap - set all pages as used initially
     for (uint64_t i = 0; i < bitmap_size; i++) {
         bitmap[i] = 0xFF;
+    }
+    // Initialize refcounts to 0 (no live pages yet).
+    for (uint64_t i = 0; i < refcount_size; i++) {
+        pp_refcounts[i] = 0;
     }
 
     // Mark usable pages as free
@@ -93,14 +111,14 @@ void pmm_init(volatile struct limine_memmap_response *memmap_response) {
         }
     }
 
-    // Mark bitmap pages as used
+    // Mark bitmap + refcount-array pages as used (combined meta_size).
     uint64_t bitmap_phys = (uint64_t)bitmap;
     if (bitmap_phys >= 0xFFFF800000000000ULL) {
         bitmap_phys -= 0xFFFF800000000000ULL;
     }
-    uint64_t bitmap_pages = (bitmap_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t meta_pages = (meta_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    for (uint64_t i = 0; i < bitmap_pages; i++) {
+    for (uint64_t i = 0; i < meta_pages; i++) {
         bitmap_set_bit((bitmap_phys / PAGE_SIZE) + i);
         used_pages++;
     }
@@ -113,6 +131,7 @@ void *pmm_alloc_page(void) {
     for (uint64_t i = last_used_index; i < total_pages; i++) {
         if (!bitmap_test_bit(i)) {
             bitmap_set_bit(i);
+            pp_refcounts[i] = 1;
             used_pages++;
             last_used_index = i + 1;
             spinlock_release(&pmm_lock);
@@ -124,6 +143,7 @@ void *pmm_alloc_page(void) {
     for (uint64_t i = 0; i < last_used_index; i++) {
         if (!bitmap_test_bit(i)) {
             bitmap_set_bit(i);
+            pp_refcounts[i] = 1;
             used_pages++;
             last_used_index = i + 1;
             spinlock_release(&pmm_lock);
@@ -153,6 +173,7 @@ void *pmm_alloc_pages(size_t num_pages) {
             uint64_t start_page = i - num_pages + 1;
             for (uint64_t j = 0; j < num_pages; j++) {
                 bitmap_set_bit(start_page + j);
+                pp_refcounts[start_page + j] = 1;
             }
             used_pages += num_pages;
             spinlock_release(&pmm_lock);
@@ -166,42 +187,51 @@ void *pmm_alloc_pages(size_t num_pages) {
 
 void pmm_free_page(void *page) {
     if (!page) return;
-    
+
     uint64_t page_index = (uint64_t)page / PAGE_SIZE;
 
     spinlock_acquire(&pmm_lock);
-    
-    if (page_index < total_pages && bitmap_test_bit(page_index)) {
-        bitmap_clear_bit(page_index);
-        used_pages--;
 
-        if (page_index < last_used_index) {
-            last_used_index = page_index;
+    if (page_index < total_pages && bitmap_test_bit(page_index)) {
+        // Phase 17: decrement refcount; actually free only at zero.
+        if (pp_refcounts[page_index] > 0) {
+            pp_refcounts[page_index]--;
+        }
+        if (pp_refcounts[page_index] == 0) {
+            bitmap_clear_bit(page_index);
+            used_pages--;
+
+            if (page_index < last_used_index) {
+                last_used_index = page_index;
+            }
         }
     }
-    
+
     spinlock_release(&pmm_lock);
 }
 
 void pmm_free_pages(void *pages, size_t num_pages) {
     if (!pages || num_pages == 0) return;
-    
+
     uint64_t start_page_index = (uint64_t)pages / PAGE_SIZE;
-    
+
     spinlock_acquire(&pmm_lock);
-    
+
     for (size_t i = 0; i < num_pages; i++) {
         uint64_t page_index = start_page_index + i;
         if (page_index < total_pages && bitmap_test_bit(page_index)) {
-            bitmap_clear_bit(page_index);
-            used_pages--;
+            if (pp_refcounts[page_index] > 0) pp_refcounts[page_index]--;
+            if (pp_refcounts[page_index] == 0) {
+                bitmap_clear_bit(page_index);
+                used_pages--;
+            }
         }
     }
-    
+
     if (start_page_index < last_used_index) {
         last_used_index = start_page_index;
     }
-    
+
     spinlock_release(&pmm_lock);
 }
 
@@ -217,4 +247,34 @@ uint64_t pmm_get_free_memory(void) {
     uint64_t free_mem = usable_memory - (used_pages * PAGE_SIZE);
     spinlock_release(&pmm_lock);
     return free_mem;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 17: per-page refcount API.
+// ---------------------------------------------------------------------------
+
+void pmm_page_ref(void *page) {
+    if (!page) return;
+    uint64_t idx = (uint64_t)page / PAGE_SIZE;
+    spinlock_acquire(&pmm_lock);
+    if (idx < total_pages && bitmap_test_bit(idx)) {
+        // Saturate at 255. Sharing a page 256-ways pins it forever, which is
+        // acceptable for Phase 17 scale (fewer than 256 processes).
+        if (pp_refcounts[idx] < 255) pp_refcounts[idx]++;
+    }
+    spinlock_release(&pmm_lock);
+}
+
+void pmm_page_unref(void *page) {
+    pmm_free_page(page);  // same semantics: decrement + free-at-zero
+}
+
+uint8_t pmm_page_get_refcount(void *page) {
+    if (!page) return 0;
+    uint64_t idx = (uint64_t)page / PAGE_SIZE;
+    if (idx >= total_pages) return 0;
+    spinlock_acquire(&pmm_lock);
+    uint8_t r = pp_refcounts[idx];
+    spinlock_release(&pmm_lock);
+    return r;
 }

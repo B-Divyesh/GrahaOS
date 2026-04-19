@@ -1,7 +1,7 @@
 // kernel/state.c
 // Phase 8a: System state collection and snapshot module
 #include "state.h"
-#include "capability.h"
+#include "cap/can.h"
 #include "../arch/x86_64/mm/pmm.h"
 #include "../arch/x86_64/cpu/sched/sched.h"
 #include "../arch/x86_64/cpu/smp.h"

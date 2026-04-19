@@ -13,6 +13,7 @@
 #include "interrupts.h"
 #include "../drivers/serial/serial.h"
 #include "../../../kernel/log.h"
+#include "../../../kernel/percpu.h"
 
 // External assembly function from ap_start.S
 #if LIMINE_API_REVISION >= 1
@@ -111,9 +112,20 @@ void ap_main(struct limine_smp_info *info) {
     g_cpu_locals[info->processor_id].cpu_id = info->processor_id;
     g_cpu_locals[info->processor_id].lapic_id = info->lapic_id;
     write_msr(MSR_GS_BASE, (uint64_t)&g_cpu_locals[info->processor_id]);
-    
-    // Initialize core structures
+
+    // Phase 14: initialise the Phase 14 extension fields (magazines,
+    // preempt counters, self-pointer) for this AP. Done via direct
+    // array indexing, not GS-relative, so it doesn't care if GSBASE
+    // gets clobbered by the upcoming gdt_init.
+    percpu_init(info->processor_id);
+
+    // Initialize core structures. gdt_init_for_cpu performs
+    // `mov gs, ax` with the kernel data selector — in long mode this
+    // clobbers the hidden GS.base that we just wrote via MSR_GS_BASE.
+    // Re-issue the wrmsr after GDT reload so per_cpu() reads land in
+    // this CPU's block.
     gdt_init_for_cpu(info->processor_id);
+    write_msr(MSR_GS_BASE, (uint64_t)&g_cpu_locals[info->processor_id]);
     idt_init();
     lapic_init();
     syscall_init();
@@ -189,9 +201,14 @@ void smp_init(volatile struct limine_mp_request *mp_request) {
     write_msr(MSR_GS_BASE, (uint64_t)&g_cpu_locals[0]);
     klog(KLOG_INFO, SUBSYS_CORE, "[SMP] BSP GS_BASE set");
 
-    // Initialize BSP's GDT and TSS (per-CPU version)
+    // Initialize BSP's GDT and TSS (per-CPU version). gdt_init_for_cpu
+    // reloads the data segment registers, and in long mode `mov gs, ax`
+    // clobbers the hidden GS.base we set via wrmsr above. Re-issue the
+    // wrmsr after the GDT reload so Phase 14 per_cpu() reads land in
+    // this CPU's block.
     klog(KLOG_INFO, SUBSYS_CORE, "[SMP] Calling gdt_init_for_cpu...");
     gdt_init_for_cpu(0);
+    write_msr(MSR_GS_BASE, (uint64_t)&g_cpu_locals[0]);
     klog(KLOG_INFO, SUBSYS_CORE, "[SMP] GDT init done");
 
     // Initialize BSP's LAPIC
@@ -321,10 +338,12 @@ void smp_init(volatile struct limine_smp_request *smp_request) {
     g_cpu_locals[0].cpu_id = 0;
     g_cpu_locals[0].lapic_id = g_bsp_lapic_id;
     write_msr(MSR_GS_BASE, (uint64_t)&g_cpu_locals[0]);
-    
-    // Initialize BSP's GDT and TSS (per-CPU version)
+
+    // Initialize BSP's GDT and TSS (per-CPU version). Re-write GSBASE
+    // after, since gdt_load clobbers the hidden GS.base via `mov gs, ax`.
     gdt_init_for_cpu(0);
-    
+    write_msr(MSR_GS_BASE, (uint64_t)&g_cpu_locals[0]);
+
     // Initialize BSP's LAPIC
     lapic_init();
     

@@ -27,7 +27,7 @@ static uint8_t *arena_base = NULL;
 static struct block_header *free_list = NULL;
 static int kmalloc_initialized = 0;
 
-void kmalloc_init(void) {
+void net_kmalloc_init(void) {
     if (kmalloc_initialized) return;
 
     // Allocate contiguous physical pages
@@ -46,7 +46,7 @@ void kmalloc_init(void) {
     kmalloc_initialized = 1;
 }
 
-void *kmalloc(size_t size) {
+void *net_kmalloc(size_t size) {
     if (size == 0 || !kmalloc_initialized) return NULL;
 
     // Align to 16 bytes
@@ -75,7 +75,7 @@ void *kmalloc(size_t size) {
     return NULL;  // Arena exhausted
 }
 
-void kfree(void *ptr) {
+void net_kfree(void *ptr) {
     if (!ptr || !kmalloc_initialized) return;
 
     // Validate pointer is within arena
@@ -105,10 +105,10 @@ void kfree(void *ptr) {
     }
 }
 
-void *kcalloc(size_t nmemb, size_t size) {
+void *net_kcalloc(size_t nmemb, size_t size) {
     size_t total = nmemb * size;
     if (total == 0) return NULL;
-    void *ptr = kmalloc(total);
+    void *ptr = net_kmalloc(total);
     if (ptr) {
         // Use extern memset from kernel/main.c
         extern void *memset(void *, int, size_t);
@@ -117,10 +117,10 @@ void *kcalloc(size_t nmemb, size_t size) {
     return ptr;
 }
 
-void *krealloc(void *ptr, size_t new_size) {
-    if (!ptr) return kmalloc(new_size);
+void *net_krealloc(void *ptr, size_t new_size) {
+    if (!ptr) return net_kmalloc(new_size);
     if (new_size == 0) {
-        kfree(ptr);
+        net_kfree(ptr);
         return NULL;
     }
 
@@ -131,11 +131,11 @@ void *krealloc(void *ptr, size_t new_size) {
     if (new_size <= old_size) return ptr;
 
     // Allocate new block, copy, free old
-    void *new_ptr = kmalloc(new_size);
+    void *new_ptr = net_kmalloc(new_size);
     if (!new_ptr) return NULL;
 
     extern void *memcpy(void *, const void *, size_t);
     memcpy(new_ptr, ptr, old_size);
-    kfree(ptr);
+    net_kfree(ptr);
     return new_ptr;
 }

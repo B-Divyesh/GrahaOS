@@ -15,7 +15,7 @@
 #define STATE_CAT_ALL            255
 
 // Limits (must match kernel defines)
-#define STATE_MAX_TASKS       32
+#define STATE_MAX_TASKS       64
 #define STATE_PROC_NAME_LEN   32
 #define STATE_MAX_DRIVERS     16
 #define STATE_DRIVER_NAME_LEN 24

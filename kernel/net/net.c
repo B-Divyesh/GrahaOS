@@ -12,7 +12,7 @@
 #include "../../arch/x86_64/cpu/interrupts.h"
 #include "../../arch/x86_64/cpu/sched/sched.h"
 #include "../../arch/x86_64/mm/pmm.h"
-#include "../capability.h"
+#include "../cap/can.h"
 #include "../sync/spinlock.h"
 #include "../log.h"
 
@@ -679,9 +679,9 @@ void net_init(void) {
          s_has_rdrand ? "[NET] RDRAND available - using hardware RNG"
                       : "[NET] RDRAND not available - using software PRNG");
 
-    // Initialize kernel malloc arena
-    kmalloc_init();
-    klog(KLOG_INFO, SUBSYS_NET, "[NET] Kernel malloc arena ready (2MB)");
+    // Initialize kernel malloc arena (Mongoose-only, renamed in Phase 14).
+    net_kmalloc_init();
+    klog(KLOG_INFO, SUBSYS_NET, "[NET] Mongoose arena ready (2MB)");
 
     // Set up RNG for micro-ecc P-256 operations (ECDH key generation)
     extern void mg_uecc_set_rng(int (*)(uint8_t *, unsigned));

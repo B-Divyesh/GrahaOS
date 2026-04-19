@@ -818,12 +818,104 @@ void cmd_caps(void) {
     print(" active\n");
 }
 
+// Phase 15b: parse a CSV of class names into a pledge mask. Returns 0 on
+// unknown class.
+static uint16_t pledge_parse_csv(const char *csv) {
+    uint16_t mask = 0;
+    const char *p = csv;
+    while (*p) {
+        char tok[32];
+        int j = 0;
+        while (*p && *p != ',' && j < 31) tok[j++] = *p++;
+        tok[j] = 0;
+        if (*p == ',') p++;
+        if (j == 0) continue;
+        if      (strcmp(tok, "fs_read") == 0)     mask |= PLEDGE_FS_READ;
+        else if (strcmp(tok, "fs_write") == 0)    mask |= PLEDGE_FS_WRITE;
+        else if (strcmp(tok, "net_client") == 0)  mask |= PLEDGE_NET_CLIENT;
+        else if (strcmp(tok, "net_server") == 0)  mask |= PLEDGE_NET_SERVER;
+        else if (strcmp(tok, "spawn") == 0)       mask |= PLEDGE_SPAWN;
+        else if (strcmp(tok, "ipc_send") == 0)    mask |= PLEDGE_IPC_SEND;
+        else if (strcmp(tok, "ipc_recv") == 0)    mask |= PLEDGE_IPC_RECV;
+        else if (strcmp(tok, "sys_query") == 0)   mask |= PLEDGE_SYS_QUERY;
+        else if (strcmp(tok, "sys_control") == 0) mask |= PLEDGE_SYS_CONTROL;
+        else if (strcmp(tok, "ai_call") == 0)     mask |= PLEDGE_AI_CALL;
+        else if (strcmp(tok, "compute") == 0)     mask |= PLEDGE_COMPUTE;
+        else if (strcmp(tok, "time") == 0)        mask |= PLEDGE_TIME;
+        else if (strcmp(tok, "all") == 0)         mask |= PLEDGE_ALL;
+        else {
+            print("pledge: unknown class '");
+            print(tok);
+            print("'\n");
+            return 0;
+        }
+    }
+    return mask;
+}
+
+static void pledge_mask_to_hex4(uint16_t v, char out[5]) {
+    static const char hex[] = "0123456789abcdef";
+    out[0] = hex[(v >> 12) & 0xF];
+    out[1] = hex[(v >>  8) & 0xF];
+    out[2] = hex[(v >>  4) & 0xF];
+    out[3] = hex[(v >>  0) & 0xF];
+    out[4] = 0;
+}
+
+void cmd_pledge(const char *csv) {
+    if (!csv || !*csv) {
+        print("pledge: usage: pledge <class[,class,...]>\n");
+        print("  classes: fs_read fs_write net_client net_server spawn\n");
+        print("           ipc_send ipc_recv sys_query sys_control ai_call\n");
+        print("           compute time all\n");
+        return;
+    }
+    long old = syscall_debug3(DEBUG_READ_PLEDGE, 0, 0);
+    uint16_t new_mask = pledge_parse_csv(csv);
+    if (new_mask == 0) return;
+    long rc = syscall_pledge(new_mask);
+    if (rc == 0) {
+        char old_hex[5], new_hex[5];
+        pledge_mask_to_hex4((uint16_t)(old & 0xFFFF), old_hex);
+        pledge_mask_to_hex4(new_mask, new_hex);
+        print("pledge narrowed: 0x");
+        print(old_hex);
+        print(" -> 0x");
+        print(new_hex);
+        print("\n");
+    } else if (rc == CAP_V2_EPERM) {
+        print("pledge: cannot widen (new mask has bits not in current)\n");
+    } else if (rc == CAP_V2_EINVAL) {
+        print("pledge: invalid mask (zero, or reserved bits set)\n");
+    } else {
+        char buf[24];
+        uint64_to_str((uint64_t)(-rc), buf);
+        print("pledge: failed rc=-");
+        print(buf);
+        print("\n");
+    }
+}
+
+// Phase 16: activate/deactivate builtins now use the token-taking syscalls
+// (SYS_CAN_LOOKUP + SYS_CAN_{ACTIVATE,DEACTIVATE}_T). The legacy name-based
+// SYS_CAP_ACTIVATE (1031) and SYS_CAP_DEACTIVATE (1032) return -EDEPRECATED.
+static size_t gash_strlen(const char *s) {
+    size_t n = 0; while (s[n]) n++; return n;
+}
+
 void cmd_activate(const char *name) {
     if (!name || name[0] == '\0') {
         print("activate: usage: activate <capability_name>\n");
         return;
     }
-    int result = syscall_cap_activate(name);
+    cap_token_u_t tok = syscall_can_lookup(name, gash_strlen(name));
+    if (tok.raw == 0) {
+        print("activate: unknown capability '");
+        print(name);
+        print("'\n");
+        return;
+    }
+    long result = syscall_can_activate_t(tok);
     if (result == 0) {
         print("Activated: ");
         print(name);
@@ -831,9 +923,9 @@ void cmd_activate(const char *name) {
     } else {
         print("Failed to activate '");
         print(name);
-        print("' (error=");
+        print("' (rc=");
         char buf[12];
-        int_to_string(result, buf);
+        int_to_string((int)result, buf);
         print(buf);
         print(")\n");
     }
@@ -844,20 +936,31 @@ void cmd_deactivate(const char *name) {
         print("deactivate: usage: deactivate <capability_name>\n");
         return;
     }
-    int result = syscall_cap_deactivate(name);
-    if (result == 0) {
-        print("Deactivated: ");
+    cap_token_u_t tok = syscall_can_lookup(name, gash_strlen(name));
+    if (tok.raw == 0) {
+        print("deactivate: unknown capability '");
         print(name);
-        print("\n");
-    } else {
+        print("'\n");
+        return;
+    }
+    long result = syscall_can_deactivate_t(tok);
+    if (result < 0) {
         print("Failed to deactivate '");
         print(name);
-        print("' (error=");
+        print("' (rc=");
         char buf[12];
-        int_to_string(result, buf);
+        int_to_string((int)result, buf);
         print(buf);
         print(")\n");
+        return;
     }
+    print("Deactivated ");
+    char cbuf[12];
+    int_to_string((int)result, cbuf);
+    print(cbuf);
+    print(" cap(s) (including ");
+    print(name);
+    print(")\n");
 }
 
 void cmd_why_not(const char *name) {
@@ -2499,6 +2602,10 @@ static int execute_builtin(char *argv[], int argc) {
     }
     else if (strcmp(cmd, "caps") == 0) {
         cmd_caps();
+        return 1;
+    }
+    else if (strcmp(cmd, "pledge") == 0) {
+        cmd_pledge(argc > 1 ? argv[1] : "");
         return 1;
     }
     else if (strcmp(cmd, "activate") == 0) {

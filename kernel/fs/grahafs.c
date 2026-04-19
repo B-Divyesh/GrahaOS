@@ -9,7 +9,7 @@
 #include "../sync/spinlock.h"
 #include "../../arch/x86_64/drivers/ahci/ahci.h"
 #include "../../arch/x86_64/drivers/serial/serial.h"
-#include "../capability.h"
+#include "../cap/can.h"
 #include "../log.h"
 
 static block_device_t* fs_device = NULL;

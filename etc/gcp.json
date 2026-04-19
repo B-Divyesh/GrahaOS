@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "description": "GrahaOS Capability Protocol manifest. Every stream opcode and channel type has an entry here; kernel and userspace derive matching tables from it via scripts/gen_manifest.py.",
+  "types": {
+    "grahaos.io.v1": {
+      "description": "Phase 18 async I/O stream operations. Submitted via SYS_STREAM_SUBMIT to a stream created with this type_hash.",
+      "ops": {
+        "READ_VMO": {
+          "op": 1,
+          "pledge": "FS_READ",
+          "dispatcher": "dispatch_read_vmo",
+          "description": "Read len bytes from fd at offset into dest_vmo at dest_vmo_offset."
+        },
+        "WRITE_VMO": {
+          "op": 2,
+          "pledge": "FS_WRITE",
+          "dispatcher": "dispatch_write_vmo",
+          "description": "Write len bytes from dest_vmo at dest_vmo_offset into fd at offset."
+        },
+        "SENDMSG": {
+          "op": 3,
+          "pledge": "IPC_SEND",
+          "dispatcher": "dispatch_sendmsg",
+          "description": "Non-blocking send of inline payload into a channel referenced by fd_or_handle."
+        },
+        "OPEN": {
+          "op": 4,
+          "pledge": "FS_READ",
+          "dispatcher": "dispatch_open_stub",
+          "description": "Reserved. Dispatcher returns -ENOSYS until Phase 19."
+        },
+        "STAT": {
+          "op": 5,
+          "pledge": "FS_READ",
+          "dispatcher": "dispatch_stat_stub",
+          "description": "Reserved. Dispatcher returns -ENOSYS until Phase 19."
+        },
+        "FSYNC": {
+          "op": 6,
+          "pledge": "FS_WRITE",
+          "dispatcher": "dispatch_fsync_stub",
+          "description": "Reserved. Dispatcher returns -ENOSYS until Phase 19."
+        },
+        "CLOSE": {
+          "op": 7,
+          "pledge": "COMPUTE",
+          "dispatcher": "dispatch_close_stub",
+          "description": "Reserved. Dispatcher returns -ENOSYS until Phase 19."
+        }
+      }
+    },
+    "grahaos.io.completion.v1": {
+      "description": "Notification messages kernel sends on a stream's notify channel when a CQE is posted. Advisory only — reap from CQ VMO is authoritative.",
+      "ops": {}
+    },
+    "grahaos.notify.v1":   { "description": "Phase 17 channel notification type (legacy).",          "ops": {} },
+    "grahaos.pipe.bytes.v1": { "description": "Phase 17 pipe-shim byte-stream.",                     "ops": {} },
+    "grahaos.fault.v1":    { "description": "Phase 17 kernel-to-userspace fault notifications.",     "ops": {} },
+    "grahaos.shutdown.v1": { "description": "Phase 17 orderly shutdown broadcast.",                  "ops": {} },
+    "grahaos.audit.v1":    { "description": "Phase 17 structured audit records.",                     "ops": {} },
+    "grahaos.test.v1":     { "description": "Phase 17 test harness freeform messages.",               "ops": {} }
+  },
+  "syscalls": {
+    "SYS_STREAM_CREATE":  { "number": 1075, "pledge": ["compute"] },
+    "SYS_STREAM_SUBMIT":  { "number": 1076, "pledge": ["compute"], "caps": ["CAP_KIND_STREAM"] },
+    "SYS_STREAM_REAP":    { "number": 1077, "pledge": ["compute"], "caps": ["CAP_KIND_STREAM"] },
+    "SYS_STREAM_DESTROY": { "number": 1078, "pledge": ["compute"], "caps": ["CAP_KIND_STREAM"] }
+  }
+}

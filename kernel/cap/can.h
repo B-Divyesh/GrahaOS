@@ -1,5 +1,8 @@
-// kernel/capability.h
+// kernel/cap/can.h
 // Phase 8b: Capability Activation Network (CAN)
+// Phase 15a: renamed from kernel/capability.h; moved into kernel/cap/.
+// The former `capability_t` is now `can_entry_t` and is paired with a
+// `cap_object_t` (see kernel/cap/object.h) created by cap_register.
 //
 // Every system component - hardware, drivers, services, applications - is a
 // "switch" with ON/OFF state and declared dependencies. To use something, you
@@ -25,7 +28,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include "state.h"
+#include "../state.h"
 
 // --- Capability Type (Layer) Constants ---
 // Lower layers cannot depend on higher layers.
@@ -51,7 +54,7 @@
 #define CAP_OP_NAME_LEN   24
 
 // --- Driver Subtype Constants ---
-// Used in capability_t.subtype for CAP_DRIVER/CAP_SERVICE caps.
+// Used in can_entry_t.subtype for CAP_DRIVER/CAP_SERVICE caps.
 // Replaces the old DRIVER_TYPE_* constants from driver.h.
 #define CAP_SUBTYPE_BLOCK    0
 #define CAP_SUBTYPE_INPUT    1
@@ -79,6 +82,9 @@
 #define CAP_ERR_WATCH_FULL    -15   // Watcher list full (8 max)
 #define CAP_ERR_ALREADY_WATCH -16   // Already watching this cap
 #define CAP_ERR_NOT_WATCHING  -17   // Not watching this cap
+// Phase 16 additions for CAN callback failures.
+#define CAP_ERR_BUSY          -18   // Driver refuses to quiesce (in-flight I/O).
+#define CAP_ERR_SYNC_FAILED   -19   // Pre-deactivate sync failed (data at risk).
 
 // --- Operation Descriptor ---
 typedef struct {
@@ -99,7 +105,12 @@ typedef struct {
 
     // Callbacks
     int  (*activate_fn)(void);       // called on activation, NULL=always succeeds
-    void (*deactivate_fn)(void);     // called on deactivation, NULL=noop
+    int  (*deactivate_fn)(void);     // called on deactivation, NULL=noop; 0=ok, <0=fail
+    // Phase 16: optional refuse-predicate. Called before the dependent cascade.
+    // If non-NULL and returns nonzero, the whole deactivate aborts with
+    // -CAP_ERR_BUSY; no dependents are touched, state stays ON. Registered
+    // post-hoc via cap_set_refuse_hook (keeps cap_register signature stable).
+    int  (*refuse_deactivate_fn)(void);
 
     // Stats (reuses driver framework pattern)
     int  (*get_stats_fn)(state_driver_stat_t *stats, int max);
@@ -118,7 +129,12 @@ typedef struct {
     // Phase 8d: Event watchers
     int32_t  watcher_pids[8];    // PIDs watching this capability
     uint32_t watcher_count;      // Number of active watchers (slots 0..watcher_count-1)
-} capability_t;
+
+    // Phase 15a: paired cap_object_t index. Populated by cap_register after
+    // the 6-pass compiler commits. 0xFFFFFFFF if not yet paired (should never
+    // persist past cap_register success). See kernel/cap/object.h.
+    uint32_t cap_object_idx;
+} can_entry_t;
 
 // --- Registration API ---
 
@@ -130,7 +146,7 @@ typedef struct {
 // Returns: cap_id (>=0) on success, negative CAP_ERR_* on failure.
 int cap_register(const char *name, uint32_t type, uint32_t subtype, int32_t owner,
                  const char **dep_names, int dep_count,
-                 int (*activate_fn)(void), void (*deactivate_fn)(void),
+                 int (*activate_fn)(void), int (*deactivate_fn)(void),
                  cap_op_t *ops, int op_count,
                  int (*get_stats)(state_driver_stat_t*, int));
 
@@ -143,6 +159,24 @@ int cap_activate(int cap_id);
 // Deactivate a capability by ID. Cascades to dependents first.
 // Returns: 0 on success, negative on failure.
 int cap_deactivate(int cap_id);
+
+// Phase 16: deactivate but count how many caps were touched (self + cascaded
+// dependents). *out_count is populated on both success and partial success
+// (caller should zero it first if it wants to distinguish "never touched" from
+// "touched 0"). Returns 0 on success, CAP_ERR_BUSY if refused, other negative
+// errors on unrecoverable failures.
+int cap_deactivate_count(int cap_id, uint32_t *out_count);
+
+// Phase 16: attach a refuse-predicate to an existing CAN entry. fn may be
+// NULL to clear. Returns 0 on success, CAP_ERR_NOT_FOUND if cap_id is out of
+// range or the slot is freed. Callable from any context (no lock taken here;
+// stores happen while the registering driver is serialised by its init path).
+int cap_set_refuse_hook(int cap_id, int (*fn)(void));
+
+// Phase 16: reverse lookup — given a cap_object_idx (from cap_token_resolve),
+// return the can_id whose entry points at that object. Returns CAP_ERR_NOT_FOUND
+// if no CAN entry pairs with obj_idx. O(n) over registered caps.
+int cap_can_by_object_idx(uint32_t obj_idx);
 
 // --- Query API ---
 
@@ -200,3 +234,10 @@ void cap_unwatch_all_for_pid(int32_t pid);
 
 // Convenience function to set up a cap_op_t entry (avoids manual string copy in drivers)
 void cap_op_set(cap_op_t *op, const char *name, uint32_t param_count, uint32_t flags);
+
+// --- Phase 15a helper ---
+
+// Return the paired cap_object_t index for a given can_id, or
+// CAP_OBJECT_IDX_NONE (0xFFFFFFFF) if the cap was never paired or
+// the can slot is empty/deleted.
+uint32_t cap_get_object_idx(int can_id);

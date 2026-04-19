@@ -41,7 +41,19 @@ int puts(const char *s) {
     if (!s) {
         return EOF;
     }
-
+    // Phase 15b console-atomicity fix: build the string-plus-newline in a
+    // stack buffer and emit via one write() — keeps puts() output
+    // contiguous on the UART under concurrent writers. Fallback to the
+    // old per-char path only if the string is larger than the buffer.
+    size_t len = 0;
+    while (s[len]) len++;
+    if (len + 1 <= 2048) {
+        char line[2049];
+        for (size_t i = 0; i < len; i++) line[i] = s[i];
+        line[len] = '\n';
+        (void)write(1, line, len + 1);
+        return (int)(len + 1);
+    }
     int count = 0;
     while (*s) {
         putchar(*s++);
@@ -398,12 +410,24 @@ static int format_output(char *buf, size_t buf_size, const char *format, va_list
 /**
  * @brief Formatted output to stdout
  */
+// Phase 15b console-atomicity fix: printf used to call putchar per byte
+// (SYS_PUTC per char), which meant concurrent processes' output interleaved
+// on the shared console. Instead, format into a stack buffer and emit with
+// ONE syscall_write — the kernel's per-SYS_WRITE serial lock now keeps each
+// printf call contiguous on the UART. 2 KiB covers virtually all practical
+// output; excess is truncated (same behaviour as snprintf under-size).
 int printf(const char *format, ...) {
+    char line[2048];
     va_list args;
     va_start(args, format);
-    int written = format_output(NULL, 0, format, args);
+    int would_have = format_output(line, sizeof(line), format, args);
     va_end(args);
-    return written;
+    int n = (would_have < 0) ? 0 :
+            ((size_t)would_have >= sizeof(line) ? (int)sizeof(line) - 1 : would_have);
+    if (n > 0) {
+        (void)write(1, line, (size_t)n);
+    }
+    return would_have;
 }
 
 /**
@@ -432,7 +456,14 @@ int snprintf(char *str, size_t size, const char *format, ...) {
  * @brief Variadic formatted output to stdout
  */
 int vprintf(const char *format, va_list ap) {
-    return format_output(NULL, 0, format, ap);
+    char line[2048];
+    int would_have = format_output(line, sizeof(line), format, ap);
+    int n = (would_have < 0) ? 0 :
+            ((size_t)would_have >= sizeof(line) ? (int)sizeof(line) - 1 : would_have);
+    if (n > 0) {
+        (void)write(1, line, (size_t)n);
+    }
+    return would_have;
 }
 
 /**

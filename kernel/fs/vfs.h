@@ -36,6 +36,23 @@ typedef struct vfs_node* (*vfs_finddir_t)(struct vfs_node*, const char*);
 typedef int (*vfs_create_t)(struct vfs_node*, const char*, uint32_t);
 typedef int (*vfs_unlink_t)(struct vfs_node*, const char*);
 
+// Phase 18: async entry points. The `cb` is invoked when the operation
+// finishes (possibly synchronously from within the call). `user_data` is
+// echoed back. Return value: 0 if the operation was dispatched (completion
+// via cb), negative errno on synchronous failure (cb is NOT called in that
+// case). For Phase 18 MVP, grahafs_async_read invokes cb synchronously from
+// within the call — the async benefit comes from the worker-thread context,
+// not interrupt-driven AHCI.
+typedef void    (*vfs_async_completion_t)(int64_t result, void *user_data);
+typedef int     (*vfs_async_read_fn_t)(struct vfs_node*, uint64_t offset,
+                                       uint64_t len, void *dst,
+                                       vfs_async_completion_t cb,
+                                       void *user_data);
+typedef int     (*vfs_async_write_fn_t)(struct vfs_node*, uint64_t offset,
+                                        uint64_t len, const void *src,
+                                        vfs_async_completion_t cb,
+                                        void *user_data);
+
 // VFS node structure
 typedef struct vfs_node {
     char name[VFS_MAX_NAME];
@@ -56,6 +73,12 @@ typedef struct vfs_node {
     vfs_finddir_t finddir;
     vfs_create_t create;
     vfs_unlink_t unlink;
+
+    // Phase 18: async I/O entry points. NULL-means-unsupported; the generic
+    // vfs_async_read/write wrappers fall back to the sync path + immediate
+    // callback invocation if these are NULL.
+    vfs_async_read_fn_t  async_read;
+    vfs_async_write_fn_t async_write;
     
     // Filesystem this node belongs to
     struct vfs_filesystem* fs;
@@ -131,3 +154,20 @@ vfs_node_t* vfs_path_to_node(const char* path);
 
 // Phase 8a: Get VFS statistics for system state reporting
 void vfs_get_stats(uint32_t *open_files, uint32_t *block_devs, uint32_t *mounted_fs);
+
+// Phase 18: async entry-point wrappers. Resolves to the node's async_read /
+// async_write fn if installed; otherwise falls back to the sync node->read
+// / node->write and invokes the callback synchronously. Returns 0 on
+// dispatch (cb will fire) or a negative errno on synchronous failure (cb
+// NOT invoked). Called from kernel/io/dispatch_fs.c.
+int vfs_async_read(vfs_node_t *node, uint64_t offset, uint64_t len,
+                   void *dst, vfs_async_completion_t cb, void *user_data);
+int vfs_async_write(vfs_node_t *node, uint64_t offset, uint64_t len,
+                    const void *src, vfs_async_completion_t cb, void *user_data);
+
+// Phase 18: resolve a global open_file_table slot into its backing node.
+// The caller supplies the file-table index (per-process fd_table[].ref for
+// FD_TYPE_FILE). Returns NULL if the slot is not in use or has no node.
+// Does not bump the node's refcount; caller must not dereference after
+// the underlying fd is closed.
+vfs_node_t *vfs_node_for_file_slot(int slot);

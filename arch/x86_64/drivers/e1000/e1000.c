@@ -5,11 +5,12 @@
 #include "e1000.h"
 #include "../../cpu/pci.h"
 #include "../../cpu/ports.h"
+#include "../../cpu/interrupts.h"
 #include "../../mm/pmm.h"
 #include "../../mm/vmm.h"
 #include "../../drivers/serial/serial.h"
 #include "../../../../drivers/video/framebuffer.h"
-#include "../../../../kernel/capability.h"
+#include "../../../../kernel/cap/can.h"
 #include "../../../../kernel/sync/spinlock.h"
 #include <stddef.h>
 #include "../../../../kernel/log.h"
@@ -34,6 +35,17 @@ static uint64_t tx_packets = 0;
 static uint64_t rx_packets = 0;
 static uint64_t tx_bytes   = 0;
 static uint64_t rx_bytes   = 0;
+
+// Phase 16: PCI device identity (captured at init, used by activate/deactivate
+// to toggle the bus-master bit) and saved PCI command register (restored on
+// reactivate). IRQ line is the PCI legacy line used by this device; saved so
+// the mask-unmask pair is symmetric even if the PIC is currently disabled.
+static uint8_t  e1000_pci_bus;
+static uint8_t  e1000_pci_dev;
+static uint8_t  e1000_pci_func;
+static uint8_t  e1000_irq_line;       // Legacy IRQ line read from PCI config.
+static uint16_t e1000_saved_pci_cmd;
+static bool     g_e1000_active = true;
 
 // ---- Register access ----
 
@@ -227,9 +239,24 @@ void e1000_init(void) {
 
     klog(KLOG_INFO, SUBSYS_DRV, "[E1000] Found at bus=%lu dev=%lu func=%lu", (unsigned long)(net_dev.bus), (unsigned long)(net_dev.device), (unsigned long)(net_dev.function));
 
+    // Phase 16: stash the PCI triple globally so activate/deactivate can
+    // toggle the command register.
+    e1000_pci_bus  = net_dev.bus;
+    e1000_pci_dev  = net_dev.device;
+    e1000_pci_func = net_dev.function;
+    // Legacy IRQ line lives at PCI config offset 0x3C byte 0.
+    uint32_t intr_reg = pci_read_config(net_dev.bus, net_dev.device, net_dev.function, 0x3C);
+    e1000_irq_line = (uint8_t)(intr_reg & 0xFF);
+
     // Enable PCI bus mastering (required for DMA)
     pci_enable_bus_mastering(net_dev.bus, net_dev.device, net_dev.function);
     klog(KLOG_INFO, SUBSYS_DRV, "[E1000] Bus mastering enabled");
+
+    // Phase 16: snapshot the post-init command register so that the first
+    // cap_activate("e1000_nic") call is idempotent (no bits disturbed). Later
+    // deactivate/activate cycles overwrite this with the pre-deactivate value.
+    uint32_t cmd_init = pci_read_config(net_dev.bus, net_dev.device, net_dev.function, 0x04);
+    e1000_saved_pci_cmd = (uint16_t)(cmd_init & 0xFFFF);
 
     // Read BAR0 (Memory-Mapped I/O base)
     uint32_t bar0 = pci_read_bar(net_dev.bus, net_dev.device, net_dev.function, 0);
@@ -309,9 +336,92 @@ void e1000_init(void) {
     cap_op_set(&e1000_ops[0], "send", 2, 1);
     cap_op_set(&e1000_ops[1], "receive", 2, 0);
     cap_register("e1000_nic", CAP_DRIVER, CAP_SUBTYPE_OTHER, -1,
-                 e1000_deps, 1, NULL, NULL, e1000_ops, 2, e1000_get_stats);
+                 e1000_deps, 1, e1000_activate, e1000_deactivate,
+                 e1000_ops, 2, e1000_get_stats);
 
     klog(KLOG_INFO, SUBSYS_DRV, "[E1000] Driver initialized successfully");
+}
+
+// Phase 16: CAN deactivate. Save the PCI command register, clear bus-master
+// (bit 2) to stop outbound DMA, disable RX/TX via RCTL.EN / TCTL.EN, mask the
+// legacy IRQ line on the PIC, busy-wait briefly for in-flight descriptors to
+// drain, and flip g_e1000_active. Returns 0 on success; if `e1000_found` is
+// false we return 0 too (no hardware means no work).
+int e1000_deactivate(void) {
+    if (!e1000_found) {
+        g_e1000_active = false;
+        return 0;
+    }
+    // Snapshot command register (16 low bits of offset 0x04) for restore.
+    uint32_t cmd32 = pci_read_config(e1000_pci_bus, e1000_pci_dev,
+                                     e1000_pci_func, 0x04);
+    e1000_saved_pci_cmd = (uint16_t)(cmd32 & 0xFFFF);
+    // Clear Bus Master (bit 2) and Memory Space (bit 1) preserving the rest.
+    uint32_t cmd_off = (cmd32 & ~(uint32_t)0x0006u);
+    pci_write_config(e1000_pci_bus, e1000_pci_dev, e1000_pci_func, 0x04, cmd_off);
+
+    // Disable RX and TX on the controller itself.
+    uint32_t rctl = e1000_read_reg(E1000_RCTL);
+    e1000_write_reg(E1000_RCTL, rctl & ~E1000_RCTL_EN);
+    uint32_t tctl = e1000_read_reg(E1000_TCTL);
+    e1000_write_reg(E1000_TCTL, tctl & ~E1000_TCTL_EN);
+    memory_barrier();
+
+    // Mask any in-flight interrupts. IMC-write sets the bits (it's the
+    // mask-clear — writing 1 clears the IRQ-enable in IMS).
+    e1000_write_reg(E1000_IMC, 0xFFFFFFFF);
+    (void)e1000_read_reg(E1000_ICR);  // clear pending
+
+    // Brief drain wait so DMA engine quiesces before PCI bus-master clears
+    // take effect hardware-side (~10ms of pause loops).
+    for (volatile int i = 0; i < 100000; i++) asm volatile("pause");
+
+    // Mask the legacy IRQ line at the PIC (belt-and-suspenders; the system
+    // is in LAPIC mode so this is redundant but symmetrical with activate).
+    if (e1000_irq_line > 0 && e1000_irq_line < 16) {
+        pic_mask_irq(e1000_irq_line);
+    }
+
+    g_e1000_active = false;
+    klog(KLOG_INFO, SUBSYS_DRV, "[E1000] deactivated (bus-master off, RCTL/TCTL disabled)");
+    return 0;
+}
+
+// Phase 16: CAN activate. Restore the saved PCI command register, re-enable
+// bus-master + memory space, unmask the IRQ line, re-enable RX/TX.
+int e1000_activate(void) {
+    if (!e1000_found) {
+        g_e1000_active = true;
+        return 0;
+    }
+    // Restore the command register (ORs in the saved bits to preserve any
+    // flags that were already set when we first captured it).
+    uint32_t cmd_now = pci_read_config(e1000_pci_bus, e1000_pci_dev,
+                                       e1000_pci_func, 0x04);
+    uint32_t cmd_restore = (cmd_now & ~(uint32_t)0xFFFFu) | (uint32_t)e1000_saved_pci_cmd;
+    pci_write_config(e1000_pci_bus, e1000_pci_dev, e1000_pci_func, 0x04, cmd_restore);
+
+    // Unmask IRQ at the PIC.
+    if (e1000_irq_line > 0 && e1000_irq_line < 16) {
+        pic_unmask_irq(e1000_irq_line);
+    }
+
+    // Re-enable RX and TX on the controller.
+    uint32_t rctl = e1000_read_reg(E1000_RCTL);
+    e1000_write_reg(E1000_RCTL, rctl | E1000_RCTL_EN);
+    uint32_t tctl = e1000_read_reg(E1000_TCTL);
+    e1000_write_reg(E1000_TCTL, tctl | E1000_TCTL_EN);
+    memory_barrier();
+
+    g_e1000_active = true;
+    klog(KLOG_INFO, SUBSYS_DRV, "[E1000] activated (bus-master on, RCTL/TCTL enabled)");
+    return 0;
+}
+
+bool     e1000_is_active(void)         { return g_e1000_active; }
+uint32_t e1000_debug_read_reg(uint32_t offset) {
+    if (!mmio_base) return 0;
+    return e1000_read_reg(offset);
 }
 
 // ---- Send packet ----
@@ -320,6 +430,9 @@ int e1000_send(const void *data, uint16_t length) {
     if (!e1000_found || !data || length == 0 || length > E1000_BUF_SIZE) {
         return -1;
     }
+    // Phase 16: fast-reject when the CAN cap is off. Callers see -ENETDOWN-ish
+    // behaviour via the normal error path.
+    if (!g_e1000_active) return -1;
 
     spinlock_acquire(&e1000_lock);
 

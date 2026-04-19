@@ -146,3 +146,50 @@ void vmm_destroy_address_space(vmm_address_space_t *space);
  * @param cr3 Physical address of the PML4 table.
  */
 void vmm_destroy_address_space_by_cr3(uint64_t cr3);
+
+// ---------------------------------------------------------------------------
+// Phase 17: VA reservation, page protection, page-fault hook.
+// ---------------------------------------------------------------------------
+
+/**
+ * Find an unmapped virtual-address range of the given length in the given
+ * address space. Searches top-down from 0x0000_7FFF_FFFF_F000 (well below
+ * the kernel half) for the first 4-KiB-aligned region where no PTE is present.
+ * Does NOT install any mappings. Caller follows up with vmm_map_page_by_cr3.
+ *
+ * @param cr3 Physical address of target PML4.
+ * @param len Length in bytes, must be 4-KiB aligned.
+ * @return Base virtual address of the range, or 0 if none found.
+ */
+uint64_t vmm_reserve_va_by_cr3(uint64_t cr3, uint64_t len);
+
+/**
+ * Modify the flags of an already-mapped page. Used by COW to clear the
+ * writable bit. Invalidates TLB for the modified page.
+ *
+ * @param cr3  Physical address of target PML4.
+ * @param virt Virtual address of mapped page (must be 4-KiB aligned).
+ * @param new_flags New PTE flags (physical-address bits are preserved).
+ * @return true if the page was mapped and flags updated; false otherwise.
+ */
+bool vmm_protect_page_by_cr3(uint64_t cr3, uint64_t virt, uint64_t new_flags);
+
+/**
+ * Page-fault hook signature. Handlers return 0 if the fault was handled
+ * (caller resumes the faulting task), or a negative value to indicate
+ * "not my fault — let the generic handler take over".
+ */
+typedef int (*vmm_pf_handler_t)(uint64_t fault_va, uint64_t error_code);
+
+/**
+ * Install the page-fault handler. Called once at boot. There is exactly one
+ * slot in Phase 17; future phases can extend to a dispatch table.
+ */
+void vmm_install_pf_handler(vmm_pf_handler_t fn);
+
+/**
+ * Invoke the installed page-fault handler. Called from the CPU exception
+ * handler BEFORE the existing user-kill / kpanic fallback. Returns 0 if the
+ * fault was resolved, negative otherwise.
+ */
+int vmm_dispatch_pf(uint64_t fault_va, uint64_t error_code);
