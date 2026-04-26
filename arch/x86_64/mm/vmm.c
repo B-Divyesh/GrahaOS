@@ -1,6 +1,7 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "../../../drivers/video/framebuffer.h"
+#include "../../../kernel/sync/spinlock.h"
 
 // Maximum number of address spaces (should match MAX_TASKS)
 #define MAX_ADDRESS_SPACES 32
@@ -15,6 +16,14 @@ static vmm_address_space_t kernel_space;
 // --- MODIFICATION: Make the pool non-static so sched.c can access it ---
 vmm_address_space_t address_space_pool[MAX_ADDRESS_SPACES];
 static int next_address_space_idx = 0;
+
+// Phase 20 SMP: serialize address-space pool slot allocation. Without this
+// two CPUs concurrently entering vmm_create_address_space pick the same NULL
+// slot, both alloc a PML4, both write space->top_level — one PML4 leaks and
+// both tasks share an address space. Manifested as silent test hangs after
+// AP release. Held only across the slot pick + assignment, not across PMM
+// allocation or the kernel-mapping copy (those have their own locks).
+static spinlock_t g_address_space_pool_lock = SPINLOCK_INITIALIZER("aspool");
 
 // Internal helper functions
 static void vmm_memset(void *s, int c, size_t n) {
@@ -191,7 +200,12 @@ void vmm_switch_address_space_phys(uint64_t pml4_phys) {
 }
 
 vmm_address_space_t* vmm_create_address_space(void) {
-    // First, try to reuse a freed slot (top_level == NULL)
+    // SMP: serialize the slot pick + commit. Two CPUs concurrently
+    // entering this function would otherwise both pick the same NULL slot
+    // and one PML4 would leak / both tasks would share an address space.
+    // PMM allocation IS held under this lock for simplicity — it has its
+    // own internal lock that is always held briefly.
+    spinlock_acquire(&g_address_space_pool_lock);
     vmm_address_space_t *space = NULL;
     for (int i = 0; i < MAX_ADDRESS_SPACES; i++) {
         if (address_space_pool[i].top_level == NULL) {
@@ -199,22 +213,20 @@ vmm_address_space_t* vmm_create_address_space(void) {
             break;
         }
     }
-
     if (!space) {
-        // No free slots available
         if (next_address_space_idx >= MAX_ADDRESS_SPACES) {
+            spinlock_release(&g_address_space_pool_lock);
             return NULL;
         }
         space = &address_space_pool[next_address_space_idx++];
     }
 
-    // Allocate a new PML4 table
     void *pml4_phys = pmm_alloc_page();
     if (!pml4_phys) {
+        spinlock_release(&g_address_space_pool_lock);
         return NULL;
     }
 
-    // Set up the address space structure
     space->top_level = (uint64_t*)((uint64_t)pml4_phys + g_hhdm_offset);
     vmm_memset(space->top_level, 0, PAGE_SIZE);
 
@@ -226,6 +238,7 @@ vmm_address_space_t* vmm_create_address_space(void) {
         space->top_level[i] = k_space->top_level[i];
     }
 
+    spinlock_release(&g_address_space_pool_lock);
     return space;
 }
 

@@ -1,6 +1,9 @@
 #include "interrupts.h"
 #include "ports.h"
 #include "sched/sched.h"
+#include "smp.h"
+#include "../../../kernel/sync/spinlock.h"
+extern spinlock_t sched_lock;
 #include "../../../drivers/video/framebuffer.h"
 #include "../../drivers/keyboard/keyboard.h"
 #include "../../drivers/lapic/lapic.h"
@@ -228,14 +231,17 @@ void interrupt_handler(struct interrupt_frame *frame) {
             print_hex_value("RIP:", frame->rip, 500, 460);
             print_hex_value("R11:", frame->r11, 500, 480);
 
-            // Kill the user process instead of halting the entire system
+            // Kill the user process instead of halting the entire system.
+            // SMP-safe ordering: bookkeeping first, ZOMBIE state LAST. See
+            // SYS_EXIT comment for why — same use-after-free hazard.
             task_t *current = sched_get_current_task();
             if (current) {
                 klog(KLOG_INFO, SUBSYS_CORE, "[PF] Killing user process %lu (page fault at 0x%lx)", (unsigned long)(current->id), (unsigned long)(fault_addr));
                 current->exit_status = 128 + 14;  // SIGSEGV-like
-                current->state = TASK_STATE_ZOMBIE;
                 sched_orphan_children(current->id);
                 wake_waiting_parent(current->id);
+                __atomic_store_n((volatile int *)&current->state, (int)TASK_STATE_ZOMBIE,
+                                 __ATOMIC_RELEASE);
             }
             schedule(frame);
             return;
@@ -300,14 +306,17 @@ void interrupt_handler(struct interrupt_frame *frame) {
         if (frame->cs & 3) {
             framebuffer_draw_string("USER MODE crash - killing process", 10, 70, COLOR_YELLOW, COLOR_RED);
 
-            // Kill the user process instead of halting the entire system
+            // Kill the user process instead of halting the entire system.
+            // SMP-safe ordering: ZOMBIE LAST so the parent reaper can't free
+            // task_ptrs[id] while we're still cleaning up.
             task_t *current = sched_get_current_task();
             if (current) {
                 klog(KLOG_INFO, SUBSYS_CORE, "[EXCEPTION] Killing user process %lu (exception #%lu at RIP=0x%lx)", (unsigned long)(current->id), (unsigned long)(frame->int_no), (unsigned long)(frame->rip));
                 current->exit_status = 128 + frame->int_no;
-                current->state = TASK_STATE_ZOMBIE;
                 sched_orphan_children(current->id);
                 wake_waiting_parent(current->id);
+                __atomic_store_n((volatile int *)&current->state, (int)TASK_STATE_ZOMBIE,
+                                 __ATOMIC_RELEASE);
             }
             schedule(frame);
             return;
@@ -341,10 +350,25 @@ void interrupt_handler(struct interrupt_frame *frame) {
                 // Phase 12: TEST_TIMEOUT watchdog piggybacks on the
                 // timer tick. No-op unless armed via watchdog_arm().
                 watchdog_tick(g_timer_ticks);
-                // Note: Minimal logging to avoid slowing down interrupts
-                static volatile uint32_t timer_tick_count = 0;
-                if ((timer_tick_count++ & 0xFF) == 0) {  // Log every 256 ticks
-                    klog(KLOG_INFO, SUBSYS_CORE, "[TIMER] Tick");
+                {
+                    // SMP diagnostic: per-CPU heartbeat. Each CPU logs once
+                    // per second so a hang on a specific CPU is visible.
+                    extern uint32_t g_cpu_count;
+                    extern cpu_local_t g_cpu_locals[];
+                    uint32_t cpu = smp_get_current_cpu();
+                    static volatile uint64_t last_heartbeat[16] = {0};
+                    if (cpu < 16) {
+                        if (g_timer_ticks - last_heartbeat[cpu] >= 100u) {
+                            last_heartbeat[cpu] = g_timer_ticks;
+                            klog(KLOG_INFO, SUBSYS_CORE,
+                                 "[HB] cpu=%lu ticks=%lu runq.current=%ld",
+                                 (unsigned long)cpu,
+                                 (unsigned long)g_timer_ticks,
+                                 (long)(g_cpu_locals[cpu].runq.current
+                                        ? g_cpu_locals[cpu].runq.current->id
+                                        : -1));
+                        }
+                    }
                 }
                 schedule(frame);
                 break;
@@ -355,11 +379,25 @@ void interrupt_handler(struct interrupt_frame *frame) {
                     outb(PIC1_COMMAND, PIC_EOI);
                 }
                 break;
+            case 48:
+                // Phase 20 IPI_VEC_WAKEUP: no-op handler. Its sole purpose
+                // is to force the target CPU out of hlt. The EOI is sent
+                // below at the end of the dispatch switch; on IRQ return
+                // the CPU executes iret and, if an interrupt is still
+                // pending on schedule (timer), lands there next.
+                break;
             case 255: // Spurious interrupt from LAPIC
                 // Just return, no EOI needed for spurious
                 return;
             default:
-                // Unknown interrupt - ignore
+                // Phase 21: vectors 50..65 are the userspace-driver IRQ pool.
+                // Forward to userdrv_isr_dispatch which posts a drv_irq_msg
+                // into the owning daemon's SPSC ring + wakes the daemon.
+                if (frame->int_no >= 50 && frame->int_no <= 65) {
+                    extern void userdrv_isr_dispatch(uint8_t vector);
+                    userdrv_isr_dispatch((uint8_t)frame->int_no);
+                }
+                // Otherwise unknown — ignore (LAPIC EOI sent below).
                 break;
         }
 

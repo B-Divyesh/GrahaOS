@@ -26,10 +26,19 @@
 // Phase 18: stream completion notifications (channel payload type).
 #define MANIFEST_NAME_IO_COMPLETION_V1 "grahaos.io.completion.v1"
 
+// Phase 22: named channel registry + netd service + raw ethernet bridge.
+#define MANIFEST_NAME_NET_ACCEPT_V1    "grahaos.net.accept.v1"   // publisher accept channel
+#define MANIFEST_NAME_NET_FRAME_V1     "grahaos.net.frame.v1"    // per-conn rawframe data
+#define MANIFEST_NAME_NET_SOCKET_V1    "grahaos.net.socket.v1"   // per-conn service data
+
+// Phase 23: ahcid block-I/O service + diagnostic channel types.
+#define MANIFEST_NAME_BLK_SERVICE_V1   "grahaos.blk.service.v1"  // ahcid per-client RPC
+#define MANIFEST_NAME_BLK_LIST_V1      "grahaos.blk.list.v1"     // blkctl diagnostic
+
 // Initialise the type-hash table. Called once from kmain after cap_object_init.
 void manifest_init(void);
 
-// Is this hash registered? Linear scan, ≤ 6 entries.
+// Is this hash registered? Linear scan, ≤ 10 entries.
 bool manifest_type_known(uint64_t type_hash);
 
 // Fast accessor: hash for a well-known name (populated by manifest_init).
@@ -41,6 +50,11 @@ uint64_t manifest_hash_fault_v1(void);
 uint64_t manifest_hash_shutdown_v1(void);
 uint64_t manifest_hash_audit_v1(void);
 uint64_t manifest_hash_test_v1(void);
+uint64_t manifest_hash_net_accept_v1(void);
+uint64_t manifest_hash_net_frame_v1(void);
+uint64_t manifest_hash_net_socket_v1(void);
+uint64_t manifest_hash_blk_service_v1(void);
+uint64_t manifest_hash_blk_list_v1(void);
 
 // Lazy-compute helper reusing kernel/fs/simhash.c's fnv1a_hash64. Callable
 // from any context.

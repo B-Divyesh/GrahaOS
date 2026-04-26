@@ -2,8 +2,10 @@
 //
 // 24 TAP assertions covering channel lifecycle, send/recv round-trip,
 // type-hash enforcement, full-ring EAGAIN, and pledge enforcement. All
-// assertions run within a single process (cross-process tests require
-// SYS_SPAWN attrs which are deferred to Phase 17.1).
+// assertions run within a single process. (Cross-process tests would
+// use SYS_SPAWN_EX with attrs.handles_to_inherit, available since
+// Phase 20 — but the in-process coverage here fully exercises the
+// channel mechanics without needing the cross-process plumbing.)
 
 #include "../libtap.h"
 #include "../syscalls.h"

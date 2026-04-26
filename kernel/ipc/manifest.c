@@ -8,7 +8,10 @@
 #include "fs/simhash.h"    // fnv1a_hash64()
 #include "log.h"
 
-#define MANIFEST_SLOTS 7
+// Phase 22 bumped MANIFEST_SLOTS 7 → 10 (added net.accept.v1 / net.frame.v1 /
+// net.socket.v1). Phase 23 bumped 10 → 12 (added blk.service.v1 / blk.list.v1).
+// 64-bit FNV-1a keeps collision probability astronomical.
+#define MANIFEST_SLOTS 12
 
 static uint64_t g_hashes[MANIFEST_SLOTS];
 static bool     g_manifest_ready = false;
@@ -26,6 +29,11 @@ void manifest_init(void) {
     g_hashes[4] = manifest_compute_hash(MANIFEST_NAME_AUDIT_V1);
     g_hashes[5] = manifest_compute_hash(MANIFEST_NAME_TEST_V1);
     g_hashes[6] = manifest_compute_hash(MANIFEST_NAME_IO_COMPLETION_V1);
+    g_hashes[7] = manifest_compute_hash(MANIFEST_NAME_NET_ACCEPT_V1);
+    g_hashes[8] = manifest_compute_hash(MANIFEST_NAME_NET_FRAME_V1);
+    g_hashes[9] = manifest_compute_hash(MANIFEST_NAME_NET_SOCKET_V1);
+    g_hashes[10] = manifest_compute_hash(MANIFEST_NAME_BLK_SERVICE_V1);
+    g_hashes[11] = manifest_compute_hash(MANIFEST_NAME_BLK_LIST_V1);
     g_manifest_ready = true;
     // Detect collisions: any two equal entries means the hash space is
     // compromised at build time. 64-bit FNV-1a has astronomically low
@@ -54,3 +62,8 @@ uint64_t manifest_hash_fault_v1(void)      { return g_manifest_ready ? g_hashes[
 uint64_t manifest_hash_shutdown_v1(void)   { return g_manifest_ready ? g_hashes[3] : 0; }
 uint64_t manifest_hash_audit_v1(void)      { return g_manifest_ready ? g_hashes[4] : 0; }
 uint64_t manifest_hash_test_v1(void)       { return g_manifest_ready ? g_hashes[5] : 0; }
+uint64_t manifest_hash_net_accept_v1(void) { return g_manifest_ready ? g_hashes[7] : 0; }
+uint64_t manifest_hash_net_frame_v1(void)  { return g_manifest_ready ? g_hashes[8] : 0; }
+uint64_t manifest_hash_net_socket_v1(void) { return g_manifest_ready ? g_hashes[9] : 0; }
+uint64_t manifest_hash_blk_service_v1(void){ return g_manifest_ready ? g_hashes[10] : 0; }
+uint64_t manifest_hash_blk_list_v1(void)   { return g_manifest_ready ? g_hashes[11] : 0; }

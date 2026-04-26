@@ -110,3 +110,38 @@ bool lapic_is_enabled(void) {
 volatile uint32_t* lapic_get_base(void) {
     return lapic_vaddr;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 20: apic_send_ipi — deliver `vector` to `target_lapic_id` via ICR.
+// On x86-64 the ICR is a 64-bit register split across two 32-bit LAPIC
+// offsets (HIGH contains destination in bits 56..63 relative to the full
+// 64-bit register; LOW contains vector + delivery-mode + destination-mode
+// bits). We use:
+//   - delivery mode 0 (Fixed)
+//   - destination mode 0 (Physical — target is a LAPIC ID, not a logical mask)
+//   - level Assert (bit 14)
+//   - trigger mode 0 (Edge)
+// After writing LOW the send is pending; hardware clears the Delivery
+// Status bit (12) when delivery completes. We wait for that before
+// returning so callers can serialise IPI traffic.
+// ---------------------------------------------------------------------------
+void apic_send_ipi(uint32_t target_lapic_id, uint8_t vector) {
+    if (!lapic_vaddr || !lapic_initialized) return;
+
+    // ICR_HIGH holds the destination LAPIC ID in bits 24..31 of that
+    // register (which corresponds to bits 56..63 of the full 64-bit ICR).
+    lapic_write(LAPIC_REG_ICR_HIGH, (target_lapic_id & 0xFFu) << 24);
+
+    // ICR_LOW: vector (0..7) | delivery Fixed (0<<8) | dest Physical (0<<11)
+    //        | level Assert (1<<14) | trigger Edge (0<<15).
+    uint32_t low = ((uint32_t)vector) | (1u << 14);
+    lapic_write(LAPIC_REG_ICR_LOW, low);
+
+    // Spin until Delivery Status (bit 12) clears. Typical latency is a
+    // handful of cycles on modern silicon; we cap at a generous bound to
+    // avoid any chance of hanging here if hardware misbehaves.
+    for (int i = 0; i < 100000; i++) {
+        if ((lapic_read(LAPIC_REG_ICR_LOW) & (1u << 12)) == 0) return;
+        __asm__ __volatile__("pause");
+    }
+}

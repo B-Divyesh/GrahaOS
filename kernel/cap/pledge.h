@@ -42,6 +42,9 @@ typedef struct {
 #define PLEDGE_CLASS_AI_CALL       9
 #define PLEDGE_CLASS_COMPUTE      10
 #define PLEDGE_CLASS_TIME         11
+// Phase 21: device-owning daemons.
+#define PLEDGE_CLASS_STORAGE_SERVER  12  // AHCI / NVMe daemon (Phase 23)
+#define PLEDGE_CLASS_INPUT_SERVER    13  // keyboard / mouse daemon (Phase 27)
 
 // Bit values as masks (for direct OR into pledge_mask_t.raw).
 #define PLEDGE_FS_READ     (1u << PLEDGE_CLASS_FS_READ)
@@ -56,9 +59,12 @@ typedef struct {
 #define PLEDGE_AI_CALL     (1u << PLEDGE_CLASS_AI_CALL)
 #define PLEDGE_COMPUTE     (1u << PLEDGE_CLASS_COMPUTE)
 #define PLEDGE_TIME        (1u << PLEDGE_CLASS_TIME)
+#define PLEDGE_STORAGE_SERVER  (1u << PLEDGE_CLASS_STORAGE_SERVER)
+#define PLEDGE_INPUT_SERVER    (1u << PLEDGE_CLASS_INPUT_SERVER)
 
-#define PLEDGE_RESERVED_MASK 0xF000u   // Bits 12..15; must be zero.
-#define PLEDGE_ALL           0x0FFFu   // All 12 classes.
+// Phase 21: bits 12..13 are now in use; bits 14..15 still reserved.
+#define PLEDGE_RESERVED_MASK 0xC000u   // Bits 14..15; must be zero.
+#define PLEDGE_ALL           0x3FFFu   // All 14 classes.
 #define PLEDGE_NONE          0x0000u   // Invalid for a running process.
 
 // Default minimum a process must retain: COMPUTE | TIME. Spec prohibits

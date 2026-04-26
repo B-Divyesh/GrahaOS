@@ -58,12 +58,135 @@
     "grahaos.fault.v1":    { "description": "Phase 17 kernel-to-userspace fault notifications.",     "ops": {} },
     "grahaos.shutdown.v1": { "description": "Phase 17 orderly shutdown broadcast.",                  "ops": {} },
     "grahaos.audit.v1":    { "description": "Phase 17 structured audit records.",                     "ops": {} },
-    "grahaos.test.v1":     { "description": "Phase 17 test harness freeform messages.",               "ops": {} }
+    "grahaos.test.v1":     { "description": "Phase 17 test harness freeform messages.",               "ops": {} },
+    "grahaos.net.frame.v1": {
+      "description": "Phase 22 raw Ethernet frame slot notify (e1000d → netd / future rawframe peers). Carries (op, slot, length) tuples; payload lives in the shared rx/tx ring VMOs that e1000d clones to peers via VMO_CLONE_SHARED at ANNOUNCE time.",
+      "ops": {}
+    },
+    "grahaos.net.service.v1": {
+      "description": "Phase 22 netd /sys/net/service per-client RPC channel. Carries libnet_msg headers (header.op_code) for HELLO / NET_QUERY / ICMP_ECHO / UDP_BIND / UDP_SENDTO / DNS_QUERY / TCP_OPEN / TCP_CLOSE / TCP_SEND / TCP_RECV / TCP_STATUS pairs.",
+      "ops": {}
+    },
+    "grahaos.net.socket.v1": {
+      "description": "Phase 22 per-TCP-socket subordinate channel — same op-code namespace as service.v1 but scoped to a single open TCP cookie (negotiated in TCP_OPEN_RESP).",
+      "ops": {}
+    },
+    "grahaos.net.accept.v1": {
+      "description": "Phase 22 named-channel accept channel for SYS_CHAN_PUBLISH/CONNECT. Internal kernel-side type used by rawnet.c to route a connector to the publisher's accept handler.",
+      "ops": {}
+    },
+    "grahaos.blk.service.v1": {
+      "description": "Phase 23 ahcid /sys/blk/service per-client RPC channel. Carries blk_req_msg_t requests (BLK_OP_READ/WRITE/FLUSH/IDENTIFY) and blk_resp_msg_t responses. Connect handshake: client sends blk_connect_msg_t with shared DMA VMO handle.",
+      "ops": {}
+    },
+    "grahaos.blk.list.v1": {
+      "description": "Phase 23 ahcid /sys/blk/list diagnostic channel. Used by /bin/blkctl to enumerate drives, sector counts, model strings, I/O counters.",
+      "ops": {}
+    }
   },
   "syscalls": {
     "SYS_STREAM_CREATE":  { "number": 1075, "pledge": ["compute"] },
     "SYS_STREAM_SUBMIT":  { "number": 1076, "pledge": ["compute"], "caps": ["CAP_KIND_STREAM"] },
     "SYS_STREAM_REAP":    { "number": 1077, "pledge": ["compute"], "caps": ["CAP_KIND_STREAM"] },
-    "SYS_STREAM_DESTROY": { "number": 1078, "pledge": ["compute"], "caps": ["CAP_KIND_STREAM"] }
+    "SYS_STREAM_DESTROY": { "number": 1078, "pledge": ["compute"], "caps": ["CAP_KIND_STREAM"] },
+
+    "SYS_FS_SNAPSHOT":      { "number": 1079, "pledge": ["fs_read"] },
+    "SYS_FS_LIST_VERSIONS": { "number": 1080, "pledge": ["fs_read"] },
+    "SYS_FS_REVERT":        { "number": 1081, "pledge": ["fs_write"] },
+    "SYS_FS_GC_NOW":        { "number": 1082, "pledge": ["sys_control"] },
+    "SYS_FSYNC":            { "number": 1083, "pledge": ["fs_write"] },
+
+    "SYS_SETRLIMIT": {
+      "number": 1084,
+      "pledge": ["sys_control"],
+      "description": "Set a per-task resource limit (mem pages, cpu ns/epoch, io bps). Pledge-gated by SYS_CONTROL regardless of direction (no self-lowering bypass). Out-of-spec: spec said 1081-1082; shifted +3 because Phase 19 consumed 1081-1083."
+    },
+    "SYS_GETRLIMIT": {
+      "number": 1085,
+      "pledge": ["sys_query"],
+      "description": "Read a per-task resource limit. Default-granted pledge class. Returns 0 + writes to *value_out; -ESRCH / -EINVAL / -EFAULT on failure."
+    },
+    "SYS_SPAWN_EX": {
+      "number": 1086,
+      "pledge": ["spawn", "sys_control"],
+      "description": "Spawn with optional rlimit overrides. attrs.flags & SPAWN_ATTR_HAS_RLIMIT requires PLEDGE_SYS_CONTROL in addition to PLEDGE_SPAWN."
+    },
+
+    "SYS_DRV_REGISTER": {
+      "number": 1087,
+      "pledge": ["sys_control", "net_server|storage_server|input_server"],
+      "caps": [],
+      "description": "Phase 21: claim a userspace driver for a PCI device. R10 = drv_caps_t* receiving MMIO + IRQ + downstream + upstream cap handles + BAR phys/size + IRQ vector. Pledge gates: SYS_CONTROL plus the class-specific (NET_SERVER for class 0x02, STORAGE_SERVER for 0x01, INPUT_SERVER for 0x09). Returns 0 on success or -ENODEV/-EBUSY/-EPLEDGE."
+    },
+    "SYS_DRV_IRQ_WAIT": {
+      "number": 1088,
+      "pledge": ["sys_control"],
+      "caps": ["CAP_KIND_IRQ_CHANNEL"],
+      "description": "Phase 21: block (or poll, timeout_ms=0) for IRQ messages from the SPSC ring associated with the supplied CAP_KIND_IRQ_CHANNEL token. Returns count copied (0..max_msgs) on success, 0 on timeout, -ESHUTDOWN on owner-death."
+    },
+    "SYS_MMIO_VMO_CREATE": {
+      "number": 1089,
+      "pledge": ["sys_control"],
+      "caps": [],
+      "description": "Phase 21: op=CREATE (default) maps a BAR-range as an MMIO VMO; phys+size validated against caller's owned BARs; returns CAP_KIND_MMIO_REGION cap_token. op=PHYS_QUERY (mode=1) resolves a VMO handle (CAP_KIND_VMO or _MMIO_REGION) and returns the physical backing of page_idx (used for descriptor-ring programming). Phase 21.1 extends SYS_VMO_MAP to accept CAP_KIND_MMIO_REGION."
+    },
+
+    "SYS_CHAN_PUBLISH": {
+      "number": 1091,
+      "pledge": ["ipc_send", "ipc_recv"],
+      "caps": [],
+      "description": "Phase 22: claim a named slot in the kernel-side rawnet registry (kernel/net/rawnet.c). Subsequent SYS_CHAN_CONNECT calls with the same name route a connector to this publisher's accept handler. ASCII names, ≤ 64 bytes. AUDIT_CHAN_NAME_PUBLISH=39 emitted on success. Returns 0 / -EPERM (name claimed) / -EBADF (no free slots)."
+    },
+    "SYS_CHAN_CONNECT": {
+      "number": 1092,
+      "pledge": ["ipc_send", "ipc_recv"],
+      "caps": [],
+      "description": "Phase 22: connect to a published named channel by string name. Returns a fresh channel pair (write + read tokens) routed to the publisher; the publisher receives the peer-end via its accept handler. AUDIT_CHAN_NAME_CONNECT=40 emitted on success. -EBADF if no publisher / publisher dead. Used for /sys/net/rawframe (e1000d→netd) and /sys/net/service (netd→clients)."
+    }
+  },
+
+  "retired_syscalls": {
+    "_note": "Phase 22 Stage F retired the in-kernel TCP/IP stack. The 5 entries below now return -ENOSYS (-38) after their pre-existing pledge gate. AUDIT_DEPRECATED_SYSCALL=17 is emitted on each call so audit_query surfaces unmigrated callers. Wrappers in user/syscalls.h are kept for pledgetest pledge-denial assertions; out-of-tree callers should migrate to libnet/libhttp.",
+    "SYS_NET_IFCONFIG": { "number": 1041, "retired_in_phase": 22, "replacement": "libnet_net_query(&ctx, LIBNET_NET_QUERY_FIELD_CONFIG, &resp)" },
+    "SYS_NET_STATUS":   { "number": 1042, "retired_in_phase": 22, "replacement": "libnet_net_query(&ctx, LIBNET_NET_QUERY_FIELD_ALL, &resp)" },
+    "SYS_HTTP_GET":     { "number": 1043, "retired_in_phase": 22, "replacement": "http_get(&resp, url, timeout_ms)" },
+    "SYS_DNS_RESOLVE":  { "number": 1044, "retired_in_phase": 22, "replacement": "libnet_dns_resolve(&ctx, hostname, &ip, timeout_ms)" },
+    "SYS_HTTP_POST":    { "number": 1045, "retired_in_phase": 22, "replacement": "http_post(&resp, url, body, body_len, content_type, timeout_ms)" }
+  },
+
+  "audit_events": {
+    "_note": "Phase 22 closeout: catalog of audit event ids (kernel/audit.h). Phase 22 added DEPRECATED_SYSCALL=17, CHAN_NAME_PUBLISH=39, CHAN_NAME_CONNECT=40.",
+    "AUDIT_DEPRECATED_SYSCALL":    17,
+    "AUDIT_CHAN_NAME_PUBLISH":     39,
+    "AUDIT_CHAN_NAME_CONNECT":     40
+  },
+
+  "phase22_libnet_msg_ops": {
+    "_note": "Phase 22 libnet GCP message op codes. Each request op pairs with response op = request | 0x8000. All travel as inline_payload on grahaos.net.service.v1 / grahaos.net.socket.v1 channels.",
+    "HELLO":       { "req": "0x0001", "resp": "0x8001", "purpose": "client → netd handshake; netd echoes capabilities" },
+    "NET_QUERY":   { "req": "0x0010", "resp": "0x8010", "purpose": "stack/interface state query (replaces SYS_NET_IFCONFIG / SYS_NET_STATUS)" },
+    "ICMP_ECHO":   { "req": "0x0020", "resp": "0x8020", "purpose": "ICMP ping primitive (used by /bin/ping)" },
+    "UDP_BIND":    { "req": "0x0030", "resp": "0x8030", "purpose": "bind UDP socket on local port" },
+    "UDP_SENDTO":  { "req": "0x0031", "resp": "0x8031", "purpose": "send UDP datagram to (ip,port)" },
+    "DNS_QUERY":   { "req": "0x0040", "resp": "0x8040", "purpose": "resolve hostname → A record(s) (replaces SYS_DNS_RESOLVE)" },
+    "TCP_OPEN":    { "req": "0x0050", "resp": "0x8050", "purpose": "open TCP connection to (ip,port); returns socket cookie" },
+    "TCP_CLOSE":   { "req": "0x0051", "resp": "0x8051", "purpose": "graceful FIN on socket" },
+    "TCP_SEND":    { "req": "0x0052", "resp": "0x8052", "purpose": "enqueue ≤ LIBNET_TCP_CHUNK_MAX bytes for transmission" },
+    "TCP_RECV":    { "req": "0x0053", "resp": "0x8053", "purpose": "drain bytes from per-socket rx ring; blocks/peeks" },
+    "TCP_STATUS":  { "req": "0x0054", "resp": "0x8054", "purpose": "query socket state (state enum + rx_buffered)" }
+  },
+
+  "phase22_rawframe_ops": {
+    "_note": "Phase 22 rawframe slot-notify ops on grahaos.net.frame.v1. e1000d publishes via SYS_CHAN_PUBLISH('/sys/net/rawframe', ...). RX_NOTIFY is e1000d → peer; TX_REQ is peer → e1000d.",
+    "RX_NOTIFY":  "0x01",
+    "TX_REQ":     "0x02",
+    "LINK_UP":    "0x10",
+    "LINK_DOWN":  "0x11",
+    "ANNOUNCE":   "0x20"
+  },
+  "rlimits": {
+    "RLIMIT_MEM": { "value": 1, "unit": "pages (4 KiB)", "default_user": 131072 },
+    "RLIMIT_CPU": { "value": 2, "unit": "ns per 1 s epoch", "default_user": 1000000000 },
+    "RLIMIT_IO":  { "value": 3, "unit": "bytes per second", "default_user": 0 }
   }
 }

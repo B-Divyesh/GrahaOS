@@ -9,7 +9,11 @@
 #include "../../../../kernel/cap/handle_table.h"
 #include "../../../../kernel/cap/pledge.h"
 
-#define MAX_TASKS 64
+// Phase 20: bumped 64 → 10240 to support the spec's AW-20.1 (1000-task
+// balance) and integration_tests (10240 stress). Soft-capped at
+// RLIMIT_MAX_TASKS in spawn/create paths; exceed → -EAGAIN. task_ptrs[]
+// remains as the iteration index until U7's schedule() rewrite drops it.
+#define MAX_TASKS 10240
 #define KERNEL_STACK_SIZE 16384
 
 // Signal definitions (Phase 7d)
@@ -48,7 +52,13 @@ typedef enum {
     // Phase 17: blocked on a channel endpoint (read or write waiter list).
     // Distinct from generic BLOCKED so the scheduler can enumerate IPC-wait
     // tasks separately and apply deadline-driven wakeups.
-    TASK_STATE_CHAN_WAIT
+    TASK_STATE_CHAN_WAIT,
+    // Phase 20: cpu_budget_remaining_ns reached ≤ 0 this epoch. Task is
+    // parked on its runq's starved_head until the next epoch tick refills
+    // its budget and moves it back to ready_tail. Distinct from BLOCKED so
+    // psinfo can count it separately and fairness auditing (AUDIT_SCHED_
+    // STARVATION) can identify starvation-vs-deliberate-block cases.
+    TASK_STATE_STARVED
 } task_state_t;
 
 // Phase 17: reason a task entered TASK_STATE_CHAN_WAIT.
@@ -84,7 +94,18 @@ typedef struct {
     // parent's handle table as a CAP_KIND_VMO. Requires PLEDGE_COMPUTE on
     // the parent.
     uint64_t exec_vmo;                 // cap_token_t raw
+    // Phase 20 U15: per-child resource-limit overrides. Default inheritance
+    // (parent → child) runs when SPAWN_ATTR_HAS_RLIMIT is clear. With the
+    // bit set, the caller MUST hold PLEDGE_SYS_CONTROL; the three fields
+    // overwrite the child's post-inheritance rlimit values after the
+    // task is created but before it gets placed on a runq.
+    uint64_t rlimit_mem_pages;
+    uint64_t rlimit_cpu_ns;
+    uint64_t rlimit_io_bps;
 } spawn_attrs_t;
+
+// spawn_attrs_t.flags bits.
+#define SPAWN_ATTR_HAS_RLIMIT  (1u << 0)
 
 // Task structure
 typedef struct task_struct {
@@ -144,6 +165,85 @@ typedef struct task_struct {
     // between "woke on data" (0) and "woke on timeout" (-ETIMEDOUT) or
     // "woke on channel close" (-EPIPE).
     int32_t             wait_result;
+
+    // ---------------------------------------------------------------------
+    // Phase 20: per-CPU runq linkage + CPU affinity.
+    // ---------------------------------------------------------------------
+    // runq_next / runq_prev: doubly-linked list links within a per-CPU
+    // runq. Valid only when state == READY or state == STARVED. NULL if
+    // not on any runq (RUNNING, BLOCKED, CHAN_WAIT, ZOMBIE).
+    struct task_struct *runq_next;
+    struct task_struct *runq_prev;
+    // cpu_pinned: -1 = schedulable on any CPU; 0..smp_cpu_count-1 = pinned
+    // to the named CPU (never migrates via work-stealing). Kernel idle
+    // tasks (one per AP) and the epoch task are pinned; user tasks default
+    // to -1.
+    int32_t  cpu_pinned;
+    // last_ran_cpu: CPU id of the most recent dispatch. Used by cross-CPU
+    // wakeup to route waking tasks back to their cache-warm home and by
+    // starvation audit. 0xFFFFFFFFu means "never ran".
+    uint32_t last_ran_cpu;
+    // last_ran_tsc: raw rdtsc() at most-recent dispatch. Used to compute
+    // elapsed-ns in schedule() for rlimit_check_cpu, and by
+    // AUDIT_SCHED_STARVATION to identify tasks READY but not dispatched.
+    uint64_t last_ran_tsc;
+
+    // ---------------------------------------------------------------------
+    // Phase 20: PID hash + global enumeration linkage.
+    // ---------------------------------------------------------------------
+    // hash_next: next task in the PID hash bucket (open chaining). NULL
+    // terminates the chain. Bucket index = id % PID_HASH_BUCKETS.
+    struct task_struct *hash_next;
+    // global_next / global_prev: doubly-linked list threading every live
+    // task_t. Used by psinfo, epoch tick, and TaskList-style enumeration.
+    // Head is g_task_global_head in pid_hash.c.
+    struct task_struct *global_next;
+    struct task_struct *global_prev;
+
+    // ---------------------------------------------------------------------
+    // Phase 20: resource limits + accounting.
+    // ---------------------------------------------------------------------
+    // mem_limit_pages: max physical pages (4 KiB each) this task may hold
+    // at once. 0 = unlimited. Checked by rlimit_check_mem at every user-
+    // attributable pmm_alloc_page site.
+    uint64_t mem_limit_pages;
+    // mem_pages_used: current pages held by this task. Incremented on
+    // successful map, decremented on unmap. Zeroed by sched_reap_zombie
+    // after vmm_destroy_address_space_by_cr3.
+    uint64_t mem_pages_used;
+    // cpu_time_slice_budget_ns: max ns of CPU per 1 s epoch. 0 = unlimited.
+    // Typical user default: 1_000_000_000 (100%).
+    uint64_t cpu_time_slice_budget_ns;
+    // cpu_budget_remaining_ns: ns left this epoch. Decremented per tick
+    // by (rdtsc() now - last_ran_tsc). Refilled by sched_epoch_task at
+    // 1 Hz. Signed so it can go briefly negative on the tick that exhausts
+    // the budget; sched_epoch_task treats anything ≤ 0 as "starved".
+    int64_t  cpu_budget_remaining_ns;
+    // io_rate_bytes_per_sec: max bytes/second through stream submit path.
+    // 0 = unlimited.
+    uint64_t io_rate_bytes_per_sec;
+    // io_tokens: current token bucket balance (bytes). Capped at
+    // io_rate_bytes_per_sec (one-second burst allowed). Can go briefly
+    // negative when a large SQE is dispatched in full; the next refill
+    // re-balances.
+    int64_t  io_tokens;
+    // io_pending_head: singly-linked list of stream_job_t entries that
+    // failed rlimit_check_io and are awaiting token refill. Drained by
+    // rlimit_refill_io_tokens per tick. Typed as void* to avoid pulling
+    // kernel/io/submit.h into the scheduler header.
+    void    *io_pending_head;
+    // is_idle: true for per-CPU idle tasks (one per CPU; pinned). The
+    // scheduler treats idle tasks specially — they are never on the runq
+    // (dispatched only as fallback when the runq is empty and
+    // work-stealing failed), their cpu_budget_remaining_ns is never
+    // decremented, and they are exempt from starvation audit.
+    bool     is_idle;
+    // last_starvation_epoch: epoch id (= g_timer_ticks / RLIMIT_EPOCH_TICKS)
+    // at which this task was last audited for starvation. Dedup guard — we
+    // emit at most one AUDIT_SCHED_STARVATION per task per epoch even if
+    // the scheduler visits the same starvation condition dozens of times
+    // during the exhaust window.
+    uint64_t last_starvation_epoch;
 } task_t;
 
 /**
@@ -280,6 +380,13 @@ task_t* sched_get_task_any(int id);
  * @return Current task index
  */
 int sched_get_current_task_index(void);
+
+// Phase 20: epoch task entry. A kernel thread pinned to CPU 0 that checks
+// g_timer_ticks against its last-seen value every wake-up and, on a 100-tick
+// boundary (1 s at 100 Hz), calls rlimit_epoch_tick() to refill CPU budgets
+// and drain starved lists back to ready. Registered via sched_create_task
+// in kmain after the audit flusher is live.
+void sched_epoch_task_entry(void);
 
 // Phase 8d: CAN event queue operations
 void sched_enqueue_cap_event(int32_t pid, const state_cap_event_t *event);

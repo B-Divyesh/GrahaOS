@@ -93,6 +93,12 @@ cpu_info_t* smp_get_cpu_info(uint32_t cpu_id) {
     return &g_cpu_info[cpu_id];
 }
 
+// Phase 20: BSP signals "APs may start their scheduler timers" via this
+// flag after grahafs_v2_mount completes in kmain. Until then, APs idle
+// without a timer. This preserves Phase 19's invariant that the FS is
+// mounted before any scheduling occurs.
+volatile bool g_ap_scheduler_go = false;
+
 // C entry point for APs
 #if LIMINE_API_REVISION >= 1
 void ap_main(struct limine_mp_info *info) {
@@ -101,13 +107,13 @@ void ap_main(struct limine_smp_info *info) {
 #endif
     // Keep interrupts disabled during initialization
     asm volatile("cli");
-    
+
     // Validate info
     if (!info || info->processor_id >= MAX_CPUS) {
         asm volatile("hlt");
         while(1);
     }
-    
+
     // Set up per-CPU data
     g_cpu_locals[info->processor_id].cpu_id = info->processor_id;
     g_cpu_locals[info->processor_id].lapic_id = info->lapic_id;
@@ -117,6 +123,9 @@ void ap_main(struct limine_smp_info *info) {
     // preempt counters, self-pointer) for this AP. Done via direct
     // array indexing, not GS-relative, so it doesn't care if GSBASE
     // gets clobbered by the upcoming gdt_init.
+    // Phase 20 side-effect: percpu_init now runs runq_init on this AP's
+    // per-CPU runqueue (sched_rq_head/tail placeholders replaced by the
+    // inline runq_t).
     percpu_init(info->processor_id);
 
     // Initialize core structures. gdt_init_for_cpu performs
@@ -129,13 +138,13 @@ void ap_main(struct limine_smp_info *info) {
     idt_init();
     lapic_init();
     syscall_init();
-    
+
     // Mark as active
     uint32_t cpu_id = info->processor_id;
     spinlock_acquire(&ap_startup_lock);
     g_cpu_info[cpu_id].active = true;
     aps_started++;
-    
+
     // Print message
     char msg[64] = "AP: CPU ";
     msg[8] = '0' + cpu_id;
@@ -148,12 +157,31 @@ void ap_main(struct limine_smp_info *info) {
     msg[15] = '\0';
     framebuffer_draw_string(msg, 50, 420 + (cpu_id * 20), COLOR_CYAN, 0x00101828);
     spinlock_release(&ap_startup_lock);
-    
-    // DON'T start timer yet - wait for BSP
-    // Just enable interrupts and idle
+
+    // Phase 20: wait for BSP to finish mounting FS and signal go-ahead. Then
+    // start this AP's LAPIC timer at 100 Hz (same vector 32 as BSP), enable
+    // interrupts, and drop into an idle loop. Every tick lands in the
+    // common schedule() which reads this CPU's local runq, work-steals if
+    // empty, falls back to the idle hlt.
+    while (!g_ap_scheduler_go) {
+        asm volatile("pause");
+    }
+    klog(KLOG_INFO, SUBSYS_CORE,
+         "[AP] CPU %u: g_ap_scheduler_go observed, arming LAPIC timer", cpu_id);
+
+    lapic_timer_init(100, 32);
+    klog(KLOG_INFO, SUBSYS_CORE,
+         "[AP] CPU %u: timer armed, enabling interrupts", cpu_id);
     asm volatile("sti");
-    
-    // Idle loop
+    klog(KLOG_INFO, SUBSYS_CORE,
+         "[AP] CPU %u: interrupts enabled, entering hlt loop", cpu_id);
+
+    // AP idle loop: hlt until next interrupt. The timer IRQ will call
+    // schedule() which may pick up a work-stolen task and jump to it; when
+    // that task blocks or time slices out, schedule() returns here and we
+    // hlt again. If the runq was empty and steal also failed, schedule()
+    // dispatches this CPU's notional idle task — which is, conceptually,
+    // this very loop.
     while (1) {
         asm volatile("hlt");
     }

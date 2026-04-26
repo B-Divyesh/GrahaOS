@@ -13,7 +13,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
+#include <stddef.h>
+extern void *memset(void *dest, int c, size_t n);
+extern void *memcpy(void *dest, const void *src, size_t n);
 
 #include "log.h"
 #include "rtc.h"
@@ -89,6 +91,10 @@ static const char *event_name(uint16_t ev) {
         "HANDLE_TRANSFER",
         "STREAM_OP_REJECTED",
         "STREAM_DESTROY_CANCELED",
+        "FS_JOURNAL_REPLAY",
+        "FS_REVERT",
+        "FS_GC_NOW",
+        "FS_SNAPSHOT",
     };
     if (ev > AUDIT_EVENT_MAX) return "UNKNOWN";
     return names[ev];
@@ -635,6 +641,62 @@ void audit_write_stream_destroy_canceled(int32_t caller_pid, uint32_t obj_idx,
     audit_enqueue(&e);
 }
 
+// -------------- Phase 19 writers --------------
+
+void audit_write_fs_journal_replay(uint32_t replayed, uint32_t discarded) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_FS_JOURNAL_REPLAY, PID_KERNEL, AUDIT_SRC_NATIVE);
+    e.object_idx  = 0xFFFFFFFFu;
+    e.result_code = 0;
+    char buf[96];
+    ksnprintf(buf, sizeof(buf), "replayed=%u discarded=%u",
+              (unsigned)replayed, (unsigned)discarded);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_fs_revert(int32_t caller_pid, uint32_t inode_num,
+                           uint64_t target_version, uint64_t new_version) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_FS_REVERT, caller_pid, AUDIT_SRC_NATIVE);
+    e.object_idx  = inode_num;
+    e.result_code = 0;
+    char buf[128];
+    ksnprintf(buf, sizeof(buf),
+              "inode=%u target=%llu new=%llu",
+              (unsigned)inode_num,
+              (unsigned long long)target_version,
+              (unsigned long long)new_version);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_fs_gc_now(int32_t caller_pid, uint32_t pruned,
+                           uint32_t segments_reclaimed) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_FS_GC_NOW, caller_pid, AUDIT_SRC_NATIVE);
+    e.object_idx  = 0xFFFFFFFFu;
+    e.result_code = 0;
+    char buf[96];
+    ksnprintf(buf, sizeof(buf), "pruned=%u segments_reclaimed=%u",
+              (unsigned)pruned, (unsigned)segments_reclaimed);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_fs_snapshot(int32_t caller_pid, uint32_t obj_idx,
+                             uint32_t inodes_pinned, const char *label) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_FS_SNAPSHOT, caller_pid, AUDIT_SRC_NATIVE);
+    e.object_idx  = obj_idx;
+    e.result_code = 0;
+    char buf[160];
+    ksnprintf(buf, sizeof(buf), "inodes=%u label=%s",
+              (unsigned)inodes_pinned, label ? label : "");
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
 void audit_write_handle_transfer(int32_t sender_pid, int32_t receiver_pid,
                                  uint32_t obj_idx, uint8_t nhandles) {
     audit_entry_t e;
@@ -658,6 +720,184 @@ void audit_write_handle_transfer(int32_t sender_pid, int32_t receiver_pid,
     else { n = 0; while (nh > 0) { digits[n++] = (char)('0' + (nh % 10)); nh /= 10; }
            while (n > 0) buf[p++] = digits[--n]; }
     buf[p] = 0;
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 20 writers: resource-limit enforcement + scheduler telemetry.
+// ---------------------------------------------------------------------------
+
+void audit_write_rlimit_mem(int32_t pid, uint64_t limit, uint64_t attempted) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_RLIMIT_MEM, pid, AUDIT_SRC_NATIVE);
+    e.result_code = -12;  // -ENOMEM
+    char buf[96];
+    ksnprintf(buf, sizeof(buf), "limit=%lu attempted=%lu",
+              (unsigned long)limit, (unsigned long)attempted);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_rlimit_cpu(int32_t pid, uint64_t limit_ns, uint64_t ns_used) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_RLIMIT_CPU, pid, AUDIT_SRC_NATIVE);
+    e.result_code = 0;  // informational, not a failure path
+    char buf[96];
+    ksnprintf(buf, sizeof(buf), "limit_ns=%lu used_ns=%lu",
+              (unsigned long)limit_ns, (unsigned long)ns_used);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_rlimit_io(int32_t pid, uint64_t limit_bps, uint64_t attempted) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_RLIMIT_IO, pid, AUDIT_SRC_NATIVE);
+    e.result_code = 0;  // submission deferred, not rejected
+    char buf[96];
+    ksnprintf(buf, sizeof(buf), "limit_bps=%lu attempted=%lu",
+              (unsigned long)limit_bps, (unsigned long)attempted);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_sched_epoch(uint32_t tasks_refilled, uint32_t starved_drained) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_SCHED_EPOCH, -1, AUDIT_SRC_NATIVE);
+    e.result_code = 0;
+    char buf[96];
+    ksnprintf(buf, sizeof(buf), "refilled=%u drained=%u",
+              (unsigned)tasks_refilled, (unsigned)starved_drained);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_sched_starvation(int32_t pid, uint64_t stale_ns) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_SCHED_STARVATION, pid, AUDIT_SRC_NATIVE);
+    e.result_code = 0;
+    char buf[64];
+    ksnprintf(buf, sizeof(buf), "stale_ns=%lu", (unsigned long)stale_ns);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_sched_spinlock_panic(const char *lock_name,
+                                      uint32_t holder_cpu,
+                                      uint32_t acquirer_cpu,
+                                      uint64_t budget_ns) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_SCHED_SPINLOCK_PANIC, -1, AUDIT_SRC_NATIVE);
+    e.result_code = -4;  // -EINTR (placeholder for "panic forced")
+    char buf[160];
+    ksnprintf(buf, sizeof(buf),
+              "lock=%s holder_cpu=%u acquirer_cpu=%u budget_ns=%lu",
+              lock_name ? lock_name : "?",
+              (unsigned)holder_cpu, (unsigned)acquirer_cpu,
+              (unsigned long)budget_ns);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 21 writers — userspace driver framework.
+// ---------------------------------------------------------------------------
+void audit_write_drv_registered(int32_t pid, uint32_t pci_addr,
+                                uint16_t vendor, uint16_t device,
+                                uint8_t irq_vector) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_DRV_REGISTERED, pid, AUDIT_SRC_NATIVE);
+    e.result_code = 0;
+    char buf[128];
+    // Phase 21.1: ksnprintf doesn't support width specifiers; use plain %u/%x.
+    ksnprintf(buf, sizeof(buf),
+              "pci=%u:%u.%u vendor=0x%x device=0x%x irq=%u",
+              (unsigned)((pci_addr >> 16) & 0xFF),
+              (unsigned)((pci_addr >> 8) & 0xFF),
+              (unsigned)(pci_addr & 0xFF),
+              (unsigned)vendor, (unsigned)device, (unsigned)irq_vector);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_drv_died(int32_t pid, uint32_t pci_addr, const char *reason) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_DRV_DIED, pid, AUDIT_SRC_NATIVE);
+    e.result_code = 0;
+    char buf[128];
+    // ksnprintf doesn't support width specifiers (%02u). Use plain %u +
+    // %s. Phase 21.1 hit a page fault at format-parse time when the
+    // %02u path mis-counted varargs and ended up dereferencing 0x4.
+    ksnprintf(buf, sizeof(buf),
+              "pci=%u:%u.%u reason=%s",
+              (unsigned)((pci_addr >> 16) & 0xFF),
+              (unsigned)((pci_addr >> 8) & 0xFF),
+              (unsigned)(pci_addr & 0xFF),
+              reason ? reason : "?");
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_mmio_denied(int32_t pid, uint64_t phys_addr,
+                             uint64_t size, const char *reason) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_MMIO_DENIED, pid, AUDIT_SRC_NATIVE);
+    e.result_code = -1;  // -EPERM equivalent
+    char buf[160];
+    ksnprintf(buf, sizeof(buf),
+              "phys=0x%lx size=0x%lx reason=%s",
+              (unsigned long)phys_addr, (unsigned long)size,
+              reason ? reason : "not_owned_bar");
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_irq_dropped(uint32_t pci_addr, uint8_t irq_vector,
+                             uint64_t total_dropped) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_IRQ_DROPPED, -1, AUDIT_SRC_NATIVE);
+    e.result_code = 0;
+    char buf[128];
+    // Phase 21.1: width specifiers removed (see audit_write_drv_died note).
+    ksnprintf(buf, sizeof(buf),
+              "pci=%u:%u.%u irq=%u total_dropped=%lu",
+              (unsigned)((pci_addr >> 16) & 0xFF),
+              (unsigned)((pci_addr >> 8) & 0xFF),
+              (unsigned)(pci_addr & 0xFF),
+              (unsigned)irq_vector,
+              (unsigned long)total_dropped);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 22 writers — named channel registry.
+// ---------------------------------------------------------------------------
+void audit_write_chan_name_publish(int32_t publisher_pid, const char *name,
+                                   uint64_t type_hash) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_CHAN_NAME_PUBLISH, publisher_pid, AUDIT_SRC_NATIVE);
+    e.result_code = 0;
+    char buf[160];
+    ksnprintf(buf, sizeof(buf),
+              "name=%s type_hash=0x%lx",
+              name ? name : "?",
+              (unsigned long)type_hash);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_chan_name_connect(int32_t connector_pid,
+                                   int32_t publisher_pid,
+                                   const char *name) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_CHAN_NAME_CONNECT, connector_pid, AUDIT_SRC_NATIVE);
+    e.result_code = 0;
+    char buf[160];
+    ksnprintf(buf, sizeof(buf),
+              "name=%s publisher_pid=%d",
+              name ? name : "?",
+              (int)publisher_pid);
     copy_detail(e.detail, buf);
     audit_enqueue(&e);
 }

@@ -45,6 +45,54 @@ void _spinlock_acquire(spinlock_t *lock, const char *file, int line);
 void _spinlock_release(spinlock_t *lock, const char *file, int line);
 bool spinlock_held(spinlock_t *lock);
 
+// ---------------------------------------------------------------------------
+// Phase 20: structured-panic spinlock.
+//
+// spinlock_acquire_with_budget enforces a TSC-derived wall-clock budget on
+// the test_and_set loop. On budget overrun, fills a spinlock_oops_t and
+// panics via Phase 13's kpanic_at(). The legacy spinlock_acquire is now a
+// thin wrapper with a default 100 ms budget. There is NO silent-timeout
+// path — if a lock can't be acquired within its budget, the kernel dies
+// LOUDLY and the oops frame names the holder CPU, the acquirer CPU, and
+// the budget that was exceeded.
+//
+// Before tsc_is_ready() returns true (i.e., during very early boot) the
+// budget enforcement falls back to a generous iteration cap. This avoids
+// needing special-case plumbing in spinlock_init.
+// ---------------------------------------------------------------------------
+
+// Default budget for legacy spinlock_acquire callers. 100 ms is large enough
+// that any healthy lock path never trips it; any holder that takes this long
+// is a deadlock or pathological priority inversion.
+#define SPINLOCK_DEFAULT_BUDGET_NS   100000000ULL
+
+void _spinlock_acquire_with_budget(spinlock_t *lock, uint64_t budget_ns,
+                                   const char *file, int line);
+
+// Convenience macro — picks up file/line automatically.
+#ifdef DEBUG_LOCKS
+#define spinlock_acquire_with_budget(lock, budget_ns) \
+    _spinlock_acquire_with_budget((lock), (budget_ns), __FILE__, __LINE__)
+#else
+#define spinlock_acquire_with_budget(lock, budget_ns) \
+    _spinlock_acquire_with_budget((lock), (budget_ns), NULL, 0)
+#endif
+
+// spinlock_oops_t — structured payload passed to kpanic_at when a spinlock
+// budget is exceeded (or an illegal release is attempted). Flattened into
+// the ==OOPS== frame's detail string by the kpanic handler.
+typedef struct spinlock_oops {
+    const char *lock_name;      // from spinlock_t.name
+    uint64_t    holder_cpu;     // CPU id that currently holds the lock (0xFF if free)
+    uint64_t    acquirer_cpu;   // CPU id that tried to acquire
+    uint64_t    budget_ns;      // the TSC-measured budget that was exceeded
+    uint64_t    elapsed_ns;     // actual wait time at panic
+    const char *acquirer_file;  // __FILE__ at acquirer site
+    int         acquirer_line;  // __LINE__ at acquirer site
+    const char *holder_file;    // __FILE__ of current holder's last acquire (if DEBUG_LOCKS)
+    int         holder_line;    // __LINE__ of current holder's last acquire
+} spinlock_oops_t;
+
 // Get current CPU ID - implementation moved to spinlock.c to avoid circular dependency
 uint64_t get_cpu_id(void);
 

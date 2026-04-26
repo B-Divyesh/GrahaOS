@@ -171,3 +171,31 @@ int vfs_async_write(vfs_node_t *node, uint64_t offset, uint64_t len,
 // Does not bump the node's refcount; caller must not dereference after
 // the underlying fd is closed.
 vfs_node_t *vfs_node_for_file_slot(int slot);
+
+// ---------------------------------------------------------------------------
+// Phase 19: GrahaFS v2 version info + fsync.
+// ---------------------------------------------------------------------------
+// One entry per on-disk version_record. SYS_FS_LIST_VERSIONS fills an array
+// of these, newest-first. Layout is ABI-stable (shared with userspace via
+// fs_version_info_u_t in user/syscalls.h) — change here REQUIRES a matching
+// change there and a _Static_assert.
+typedef struct fs_version_info {
+    uint64_t version_id;       //   0..7   Monotonic per-file.
+    uint64_t timestamp_ns;     //   8..15  Wall time at close.
+    uint64_t size;             //  16..23  File size at this version.
+    uint64_t simhash;          //  24..31  SimHash at this version.
+    uint32_t cluster_id;       //  32..35  Cluster at this version (from ai_reserved).
+    uint32_t segment_id;       //  36..39  Segment holding this version's data.
+    uint64_t parent_version;   //  40..47  Non-zero if revert-created.
+    uint64_t prev_version;     //  48..55  Chain pointer; 0 at root.
+    uint8_t  reserved[8];      //  56..63  Reserved zero.
+} fs_version_info_t;
+
+_Static_assert(sizeof(fs_version_info_t) == 64,
+               "fs_version_info_t must be 64 bytes (ABI)");
+
+// fsync wrapper. Returns 0 on success, negative errno on failure. Called from
+// SYS_FSYNC, OP_FSYNC stream dispatcher, and close paths that need durability.
+// If the node's fs ops don't implement fsync, vfs_sync() is called as a
+// best-effort fallback and 0 is returned.
+int vfs_fsync(vfs_node_t *node);

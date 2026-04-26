@@ -7,7 +7,7 @@
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../drivers/video/framebuffer.h"
 #include "../sync/spinlock.h"
-#include "../../arch/x86_64/drivers/ahci/ahci.h"
+#include "blk_client.h"
 #include "../../arch/x86_64/drivers/serial/serial.h"
 #include "../cap/can.h"
 #include "../log.h"
@@ -146,7 +146,7 @@ static int write_superblock(void) {
     
     // Force flush after superblock write
     if (result == 0 && fs_device && fs_device->device_id >= 0) {
-        ahci_flush_cache(fs_device->device_id);
+        grahafs_block_flush((uint8_t)fs_device->device_id);
     }
     
     return result;
@@ -313,7 +313,7 @@ static int write_inode(uint32_t inode_num, grahafs_inode_t* inode) {
     
     // Flush after inode write
     if (result == 0 && fs_device && fs_device->device_id >= 0) {
-        ahci_flush_cache(fs_device->device_id);
+        grahafs_block_flush((uint8_t)fs_device->device_id);
     }
     
     return result;
@@ -511,7 +511,7 @@ ssize_t grahafs_write(vfs_node_t* node, uint64_t offset, size_t size, void* buff
 
     // After successful write/create, flush to ensure persistence
     if (fs_device && fs_device->device_id >= 0) {
-        ahci_flush_cache(fs_device->device_id);
+        grahafs_block_flush((uint8_t)fs_device->device_id);
     }
     
     pmm_free_page(temp_buffer_phys);
@@ -538,7 +538,7 @@ int grahafs_truncate_inode(uint32_t inode_num) {
     write_inode(inode_num, &inode);
 
     if (fs_device && fs_device->device_id >= 0) {
-        ahci_flush_cache(fs_device->device_id);
+        grahafs_block_flush((uint8_t)fs_device->device_id);
     }
 
     spinlock_release(&grahafs_lock);
@@ -700,7 +700,7 @@ int grahafs_create(vfs_node_t* parent, const char* name, uint32_t type) {
     
     // Force flush to disk
     if (fs_device && fs_device->device_id >= 0) {
-        ahci_flush_cache(fs_device->device_id);
+        grahafs_block_flush((uint8_t)fs_device->device_id);
     }
     
     spinlock_release(&grahafs_lock);
@@ -1235,7 +1235,7 @@ int grahafs_set_ai_metadata(uint32_t inode_num, const grahafs_ai_metadata_t *met
     write_inode(inode_num, &inode);
 
     if (fs_device && fs_device->device_id >= 0) {
-        ahci_flush_cache(fs_device->device_id);
+        grahafs_block_flush((uint8_t)fs_device->device_id);
     }
 
     spinlock_release(&grahafs_lock);
@@ -1595,7 +1595,7 @@ uint64_t grahafs_compute_simhash(uint32_t inode_num) {
     write_inode(inode_num, &inode);
 
     if (fs_device && fs_device->device_id >= 0) {
-        ahci_flush_cache(fs_device->device_id);
+        grahafs_block_flush((uint8_t)fs_device->device_id);
     }
 
     spinlock_release(&grahafs_lock);

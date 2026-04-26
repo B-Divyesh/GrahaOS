@@ -44,7 +44,7 @@ static cap_token_u_t lookup(const char *n) {
 }
 
 void _start(void) {
-    tap_plan(37);
+    tap_plan(38);  // Phase 21.1: +1 (e1000_act() == 0 after deactivate)
 
     // =======================================================================
     // G1: SYS_CAN_LOOKUP resolves the four major CAN caps (4 asserts)
@@ -71,8 +71,11 @@ void _start(void) {
     TAP_ASSERT(fb_active()    == 1, "framebuffer is active at test start");
     TAP_ASSERT(e1000_act()    == 1, "e1000 is active at test start");
     TAP_ASSERT(ahci_act()     == 1, "ahci is active at test start");
-    TAP_ASSERT((e1000_reg(0x100) & (1u<<1)) != 0,
-               "E1000_RCTL.EN is set initially");
+    // Phase 21.1: register-level reads no longer reachable from kernel — the
+    // E1000 MMIO is owned by /bin/e1000d. Skip and rely on cap-state asserts
+    // below to verify CAN deactivate/activate semantics.
+    tap_skip("E1000_RCTL.EN is set initially",
+             "Phase 21.1: e1000_debug_read_reg removed (daemon owns MMIO)");
 
     // =======================================================================
     // G4: deactivate keyboard -> flag off, PIC mask bit set (3 asserts)
@@ -104,15 +107,18 @@ void _start(void) {
     // =======================================================================
     r = syscall_can_deactivate_t(t_e1000);
     TAP_ASSERT(r >= 1, "SYS_CAN_DEACTIVATE_T(e1000) returns count >= 1");
-    TAP_ASSERT((e1000_reg(0x100) & (1u<<1)) == 0,
-               "E1000_RCTL.EN cleared after deactivate");
-    TAP_ASSERT((e1000_reg(0x400) & (1u<<1)) == 0,
-               "E1000_TCTL.EN cleared after deactivate");
+    // Phase 21.1: the kernel can no longer read E1000 registers. The
+    // CAN-state assertions below cover deactivate/activate semantics.
+    tap_skip("E1000_RCTL.EN cleared after deactivate",
+             "Phase 21.1: e1000_debug_read_reg removed (daemon owns MMIO)");
+    tap_skip("E1000_TCTL.EN cleared after deactivate",
+             "Phase 21.1: e1000_debug_read_reg removed (daemon owns MMIO)");
+    TAP_ASSERT(e1000_act() == 0, "e1000_act() reports cap OFF after deactivate");
 
     r = syscall_can_activate_t(t_e1000);
     TAP_ASSERT(r == 0, "SYS_CAN_ACTIVATE_T(e1000) succeeds");
-    TAP_ASSERT((e1000_reg(0x100) & (1u<<1)) != 0,
-               "E1000_RCTL.EN set after reactivate");
+    tap_skip("E1000_RCTL.EN set after reactivate",
+             "Phase 21.1: e1000_debug_read_reg removed (daemon owns MMIO)");
 
     // =======================================================================
     // G7: deactivate disk -> port CMD.ST cleared (3 asserts)

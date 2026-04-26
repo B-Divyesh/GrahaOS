@@ -134,3 +134,20 @@ int      ahci_deactivate(void);
 int      ahci_can_refuse_deactivate(void);
 bool     ahci_is_active(void);
 uint32_t ahci_debug_port_cmd(int port_num);
+
+// Phase 23 S2: mark the AHCI HBA as claimable by a userspace driver
+// (mirrors e1000_expose_to_userdrv from Phase 21.1). Today this just
+// publishes the device for /bin/ahcid to claim via SYS_DRV_REGISTER;
+// the in-kernel ahci_init() above continues to drive the hardware so
+// grahafs mount works while the userspace ahcid daemon is brought up
+// and tested in parallel. The full kernel strip + channel-mediated FS
+// I/O is the Phase 23 production cutover.
+void ahci_expose_to_userdrv(void);
+
+// Phase 23 P23.deferred.2: restore PxCLB/PxFB to the kernel's saved
+// values after a userspace ahcid daemon died. Called from
+// userdrv_on_owner_death after the AHCI MMIO cap is destroyed. Without
+// this, kernel ahci_read/ahci_write would touch unmapped memory because
+// ahcid's port_init overwrote our pointers with addresses from ahcid's
+// (now-freed) DMA VMOs.
+void ahci_restore_after_userdrv_death(void);

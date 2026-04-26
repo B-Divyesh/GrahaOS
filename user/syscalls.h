@@ -39,11 +39,16 @@ typedef long ssize_t;
 #define SYS_CAP_WATCH        1038
 #define SYS_CAP_UNWATCH      1039
 #define SYS_CAP_POLL         1040
-#define SYS_NET_IFCONFIG     1041
-#define SYS_NET_STATUS       1042
-#define SYS_HTTP_GET         1043
-#define SYS_DNS_RESOLVE      1044
-#define SYS_HTTP_POST        1045
+// 1041..1045 retired in Phase 22 Stage F (-ENOSYS + AUDIT_DEPRECATED_SYSCALL).
+// Replaced by libnet/libhttp over /sys/net/service.  IDs and wrappers below
+// remain so pledgetest can still exercise NET_SERVER/NET_CLIENT pledge denial
+// (the kernel checks pledge before returning -ENOSYS) and so that callers
+// who didn't migrate yet get a loud audit entry instead of a link error.
+#define SYS_NET_IFCONFIG     1041  // retired — see kernel/audit.c AUDIT_DEPRECATED_SYSCALL
+#define SYS_NET_STATUS       1042  // retired
+#define SYS_HTTP_GET         1043  // retired — use libhttp http_get
+#define SYS_DNS_RESOLVE      1044  // retired — use libnet libnet_dns_resolve
+#define SYS_HTTP_POST        1045  // retired — use libhttp http_post
 #define SYS_PIPE             1046
 #define SYS_DUP2             1047
 #define SYS_DUP              1048
@@ -82,6 +87,81 @@ typedef long ssize_t;
 #define SYS_STREAM_SUBMIT  1076
 #define SYS_STREAM_REAP    1077
 #define SYS_STREAM_DESTROY 1078
+// Phase 19: GrahaFS v2
+#define SYS_FS_SNAPSHOT       1079
+#define SYS_FS_LIST_VERSIONS  1080
+#define SYS_FS_REVERT         1081
+#define SYS_FS_GC_NOW         1082
+#define SYS_FSYNC             1083
+
+// Phase 20: resource limits (shifted from spec 1081-1082; Phase 19 owns those).
+#define SYS_SETRLIMIT         1084
+#define SYS_GETRLIMIT         1085
+// Phase 20 U15: spawn-with-rlimit-overrides. Path + attrs*. attrs may be
+// NULL (equivalent to SYS_SPAWN). When attrs.flags has SPAWN_ATTR_HAS_RLIMIT
+// set, the caller MUST hold PLEDGE_SYS_CONTROL; the child's mem/cpu/io
+// limits are overwritten before it runs.
+#define SYS_SPAWN_EX          1086
+
+// Phase 21: userspace driver framework + E1000 migration.
+#define SYS_DRV_REGISTER      1087
+#define SYS_DRV_IRQ_WAIT      1088
+#define SYS_MMIO_VMO_CREATE   1089
+#define SYS_DEBUG_INJECT_PCI  1090
+// Phase 22: named channel registry. Replaces implicit-lookup assumptions in
+// the spec with two explicit syscalls routed through kernel/net/rawnet.c.
+#define SYS_CHAN_PUBLISH      1091
+#define SYS_CHAN_CONNECT      1092
+
+// SYS_MMIO_VMO_CREATE op codes (in RDI).
+#define MMIO_VMO_OP_CREATE      0u
+#define MMIO_VMO_OP_PHYS_QUERY  1u
+
+// drv_caps_t — populated by sys_drv_register, returned via R10 ptr.
+// Layout MUST match kernel/driver/userdrv.h struct drv_caps.
+// Phase 21.1: added upstream_handle (daemon's READ end of the proxy→daemon
+// control channel). Struct grew 56 → 64 bytes.
+typedef struct {
+    uint64_t mmio_handle;             // cap_token raw, CAP_KIND_MMIO_REGION
+    uint64_t irq_channel_handle;      // cap_token raw, CAP_KIND_IRQ_CHANNEL
+    uint64_t downstream_handle;       // cap_token raw, CAP_KIND_CHANNEL (daemon's WRITE end)
+    uint64_t upstream_handle;         // Phase 21.1: cap_token raw, CAP_KIND_CHANNEL (daemon's READ end)
+    uint64_t bar_phys;                // physical base of mapped BAR
+    uint64_t bar_size;                // size of BAR in bytes
+    uint32_t pci_addr;                // bus<<16 | dev<<8 | func
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint8_t  irq_vector;              // IDT vector assigned
+    uint8_t  _pad[7];
+} drv_caps_t;
+
+// drv_irq_msg_t — 16 bytes; produced by ISR, consumed by sys_drv_irq_wait.
+// Layout MUST match kernel/driver/userdrv.h struct drv_irq_msg.
+typedef struct {
+    uint8_t  vector;
+    uint8_t  _pad0[7];
+    uint64_t timestamp_tsc;
+} drv_irq_msg_t;
+
+#define SPAWN_ATTR_HAS_RLIMIT_U  (1u << 0)
+
+// Userspace mirror of the kernel's spawn_attrs_t subset — same layout as the
+// kernel tail fields so the syscall can copy straight across. Fields not set
+// by the caller MUST be zeroed (the kernel reads trailing fields conditionally
+// on flag bits; stale pointer-like slots could be misinterpreted).
+typedef struct {
+    uint32_t flags;           // SPAWN_ATTR_HAS_RLIMIT_U, etc.
+    uint32_t _pad;
+    uint64_t rlimit_mem_pages;
+    uint64_t rlimit_cpu_ns;
+    uint64_t rlimit_io_bps;
+} spawn_rlimits_t;
+
+// Resource identifiers for SYS_SETRLIMIT / SYS_GETRLIMIT. Value = 0 means "no
+// limit" for every resource.
+#define RLIMIT_MEM            1   // pages of 4 KiB each
+#define RLIMIT_CPU            2   // ns per 1-second epoch (max 1_000_000_000)
+#define RLIMIT_IO             3   // bytes per second through stream submit
 
 // Phase 17 constants (mirror kernel headers).
 #define CHAN_MODE_BLOCKING     1u
@@ -99,6 +179,10 @@ typedef long ssize_t;
 #define VMO_ONDEMAND     0x2u
 #define VMO_PINNED       0x4u
 #define VMO_CLONE_COW    0x10u
+// Phase 22 Stage B: shared clone. Parent + child map the same physical
+// pages with RW; no copy-on-write machinery. Used for DMA ring handoff
+// between e1000d (producer) and netd (consumer).
+#define VMO_CLONE_SHARED 0x20u
 
 // Phase 17 userspace errno mirrors.
 #define EPROTOTYPE_U  71
@@ -133,6 +217,15 @@ typedef long ssize_t;
 #define CAP_KIND_PROC    3
 #define CAP_KIND_CHANNEL 4
 #define CAP_KIND_VMO     5
+// Phase 18-19
+#define CAP_KIND_SNAPSHOT       6
+#define CAP_KIND_WASM_INSTANCE  7
+#define CAP_KIND_STREAM         8
+#define CAP_KIND_FS_SNAPSHOT    9
+// Phase 21
+#define CAP_KIND_DRIVER_REGISTRAR  10
+#define CAP_KIND_IRQ_CHANNEL       11
+#define CAP_KIND_MMIO_REGION       12
 // Rights
 #define RIGHT_READ       0x0000000000000001ULL
 #define RIGHT_WRITE      0x0000000000000002ULL
@@ -198,26 +291,58 @@ typedef long ssize_t;
 #define PLEDGE_AI_CALL     (1u << PLEDGE_CLASS_AI_CALL)
 #define PLEDGE_COMPUTE     (1u << PLEDGE_CLASS_COMPUTE)
 #define PLEDGE_TIME        (1u << PLEDGE_CLASS_TIME)
+// Phase 21
+#define PLEDGE_CLASS_STORAGE_SERVER  12
+#define PLEDGE_CLASS_INPUT_SERVER    13
+#define PLEDGE_STORAGE_SERVER  (1u << PLEDGE_CLASS_STORAGE_SERVER)
+#define PLEDGE_INPUT_SERVER    (1u << PLEDGE_CLASS_INPUT_SERVER)
 
-#define PLEDGE_ALL  0x0FFFu
+#define PLEDGE_ALL  0x3FFFu
 #define PLEDGE_NONE 0x0000u
 
-// Audit event types.
-#define AUDIT_CAP_REGISTER        1
-#define AUDIT_CAP_UNREGISTER      2
-#define AUDIT_CAP_DERIVE          3
-#define AUDIT_CAP_REVOKE          4
-#define AUDIT_CAP_GRANT           5
-#define AUDIT_CAP_VIOLATION       6
-#define AUDIT_PLEDGE_NARROW       7
-#define AUDIT_SPAWN               8
-#define AUDIT_KILL                9
-#define AUDIT_FS_WRITE_CRITICAL  10
-#define AUDIT_MMIO_DIRECT        11
-#define AUDIT_REBOOT             12
-#define AUDIT_NET_BIND           13
-#define AUDIT_AI_INVOKE          14
-#define AUDIT_EVENT_MAX          14
+// Audit event types. MUST stay in sync with kernel/audit.h — drift here causes
+// auditq to misname events. Kept up to AUDIT_EVENT_MAX through Phase 20.
+#define AUDIT_CAP_REGISTER            1
+#define AUDIT_CAP_UNREGISTER          2
+#define AUDIT_CAP_DERIVE              3
+#define AUDIT_CAP_REVOKE              4
+#define AUDIT_CAP_GRANT               5
+#define AUDIT_CAP_VIOLATION           6
+#define AUDIT_PLEDGE_NARROW           7
+#define AUDIT_SPAWN                   8
+#define AUDIT_KILL                    9
+#define AUDIT_FS_WRITE_CRITICAL      10
+#define AUDIT_MMIO_DIRECT            11
+#define AUDIT_REBOOT                 12
+#define AUDIT_NET_BIND               13
+#define AUDIT_AI_INVOKE              14
+#define AUDIT_CAP_ACTIVATE           15
+#define AUDIT_CAP_DEACTIVATE         16
+#define AUDIT_DEPRECATED_SYSCALL     17
+#define AUDIT_CHAN_SEND              18
+#define AUDIT_CHAN_RECV              19
+#define AUDIT_CHAN_TYPE_MISMATCH     20
+#define AUDIT_VMO_FAULT              21
+#define AUDIT_HANDLE_TRANSFER        22
+#define AUDIT_STREAM_OP_REJECTED     23
+#define AUDIT_STREAM_DESTROY_CANCELED 24
+#define AUDIT_FS_JOURNAL_REPLAY      25
+#define AUDIT_FS_REVERT              26
+#define AUDIT_FS_GC_NOW              27
+#define AUDIT_FS_SNAPSHOT            28
+// Phase 20: resource limits + scheduler telemetry.
+#define AUDIT_RLIMIT_MEM             29
+#define AUDIT_RLIMIT_CPU             30
+#define AUDIT_RLIMIT_IO              31
+#define AUDIT_SCHED_EPOCH            32
+#define AUDIT_SCHED_STARVATION       33
+#define AUDIT_SCHED_SPINLOCK_PANIC   34
+// Phase 21: driver framework events.
+#define AUDIT_DRV_REGISTERED         35
+#define AUDIT_DRV_DIED               36
+#define AUDIT_MMIO_DENIED            37
+#define AUDIT_IRQ_DROPPED            38
+#define AUDIT_EVENT_MAX              38
 
 #define AUDIT_SRC_NATIVE  0
 #define AUDIT_SRC_SHIM    1
@@ -394,10 +519,94 @@ static inline void syscall_sync(void) {
     asm volatile("syscall" : : "a"(SYS_SYNC) : "rcx", "r11", "memory");
 }
 
+// Phase 21 — userspace driver framework wrappers.
+// drv_register: claim a PCI device. Pledge: SYS_CONTROL + class-specific.
+static inline long syscall_drv_register(uint16_t vendor_id, uint16_t device_id,
+                                        uint8_t device_class,
+                                        drv_caps_t *out_caps) {
+    long ret;
+    register uint64_t r10 asm("r10") = (uint64_t)(uintptr_t)out_caps;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_DRV_REGISTER),
+          "D"((uint64_t)vendor_id),
+          "S"((uint64_t)device_id),
+          "d"((uint64_t)device_class),
+          "r"(r10)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// drv_irq_wait: block (or poll if timeout_ms==0) for IRQ messages on a
+// CAP_KIND_IRQ_CHANNEL handle. Returns N copied (0..max), 0 on timeout,
+// negative on error.
+static inline long syscall_drv_irq_wait(uint64_t irq_handle,
+                                        drv_irq_msg_t *out_msgs,
+                                        uint32_t max_msgs,
+                                        uint32_t timeout_ms) {
+    long ret;
+    register uint64_t r10 asm("r10") = (uint64_t)timeout_ms;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_DRV_IRQ_WAIT),
+          "D"(irq_handle),
+          "S"((uint64_t)(uintptr_t)out_msgs),
+          "d"((uint64_t)max_msgs),
+          "r"(r10)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// mmio_vmo_create: SYS_MMIO_VMO_CREATE op=CREATE. Returns cap_token raw or
+// negative errno. flags currently unused (CACHE_DISABLE forced).
+static inline long syscall_mmio_vmo_create(uint64_t phys, uint64_t size,
+                                           uint32_t flags) {
+    long ret;
+    register uint64_t r10 asm("r10") = (uint64_t)flags;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_MMIO_VMO_CREATE),
+          "D"((uint64_t)MMIO_VMO_OP_CREATE),
+          "S"(phys),
+          "d"(size),
+          "r"(r10)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// vmo_phys_query: SYS_MMIO_VMO_CREATE op=PHYS_QUERY. Writes the physical
+// address backing page `page_idx` of vmo handle `vmo` to *phys_out.
+static inline long syscall_vmo_phys(uint64_t vmo_handle, uint32_t page_idx,
+                                    uint64_t *phys_out) {
+    long ret;
+    register uint64_t r10 asm("r10") = (uint64_t)(uintptr_t)phys_out;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_MMIO_VMO_CREATE),
+          "D"((uint64_t)MMIO_VMO_OP_PHYS_QUERY),
+          "S"(vmo_handle),
+          "d"((uint64_t)page_idx),
+          "r"(r10)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
 // Phase 7d: Spawn a new process (modern replacement for fork+exec)
 static inline int syscall_spawn(const char *path) {
     long ret;
     asm volatile("syscall" : "=a"(ret) : "a"(SYS_SPAWN), "D"(path) : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 20 U15: spawn with optional rlimit overrides. attrs may be NULL
+// (equivalent to syscall_spawn). If attrs.flags has SPAWN_ATTR_HAS_RLIMIT_U
+// the caller must hold PLEDGE_SYS_CONTROL or the call returns -EPLEDGE.
+static inline int syscall_spawn_ex(const char *path, const spawn_rlimits_t *attrs) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_SPAWN_EX), "D"(path), "S"(attrs)
+        : "rcx", "r11", "memory");
     return (int)ret;
 }
 
@@ -971,6 +1180,41 @@ static inline long syscall_chan_poll(chan_poll_entry_t *polls, uint32_t npolls,
     return ret;
 }
 
+// Phase 22: named channel registry wrappers. Publish registers the caller as
+// the owner of `name`; connect allocates a fresh bidirectional channel pair
+// (request direction + response direction) and delivers the server-side
+// endpoints to the publisher via its registered accept channel.
+//
+// Note: R10 is not reliably set from inline asm under our syscall ABI (same
+// caveat as SYS_VMO_MAP above); we stage it explicitly.
+static inline long syscall_chan_publish(const char *name, uint32_t name_len,
+                                        uint64_t payload_type_hash,
+                                        cap_token_u_t accept_write_end) {
+    long ret;
+    asm volatile(
+        "movq %5, %%r10\n\t"
+        "syscall"
+        : "=a"(ret)
+        : "a"(SYS_CHAN_PUBLISH), "D"(name), "S"((uint64_t)name_len),
+          "d"(payload_type_hash), "r"(accept_write_end.raw)
+        : "rcx", "r10", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_chan_connect(const char *name, uint32_t name_len,
+                                        cap_token_u_t *out_wr_req,
+                                        cap_token_u_t *out_rd_resp) {
+    long ret;
+    asm volatile(
+        "movq %5, %%r10\n\t"
+        "syscall"
+        : "=a"(ret)
+        : "a"(SYS_CHAN_CONNECT), "D"(name), "S"((uint64_t)name_len),
+          "d"(out_wr_req), "r"(out_rd_resp)
+        : "rcx", "r10", "r11", "memory");
+    return ret;
+}
+
 static inline long syscall_vmo_create(uint64_t size_bytes, uint32_t flags) {
     long ret;
     asm volatile("syscall"
@@ -1137,6 +1381,133 @@ static inline long syscall_stream_destroy(uint64_t stream_handle_raw) {
     asm volatile("syscall"
         : "=a"(ret)
         : "a"(SYS_STREAM_DESTROY), "D"(stream_handle_raw)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// ------------------------------------------------------------------------
+// Phase 19: GrahaFS v2 — version info struct + 4 syscall wrappers + fsync.
+// fs_version_info_u_t mirrors kernel/fs/vfs.h:fs_version_info_t layout
+// exactly. A _Static_assert on sizeof guards against drift.
+// ------------------------------------------------------------------------
+typedef struct {
+    uint64_t version_id;       //   0..7
+    uint64_t timestamp_ns;     //   8..15
+    uint64_t size;             //  16..23
+    uint64_t simhash;          //  24..31
+    uint32_t cluster_id;       //  32..35
+    uint32_t segment_id;       //  36..39
+    uint64_t parent_version;   //  40..47
+    uint64_t prev_version;     //  48..55
+    uint8_t  reserved[8];      //  56..63
+} fs_version_info_u_t;
+
+_Static_assert(sizeof(fs_version_info_u_t) == 64,
+               "fs_version_info_u_t must be 64 bytes (ABI match with kernel)");
+
+// SYS_FS_SNAPSHOT: captures version-chain heads of every live inode and
+// pins their segments. Returns a cap_token_raw_t of CAP_KIND_FS_SNAPSHOT,
+// or a negative errno. label may be NULL (in which case label_len must be 0).
+static inline long syscall_fs_snapshot(const char *label, uint32_t label_len) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_FS_SNAPSHOT), "D"((unsigned long)(uintptr_t)label),
+          "S"((unsigned long)label_len)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// SYS_FS_LIST_VERSIONS: fills out[0..max_count) with newest-first version
+// records for `inode_num`. Returns entries written, or -errno.
+static inline long syscall_fs_list_versions(uint32_t inode_num,
+                                            fs_version_info_u_t *out,
+                                            uint32_t max_count) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_FS_LIST_VERSIONS), "D"((unsigned long)inode_num),
+          "S"((unsigned long)(uintptr_t)out), "d"((unsigned long)max_count)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// SYS_FS_REVERT: non-destructive revert — allocates a new version_record that
+// references the target's data segments. Returns the new version_id
+// (positive uint64_t cast to long), or -errno.
+static inline long syscall_fs_revert(uint32_t inode_num,
+                                     uint64_t target_version_id) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_FS_REVERT), "D"((unsigned long)inode_num),
+          "S"(target_version_id)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// SYS_FS_GC_NOW: synchronous garbage collection pass. Returns pruned count or -errno.
+static inline long syscall_fs_gc_now(void) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_FS_GC_NOW)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// SYS_FSYNC: force-durably commits any in-flight journal txn for the file
+// backing `fd`. Returns 0 or -errno.
+static inline long syscall_fsync(int fd) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_FSYNC), "D"((unsigned long)fd)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Minimal brk wrapper (syscall 1016) — passes NULL to query current brk,
+// or a new address to grow/shrink. Returns the resulting brk or -1.
+#ifndef SYS_BRK
+#define SYS_BRK 1016
+#endif
+static inline long syscall_brk(void *addr) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_BRK), "D"((unsigned long)addr)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Phase 20: SYS_SETRLIMIT — set a resource limit on a task. pid == 0 means
+// "self". Requires PLEDGE_SYS_CONTROL on caller regardless of whether the
+// value raises or lowers the existing limit (self-lowering is not allowed).
+// Returns 0 on success, or -ESRCH / -EINVAL / -EPLEDGE.
+static inline long syscall_setrlimit(unsigned int pid,
+                                     unsigned int resource,
+                                     unsigned long value) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_SETRLIMIT), "D"((unsigned long)pid),
+          "S"((unsigned long)resource), "d"(value)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Phase 20: SYS_GETRLIMIT — read a resource limit. pid == 0 means "self".
+// Writes the current limit to *value_out on success. Requires PLEDGE_SYS_QUERY
+// (default-granted). Returns 0 on success, or -ESRCH / -EINVAL / -EFAULT.
+static inline long syscall_getrlimit(unsigned int pid,
+                                     unsigned int resource,
+                                     unsigned long *value_out) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_GETRLIMIT), "D"((unsigned long)pid),
+          "S"((unsigned long)resource), "d"(value_out)
         : "rcx", "r11", "memory");
     return ret;
 }

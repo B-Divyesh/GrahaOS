@@ -32,8 +32,10 @@ void _start(void) {
     // G1: Default mask is PLEDGE_ALL (2 asserts)
     // =======================================================================
     uint16_t initial = read_my_pledge();
-    TAP_ASSERT(initial == PLEDGE_ALL, "default pledge mask is PLEDGE_ALL (0x0FFF)");
-    TAP_ASSERT((initial & 0xF000) == 0, "reserved bits 12..15 are zero");
+    TAP_ASSERT(initial == PLEDGE_ALL, "default pledge mask is PLEDGE_ALL (0x3FFF)");
+    // Phase 21: bits 12 and 13 now used (storage_server, input_server). Only
+    // bits 14..15 remain reserved.
+    TAP_ASSERT((initial & 0xC000) == 0, "reserved bits 14..15 are zero");
 
     // =======================================================================
     // G2: SYS_PLEDGE narrows successfully (3 asserts)
@@ -60,8 +62,10 @@ void _start(void) {
     // =======================================================================
     r = syscall_pledge(PLEDGE_NONE);
     TAP_ASSERT(r == CAP_V2_EINVAL, "SYS_PLEDGE(0) returns -EINVAL");
-    r = syscall_pledge(0x1000);  // reserved bit 12
-    TAP_ASSERT(r == CAP_V2_EINVAL, "SYS_PLEDGE(0x1000) with reserved bit returns -EINVAL");
+    // Phase 21: bit 12 is now PLEDGE_STORAGE_SERVER (assigned). Use bit 14
+    // which is still reserved (PLEDGE_RESERVED_MASK = 0xC000 post-Phase-21).
+    r = syscall_pledge(0x4000);  // reserved bit 14
+    TAP_ASSERT(r == CAP_V2_EINVAL, "SYS_PLEDGE(0x4000) with reserved bit returns -EINVAL");
     TAP_ASSERT(read_my_pledge() == mask_wide, "mask unchanged after rejected narrows");
 
     // =======================================================================

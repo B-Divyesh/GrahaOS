@@ -40,6 +40,14 @@ typedef struct cap_token {
 #define CAP_KIND_SNAPSHOT       6   // Phase 24
 #define CAP_KIND_WASM_INSTANCE  7   // Phase 26
 #define CAP_KIND_STREAM         8   // Phase 18
+#define CAP_KIND_FS_SNAPSHOT    9   // Phase 19 (FS-level version-chain pin)
+// Phase 21: userspace driver framework. REGISTRAR is held by daemons authorised
+// to claim PCI devices via sys_drv_register; init grants derived tokens to its
+// declared driver children. IRQ_CHANNEL and MMIO_REGION are returned by a
+// successful registration and resolved by sys_drv_irq_wait / sys_mmio_vmo_create.
+#define CAP_KIND_DRIVER_REGISTRAR  10
+#define CAP_KIND_IRQ_CHANNEL       11
+#define CAP_KIND_MMIO_REGION       12
 
 // ------------------------------------------------------------------------
 // Rights bitmap (cap_object_t.rights_bitmap — 64 bits).
@@ -104,6 +112,10 @@ typedef struct cap_token {
 
 // Phase 18: stream (async I/O) errors.
 #define CAP_V2_ECANCELED  -125  // Outstanding stream job cancelled by destroy.
+
+// Phase 19: GrahaFS v2 errors.
+#define CAP_V2_EBADFS     -126  // Superblock magic/CRC bad; or unknown FS version.
+#define CAP_V2_EROFS      -127  // Write attempted on read-only mount (v1 compat).
 
 // Null token: idx==0 is reserved slot, always fails resolve.
 #define CAP_TOKEN_NULL ((cap_token_t){.raw = 0})

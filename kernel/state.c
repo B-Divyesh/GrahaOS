@@ -4,7 +4,9 @@
 #include "cap/can.h"
 #include "../arch/x86_64/mm/pmm.h"
 #include "../arch/x86_64/cpu/sched/sched.h"
+#include "../arch/x86_64/cpu/sched/runq.h"
 #include "../arch/x86_64/cpu/smp.h"
+#include "../arch/x86_64/cpu/tsc.h"
 #include "fs/vfs.h"
 #include "fs/grahafs.h"
 
@@ -72,6 +74,14 @@ void state_collect_system(state_system_t *out) {
     out->context_switches = context_switches;
     // Phase 12: expose LAPIC 100 Hz tick count (divide by 100 for seconds).
     out->uptime_ticks = g_timer_ticks;
+    // Phase 20: TSC snapshot. Available once tsc_init has calibrated.
+    if (tsc_is_ready()) {
+        out->tsc_ns_now = tsc_to_ns(rdtsc());
+        out->tsc_hz = g_tsc_hz;
+    } else {
+        out->tsc_ns_now = 0;
+        out->tsc_hz = 0;
+    }
 
     uint32_t entries = g_cpu_count;
     if (entries > STATE_MAX_CPUS) entries = STATE_MAX_CPUS;
@@ -80,6 +90,18 @@ void state_collect_system(state_system_t *out) {
     for (uint32_t i = 0; i < entries; i++) {
         out->cpus[i].lapic_id = g_cpu_info[i].lapic_id;
         out->cpus[i].active = g_cpu_info[i].active ? 1 : 0;
+        // Phase 20 U17: snapshot the per-CPU runq. These are read racily
+        // (no lock) — the values are informational, not control-plane.
+        // ready_count and the three counters are 32/64-bit scalars whose
+        // torn reads are at worst a tick stale; current pointer deref is
+        // guarded by NULL check.
+        runq_t *rq = &g_cpu_locals[i].runq;
+        out->cpus[i].runq_depth      = rq->ready_count;
+        out->cpus[i].ctx_switches    = rq->context_switches;
+        out->cpus[i].steal_successes = rq->steal_successes;
+        out->cpus[i].steal_failures  = rq->steal_failures;
+        task_t *cur = rq->current;
+        out->cpus[i].current_pid = cur ? cur->id : -1;
     }
 }
 
@@ -101,7 +123,7 @@ int state_collect_all(state_snapshot_t *out) {
     if (!out) return -1;
     state_memset(out, 0, sizeof(*out));
 
-    out->version = 2;  // Phase 8b v2
+    out->version = 3;  // Phase 21.1: state_process_t gained pledge_mask
 
     state_collect_memory(&out->memory);
     state_collect_processes(&out->processes);
@@ -122,6 +144,7 @@ int state_get_size(uint32_t category) {
         case STATE_CAT_SYSTEM:     return sizeof(state_system_t);
         case STATE_CAT_DRIVERS:        return sizeof(state_driver_list_t);
         case STATE_CAT_CAPABILITIES:   return sizeof(state_cap_list_t);
+        case STATE_CAT_USERDRV:        return sizeof(state_userdrv_list_t);
         case STATE_CAT_ALL:            return sizeof(state_snapshot_t);
         default:                   return -1;
     }

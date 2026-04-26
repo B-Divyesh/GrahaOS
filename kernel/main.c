@@ -18,15 +18,20 @@
 #include "../arch/x86_64/cpu/interrupts.h"
 #include "../arch/x86_64/cpu/smp.h"
 #include "../arch/x86_64/drivers/lapic_timer/lapic_timer.h"
+#include "../arch/x86_64/cpu/tsc.h"
+#include "vsnprintf.h"
+#include "pid_hash.h"
 #include "../arch/x86_64/cpu/ports.h"
+#include "../arch/x86_64/cpu/pci_enum.h"
 #include "../arch/x86_64/drivers/keyboard/keyboard.h"
 #include "keyboard_task.h"
 #include "../arch/x86_64/drivers/lapic/lapic.h"
 #include "../arch/x86_64/drivers/ahci/ahci.h"
 #include "../arch/x86_64/drivers/e1000/e1000.h"
-#include "net/net.h"
-#include "net/net_task.h"
+// Phase 22 Stage F: net/net.h + net/net_task.h removed; Mongoose retired.
+// Userspace netd (/bin/netd) speaks libnet over /sys/net/service.
 #include "fs/grahafs.h"
+#include "fs/grahafs_v2.h"
 #include "../arch/x86_64/drivers/serial/serial.h"
 #include "cap/can.h"
 #include "cap/object.h"
@@ -173,6 +178,24 @@ size_t strlen(const char *str) {
     return len;
 }
 
+// Phase 22 Stage F: kernel libc shims that previously came from
+// kernel/net/klib.{c,h} (deleted with the Mongoose teardown).  Only the
+// few entry points that survive in non-net call sites are kept.
+int strncmp(const char *s1, const char *s2, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c1 = (unsigned char)s1[i];
+        unsigned char c2 = (unsigned char)s2[i];
+        if (c1 != c2) return (int)c1 - (int)c2;
+        if (c1 == 0) return 0;
+    }
+    return 0;
+}
+
+int strcmp(const char *s1, const char *s2) {
+    while (*s1 && *s1 == *s2) { s1++; s2++; }
+    return (int)(unsigned char)*s1 - (int)(unsigned char)*s2;
+}
+
 // --- Keyboard Polling Task ---
 // External keyboard task function from keyboard_task.c
 extern void keyboard_poll_task(void);
@@ -200,7 +223,7 @@ void kmain(void) {
     }
 
     // Enable SSE/SSE2 on BSP (APs do this in ap_start.S)
-    // Required for mongoose.c compiled with SSE2 (TLS crypto, float code)
+    // Required by libgcc soft-float intrinsics + future userspace TLS crypto.
     {
         uint64_t cr0, cr4;
         asm volatile("mov %%cr0, %0" : "=r"(cr0));
@@ -330,6 +353,16 @@ void kmain(void) {
     klog(KLOG_INFO, SUBSYS_CORE, "Framebuffer drawn OK");
     y_pos += 20;
 
+    // Phase 21.1: bring up the IOAPIC immediately after SMP/LAPIC is ready.
+    // pic_disable() runs inside smp_init and masks all 16 PIC lines globally;
+    // without IOAPIC redirection-table programming, no legacy IRQ (e.g. the
+    // E1000 line, typically 11) can reach userdrv vectors 50..65. ioapic_init
+    // maps the MMIO page and masks every redirection entry to a known state.
+    extern void ioapic_init(void);
+    ioapic_init();
+    framebuffer_draw_string("IOAPIC Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
     // 3b. Phase 14: per-CPU data + slab + kheap.
     // percpu_init(0) populates the BSP's Phase 14 extension fields
     // (magazines, preempt counters, self-pointer). APs run their own
@@ -424,6 +457,9 @@ void kmain(void) {
     y_pos += 20;
 
     // 5. Initialize scheduler (after per-CPU structures exist)
+    // Phase 20: the PID hash table must be live before sched_init creates
+    // the idle task (which will be the first hash insert).
+    pid_hash_init();
     klog(KLOG_INFO, SUBSYS_CORE, "About to initialize scheduler...");
     sched_init();
     klog(KLOG_INFO, SUBSYS_CORE, "Scheduler initialized successfully");
@@ -441,6 +477,19 @@ void kmain(void) {
         klog(KLOG_WARN, SUBSYS_AUDIT,
              "audit: flusher task creation failed (rc=%d); remaining in klog-only mode",
              audit_flusher_pid);
+    }
+
+    // Phase 20 U11: epoch task refills cpu_budget_remaining_ns + drains
+    // per-CPU starved lists once per second. Pinned to CPU 0 implicitly
+    // via sched_create_task (kernel threads default to cpu_pinned=0).
+    int epoch_pid = sched_create_task(sched_epoch_task_entry);
+    if (epoch_pid >= 0) {
+        klog(KLOG_INFO, SUBSYS_SCHED,
+             "sched: epoch task started as pid=%d", epoch_pid);
+    } else {
+        klog(KLOG_ERROR, SUBSYS_SCHED,
+             "sched: epoch task creation failed (rc=%d) — rlimits wont refill",
+             epoch_pid);
     }
 
     // Phase 18: stream subsystem. Depends on VMO + channel subsystems AND
@@ -471,23 +520,76 @@ void kmain(void) {
     framebuffer_draw_string("VFS Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 40;
 
+    // Phase 21: enumerate PCI bus once at boot so subsequent driver init
+    // (and SYS_DRV_REGISTER / SYS_MMIO_VMO_CREATE / drvctl) see a stable
+    // pre-decoded table including BAR sizes.
+    pci_enumerate_all();
+    // Initialise the userspace-driver registry from the post-enumeration PCI
+    // table. Devices start unclaimable; kernel-side stubs (e.g.
+    // e1000_expose_to_userdrv) flip is_claimable=1 inside their _init.
+    extern void userdrv_init(void);
+    userdrv_init();
+
+    // Phase 22: named channel registry. Initialised before any userspace
+    // daemons spawn so they can publish on /sys/net/* as soon as their
+    // _start runs.  See kernel/net/rawnet.h for protocol-level docs.
+    extern void rawnet_init(void);
+    rawnet_init();
+
     //adding AHCI
     klog(KLOG_INFO, SUBSYS_CORE, "About to initialize AHCI...");
     ahci_init();
     klog(KLOG_INFO, SUBSYS_CORE, "AHCI initialized successfully");
     y_pos += 20;
 
-    // Initialize E1000 NIC driver
+    // Phase 23 S2: mark the AHCI HBA as claimable by userspace ahcid.
+    // Side-effect-only on the userdrv registry (sets is_claimable=1);
+    // the in-kernel ahci_init above continues to drive the hardware
+    // until the production cutover.
+    extern void ahci_expose_to_userdrv(void);
+    ahci_expose_to_userdrv();
+
+    // Phase 23 S4: kernel-side block I/O client. All FS code (grahafs_v2,
+    // journal, vfs, segment) routes through grahafs_block_{read,write,
+    // flush} wrappers in blk_client. Today they shim onto the in-kernel
+    // AHCI driver; the channel-mediated path to /bin/ahcid lands as
+    // ahcid stabilises. State machine accommodates ahcid death/respawn
+    // (FS_ERROR + journal-replay-on-reconnect).
+    extern void blk_client_init(void);
+    blk_client_init();
+
+    // Phase 21.1: e1000_init is now a thin PCI-detect stub; the real driver
+    // runs as /bin/e1000d in userspace. expose_to_userdrv flips the entry's
+    // is_claimable bit so the daemon can call sys_drv_register on it.
     klog(KLOG_INFO, SUBSYS_CORE, "About to initialize E1000 NIC...");
     e1000_init();
-    klog(KLOG_INFO, SUBSYS_CORE, "E1000 initialization complete");
+    e1000_expose_to_userdrv();
+    klog(KLOG_INFO, SUBSYS_CORE, "E1000 detection + userdrv exposure complete");
     y_pos += 20;
 
-    // Initialize Mongoose TCP/IP stack
-    klog(KLOG_INFO, SUBSYS_CORE, "About to initialize network stack...");
-    net_init();
-    klog(KLOG_INFO, SUBSYS_CORE, "Network stack initialization complete");
-    y_pos += 20;
+    // Phase 22 Stage F: e1000_proxy + Mongoose net_init retired.  The user
+    // TCP/IP stack lives in /bin/netd; e1000d owns the NIC.  The CAN caps
+    // formerly registered by e1000_proxy_init/net_init are recreated here
+    // as kernel-resident nodes so cantest_v2/nettest/httptest still observe
+    // them in the registry.  The activate/deactivate callbacks are thin
+    // shims — actual driver state is owned by the userspace daemons.
+    {
+        const char *e1000_deps[] = { "pci_bus" };
+        cap_register("e1000_nic", CAP_DRIVER, /*subtype=*/0, -1,
+                     e1000_deps, 1,
+                     /*activate=*/NULL, /*deactivate=*/NULL,
+                     NULL, 0, NULL);
+        int e1000_id = cap_find("e1000_nic");
+        if (e1000_id >= 0) cap_activate(e1000_id);
+
+        const char *tcpip_deps[] = { "e1000_nic" };
+        cap_register("tcp_ip", CAP_SERVICE, /*subtype=*/0, -1,
+                     tcpip_deps, 1,
+                     /*activate=*/NULL, /*deactivate=*/NULL,
+                     NULL, 0, NULL);
+        int tcpip_id = cap_find("tcp_ip");
+        if (tcpip_id >= 0) cap_activate(tcpip_id);
+    }
 
     // Initialize filesystem AFTER a small delay to let AHCI stabilize
     klog(KLOG_INFO, SUBSYS_CORE, "Waiting for AHCI to stabilize...");
@@ -515,8 +617,27 @@ void kmain(void) {
         klog(KLOG_INFO, SUBSYS_CORE, "Framebuffer msg drawn");
         y_pos += 20;
 
-        klog(KLOG_INFO, SUBSYS_CORE, "About to call grahafs_mount...");
-        vfs_node_t* root = grahafs_mount(hdd);
+        // Phase 19: try v2 first. If the disk is v2-formatted, grahafs_v2_mount
+        // succeeds; build root + wire workers. If it returns -126 (CAP_V2_EBADFS
+        // — not a v2 image), fall back to the v1 driver.
+        klog(KLOG_INFO, SUBSYS_CORE, "Phase 19: probing for grahafs v2...");
+        int v2_rc = grahafs_v2_mount(hdd->device_id);
+        vfs_node_t *root = NULL;
+        if (v2_rc == 0) {
+            klog(KLOG_INFO, SUBSYS_CORE, "grahafs_v2_mount: success, building root");
+            extern struct vfs_node *grahafs_v2_build_root_node(void);
+            root = grahafs_v2_build_root_node();
+            if (root) vfs_set_root(root);
+            extern void gc_init(void);
+            extern void recluster_init(void);
+            gc_init();
+            recluster_init();
+        } else {
+            klog(KLOG_INFO, SUBSYS_CORE,
+                 "grahafs_v2_mount rc=%d — falling back to v1", v2_rc);
+            klog(KLOG_INFO, SUBSYS_CORE, "About to call grahafs_mount (v1)...");
+            root = grahafs_mount(hdd);
+        }
         klog(KLOG_INFO, SUBSYS_CORE, "grahafs_mount returned: 0x%lx", (unsigned long)((uint64_t)root));
 
         if (root) {
@@ -691,23 +812,8 @@ void kmain(void) {
         y_pos += 20;
     }
 
-    // Create Mongoose polling task
-    klog(KLOG_INFO, SUBSYS_CORE, "Creating mongoose poll task...");
-    int mg_task_id = sched_create_task(mongoose_poll_task);
-    klog(KLOG_INFO, SUBSYS_CORE, "sched_create_task (mongoose) returned: %lu", (unsigned long)(mg_task_id));
-    {
-        task_t *mg_task = sched_get_task(mg_task_id);
-        if (mg_task) {
-            const char *n = "mongoose";
-            int j = 0;
-            while (n[j] && j < 31) { mg_task->name[j] = n[j]; j++; }
-            mg_task->name[j] = '\0';
-        }
-    }
-    if (mg_task_id >= 0) {
-        framebuffer_draw_string("Mongoose task created successfully", 50, y_pos, COLOR_GREEN, 0x00101828);
-        y_pos += 20;
-    }
+    // Phase 22 Stage F: mongoose_poll_task retired.  The userspace netd
+    // event loop replaces it; e1000d feeds frames over /sys/net/rawframe.
 
     // Create background indexer task (Phase 11b)
     klog(KLOG_INFO, SUBSYS_CORE, "Creating indexer task...");
@@ -784,6 +890,22 @@ void kmain(void) {
     
     // Disable interrupts briefly while starting timer
     asm volatile("cli");
+
+    // Phase 20: calibrate the TSC against the PIT before the LAPIC timer
+    // starts firing. Must run with interrupts off; tsc_init handles that
+    // internally but doing it while the scheduler tick is inactive avoids
+    // any overlap between calibration and subsequent scheduler accounting.
+    klog(KLOG_INFO, SUBSYS_CORE, "Calibrating TSC via PIT 10 ms gate...");
+    tsc_init();
+    if (tsc_is_ready()) {
+        char msg[80];
+        ksnprintf(msg, sizeof(msg), "TSC: %lu Hz (ns_per_tsc_fp32=0x%lx)",
+                  (unsigned long)g_tsc_hz, (unsigned long)g_ns_per_tsc_fp32);
+        klog(KLOG_INFO, SUBSYS_CORE, msg);
+    } else {
+        klog(KLOG_WARN, SUBSYS_CORE, "TSC not ready post-calibration; fallbacks engaged");
+    }
+
     klog(KLOG_INFO, SUBSYS_CORE, "Calling lapic_timer_init...");
     lapic_timer_init(100, 32);
     klog(KLOG_INFO, SUBSYS_CORE, "lapic_timer_init returned");
@@ -797,13 +919,27 @@ void kmain(void) {
         klog(KLOG_INFO, SUBSYS_CORE, "Timer is running, system initialized!");
         framebuffer_draw_string("System running!", 10, 90, COLOR_GREEN, 0x00101828);
     }
-    
-   
-    // OPTIONAL: Start timers on APs later (commented out for now)
-    // This would require IPI (Inter-Processor Interrupts) to signal APs
-    // For now, only BSP handles scheduling
 
-    // Register service and application capabilities
+    // Phase 20: create a per-AP idle task for each active peer CPU. Each
+    // idle task is pinned, marked is_idle, and pre-installed as the
+    // target CPU's runq.current. When AP ticks into schedule() for the
+    // first time, its frame saves cleanly into idle's regs instead of
+    // clobbering BSP's idle task (which was the bug that broke the first
+    // U14 attempt). Only after all peer idles exist do we release the
+    // go-ahead flag.
+    extern task_t *sched_create_idle_for_cpu(uint32_t cpu_id);
+    for (uint32_t ap = 1; ap < g_cpu_count; ap++) {
+        task_t *idle = sched_create_idle_for_cpu(ap);
+        if (!idle) {
+            klog(KLOG_WARN, SUBSYS_CORE,
+                 "failed to create idle task for CPU %u — peer will stay parked", ap);
+        }
+    }
+
+    // Register service and application capabilities BEFORE releasing APs.
+    // Otherwise the AP scheduler can dispatch user tasks that read CAN
+    // capability state while BSP is still running cap_activate() (which
+    // does slow hardware spins for AHCI/E1000) — see P20.4 RCA.
     klog(KLOG_INFO, SUBSYS_CORE, "Registering service/application capabilities...");
     {
         const char *sched_deps[] = {"timer", "memory"};
@@ -825,8 +961,18 @@ void kmain(void) {
     for (int i = 0; i < cap_get_count(); i++) {
         cap_activate(i);
     }
-    asm volatile("sti");
     klog(KLOG_INFO, SUBSYS_CORE, "All capabilities activated");
+
+    // Phase 20 U14: release APs INSIDE the cli/sti block. After sti, BSP
+    // gets preempted by the queued timer tick into one of tasks 1-7
+    // (kernel threads pinned to CPU 0); BSP idle (task 0) is the fallback
+    // and never re-dispatches because rq[0] always has work — meaning any
+    // code AFTER sti in kmain is unreachable. Setting the AP gate inside
+    // cli guarantees it actually executes.
+    extern volatile bool g_ap_scheduler_go;
+    g_ap_scheduler_go = true;
+    klog(KLOG_INFO, SUBSYS_CORE, "APs released (g_ap_scheduler_go=true)");
+    asm volatile("sti");
 
     klog(KLOG_INFO, SUBSYS_CORE, "\n=== ENTERING IDLE LOOP ===\nSystem fully initialized, waiting for timer interrupts...\n");
 

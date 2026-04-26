@@ -5,12 +5,12 @@
 #include "../kernel/fs/cluster.h"
 #include "../kernel/log.h"
 #include "json.h"
+// Phase 22 Stage E U21d: cmd_ai migrated from SYS_HTTP_POST to libhttp.
+#include "libhttp/libhttp.h"
 
-// Helper functions
-int strcmp(const char *s1, const char *s2) {
-    while (*s1 && (*s1 == *s2)) { s1++; s2++; }
-    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
-}
+// Phase 22 Stage E U21d: gash now links libc (transitive via libhttp), so
+// strcmp/strncmp/strlen/strcpy come from there.
+extern int strcmp(const char *s1, const char *s2);
 
 // Phase 13: minimal atoi for the dmesg builtin's --tail / --subsys.
 // libc's stdlib.h isn't included here to keep gash freestanding-ish.
@@ -37,29 +37,12 @@ static int strcasecmp(const char *s1, const char *s2) {
     return (int)(unsigned char)*s1 - (int)(unsigned char)*s2;
 }
 
-int strncmp(const char *s1, const char *s2, size_t n) {
-    for (size_t i = 0; i < n && s1[i] && s2[i]; i++) {
-        if (s1[i] != s2[i]) {
-            return (unsigned char)s1[i] - (unsigned char)s2[i];
-        }
-    }
-    return 0;
-}
+extern int strncmp(const char *s1, const char *s2, size_t n);
+extern size_t strlen(const char *str);
+extern char *strcpy(char *dest, const char *src);
 
 void print(const char *str) {
     while (*str) syscall_putc(*str++);
-}
-
-size_t strlen(const char *str) {
-    size_t len = 0;
-    while (str[len]) len++;
-    return len;
-}
-
-char* strcpy(char* dest, const char* src) {
-    char* ret = dest;
-    while ((*dest++ = *src++));
-    return ret;
 }
 
 void int_to_string(int num, char *str) {
@@ -597,6 +580,50 @@ static const char *proc_state_str(uint32_t state) {
     }
 }
 
+// Phase 21.1: render a 14-bit pledge mask as a compact CSV. Lists at most
+// 3 class names, then "+N" if more bits set. The short-name table below
+// must match the bit ordering in kernel/cap/pledge.h (PLEDGE_CLASS_* idxs
+// 0..13). Fits the gash `ps` PLEDGE column in ~16 visible characters.
+static const char *k_pledge_short_names[14] = {
+    "fs_r", "fs_w", "net_c", "net_s", "spawn",
+    "ipc_s", "ipc_r", "sys_q", "sys_c", "ai",
+    "comp", "time", "stor_s", "in_s",
+};
+
+static void pledge_describe_short(uint16_t mask, char *out, int outlen) {
+    if (outlen <= 0 || !out) return;
+    out[0] = '\0';
+    int extra = 0;
+    int slot = 0;
+    int written = 0;
+    int total = 0;
+    for (int i = 0; i < 14; i++) {
+        if (mask & (1u << i)) total++;
+    }
+    for (int i = 0; i < 14; i++) {
+        if (!(mask & (1u << i))) continue;
+        if (slot >= 3) { extra++; continue; }
+        const char *n = k_pledge_short_names[i];
+        // Append separator if not first.
+        if (slot > 0 && written < outlen - 1) {
+            out[written++] = ',';
+        }
+        for (int j = 0; n[j] && written < outlen - 1; j++) {
+            out[written++] = n[j];
+        }
+        slot++;
+    }
+    if (extra > 0 && written < outlen - 4) {
+        out[written++] = '+';
+        // tiny int-to-decimal for 1..2 digit extras
+        if (extra >= 10) out[written++] = (char)('0' + (extra / 10));
+        out[written++] = (char)('0' + (extra % 10));
+    }
+    if (written < outlen) out[written] = '\0';
+    else out[outlen - 1] = '\0';
+    (void)total;
+}
+
 void cmd_ps(void) {
     state_process_list_t procs;
     long ret = syscall_get_system_state(STATE_CAT_PROCESSES, &procs, sizeof(procs));
@@ -605,10 +632,11 @@ void cmd_ps(void) {
         return;
     }
 
-    print("PID  PPID PGID STATE   HEAP_USED  NAME\n");
-    print("---- ---- ---- ------- ---------- ----------------\n");
+    print("PID  PPID PGID STATE   HEAP_USED  PLEDGE            NAME\n");
+    print("---- ---- ---- ------- ---------- ----------------- ----------------\n");
 
     char buf[21];
+    char pbuf[18];
     for (uint32_t i = 0; i < procs.count; i++) {
         state_process_t *p = &procs.procs[i];
 
@@ -644,6 +672,13 @@ void cmd_ps(void) {
         print(buf);
         print(" ");
 
+        // Phase 21.1: PLEDGE column (16 chars wide).
+        pledge_describe_short(p->pledge_mask, pbuf, sizeof(pbuf));
+        print(pbuf);
+        int plen = strlen(pbuf);
+        for (int j = plen; j < 17; j++) print(" ");
+        print(" ");
+
         // Name
         if (p->name[0]) {
             print(p->name);
@@ -657,6 +692,77 @@ void cmd_ps(void) {
     uint64_to_str(procs.count, buf);
     print(buf);
     print(" processes\n");
+}
+
+// Phase 20 U17: psinfo [--per-cpu] — short system snapshot. Without the
+// flag, prints one-line totals. With it, prints one row per online CPU
+// showing runq depth, current pid, ctx-switch counter, and work-stealing
+// counters. Data comes from the extended state_system_t populated in
+// kernel/state.c.
+void cmd_psinfo(int per_cpu) {
+    state_system_t sys;
+    long rc = syscall_get_system_state(STATE_CAT_SYSTEM, &sys, sizeof(sys));
+    if (rc < 0) {
+        print("psinfo: failed to get system state\n");
+        return;
+    }
+
+    char buf[21];
+    print("psinfo: cpus=");
+    uint64_to_str(sys.cpu_count, buf); print(buf);
+    print(" schedules=");
+    uint64_to_str(sys.schedule_count, buf); print(buf);
+    print(" ctx_switches=");
+    uint64_to_str(sys.context_switches, buf); print(buf);
+    print(" uptime_ticks=");
+    uint64_to_str(sys.uptime_ticks, buf); print(buf);
+    print("\n");
+
+    if (!per_cpu) return;
+
+    print("\nCPU  LAPIC ACTIVE RUNQ CURRENT_PID CTX_SWITCHES STEAL_OK STEAL_FAIL\n");
+    print("---- ----- ------ ---- ----------- ------------ -------- ----------\n");
+    for (uint32_t i = 0; i < sys.cpu_entries; i++) {
+        // CPU index (left-padded to 4)
+        int_to_string((int)i, buf);
+        int len = strlen(buf);
+        for (int j = 0; j < 4 - len; j++) print(" ");
+        print(buf); print(" ");
+        // LAPIC id (5)
+        int_to_string((int)sys.cpus[i].lapic_id, buf);
+        len = strlen(buf);
+        for (int j = 0; j < 5 - len; j++) print(" ");
+        print(buf); print(" ");
+        // active (6)
+        print(sys.cpus[i].active ? "   yes" : "    no");
+        print(" ");
+        // runq depth (4)
+        uint64_to_str(sys.cpus[i].runq_depth, buf);
+        len = strlen(buf);
+        for (int j = 0; j < 4 - len; j++) print(" ");
+        print(buf); print(" ");
+        // current_pid (11)
+        int_to_string(sys.cpus[i].current_pid, buf);
+        len = strlen(buf);
+        for (int j = 0; j < 11 - len; j++) print(" ");
+        print(buf); print(" ");
+        // ctx_switches (12)
+        uint64_to_str(sys.cpus[i].ctx_switches, buf);
+        len = strlen(buf);
+        for (int j = 0; j < 12 - len; j++) print(" ");
+        print(buf); print(" ");
+        // steal_ok (8)
+        uint64_to_str(sys.cpus[i].steal_successes, buf);
+        len = strlen(buf);
+        for (int j = 0; j < 8 - len; j++) print(" ");
+        print(buf); print(" ");
+        // steal_fail (10)
+        uint64_to_str(sys.cpus[i].steal_failures, buf);
+        len = strlen(buf);
+        for (int j = 0; j < 10 - len; j++) print(" ");
+        print(buf);
+        print("\n");
+    }
 }
 
 static const char *driver_type_str(uint32_t type) {
@@ -1668,175 +1774,13 @@ void cmd_events(void) {
     }
 }
 
-// --- Phase 9a: Network Commands ---
-
-void cmd_ifconfig(void) {
-    uint8_t info[7];
-    int ret = syscall_net_ifconfig(info);
-
-    if (ret == -2) {
-        print("ifconfig: no network interface found\n");
-        return;
-    }
-    if (ret < 0) {
-        print("ifconfig: failed\n");
-        return;
-    }
-
-    print("eth0: MAC=");
-    const char *hex = "0123456789abcdef";
-    for (int i = 0; i < 6; i++) {
-        char h[3];
-        h[0] = hex[(info[i] >> 4) & 0xf];
-        h[1] = hex[info[i] & 0xf];
-        h[2] = '\0';
-        print(h);
-        if (i < 5) print(":");
-    }
-    print(" Link=");
-    print(info[6] ? "UP" : "DOWN");
-    print("\n");
-}
-
-// Phase 9b: Network status
-void cmd_netstat(void) {
-    // net_status_t: stack_running(1) + ip(4) + netmask(4) + gateway(4) + rx_count(4) + tx_count(4) = 21 bytes
-    uint8_t buf[21];
-    for (int i = 0; i < 21; i++) buf[i] = 0;
-    int ret = syscall_net_status(buf);
-    if (ret < 0) {
-        print("netstat: failed to get network status\n");
-        return;
-    }
-
-    print("TCP/IP Stack: ");
-    print(buf[0] ? "RUNNING" : "STOPPED");
-    print("\n");
-
-    // IP address
-    char num[4];
-    print("IP:      ");
-    for (int i = 0; i < 4; i++) {
-        // Convert byte to decimal
-        int val = buf[1 + i];
-        int idx = 0;
-        if (val >= 100) { num[idx++] = '0' + val / 100; val %= 100; }
-        if (val >= 10 || idx > 0) { num[idx++] = '0' + val / 10; val %= 10; }
-        num[idx++] = '0' + val;
-        num[idx] = '\0';
-        print(num);
-        if (i < 3) print(".");
-    }
-    print("\n");
-
-    print("Netmask: ");
-    for (int i = 0; i < 4; i++) {
-        int val = buf[5 + i];
-        int idx = 0;
-        if (val >= 100) { num[idx++] = '0' + val / 100; val %= 100; }
-        if (val >= 10 || idx > 0) { num[idx++] = '0' + val / 10; val %= 10; }
-        num[idx++] = '0' + val;
-        num[idx] = '\0';
-        print(num);
-        if (i < 3) print(".");
-    }
-    print("\n");
-
-    print("Gateway: ");
-    for (int i = 0; i < 4; i++) {
-        int val = buf[9 + i];
-        int idx = 0;
-        if (val >= 100) { num[idx++] = '0' + val / 100; val %= 100; }
-        if (val >= 10 || idx > 0) { num[idx++] = '0' + val / 10; val %= 10; }
-        num[idx++] = '0' + val;
-        num[idx] = '\0';
-        print(num);
-        if (i < 3) print(".");
-    }
-    print("\n");
-
-    // RX/TX counts (uint32_t at offset 13 and 17)
-    uint32_t rx = *(uint32_t *)&buf[13];
-    uint32_t tx = *(uint32_t *)&buf[17];
-    print_u32("RX packets: ", rx);
-    print_u32("TX packets: ", tx);
-}
-
-void cmd_http(const char *url) {
-    if (!url || url[0] == '\0') {
-        print("http: usage: http <url>\n");
-        return;
-    }
-
-    print("Fetching ");
-    print(url);
-    print("...\n");
-
-    char response[4096];
-    int ret = syscall_http_get(url, response, sizeof(response));
-
-    if (ret < 0) {
-        print("http: error ");
-        char num[12];
-        int_to_string(ret, num);
-        print(num);
-        if (ret == -10) print(" (timeout)");
-        else if (ret == -11) print(" (DNS failed)");
-        else if (ret == -12) print(" (connection failed)");
-        else if (ret == -17) print(" (no network)");
-        print("\n");
-        return;
-    }
-
-    print("Response (");
-    char len_str[12];
-    int_to_string(ret, len_str);
-    print(len_str);
-    print(" bytes):\n");
-    // Print response character by character (it's already null-terminated)
-    for (int i = 0; i < ret; i++) {
-        syscall_putc(response[i]);
-    }
-    print("\n");
-}
-
-void cmd_dns(const char *hostname) {
-    if (!hostname || hostname[0] == '\0') {
-        print("dns: usage: dns <hostname>\n");
-        return;
-    }
-
-    print("Resolving ");
-    print(hostname);
-    print("...\n");
-
-    uint8_t ip[4];
-    int ret = syscall_dns_resolve(hostname, ip);
-
-    if (ret < 0) {
-        print("dns: resolution failed (error ");
-        char num[12];
-        int_to_string(ret, num);
-        print(num);
-        print(")\n");
-        return;
-    }
-
-    print(hostname);
-    print(" -> ");
-    for (int i = 0; i < 4; i++) {
-        char num[4];
-        int val = ip[i];
-        int idx = 0;
-        if (val >= 100) { num[idx++] = '0' + val / 100; val %= 100; }
-        if (val >= 10 || idx > 0) { num[idx++] = '0' + val / 10; val %= 10; }
-        num[idx++] = '0' + val;
-        num[idx] = '\0';
-        print(num);
-        if (i < 3) print(".");
-    }
-    print("\n");
-}
+// --- Phase 22 Stage E U21d: Network builtins removed ---
+// Pre-Phase-22 gash had cmd_ifconfig, cmd_netstat, cmd_http, cmd_dns all
+// hard-wired against the deleted SYS_NET_IFCONFIG / SYS_NET_STATUS /
+// SYS_HTTP_GET / SYS_DNS_RESOLVE syscalls. They're now provided by
+// /bin/ifconfig (libnet client), /bin/ping (ICMP via libnet), and any
+// future user-binary that links libhttp.a / libnet.a. gash falls through
+// to spawn_program() on those names so `gash> ifconfig` still works.
 
 // --- Phase 9e: AI Command ---
 
@@ -2046,47 +1990,62 @@ void cmd_ai(char *argv[], int argc) {
 
     print("Thinking...\n");
 
-    // 6. Call HTTP POST
+    // 6. Call HTTP POST via libhttp (Phase 22 Stage E migration).
+    //    Until P22.D.2 lands the Mongoose TLS extraction, https:// returns
+    //    -EPROTO; cmd_ai surfaces the error rather than spinning.
     char response[8192];
     for (int i = 0; i < (int)sizeof(response); i++) response[i] = 0;
 
-    int ret = syscall_http_post(url, body, b, response, sizeof(response));
+    int ret = 0;
+    {
+        http_response_t resp;
+        for (int i = 0; i < (int)sizeof(resp); i++) ((char *)&resp)[i] = 0;
+        int rc = http_post(&resp, url,
+                           (const uint8_t *)body, (uint32_t)b,
+                           "application/json", /*timeout_ms=*/15000);
 
-    // Handle 429 rate limit: check response for "429" and retry once
-    if (ret > 0) {
-        // Quick check for rate limiting in response
+        // Detect 429 in body and retry once.
         int is_429 = 0;
-        for (int i = 0; i < ret - 2; i++) {
-            if (response[i] == '4' && response[i+1] == '2' && response[i+2] == '9') {
-                is_429 = 1;
-                break;
+        if (rc == 0 && resp.body && resp.body_len >= 3) {
+            for (uint32_t i = 0; i + 2 < resp.body_len; i++) {
+                if (resp.body[i] == '4' && resp.body[i+1] == '2' && resp.body[i+2] == '9') {
+                    is_429 = 1; break;
+                }
             }
         }
         if (is_429) {
             print("Rate limited, retrying in 2s...\n");
-            // Simple delay: busy-wait loop (~2 seconds)
             for (volatile int d = 0; d < 200000000; d++) {}
-            for (int i = 0; i < (int)sizeof(response); i++) response[i] = 0;
-            ret = syscall_http_post(url, body, b, response, sizeof(response));
+            http_response_free(&resp);
+            for (int i = 0; i < (int)sizeof(resp); i++) ((char *)&resp)[i] = 0;
+            rc = http_post(&resp, url,
+                           (const uint8_t *)body, (uint32_t)b,
+                           "application/json", /*timeout_ms=*/15000);
         }
-    }
 
-    if (ret < 0) {
-        print("ai: HTTP POST failed (error ");
-        char num[12];
-        int_to_string(ret, num);
-        print(num);
-        if (ret == -10) print(" timeout");
-        else if (ret == -11) print(" DNS failed");
-        else if (ret == -12) print(" connection failed");
-        else if (ret == -17) print(" no network");
-        print(")\n");
-        return;
-    }
+        if (rc < 0) {
+            print("ai: HTTP POST failed (error ");
+            char num[12];
+            int_to_string(rc, num);
+            print(num);
+            print(")\n");
+            http_response_free(&resp);
+            return;
+        }
+        if (resp.body == 0 || resp.body_len == 0) {
+            print("ai: empty response\n");
+            http_response_free(&resp);
+            return;
+        }
 
-    if (ret == 0) {
-        print("ai: empty response\n");
-        return;
+        // Copy into existing fixed buffer so the rest of cmd_ai (jsmn parse)
+        // keeps working unchanged.
+        uint32_t copy_len = resp.body_len;
+        if (copy_len > sizeof(response) - 1) copy_len = sizeof(response) - 1;
+        for (uint32_t i = 0; i < copy_len; i++) response[i] = (char)resp.body[i];
+        response[copy_len] = '\0';
+        ret = (int)copy_len;
+        http_response_free(&resp);
     }
 
     // 7. Parse JSON response with JSMN
@@ -2506,10 +2465,8 @@ static int execute_builtin(char *argv[], int argc) {
         print("  watch <cap>         - Watch capability state changes\n");
         print("  unwatch <cap>       - Stop watching a capability\n");
         print("  events              - Show pending CAN events\n");
-        print("  ifconfig            - Show network interface info\n");
-        print("  netstat             - Show TCP/IP stack status\n");
-        print("  http <url>          - Fetch URL via HTTP/HTTPS GET\n");
-        print("  dns <hostname>      - Resolve hostname to IP address\n");
+        print("  ifconfig            - Show network info (exec /bin/ifconfig)\n");
+        print("  ping <ip|host>      - ICMP echo (exec /bin/ping)\n");
         print("  ai <prompt...>      - Ask AI (Gemini) with system context\n");
         print("  agent <prompt...>   - AI agent: plan + validate + execute\n");
         print("  pid                 - Show current process ID\n");
@@ -2590,6 +2547,14 @@ static int execute_builtin(char *argv[], int argc) {
     }
     else if (strcmp(cmd, "ps") == 0) {
         cmd_ps();
+        return 1;
+    }
+    else if (strcmp(cmd, "psinfo") == 0) {
+        int per_cpu = 0;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--per-cpu") == 0) per_cpu = 1;
+        }
+        cmd_psinfo(per_cpu);
         return 1;
     }
     else if (strcmp(cmd, "drivers") == 0) {
@@ -2713,22 +2678,11 @@ static int execute_builtin(char *argv[], int argc) {
         cmd_events();
         return 1;
     }
-    else if (strcmp(cmd, "ifconfig") == 0) {
-        cmd_ifconfig();
-        return 1;
-    }
-    else if (strcmp(cmd, "netstat") == 0) {
-        cmd_netstat();
-        return 1;
-    }
-    else if (strcmp(cmd, "http") == 0) {
-        cmd_http(argc > 1 ? argv[1] : "");
-        return 1;
-    }
-    else if (strcmp(cmd, "dns") == 0) {
-        cmd_dns(argc > 1 ? argv[1] : "");
-        return 1;
-    }
+    // Phase 22 Stage E U21d: ifconfig / netstat / http / dns builtins
+    // removed. `gash> ifconfig` falls through to spawn_program("ifconfig")
+    // which exec's /bin/ifconfig (libnet net_query). Same path for ping.
+    // Plain `http` / `dns` builtins are gone — user-space binaries that
+    // need HTTP or DNS link libhttp.a / libnet.a directly.
     else if (strcmp(cmd, "ai") == 0) {
         cmd_ai(argv, argc);
         return 1;
@@ -2781,6 +2735,91 @@ static int execute_builtin(char *argv[], int argc) {
         int_to_string(current_pid, buf);
         print(buf);
         print("\n");
+        return 1;
+    }
+    // ----- Phase 19: versioned-FS builtins -----
+    else if (strcmp(cmd, "versions") == 0) {
+        if (argc < 2) {
+            print("versions: usage: versions <path>\n");
+            return 1;
+        }
+        int fd = syscall_open(argv[1]);
+        if (fd < 0) {
+            print("versions: open failed: ");
+            print(argv[1]);
+            print("\n");
+            return 1;
+        }
+        fs_version_info_u_t vbuf[16];
+        long n = syscall_fs_list_versions((uint32_t)fd, vbuf, 16);
+        if (n == -127) {
+            print("versions: FS is v1-compat read-only; no version history.\n");
+            syscall_close(fd);
+            return 1;
+        }
+        if (n < 0) {
+            print("versions: list_versions failed\n");
+            syscall_close(fd);
+            return 1;
+        }
+        char ibuf[24];
+        print("versions: ");
+        print(argv[1]);
+        print(" total=");
+        int_to_string((int)n, ibuf);
+        print(ibuf);
+        print("\n");
+        for (long i = 0; i < n; ++i) {
+            print("  v");
+            int_to_string((int)vbuf[i].version_id, ibuf);
+            print(ibuf);
+            print("\n");
+        }
+        syscall_close(fd);
+        return 1;
+    }
+    else if (strcmp(cmd, "revert") == 0) {
+        if (argc < 3) {
+            print("revert: usage: revert <path> <version_id>\n");
+            return 1;
+        }
+        int fd = syscall_open(argv[1]);
+        if (fd < 0) { print("revert: open failed\n"); return 1; }
+        uint64_t vid = 0;
+        for (int i = 0; argv[2][i]; ++i) {
+            if (argv[2][i] >= '0' && argv[2][i] <= '9')
+                vid = vid * 10 + (uint64_t)(argv[2][i] - '0');
+        }
+        long rc = syscall_fs_revert((uint32_t)fd, vid);
+        syscall_close(fd);
+        if (rc == 0) print("revert: ok\n");
+        else if (rc == -127) print("revert: v1 compat mount is read-only\n");
+        else print("revert: failed\n");
+        return 1;
+    }
+    else if (strcmp(cmd, "snapshot") == 0) {
+        const char *lbl = (argc > 1) ? argv[1] : "";
+        long rc = syscall_fs_snapshot(lbl, (uint32_t)strlen(lbl));
+        if (rc > 0) {
+            print("snapshot: ok (cap token minted)\n");
+        } else if (rc == -127) {
+            print("snapshot: v1 compat mount is read-only\n");
+        } else {
+            print("snapshot: failed\n");
+        }
+        return 1;
+    }
+    else if (strcmp(cmd, "gc") == 0) {
+        long pruned = syscall_fs_gc_now();
+        if (pruned == -127) {
+            print("gc: v1 compat mount has no version history\n");
+        } else {
+            char buf[16];
+            int_to_string((int)pruned, buf);
+            print("gc: pruned ");
+            print(buf);
+            print(" version(s)\n");
+        }
         return 1;
     }
     else if (strcmp(cmd, "kill") == 0) {

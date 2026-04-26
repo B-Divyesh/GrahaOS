@@ -34,6 +34,30 @@ static const char *event_name(unsigned ev) {
     case AUDIT_REBOOT:             return "REBOOT";
     case AUDIT_NET_BIND:           return "NET_BIND";
     case AUDIT_AI_INVOKE:          return "AI_INVOKE";
+    case AUDIT_CAP_ACTIVATE:           return "CAP_ACTIVATE";
+    case AUDIT_CAP_DEACTIVATE:         return "CAP_DEACTIVATE";
+    case AUDIT_DEPRECATED_SYSCALL:     return "DEPRECATED_SYSCALL";
+    case AUDIT_CHAN_SEND:              return "CHAN_SEND";
+    case AUDIT_CHAN_RECV:              return "CHAN_RECV";
+    case AUDIT_CHAN_TYPE_MISMATCH:     return "CHAN_TYPE_MISMATCH";
+    case AUDIT_VMO_FAULT:              return "VMO_FAULT";
+    case AUDIT_HANDLE_TRANSFER:        return "HANDLE_TRANSFER";
+    case AUDIT_STREAM_OP_REJECTED:     return "STREAM_OP_REJECTED";
+    case AUDIT_STREAM_DESTROY_CANCELED: return "STREAM_DESTROY_CANCELED";
+    case AUDIT_FS_JOURNAL_REPLAY:      return "FS_JOURNAL_REPLAY";
+    case AUDIT_FS_REVERT:              return "FS_REVERT";
+    case AUDIT_FS_GC_NOW:              return "FS_GC_NOW";
+    case AUDIT_FS_SNAPSHOT:            return "FS_SNAPSHOT";
+    case AUDIT_RLIMIT_MEM:             return "RLIMIT_MEM";
+    case AUDIT_RLIMIT_CPU:             return "RLIMIT_CPU";
+    case AUDIT_RLIMIT_IO:              return "RLIMIT_IO";
+    case AUDIT_SCHED_EPOCH:            return "SCHED_EPOCH";
+    case AUDIT_SCHED_STARVATION:       return "SCHED_STARVATION";
+    case AUDIT_SCHED_SPINLOCK_PANIC:   return "SCHED_SPINLOCK_PANIC";
+    case AUDIT_DRV_REGISTERED:         return "DRV_REGISTERED";
+    case AUDIT_DRV_DIED:               return "DRV_DIED";
+    case AUDIT_MMIO_DENIED:            return "MMIO_DENIED";
+    case AUDIT_IRQ_DROPPED:            return "IRQ_DROPPED";
     default:                        return "UNKNOWN";
     }
 }

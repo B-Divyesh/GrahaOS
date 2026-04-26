@@ -6,7 +6,7 @@
 #include "../../arch/x86_64/mm/pmm.h"
 #include "../../arch/x86_64/mm/vmm.h"
 #include "../../drivers/video/framebuffer.h"
-#include "../../arch/x86_64/drivers/ahci/ahci.h"
+#include "blk_client.h"
 
 static open_file_t open_file_table[MAX_OPEN_FILES];
 static block_device_t block_device_table[MAX_BLOCK_DEVICES];
@@ -553,8 +553,7 @@ void vfs_sync(void) {
     // Flush all block devices
     for (int i = 0; i < MAX_BLOCK_DEVICES; i++) {
         if (block_device_table[i].in_use) {
-            // Call AHCI flush for this device
-            ahci_flush_cache(i);
+            grahafs_block_flush((uint8_t)i);
         }
     }
 }
@@ -631,5 +630,22 @@ int vfs_async_write(vfs_node_t *node, uint64_t offset, uint64_t len,
     }
     ssize_t r = node->write(node, offset, (size_t)len, (void *)src);
     cb((int64_t)r, user_data);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 19: vfs_fsync.
+// ---------------------------------------------------------------------------
+// Dispatches to the v2 driver if it is mounted; otherwise degrades to a
+// vfs_sync() cache flush (preserves prior semantics for v1 consumers).
+extern bool grahafs_v2_is_mounted(void);
+extern int  grahafs_v2_fsync(vfs_node_t *node);
+
+int vfs_fsync(vfs_node_t *node) {
+    if (!node) return -22;
+    if (grahafs_v2_is_mounted()) {
+        return grahafs_v2_fsync(node);
+    }
+    vfs_sync();
     return 0;
 }

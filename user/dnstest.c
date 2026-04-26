@@ -1,151 +1,133 @@
-// user/dnstest.c
-// Phase 9c: DNS + HTTP Client test suite
+// user/dnstest.c — Phase 22 Stage E migration.
+//
+// Pre-Phase-22 this called SYS_HTTP_GET + SYS_DNS_RESOLVE (now scheduled
+// for -ENOSYS in Stage F). Stage E swaps to libhttp http_get and
+// libnet_dns_resolve.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
 #include "syscalls.h"
+#include "libnet/libnet.h"
+#include "libnet/libnet_msg.h"
+#include "libhttp/libhttp.h"
 
-// Minimal string helpers (same pattern as other test programs)
-static int my_strlen(const char *s) {
-    int len = 0;
-    while (s[len]) len++;
-    return len;
-}
-
-static int my_strstr(const char *haystack, const char *needle) {
-    int hlen = my_strlen(haystack);
-    int nlen = my_strlen(needle);
+static int my_strstr_local(const uint8_t *haystack, size_t hlen, const char *needle) {
+    size_t nlen = 0;
+    while (needle[nlen]) nlen++;
     if (nlen == 0) return 1;
     if (nlen > hlen) return 0;
-    for (int i = 0; i <= hlen - nlen; i++) {
-        int match = 1;
-        for (int j = 0; j < nlen; j++) {
-            if (haystack[i + j] != needle[j]) { match = 0; break; }
-        }
-        if (match) return 1;
+    for (size_t i = 0; i + nlen <= hlen; i++) {
+        size_t j = 0;
+        while (j < nlen && haystack[i + j] == (uint8_t)needle[j]) j++;
+        if (j == nlen) return 1;
     }
     return 0;
-}
-
-static void print(const char *str) {
-    while (*str) syscall_putc(*str++);
-}
-
-static void print_int(int val) {
-    if (val < 0) {
-        syscall_putc('-');
-        val = -val;
-    }
-    char buf[12];
-    int i = 0;
-    if (val == 0) { buf[i++] = '0'; }
-    else {
-        while (val > 0) { buf[i++] = '0' + (val % 10); val /= 10; }
-    }
-    while (i > 0) syscall_putc(buf[--i]);
 }
 
 static int tests_passed = 0;
 static int tests_failed = 0;
 
-static void test(const char *name, int condition) {
-    if (condition) {
-        print("[PASS] ");
-        tests_passed++;
-    } else {
-        print("[FAIL] ");
-        tests_failed++;
-    }
-    print(name);
-    print("\n");
+static void test_(const char *name, int condition) {
+    if (condition) { printf("[PASS] %s\n", name); tests_passed++; }
+    else            { printf("[FAIL] %s\n", name); tests_failed++; }
 }
 
 void _start(void) {
-    print("=== DNS + HTTP Client Test Suite ===\n");
-    print("Phase 9c: DNS resolution and HTTP client tests\n");
+    printf("=== dnstest — Phase 22 Stage E ===\n");
 
-    // === Group 1: HTTP GET localhost ===
-    print("\n=== Group 1: HTTP GET localhost ===\n");
+    libnet_client_ctx_t ctx;
+    int rc = libnet_connect_service_with_retry(LIBNET_NAME_SERVICE,
+                                                (uint32_t)strlen(LIBNET_NAME_SERVICE),
+                                                /*total_timeout_ms=*/5000, &ctx);
+    if (rc < 0) {
+        printf("dnstest: cannot connect to /sys/net/service (rc=%d)\n", rc);
+        syscall_exit(1);
+    }
+
+    // Group 1: HTTP GET / via libhttp
+    printf("\n=== Group 1: HTTP GET localhost ===\n");
     {
-        char response[4096];
-        int ret = syscall_http_get("http://10.0.2.2:8080/", response, sizeof(response));
-        test("1. HTTP GET / returns positive length", ret > 0);
-
-        if (ret > 0) {
-            test("2. Response contains 'GrahaOS'", my_strstr(response, "GrahaOS"));
+        http_response_t resp;
+        memset(&resp, 0, sizeof(resp));
+        int gr = http_get(&resp, "http://10.0.2.2:8080/", /*timeout_ms=*/5000);
+        int ok = (gr == 0 && resp.body_len > 0);
+        test_("1. HTTP GET / returns positive length", ok);
+        if (ok) {
+            test_("2. Response contains 'GrahaOS'",
+                  my_strstr_local(resp.body, resp.body_len, "GrahaOS"));
         } else {
-            print("  Skipping content check (request failed: ");
-            print_int(ret);
-            print(")\n");
+            printf("  (rc=%d status=%d)\n", gr, resp.status_code);
             tests_failed++;
         }
+        http_response_free(&resp);
     }
 
-    // === Group 2: HTTP GET /api/status ===
-    print("\n=== Group 2: HTTP GET /api/status ===\n");
+    // Group 2: HTTP GET /api/status
+    printf("\n=== Group 2: HTTP GET /api/status ===\n");
     {
-        char response[4096];
-        int ret = syscall_http_get("http://10.0.2.2:8080/api/status", response, sizeof(response));
-        test("3. HTTP GET /api/status returns positive length", ret > 0);
-
-        if (ret > 0) {
-            test("4. Status response contains 'Uptime'", my_strstr(response, "Uptime"));
+        http_response_t resp;
+        memset(&resp, 0, sizeof(resp));
+        int gr = http_get(&resp, "http://10.0.2.2:8080/api/status",
+                          /*timeout_ms=*/5000);
+        int ok = (gr == 0 && resp.body_len > 0);
+        test_("3. HTTP GET /api/status returns positive length", ok);
+        if (ok) {
+            test_("4. Status response contains 'Uptime'",
+                  my_strstr_local(resp.body, resp.body_len, "Uptime"));
         } else {
-            print("  Skipping content check (request failed: ");
-            print_int(ret);
-            print(")\n");
             tests_failed++;
         }
+        http_response_free(&resp);
     }
 
-    // === Group 3: HTTP GET nonexistent path ===
-    print("\n=== Group 3: HTTP GET nonexistent path ===\n");
+    // Group 3: 404 path
+    printf("\n=== Group 3: HTTP GET nonexistent path ===\n");
     {
-        char response[4096];
-        int ret = syscall_http_get("http://10.0.2.2:8080/nonexistent", response, sizeof(response));
-        test("5. HTTP GET /nonexistent returns data", ret > 0);
-
-        if (ret > 0) {
-            test("6. 404 response contains 'Not found'", my_strstr(response, "Not found"));
+        http_response_t resp;
+        memset(&resp, 0, sizeof(resp));
+        int gr = http_get(&resp, "http://10.0.2.2:8080/nonexistent",
+                          /*timeout_ms=*/5000);
+        int ok = (gr == 0 && resp.body_len > 0);
+        test_("5. HTTP GET /nonexistent returns data", ok);
+        if (ok) {
+            test_("6. 404 response contains 'Not found'",
+                  my_strstr_local(resp.body, resp.body_len, "Not found"));
         } else {
-            print("  Skipping content check\n");
             tests_failed++;
         }
+        http_response_free(&resp);
     }
 
-    // === Group 4: DNS Resolution ===
-    print("\n=== Group 4: DNS Resolution ===\n");
+    // Group 4: DNS resolution via libnet
+    printf("\n=== Group 4: DNS Resolution ===\n");
     {
-        // Try resolving dns.google (should be 8.8.8.8 or 8.8.4.4)
-        uint8_t ip[4] = {0, 0, 0, 0};
-        int ret = syscall_dns_resolve("dns.google", ip);
-        if (ret == 0) {
-            int valid = (ip[0] == 8 && ip[1] == 8 &&
-                        (ip[2] == 8 || ip[2] == 4) &&
-                        (ip[3] == 8 || ip[3] == 4));
-            test("7. dns.google resolves to 8.8.x.x", valid);
+        libnet_dns_query_resp_t dr;
+        memset(&dr, 0, sizeof(dr));
+        int dnr = libnet_dns_resolve(&ctx, "dns.google",
+                                     /*timeout_ms=*/5000, &dr);
+        if (dnr == 0 && dr.answer_count > 0) {
+            uint32_t ip = dr.answers[0];
+            uint8_t a = (uint8_t)((ip >> 24) & 0xFF);
+            uint8_t b = (uint8_t)((ip >> 16) & 0xFF);
+            uint8_t c = (uint8_t)((ip >>  8) & 0xFF);
+            uint8_t d = (uint8_t)(ip & 0xFF);
+            int valid = (a == 8 && b == 8 &&
+                         (c == 8 || c == 4) &&
+                         (d == 8 || d == 4));
+            test_("7. dns.google resolves to 8.8.x.x", valid);
         } else {
-            // DNS may fail depending on QEMU/host config — not a hard failure
-            print("  DNS returned ");
-            print_int(ret);
-            print(" (may be expected in some configs)\n");
-            test("7. DNS syscall returned without crash", 1);
+            printf("  DNS rc=%d answers=%u\n", dnr, (unsigned)dr.answer_count);
+            test_("7. DNS query returned without crash", 1);
         }
     }
 
-    // === Group 5: HTTP subsystem functional ===
-    print("\n=== Group 5: Subsystem Health ===\n");
-    test("8. HTTP client subsystem is functional", 1);
+    printf("\n=== Group 5: Subsystem Health ===\n");
+    test_("8. libhttp + libnet subsystem is functional", 1);
 
-    // Results
-    print("\n=== Results: ");
-    print_int(tests_passed);
-    print(" passed, ");
-    print_int(tests_failed);
-    print(" failed (Total: ");
-    print_int(tests_passed + tests_failed);
-    print(") ===\n");
-
-    if (tests_failed == 0) {
-        print("ALL TESTS PASSED!\n");
-    }
-
+    printf("\n=== Results: %d passed, %d failed (Total: %d) ===\n",
+           tests_passed, tests_failed, tests_passed + tests_failed);
+    if (tests_failed == 0) printf("ALL TESTS PASSED!\n");
     syscall_exit(tests_failed);
 }

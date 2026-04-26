@@ -146,6 +146,125 @@
                                  //   RDX=timeout_ns
 #define SYS_STREAM_DESTROY 1078  // RDI=stream_handle_raw
 
+// Phase 19: GrahaFS v2 — versioned segments + full data journaling.
+// Spec listed 1077-1080; shifted +2 because Phase 18 consumed 1077-1078 for
+// SYS_STREAM_REAP / SYS_STREAM_DESTROY. Out-of-spec addition #1.
+#define SYS_FS_SNAPSHOT       1079  // RDI = const char *label (user ptr, may be NULL)
+                                    //   RSI = label_len (0..64)
+                                    // Returns: cap_token_raw_t for new
+                                    //   CAP_KIND_FS_SNAPSHOT, or -errno.
+#define SYS_FS_LIST_VERSIONS  1080  // RDI = uint32_t inode_num
+                                    //   RSI = fs_version_info_t *out (user ptr)
+                                    //   RDX = uint32_t max_count (1..64)
+                                    // Returns count written (0..max_count), or -errno.
+#define SYS_FS_REVERT         1081  // RDI = uint32_t inode_num
+                                    //   RSI = uint64_t target_version_id
+                                    // Returns new version_id (uint64_t cast), or -errno.
+#define SYS_FS_GC_NOW         1082  // No args.
+                                    // Returns count of versions pruned, or -errno.
+#define SYS_FSYNC             1083  // RDI = int fd
+                                    // Force-commits any pending journal txn for
+                                    // the underlying node and issues a disk
+                                    // flush. Returns 0 or -errno.
+
+// Phase 20: resource limits.
+// Spec listed 1081-1082; shifted +3 because Phase 19 consumed 1081-1083
+// for SYS_FS_REVERT / SYS_FS_GC_NOW / SYS_FSYNC. Out-of-spec addition #1.
+#define SYS_SETRLIMIT         1084  // RDI = uint32_t pid (0 = self)
+                                    //   RSI = uint32_t resource (RLIMIT_MEM/CPU/IO)
+                                    //   RDX = uint64_t value
+                                    // Requires PLEDGE_SYS_CONTROL even for self
+                                    // (limits are not self-manageable). Returns
+                                    // 0 on success, -ESRCH / -EINVAL / -EPLEDGE.
+#define SYS_GETRLIMIT         1085  // RDI = uint32_t pid (0 = self)
+                                    //   RSI = uint32_t resource
+                                    //   RDX = uint64_t *value_out (user ptr)
+                                    // Requires PLEDGE_SYS_QUERY (default-granted).
+                                    // Returns 0 on success, writes limit to
+                                    // *value_out; -ESRCH / -EINVAL / -EFAULT.
+#define SYS_SPAWN_EX          1086  // RDI = const char *path
+                                    //   RSI = const spawn_rlimits_t *attrs (user ptr, may be NULL)
+                                    // Default inheritance (attrs==NULL): same as SYS_SPAWN.
+                                    // With SPAWN_ATTR_HAS_RLIMIT set in attrs.flags, caller
+                                    // MUST hold PLEDGE_SYS_CONTROL. Returns child pid or
+                                    // -EAGAIN / -EPLEDGE / -EFAULT.
+
+// Phase 21: userspace driver framework + E1000 migration.
+// Spec listed 1083-1085; shifted +4 because Phase 19/20 consumed 1083-1086.
+// Out-of-spec addition #1 (same drift pattern as prior phases).
+#define SYS_DRV_REGISTER      1087  // RDI = uint16_t vendor_id
+                                    //   RSI = uint16_t device_id
+                                    //   RDX = uint8_t  device_class (PCI class)
+                                    //   R10 = struct drv_caps *out_caps (user ptr)
+                                    // Pledge: SYS_CONTROL + class-specific
+                                    // (NET_SERVER for NICs, STORAGE_SERVER for AHCI).
+                                    // Cap: CAP_KIND_DRIVER_REGISTRAR token in caller's
+                                    // handle table (slot 0 by convention, granted by init).
+                                    // Returns 0, fills out_caps; -ENODEV/-EBUSY/-EPLEDGE/
+                                    // -EFAULT/-ENOMEM.
+#define SYS_DRV_IRQ_WAIT      1088  // RDI = uint32_t irq_channel_handle (cap_token raw)
+                                    //   RSI = struct drv_irq_msg *out_msgs (user ptr)
+                                    //   RDX = uint32_t max_msgs (1..64; capped at 64)
+                                    //   R10 = uint32_t timeout_ms (0=poll, UINT32_MAX=block)
+                                    // Pledge: SYS_CONTROL.
+                                    // Cap: CAP_KIND_IRQ_CHANNEL.
+                                    // Returns N copied (0..max_msgs), 0 on timeout, or
+                                    // -EBADF/-EFAULT/-ESHUTDOWN/-EPLEDGE.
+#define SYS_MMIO_VMO_CREATE   1089  // RDI = uint64_t op (0=CREATE, 1=PHYS_QUERY)
+                                    // op=CREATE: RSI=phys_addr, RDX=size, R10=flags
+                                    //   Returns vmo cap_token raw or -EACCES/-EINVAL/
+                                    //   -ENOMEM/-EPLEDGE.
+                                    // op=PHYS_QUERY: RSI=vmo_handle, RDX=page_index,
+                                    //   R10=uint64_t *phys_out
+                                    //   Returns 0 (writes phys_out), or -EBADF/-EINVAL.
+                                    // Pledge: SYS_CONTROL. Cap: CAP_KIND_DRIVER_REGISTRAR.
+#define SYS_DEBUG_INJECT_PCI  1090  // RDI = const struct pci_inject *desc (user ptr)
+                                    // Debug-only: gated by WITH_DEBUG_SYSCALL build flag
+                                    // AND cmdline test_mode=1. Adds a fake PCI entry to
+                                    // g_pci_table for the test harness's deterministic
+                                    // EBUSY/ENODEV/EACCES tests. Returns the new entry
+                                    // index (0..g_pci_table_count-1), or -EPERM if not
+                                    // built/enabled, or -ENOSPC if table full.
+
+// Phase 22: named channel registry (backed by kernel/net/rawnet.c). Enables
+// `chan_connect("/sys/net/service")`-style service lookup that the spec
+// (AW-22.1 / AW-22.2) assumes but that Phase 17 did not provide. The five
+// Mongoose-era syscalls (1041-1045) are retired in Phase 22's Stage F and
+// return -ENOSYS + AUDIT_DEPRECATED_SYSCALL thereafter. Net delta: -3 syscalls.
+#define SYS_CHAN_PUBLISH      1091  // RDI = const char *name (user ptr)
+                                    //   RSI = uint32_t name_len
+                                    //   RDX = uint64_t payload_type_hash (FNV-1a)
+                                    //   R10 = cap_token_raw_t accept_channel_write_end
+                                    // Pledge: IPC_SEND | IPC_RECV. No cap
+                                    // requirement beyond endpoint ownership.
+                                    // Returns 0 on success, -EPERM (name already
+                                    //   owned by different pid), -EINVAL (bad
+                                    //   name or unknown type_hash), -ENOMEM
+                                    //   (registry full), -EPROTOTYPE (hash not
+                                    //   in the manifest).
+#define SYS_CHAN_CONNECT      1092  // RDI = const char *name (user ptr)
+                                    //   RSI = uint32_t name_len
+                                    //   RDX = cap_token_u_t *out_wr_req   (user ptr)
+                                    //   R10 = cap_token_u_t *out_rd_resp  (user ptr)
+                                    // Pledge: IPC_SEND | IPC_RECV.
+                                    // On success, a fresh request channel (client
+                                    //   writes, publisher reads) and response
+                                    //   channel (publisher writes, client reads)
+                                    //   are allocated; the client-side tokens
+                                    //   are written to out_wr_req / out_rd_resp;
+                                    //   the server-side tokens are delivered to
+                                    //   the publisher via the accept channel it
+                                    //   registered at publish time.
+                                    // Returns 0, -EBADF (no such name),
+                                    //   -EINVAL (bad name), -ENOMEM, -EFAULT
+                                    //   (bad user pointer), -EPIPE (publisher
+                                    //   has died and cleanup has not yet run).
+
+// Resource identifiers for SYS_SETRLIMIT / SYS_GETRLIMIT.
+#define RLIMIT_MEM            1     // pages (4 KiB each); 0 = unlimited
+#define RLIMIT_CPU            2     // ns per 1-second epoch (max 1_000_000_000); 0 = unlimited
+#define RLIMIT_IO             3     // bytes per second through stream submit; 0 = unlimited
+
 // SYS_DEBUG sub-operations passed in RDI.
 #define DEBUG_PANIC         1   // RSI = const char *reason
 #define DEBUG_KERNEL_PF     2   // no args; writes to unmapped kernel addr

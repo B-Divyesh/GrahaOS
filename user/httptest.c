@@ -1,15 +1,18 @@
-// user/httptest.c
-// Phase 9b: Mongoose TCP/IP stack test suite
-// 5 automated tests covering network stack status
+// user/httptest.c — Phase 22 Stage E migration.
+//
+// Pre-Phase-22 this called SYS_NET_STATUS. Stage E swaps to libnet_net_query
+// against /sys/net/service. Same 6 assertions: stack running + IP/netmask/
+// gateway match + tcp_ip CAN capability ON.
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include "syscalls.h"
+#include "libnet/libnet.h"
+#include "libnet/libnet_msg.h"
 #include "../kernel/state.h"
 
-// Test counters
 static int tests_passed = 0;
 static int tests_failed = 0;
 
@@ -23,117 +26,63 @@ static int tests_failed = 0;
     } \
 } while(0)
 
-// Net status structure (matches kernel/net/net.h)
-typedef struct {
-    uint8_t  stack_running;
-    uint8_t  ip[4];
-    uint8_t  netmask[4];
-    uint8_t  gateway[4];
-    uint32_t rx_count;
-    uint32_t tx_count;
-} net_status_t;
-
-// =====================================================
-// Test 1: NET_STATUS syscall succeeds and stack is running
-// =====================================================
-void test_stack_running(void) {
-    printf("\n=== Group 1: Stack Status ===\n");
-
-    net_status_t status;
-    memset(&status, 0, sizeof(status));
-    int ret = syscall_net_status(&status);
-    TEST("1. NET_STATUS syscall succeeds (ret=0)", ret == 0);
-    TEST("2. TCP/IP stack is running", status.stack_running == 1);
+static void ip_octets(uint32_t ip, uint8_t out[4]) {
+    out[0] = (uint8_t)((ip >> 24) & 0xFF);
+    out[1] = (uint8_t)((ip >> 16) & 0xFF);
+    out[2] = (uint8_t)((ip >> 8)  & 0xFF);
+    out[3] = (uint8_t)(ip & 0xFF);
 }
 
-// =====================================================
-// Test 2: IP address is 10.0.2.15
-// =====================================================
-void test_ip_address(void) {
-    printf("\n=== Group 2: IP Configuration ===\n");
+void _start(void) {
+    printf("=== httptest — Phase 22 Stage E ===\n");
 
-    net_status_t status;
-    memset(&status, 0, sizeof(status));
-    syscall_net_status(&status);
+    libnet_client_ctx_t ctx;
+    int rc = libnet_connect_service_with_retry(LIBNET_NAME_SERVICE,
+                                                (uint32_t)strlen(LIBNET_NAME_SERVICE),
+                                                /*total_timeout_ms=*/5000, &ctx);
+    if (rc < 0) {
+        printf("httptest: cannot connect to /sys/net/service (rc=%d)\n", rc);
+        syscall_exit(1);
+    }
 
-    int correct_ip = (status.ip[0] == 10 && status.ip[1] == 0 &&
-                      status.ip[2] == 2 && status.ip[3] == 15);
+    libnet_net_query_resp_t resp;
+    memset(&resp, 0, sizeof(resp));
+    rc = libnet_net_query(&ctx, LIBNET_NET_QUERY_FIELD_ALL,
+                          /*timeout_ns=*/2000000000ull, &resp);
+    TEST("1. net_query syscall succeeds (rc=0)", rc == 0);
+    TEST("2. TCP/IP stack is running", resp.stack_running == 1);
+
+    uint8_t ip[4], mask[4], gw[4];
+    ip_octets(resp.ip, ip);
+    ip_octets(resp.netmask, mask);
+    ip_octets(resp.gateway, gw);
+
+    int correct_ip = (ip[0] == 10 && ip[1] == 0 && ip[2] == 2 && ip[3] == 15);
     TEST("3. IP address is 10.0.2.15", correct_ip);
-}
 
-// =====================================================
-// Test 3: Netmask is 255.255.255.0
-// =====================================================
-void test_netmask(void) {
-    printf("\n=== Group 3: Netmask ===\n");
-
-    net_status_t status;
-    memset(&status, 0, sizeof(status));
-    syscall_net_status(&status);
-
-    int correct_mask = (status.netmask[0] == 255 && status.netmask[1] == 255 &&
-                        status.netmask[2] == 255 && status.netmask[3] == 0);
+    int correct_mask = (mask[0] == 255 && mask[1] == 255 && mask[2] == 255 && mask[3] == 0);
     TEST("4. Netmask is 255.255.255.0", correct_mask);
-}
 
-// =====================================================
-// Test 4: Gateway is 10.0.2.2
-// =====================================================
-void test_gateway(void) {
-    printf("\n=== Group 4: Gateway ===\n");
-
-    net_status_t status;
-    memset(&status, 0, sizeof(status));
-    syscall_net_status(&status);
-
-    int correct_gw = (status.gateway[0] == 10 && status.gateway[1] == 0 &&
-                      status.gateway[2] == 2 && status.gateway[3] == 2);
+    int correct_gw = (gw[0] == 10 && gw[1] == 0 && gw[2] == 2 && gw[3] == 2);
     TEST("5. Gateway is 10.0.2.2", correct_gw);
-}
-
-// =====================================================
-// Test 5: tcp_ip CAN capability is registered and ON
-// =====================================================
-void test_can_capability(void) {
-    printf("\n=== Group 5: CAN Capability ===\n");
 
     state_cap_list_t caps;
-    long ret = syscall_get_system_state(STATE_CAT_CAPABILITIES, &caps, sizeof(caps));
-    if (ret < 0) {
-        printf("  Failed to query capabilities\n");
-        tests_failed++;
-        return;
-    }
-
-    int found = 0;
-    int is_on = 0;
-    for (uint32_t i = 0; i < caps.count; i++) {
-        if (strcmp(caps.caps[i].name, "tcp_ip") == 0) {
-            found = 1;
-            is_on = (caps.caps[i].state == 2);  // ON
-            break;
+    long sret = syscall_get_system_state(STATE_CAT_CAPABILITIES, &caps, sizeof(caps));
+    int found_cap = 0, on = 0;
+    if (sret >= 0) {
+        for (uint32_t i = 0; i < caps.count; i++) {
+            if (strcmp(caps.caps[i].name, "tcp_ip") == 0) {
+                found_cap = 1;
+                on = (caps.caps[i].state == 2);
+                break;
+            }
         }
     }
-    TEST("6. tcp_ip capability registered and ON", found && is_on);
-}
-
-// Main
-void _start(void) {
-    printf("=== Mongoose TCP/IP Stack Test Suite ===\n");
-    printf("Phase 9b: Network stack tests\n");
-
-    test_stack_running();
-    test_ip_address();
-    test_netmask();
-    test_gateway();
-    test_can_capability();
+    TEST("6. tcp_ip capability registered and ON", found_cap && on);
 
     printf("\n=== Results: %d passed, %d failed (Total: %d) ===\n",
            tests_passed, tests_failed, tests_passed + tests_failed);
 
-    if (tests_failed == 0) {
-        printf("ALL TESTS PASSED!\n");
-    }
-
+    if (tests_failed == 0) printf("ALL TESTS PASSED!\n");
     syscall_exit(tests_failed);
 }

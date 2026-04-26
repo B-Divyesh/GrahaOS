@@ -36,6 +36,15 @@ static spinlock_t ahci_lock = SPINLOCK_INITIALIZER("ahci");
 // ST+FRE state the port had before deactivation.
 static bool g_ahci_active = true;
 static uint32_t g_ahci_saved_cmd[32];
+
+// Phase 23 P23.deferred.2 mitigation: Snapshot of each port's CLB/FB
+// physical addresses captured at port_rebase. Used by
+// ahci_restore_after_userdrv_death to recover from a userspace ahcid
+// daemon that called port_init (overwriting our pointers) and then
+// died. Without this, kernel writes to PxCLB after ahcid dies hit
+// unmapped memory because ahcid's DMA VMO is freed.
+static uint64_t g_ahci_saved_clb[32];
+static uint64_t g_ahci_saved_fb[32];
 // Drain / quiesce timeout limits. Values chosen to match Phase 16 spec.
 #define AHCI_CR_TIMEOUT_ITERS  2000000   // ~1s of pause loops on QEMU.
 #define AHCI_FR_TIMEOUT_ITERS  1000000   // ~500ms of pause loops.
@@ -67,10 +76,12 @@ static void port_rebase(ahci_port_t *port, int portno) {
     // Allocate Command List (1KB, 1KB aligned)
     void* cmd_list_phys = pmm_alloc_page();
     port->clb = (uint64_t)cmd_list_phys;
+    g_ahci_saved_clb[portno] = (uint64_t)cmd_list_phys;  // Phase 23 P23.deferred.2
 
     // Allocate FIS Receive Buffer (256 bytes, 256-byte aligned)
     void* fis_buf_phys = pmm_alloc_page();
     port->fb = (uint64_t)fis_buf_phys;
+    g_ahci_saved_fb[portno] = (uint64_t)fis_buf_phys;    // Phase 23 P23.deferred.2
 
     // Get virtual addresses
     ahci_cmd_header_t *cmd_header = (ahci_cmd_header_t*)((uint64_t)cmd_list_phys + g_hhdm_offset);
@@ -363,6 +374,84 @@ bool     ahci_is_active(void)          { return g_ahci_active; }
 uint32_t ahci_debug_port_cmd(int port_num) {
     if (port_num < 0 || port_num >= 32 || !ports[port_num]) return 0;
     return ports[port_num]->cmd;
+}
+
+// Phase 23 P23.deferred.2: restore the kernel's view of each port's
+// command list and FIS receive buffer pointers after a userspace ahcid
+// daemon died. ahcid's port_init overwrites PxCLB/PxFB with addresses
+// from its own DMA VMOs; once ahcid exits those VMOs are unmapped, so
+// the next ahci_read/ahci_write would touch invalid memory. Restoring
+// our saved addresses (captured at port_rebase) makes the kernel-resident
+// driver functional again.
+//
+// Steps per port:
+//   1. Stop the command engine (clear ST/FRE; spin until CR/FR clear).
+//   2. Re-write PxCLB and PxFB to our saved physical addresses.
+//   3. Clear interrupt status (PxIS).
+//   4. Restart the command engine (FRE then ST).
+//
+// Idempotent. Safe to call even if no userspace driver was ever active
+// (the saved values are simply re-written; effectively a no-op).
+//
+// Called from userdrv_on_owner_death after the AHCI MMIO cap is destroyed.
+// At that point ahcid's process memory has been torn down — but we still
+// have safe access to the HBA registers because hba_mem maps the BAR
+// physically.
+void ahci_restore_after_userdrv_death(void) {
+    if (!hba_mem) return;
+    spinlock_acquire(&ahci_lock);
+    for (int i = 0; i < 32; i++) {
+        if (!ports[i]) continue;
+        if (g_ahci_saved_clb[i] == 0) continue;  // never rebased
+        ahci_port_t *p = ports[i];
+
+        // Stop CMD engine.
+        p->cmd &= ~(HBA_PxCMD_ST | HBA_PxCMD_FRE);
+        int budget = 200000;
+        while ((p->cmd & (HBA_PxCMD_FR | HBA_PxCMD_CR)) && budget-- > 0) {
+            asm volatile("pause" ::: "memory");
+        }
+
+        // Restore our pointers.
+        p->clb = g_ahci_saved_clb[i];
+        p->fb  = g_ahci_saved_fb[i];
+
+        // Clear pending interrupts.
+        p->is = 0xFFFFFFFFu;
+
+        // Restart the engine.
+        budget = 200000;
+        while ((p->cmd & HBA_PxCMD_CR) && budget-- > 0) {
+            asm volatile("pause" ::: "memory");
+        }
+        p->cmd |= HBA_PxCMD_FRE;
+        p->cmd |= HBA_PxCMD_ST;
+        memory_barrier();
+    }
+    spinlock_release(&ahci_lock);
+    klog(KLOG_INFO, SUBSYS_DRV,
+         "ahci_restore_after_userdrv_death: ports re-pointed to kernel state");
+}
+
+// Phase 23 S2: mark this device as claimable so /bin/ahcid can call
+// SYS_DRV_REGISTER and obtain MMIO + IRQ caps. The kernel-side driver
+// above continues to operate the hardware; the cutover (kernel strip +
+// channel-mediated FS I/O) is the Phase 23 production close. Today this
+// hook lets the ahcid daemon exist on the live system without disturbing
+// grahafs mount or the in-kernel I/O paths.
+void ahci_expose_to_userdrv(void) {
+    extern int userdrv_mark_claimable(uint16_t vendor_id, uint16_t device_id);
+    // QEMU AHCI is always Intel ICH9 family vendor=0x8086 device=0x2922.
+    // Real hardware enumerates whatever the BIOS reports; userdrv_mark_
+    // claimable looks up by (vendor, device).
+    int rc = userdrv_mark_claimable(0x8086, 0x2922);
+    if (rc != 0) {
+        klog(KLOG_INFO, SUBSYS_DRV,
+             "ahci_expose_to_userdrv: no AHCI HBA found (rc=%d)", rc);
+    } else {
+        klog(KLOG_INFO, SUBSYS_DRV,
+             "ahci_expose_to_userdrv: AHCI HBA claimable by ahcid");
+    }
 }
 
 int ahci_read(int port_num, uint64_t lba, uint16_t count, void *buf) {

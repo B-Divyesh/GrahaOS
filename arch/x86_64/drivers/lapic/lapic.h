@@ -75,3 +75,23 @@ bool lapic_is_enabled(void);
  * @return Virtual address of LAPIC registers
  */
 volatile uint32_t* lapic_get_base(void);
+
+// ---------------------------------------------------------------------------
+// Phase 20: IPI support.
+// ---------------------------------------------------------------------------
+// Wakeup IPI vector. Handler is a no-op that just issues lapic_eoi — its
+// sole purpose is to force the target CPU out of hlt so its next local tick
+// picks up whatever was just enqueued onto its runq. Vector 48 is the first
+// free slot after the 16 standard device IRQs (32..47).
+#define IPI_VEC_WAKEUP  48u
+
+/**
+ * @brief Send an IPI to a specific CPU. The target CPU's IDT entry for
+ *        `vector` will fire. Used by Phase 20 cross-CPU wakeup to nudge a
+ *        halting peer into its next schedule() tick.
+ *
+ * @param target_lapic_id  The destination CPU's LAPIC ID (not the linear
+ *                         cpu_id — caller must map via g_cpu_info[cpu].lapic_id).
+ * @param vector           Interrupt vector to deliver.
+ */
+void apic_send_ipi(uint32_t target_lapic_id, uint8_t vector);

@@ -68,7 +68,27 @@
 // Phase 18: stream events.
 #define AUDIT_STREAM_OP_REJECTED     23  // SQE op not in manifest or pledge-denied
 #define AUDIT_STREAM_DESTROY_CANCELED 24 // stream_destroy cancelled outstanding jobs
-#define AUDIT_EVENT_MAX          24
+// Phase 19: GrahaFS v2 events.
+#define AUDIT_FS_JOURNAL_REPLAY   25  // mount-time replay summary (txns, discards)
+#define AUDIT_FS_REVERT           26  // SYS_FS_REVERT success
+#define AUDIT_FS_GC_NOW           27  // SYS_FS_GC_NOW: N versions pruned, M segments reclaimed
+#define AUDIT_FS_SNAPSHOT         28  // SYS_FS_SNAPSHOT: handle minted
+// Phase 20: scheduler + resource-limit events.
+#define AUDIT_RLIMIT_MEM              29  // per-task memory page quota exceeded
+#define AUDIT_RLIMIT_CPU              30  // per-task CPU time budget exhausted for epoch
+#define AUDIT_RLIMIT_IO               31  // per-task I/O byte rate exceeded
+#define AUDIT_SCHED_EPOCH             32  // per-second epoch tick: budgets refilled
+#define AUDIT_SCHED_STARVATION        33  // READY task not scheduled for > 100 ms
+#define AUDIT_SCHED_SPINLOCK_PANIC    34  // spinlock acquire budget exceeded → structured oops
+// Phase 21: userspace driver framework + E1000 migration.
+#define AUDIT_DRV_REGISTERED          35  // sys_drv_register success: pid claims pci device
+#define AUDIT_DRV_DIED                36  // owner task exit: ownership reaped
+#define AUDIT_MMIO_DENIED             37  // sys_mmio_vmo_create rejected (BAR escape attempt)
+#define AUDIT_IRQ_DROPPED             38  // drv_irq_channel ring overflow (throttled 1/sec/channel)
+// Phase 22: named channel registry for rawframe + service.
+#define AUDIT_CHAN_NAME_PUBLISH       39  // rawnet_publish success: a daemon claimed a name
+#define AUDIT_CHAN_NAME_CONNECT       40  // rawnet_connect success: a client connected to a name
+#define AUDIT_EVENT_MAX          40
 
 // Source of the event.
 #define AUDIT_SRC_NATIVE  0   // Native v2 API.
@@ -280,6 +300,85 @@ void audit_write_stream_op_rejected(int32_t caller_pid, uint32_t obj_idx,
 // ncancelled reports how many jobs received a CQE with CQE_FLAG_CANCELED.
 void audit_write_stream_destroy_canceled(int32_t caller_pid, uint32_t obj_idx,
                                          uint32_t ncancelled);
+
+// Phase 19 writers.
+// JOURNAL_REPLAY fires once at mount after replay completes. `replayed` is the
+// count of committed txns reapplied; `discarded` is the count of partial txns
+// (missing commit magic or failed CRC) that were skipped.
+void audit_write_fs_journal_replay(uint32_t replayed, uint32_t discarded);
+// REVERT fires on successful SYS_FS_REVERT. obj_idx is the inode; target is
+// the version_id reverted to; new_version is the version_id the revert created.
+void audit_write_fs_revert(int32_t caller_pid, uint32_t inode_num,
+                           uint64_t target_version, uint64_t new_version);
+// GC_NOW fires on successful SYS_FS_GC_NOW. pruned = version records unlinked;
+// segments_reclaimed = segments returned to the free pool.
+void audit_write_fs_gc_now(int32_t caller_pid, uint32_t pruned,
+                           uint32_t segments_reclaimed);
+// SNAPSHOT fires on successful SYS_FS_SNAPSHOT. obj_idx is the cap_object idx
+// of the newly minted CAP_KIND_FS_SNAPSHOT handle. `inodes_pinned` counts
+// distinct inodes whose version-chain heads the snapshot captured.
+void audit_write_fs_snapshot(int32_t caller_pid, uint32_t obj_idx,
+                             uint32_t inodes_pinned, const char *label);
+
+// Phase 20 writers.
+// RLIMIT_MEM fires when a task's mem_pages_used + requested pages would exceed
+// mem_limit_pages. `limit` is the cap (pages); `attempted` is used+delta.
+void audit_write_rlimit_mem(int32_t pid, uint64_t limit, uint64_t attempted);
+// RLIMIT_CPU fires when a task's cpu_budget_remaining_ns drops to ≤ 0 within
+// an epoch. `limit_ns` is the per-epoch budget; `ns_used` is how much of it
+// was consumed this epoch.
+void audit_write_rlimit_cpu(int32_t pid, uint64_t limit_ns, uint64_t ns_used);
+// RLIMIT_IO fires when the token bucket cannot cover a submission (drops to
+// pending queue). `limit_bps` is the configured rate; `attempted` is the byte
+// count of the SQE that tripped the check.
+void audit_write_rlimit_io(int32_t pid, uint64_t limit_bps, uint64_t attempted);
+// SCHED_EPOCH fires once per 1 Hz epoch tick. `tasks_refilled` counts how many
+// tasks had their cpu_budget_remaining_ns refilled; `starved_drained` counts
+// tasks moved back from starved → ready across all runqueues.
+void audit_write_sched_epoch(uint32_t tasks_refilled, uint32_t starved_drained);
+// SCHED_STARVATION fires when a READY task has not been dispatched for
+// > 100 ms. Emitted at most once per epoch per task.
+void audit_write_sched_starvation(int32_t pid, uint64_t stale_ns);
+// SCHED_SPINLOCK_PANIC fires synchronously before kernel_panic when a
+// spinlock_acquire_with_budget overruns its budget. `holder_cpu` is the CPU
+// currently holding the lock (0xFF if unknown); `acquirer_cpu` is the CPU
+// that timed out.
+void audit_write_sched_spinlock_panic(const char *lock_name,
+                                      uint32_t holder_cpu,
+                                      uint32_t acquirer_cpu,
+                                      uint64_t budget_ns);
+
+// Phase 21 writers.
+// DRV_REGISTERED fires on every successful sys_drv_register. pci_addr is the
+// 24-bit PCI bus/dev/func triple; vendor/device come from PCI config.
+void audit_write_drv_registered(int32_t pid, uint32_t pci_addr,
+                                uint16_t vendor, uint16_t device,
+                                uint8_t irq_vector);
+// DRV_DIED fires from userdrv_on_owner_death when a driver-owning task exits.
+// reason is a short human-readable string ("exit", "killed", "fault", etc.).
+void audit_write_drv_died(int32_t pid, uint32_t pci_addr, const char *reason);
+// MMIO_DENIED fires when sys_mmio_vmo_create rejects a phys_addr (not within
+// any owned BAR, RAM region, etc.). detail describes the rule violated.
+void audit_write_mmio_denied(int32_t pid, uint64_t phys_addr,
+                             uint64_t size, const char *reason);
+// IRQ_DROPPED fires when a drv_irq_channel ring overflow drops a message.
+// Throttled to one entry per channel per second by the caller.
+void audit_write_irq_dropped(uint32_t pci_addr, uint8_t irq_vector,
+                             uint64_t total_dropped);
+
+// Phase 22 writers.
+// CHAN_NAME_PUBLISH fires on successful rawnet_publish. `name` is the
+// ASCII well-known path (e.g., "/sys/net/rawframe"); `type_hash` is the
+// payload type each per-connection channel will carry.
+void audit_write_chan_name_publish(int32_t publisher_pid, const char *name,
+                                   uint64_t type_hash);
+// CHAN_NAME_CONNECT fires on successful rawnet_connect. subject is the
+// connector; object is identified by publisher_pid + name. No object_idx
+// (the fresh per-connection channels exist only transiently on kernel
+// stack during the accept-send).
+void audit_write_chan_name_connect(int32_t connector_pid,
+                                   int32_t publisher_pid,
+                                   const char *name);
 
 // ---------------------------------------------------------------------------
 // Query path. Backs SYS_AUDIT_QUERY.

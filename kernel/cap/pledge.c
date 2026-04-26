@@ -65,7 +65,8 @@ int pledge_narrow(task_t *task, pledge_mask_t new_mask) {
 }
 
 // Class-name table for describe. Order MUST match PLEDGE_CLASS_* bit values.
-static const char *const k_class_names[12] = {
+// Extended in Phase 21 with storage_server (12) and input_server (13).
+static const char *const k_class_names[14] = {
     "fs_read",
     "fs_write",
     "net_client",
@@ -78,13 +79,15 @@ static const char *const k_class_names[12] = {
     "ai_call",
     "compute",
     "time",
+    "storage_server",
+    "input_server",
 };
 
 int pledge_mask_describe(pledge_mask_t mask, char *buf, int buflen) {
     if (buflen <= 0) return 0;
     int written = 0;
     bool first = true;
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < 14; i++) {
         if ((mask.raw & (1u << i)) == 0) continue;
         const char *name = k_class_names[i];
         int name_len = 0;

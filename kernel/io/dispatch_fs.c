@@ -172,7 +172,17 @@ int dispatch_stat_stub(stream_job_t *job) {
     return 0;
 }
 int dispatch_fsync_stub(stream_job_t *job) {
-    stream_complete_job(job, -38);
+    // Phase 19: replace -ENOSYS stub with a real fsync that resolves the
+    // submitter's FD → node → vfs_fsync. Returns 0 on success, -errno on
+    // failure. Gate test 14 exercises this path.
+    vfs_node_t *node = node_for_submitter_fd(job->submitter_pid,
+                                             (int)job->sqe_copy.fd_or_handle);
+    if (!node) {
+        stream_complete_job(job, -9 /* -EBADF */);
+        return 0;
+    }
+    int rc = vfs_fsync(node);
+    stream_complete_job(job, (int64_t)rc);
     return 0;
 }
 int dispatch_close_stub(stream_job_t *job) {

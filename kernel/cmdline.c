@@ -5,9 +5,12 @@
 
 #include "cmdline.h"
 #include "../arch/x86_64/drivers/serial/serial.h"
-#include "net/klib.h"
 #include <stddef.h>
 #include "log.h"
+
+// Phase 22 Stage F: strcmp shim moved from kernel/net/klib.h (deleted) into
+// kernel/main.c.  Forward-declare here so the deleted include doesn't bite.
+extern int strcmp(const char *s1, const char *s2);
 
 #define CMDLINE_BUF_BYTES         256
 #define TIMEOUT_DEFAULT_SECONDS   60u

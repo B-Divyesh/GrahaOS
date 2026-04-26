@@ -16,6 +16,11 @@
 #include "../../../../kernel/cap/object.h"
 #include "../../../../kernel/cap/deprecated.h"
 #include "../../../../kernel/mm/vmo.h"
+#include "../../../../kernel/pid_hash.h"
+#include "../../../../kernel/resource/rlimit.h"
+#include "../../../../kernel/audit.h"
+#include "../tsc.h"
+#include "work_steal.h"
 
 // Phase 14: task_t objects now live in task_cache (Bonwick slab). The
 // scheduler still keeps a fixed-size index array for stable task ids
@@ -40,6 +45,132 @@ static void *memset(void *s, int c, size_t n) {
         *p++ = (uint8_t)c;
     }
     return s;
+}
+
+// Phase 20: create a per-AP idle task. Each AP needs a distinct idle
+// task (separate task_t + separate kernel stack) so that schedule() can
+// save the AP's interrupt frame into a task other than the BSP idle.
+// Called from kmain (BSP context) for each active AP before APs are
+// released via g_ap_scheduler_go. Returns the task_t* or NULL on failure.
+//
+// The idle task's entry is ap_idle_entry — a simple `while (1) hlt` loop.
+// It never appears on the runq; schedule() dispatches it by falling
+// through when both the local runq and work-stealing came up empty.
+static void ap_idle_entry(void) {
+    while (1) {
+        asm volatile("sti; hlt");
+    }
+}
+
+task_t *sched_create_idle_for_cpu(uint32_t cpu_id) {
+    if (cpu_id >= g_cpu_count) return NULL;
+    if (!task_cache) return NULL;
+
+    spinlock_acquire(&sched_lock);
+    if (next_task_id >= MAX_TASKS) {
+        spinlock_release(&sched_lock);
+        return NULL;
+    }
+    int id = next_task_id++;
+
+    task_t *t = kmem_cache_alloc(task_cache);
+    if (!t) {
+        next_task_id--;
+        spinlock_release(&sched_lock);
+        return NULL;
+    }
+    task_ptrs[id] = t;
+
+    t->id = id;
+    t->state = TASK_STATE_RUNNING;  // about to run on target CPU
+    t->parent_id = 0;
+    t->waiting_for_child = -1;
+    t->pgid = 0;
+    t->pending_signals = 0;
+    t->name[0] = 'i'; t->name[1] = 'd'; t->name[2] = 'l'; t->name[3] = 'e';
+    t->name[4] = '0' + (cpu_id % 10); t->name[5] = '\0';
+    for (int i = 0; i < MAX_SIGNALS; i++) t->signal_handlers[i] = SIG_DFL;
+    t->event_head = 0; t->event_tail = 0; t->event_count = 0; t->event_waiting = 0;
+    for (int f = 0; f < PROC_MAX_FDS; f++) {
+        t->fd_table[f].type = FD_TYPE_UNUSED;
+        t->fd_table[f].ref = -1;
+        t->fd_table[f].flags = 0;
+    }
+    (void)cap_handle_table_init(&t->cap_handles);
+    pledge_init(t, (pledge_mask_t){.raw = PLEDGE_ALL});
+    rlimit_init_defaults(t, NULL);
+    t->is_idle = true;
+    t->cpu_pinned = (int32_t)cpu_id;
+    t->last_ran_cpu = cpu_id;
+    t->cr3 = vmm_get_pml4_phys(vmm_get_kernel_space());
+
+    pid_hash_insert(t);
+    g_task_count++;
+    spinlock_release(&sched_lock);
+
+    // Allocate a kernel stack for this idle task (outside sched_lock).
+    size_t num_pages = KERNEL_STACK_SIZE / PAGE_SIZE;
+    void *kstack_phys = pmm_alloc_pages(num_pages);
+    if (!kstack_phys) {
+        // Best-effort cleanup: mark zombie and return NULL.
+        spinlock_acquire(&sched_lock);
+        t->state = TASK_STATE_ZOMBIE;
+        spinlock_release(&sched_lock);
+        return NULL;
+    }
+    uint64_t kstack_virt_base = (uint64_t)kstack_phys + g_hhdm_offset;
+    uint64_t kstack_top = kstack_virt_base + KERNEL_STACK_SIZE;
+    for (size_t i = 0; i < num_pages; i++) {
+        vmm_map_page(vmm_get_kernel_space(),
+                     kstack_virt_base + i * PAGE_SIZE,
+                     (uint64_t)kstack_phys + i * PAGE_SIZE,
+                     PTE_PRESENT | PTE_WRITABLE);
+    }
+
+    spinlock_acquire(&sched_lock);
+    t->kernel_stack_top = kstack_top;
+    for (size_t i = 0; i < sizeof(t->regs); i++) ((uint8_t *)&t->regs)[i] = 0;
+    t->regs.rip = (uint64_t)ap_idle_entry;
+    t->regs.cs = 0x08;
+    t->regs.ss = 0x10;
+    t->regs.ds = 0x10;
+    t->regs.rflags = 0x202;
+    t->regs.rsp = ((kstack_top - 128) & ~0xFULL) - 8;
+    t->regs.rbp = t->regs.rsp;
+
+    // Install as this CPU's "current" so its first schedule() finds a
+    // valid outgoing task to save regs into. Also set idle_task so the
+    // schedule() fallback (runq empty + work-stealing failed) routes
+    // here instead of racing on task_ptrs[0] (BSP's idle).
+    g_cpu_locals[cpu_id].runq.current = t;
+    g_cpu_locals[cpu_id].runq.idle_task = t;
+    g_cpu_locals[cpu_id].tss.rsp0 = kstack_top;
+    spinlock_release(&sched_lock);
+
+    klog(KLOG_INFO, SUBSYS_SCHED,
+         "[SCHED] Per-CPU idle task id=%d created for CPU %u", id, cpu_id);
+    return t;
+}
+
+// Phase 20: place a READY task onto a per-CPU runqueue. Central helper used
+// by every state → READY transition (create + wake paths + per-tick deadline
+// scan). Routes based on:
+//   - cpu_pinned: if >= 0 and valid, respected absolutely (per-CPU idle tasks
+//     and epoch task end up here).
+//   - last_ran_cpu: cache-affinity preference for tasks that have run before.
+//   - default: CPU 0. Work-stealing will redistribute if imbalance develops.
+void sched_enqueue_ready(task_t *task) {
+    if (!task) return;
+    uint32_t target_cpu = 0;
+    if (task->cpu_pinned >= 0 && (uint32_t)task->cpu_pinned < g_cpu_count) {
+        target_cpu = (uint32_t)task->cpu_pinned;
+    } else if (task->last_ran_cpu != 0xFFFFFFFFu && task->last_ran_cpu < g_cpu_count) {
+        target_cpu = task->last_ran_cpu;
+    }
+    runq_t *rq = &g_cpu_locals[target_cpu].runq;
+    spinlock_acquire(&rq->lock);
+    runq_enqueue_ready(rq, task);
+    spinlock_release(&rq->lock);
 }
 
 void sched_init(void) {
@@ -98,6 +229,22 @@ void sched_init(void) {
     // Phase 15b: task 0 gets the full pledge (kernel idle has full authority,
     // though it does no syscalls). Child tasks inherit via pledge_init below.
     pledge_init(task_ptrs[0], (pledge_mask_t){.raw = PLEDGE_ALL});
+
+    // Phase 20: seed resource-limit defaults (kernel-internal tasks get
+    // unlimited everything) and register with the PID hash / global list.
+    rlimit_init_defaults(task_ptrs[0], NULL);
+    task_ptrs[0]->is_idle = true;         // BSP's idle
+    task_ptrs[0]->cpu_pinned = 0;         // stays on CPU 0
+    task_ptrs[0]->last_ran_cpu = 0;
+    pid_hash_insert(task_ptrs[0]);
+    g_task_count++;
+
+    // Seed this CPU's runq.current so schedule() has a valid outgoing
+    // task on the very first tick. Also set idle_task — the schedule()
+    // fallback path uses this to avoid racing two CPUs on task_ptrs[0]
+    // when the local runq is empty + work-stealing fails.
+    g_cpu_locals[0].runq.current = task_ptrs[0];
+    g_cpu_locals[0].runq.idle_task = task_ptrs[0];
 
     // Phase 10a: Kernel idle task has no FDs
     for (int f = 0; f < PROC_MAX_FDS; f++) {
@@ -208,6 +355,18 @@ int sched_create_task(void (*entry_point)(void)) {
     // every subsystem).
     pledge_init(task_ptrs[id], (pledge_mask_t){.raw = PLEDGE_ALL});
 
+    // Phase 20: unlimited resource defaults for kernel threads; register
+    // with the PID hash + global list so psinfo and epoch tick see them.
+    // Kernel threads are pinned to CPU 0 — Mongoose, audit flusher, GC,
+    // recluster, stream worker etc. were never designed for SMP migration
+    // and their internal state assumes single-CPU execution. User
+    // processes (sched_create_user_process) keep cpu_pinned = -1 so
+    // work-stealing can redistribute them.
+    rlimit_init_defaults(task_ptrs[id], NULL);
+    task_ptrs[id]->cpu_pinned = 0;
+    pid_hash_insert(task_ptrs[id]);
+    g_task_count++;
+
     spinlock_release(&sched_lock);
 
     // Allocate kernel stack (outside lock to avoid holding lock during allocation)
@@ -259,7 +418,10 @@ int sched_create_task(void (*entry_point)(void)) {
     (*task_ptrs[id]).state = TASK_STATE_READY;
 
     spinlock_release(&sched_lock);
-    
+
+    // Phase 20: runq insertion outside sched_lock (lock hierarchy).
+    sched_enqueue_ready(task_ptrs[id]);
+
     return id;
 }
 
@@ -272,6 +434,14 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
         asm volatile("push %0; popfq" : : "r"(flags));
         spinlock_release(&sched_lock);
         return -1;
+    }
+    // Phase 20 U15: live-task soft cap. Callers see -EAGAIN (-11) which the
+    // user-libc translates to EAGAIN. Past the cap the system is still
+    // functioning — it just refuses new spawns until some task exits.
+    if (g_task_count >= RLIMIT_MAX_TASKS) {
+        asm volatile("push %0; popfq" : : "r"(flags));
+        spinlock_release(&sched_lock);
+        return -11;  // -EAGAIN
     }
     id = next_task_id++;
 
@@ -322,6 +492,17 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     // will override with parent_mask & attrs.pledge_subset; direct callers of
     // sched_create_user_process (notably the initial user bootstrap) get ALL.
     pledge_init(task_ptrs[id], (pledge_mask_t){.raw = PLEDGE_ALL});
+
+    // Phase 20: inherit parent's resource limits (if any parent).
+    // Use sched_get_current_task() (per-CPU runq.current) instead of the
+    // global current_task_index, which is shared across CPUs and gives
+    // wrong inheritance under SMP. The bootstrap user process has no
+    // parent yet — sched_get_current_task may return NULL pre-scheduler,
+    // which yields default unlimited limits.
+    task_t *parent_for_limits = sched_get_current_task();
+    rlimit_init_defaults(task_ptrs[id], parent_for_limits);
+    pid_hash_insert(task_ptrs[id]);
+    g_task_count++;
 
     asm volatile("push %0; popfq" : : "r"(flags));
     spinlock_release(&sched_lock);
@@ -384,7 +565,16 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     memset(&(*task_ptrs[id]).regs, 0, sizeof(struct interrupt_frame));
     (*task_ptrs[id]).regs.rip = rip;
     (*task_ptrs[id]).regs.rflags = 0x202;
-    (*task_ptrs[id]).regs.rsp = user_stack_top - 16;  // RSP near top of user stack
+    // System V ABI: at function entry, RSP%16 must be 8 (because a `call`
+    // would have pushed a return address). _start has no caller, so the
+    // kernel must simulate the post-`call` alignment. user_stack_top is
+    // page-aligned (%16==0), so subtracting 8 gives %16==8 at entry.
+    // GCC's prologue (`sub $N, %rsp` with N%16==8 for typical N) then
+    // brings RSP%16 back to 0 inside the function, which is what SSE
+    // movaps/movdqa instructions require for 16-byte-aligned local stack
+    // slots. Pre-Phase-20-rlimittest `- 16` made RSP%16==0 at entry, which
+    // GCC then offset to %16==8 — SSE locals at fixed offsets crashed.
+    (*task_ptrs[id]).regs.rsp = user_stack_top - 8;
     (*task_ptrs[id]).regs.cs = 0x20 | 3;
     (*task_ptrs[id]).regs.ss = 0x18 | 3;
 
@@ -400,228 +590,239 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
 
     spinlock_release(&sched_lock);
 
+    // Phase 20: enqueue on a per-CPU runq outside sched_lock.
+    sched_enqueue_ready(task_ptrs[id]);
+
     return id;
 }
 
 void wake_waiting_parent(int child_id) {
     // NO FRAMEBUFFER CALLS - might be called from interrupt context
-    
+    //
+    // SMP-safe: don't dereference task_ptrs[child_id]. The caller (SYS_EXIT
+    // / PF / exception kill paths) already set the child's state to ZOMBIE
+    // before us, which means a parent on another CPU may have already raced
+    // through SYS_WAIT, called sched_reap_zombie, and zeroed task_ptrs[child_id].
+    // Use the child's parent_id captured at task-creation time, not via a
+    // re-read. Pass it through a separate snapshot below.
     if (child_id < 0 || child_id >= next_task_id || child_id >= MAX_TASKS) {
         return;
     }
-    
-    int parent_id = (*task_ptrs[child_id]).parent_id;
-    
+
+    // Snapshot the task pointer once. If it's already NULL (reaped), the
+    // parent already has the zombie info — nothing left for us to wake.
+    task_t *child = task_ptrs[child_id];
+    if (!child) return;
+
+    int parent_id = child->parent_id;
+
     if (parent_id < 0 || parent_id >= next_task_id) {
         return;
     }
-    
+
+    task_t *parent = task_ptrs[parent_id];
+    if (!parent) return;
+
     // Check if parent is waiting for this child or any child
-    if ((*task_ptrs[parent_id]).state == TASK_STATE_BLOCKED &&
-        ((*task_ptrs[parent_id]).waiting_for_child == child_id || 
-         (*task_ptrs[parent_id]).waiting_for_child == -1)) {
-        
+    if (parent->state == TASK_STATE_BLOCKED &&
+        (parent->waiting_for_child == child_id ||
+         parent->waiting_for_child == -1)) {
+
         // Wake up the parent
-        (*task_ptrs[parent_id]).state = TASK_STATE_READY;
-        (*task_ptrs[parent_id]).waiting_for_child = -1;
+        parent->state = TASK_STATE_READY;
+        parent->waiting_for_child = -1;
+        // Phase 20: state → READY must be paired with runq insertion.
+        sched_enqueue_ready(parent);
     }
 }
 
 // CRITICAL: This function is called from interrupt context
 // NO LOCKS THAT CAN BE HELD BY NORMAL CODE!
 // NO FRAMEBUFFER CALLS!
+//
+// Phase 20 rewrite: dispatch is now runq-driven instead of task_ptrs[] round-
+// robin. Every READY task sits on some per-CPU runq (for now, CPU 0's — U14
+// brings APs online). schedule() pops the local runq's head; if empty, U8's
+// work-stealer scans peer runqs. Falls through to the per-CPU idle task
+// (task 0 on BSP; per-AP idle in U14) when no work is available.
+//
+// The ad-hoc silent-timeout sched_lock acquire is gone — we use the standard
+// budgeted spinlock_acquire, which panics with a structured oops on timeout.
+// Any lock-held-too-long bug now surfaces as a parseable ==OOPS== frame.
 void schedule(struct interrupt_frame *frame) {
-    // Increment counter
     schedule_count++;
 
-    // Minimal logging for debugging context switches
-    static volatile uint32_t sched_log_count = 0;
-    if ((sched_log_count++ & 0xFF) == 0) {  // Log every 256 calls
-        klog(KLOG_INFO, SUBSYS_SCHED, "[SCHED] schedule() called");
-    }
-    
-    // Validate frame
-    if (!frame) {
-        asm volatile("cli; hlt");
-        while(1);
-    }
-    
+    if (!frame) { asm volatile("cli; hlt"); while (1); }
     uint64_t frame_addr = (uint64_t)frame;
-    if (frame_addr < 0xFFFF800000000000) {
-        asm volatile("cli; hlt");
-        while(1);
-    }
+    if (frame_addr < 0xFFFF800000000000) { asm volatile("cli; hlt"); while (1); }
 
-    // Phase 17: per-tick deadline scan. Wake any CHAN_WAIT task whose
-    // deadline has expired. The waker patches state→READY and stamps
-    // -ETIMEDOUT in wait_result. The blocking syscall's spin loop sees
-    // state != CHAN_WAIT on next resume and returns the result.
-    for (int i = 0; i < next_task_id; i++) {
-        if (!task_ptrs[i]) continue;
-        task_t *tk = task_ptrs[i];
-        if (tk->state != TASK_STATE_CHAN_WAIT) continue;
-        if (tk->deadline_tsc == 0) continue;
-        if (g_timer_ticks < tk->deadline_tsc) continue;
-        // Timed out — unlink from whichever waiter list (read/write).
-        // We don't have direct access to the channel struct here, but
-        // wait_channel pointer + linked list maintenance is the
-        // syscall's responsibility. Just flip state + result.
-        tk->wait_result = -110;  // -ETIMEDOUT
-        tk->state = TASK_STATE_READY;
-    }
-    
-    // Check if scheduler is initialized
-    if (next_task_id == 0) {
-        return;
-    }
-    
-    // Validate current task index
-    if (current_task_index >= next_task_id || current_task_index < 0) {
-        current_task_index = 0;
-    }
-    
-    // CRITICAL: Don't try to lock if we're already in a critical section
-    // This can happen if timer interrupt fires while we're in spinlock code
+    if (next_task_id == 0) return;  // scheduler not yet initialised
+
     uint64_t cpu_id = smp_get_current_cpu();
-    
-    // Check if we're holding ANY lock
+
+    // Reentrancy guard: if this CPU is already inside schedule() (e.g.,
+    // timer IRQ fired while we were doing a context switch), bail.
     if (sched_lock.locked && sched_lock.owner == cpu_id) {
-        // We're already in scheduler - skip this tick
         return;
     }
-    
-    // Try to acquire scheduler lock with timeout
-    int lock_attempts = 1000;
-    while (lock_attempts-- > 0) {
-        if (!sched_lock.locked) {
-            if (!__atomic_test_and_set(&sched_lock.locked, __ATOMIC_ACQUIRE)) {
-                sched_lock.owner = cpu_id;
-                sched_lock.count = 1;
-                break;
-            }
-        }
-        asm volatile("pause");
-    }
-    
-    if (lock_attempts <= 0) {
-        // Couldn't get lock - skip this scheduling round
-        return;
-    }
-    
-    // Save current task state
-    (*task_ptrs[current_task_index]).regs = *frame;
-    
-    // Update task state
-    if ((*task_ptrs[current_task_index]).state == TASK_STATE_RUNNING) {
-        (*task_ptrs[current_task_index]).state = TASK_STATE_READY;
-    }
 
-    // Find next task to run
-    int start_index = current_task_index;
-    int next_index = current_task_index;
-    bool found = false;
-    
-    for (int attempts = 0; attempts < next_task_id; attempts++) {
-        next_index = (next_index + 1) % next_task_id;
-        if (!task_ptrs[next_index]) continue;  // reaped slot
-        if ((*task_ptrs[next_index]).state == TASK_STATE_READY) {
-            found = true;
-            current_task_index = next_index;
-            context_switches++;
-
-            // Log first switch to each task
-            static uint8_t task_switched[MAX_TASKS] = {0};
-            if (!task_switched[next_index]) {
-                task_switched[next_index] = 1;
-                klog(KLOG_INFO, SUBSYS_SCHED, "[SCHED] First switch to task %lu (id=%lu)", (unsigned long)(next_index), (unsigned long)((*task_ptrs[next_index]).id));
-            }
-            break;
-        }
-    }
-    
-    if (!found) {
-        // No ready tasks - stay with current
-        if (task_ptrs[start_index] && (*task_ptrs[start_index]).state != TASK_STATE_ZOMBIE) {
-            current_task_index = start_index;
-        } else {
-            // Find any non-zombie task
-            for (int i = 0; i < next_task_id; i++) {
-                if (!task_ptrs[i]) continue;
-                if ((*task_ptrs[i]).state != TASK_STATE_ZOMBIE) {
-                    current_task_index = i;
-                    break;
-                }
-            }
-        }
-    }
-
-    (*task_ptrs[current_task_index]).state = TASK_STATE_RUNNING;
-
-    // Phase 7d: Deliver pending signals before resuming the task
-    if (sched_deliver_signals(&(*task_ptrs[current_task_index]))) {
-        // Task was terminated by a signal - find another runnable task
-        bool found_replacement = false;
+    // Phase 20 SMP fix: deadline scan is done by BSP only. APs skip it —
+    // any expired CHAN_WAIT task gets re-enqueued by BSP onto its
+    // last_ran_cpu's runq (sched_enqueue_ready routes by cpu_pinned/
+    // last_ran_cpu). Without this, all 4 CPUs serialize through sched_lock
+    // every tick which causes 100ms+ holds and SPINLOCK_PANIC under load.
+    if (cpu_id == 0) {
+        spinlock_acquire(&sched_lock);
         for (int i = 0; i < next_task_id; i++) {
             if (!task_ptrs[i]) continue;
-            if ((*task_ptrs[i]).state == TASK_STATE_READY) {
-                current_task_index = i;
-                (*task_ptrs[i]).state = TASK_STATE_RUNNING;
-                found_replacement = true;
-                break;
-            }
+            task_t *tk = task_ptrs[i];
+            if (tk->state != TASK_STATE_CHAN_WAIT) continue;
+            if (tk->deadline_tsc == 0) continue;
+            if (g_timer_ticks < tk->deadline_tsc) continue;
+            tk->wait_result = -110;  // -ETIMEDOUT
+            tk->state = TASK_STATE_READY;
+            sched_enqueue_ready(tk);
         }
-        if (!found_replacement) {
-            // No runnable tasks - fall back to the idle task (task 0)
-            // The idle task should always exist and never be in zombie state
-            current_task_index = 0;
-            if ((*task_ptrs[0]).state == TASK_STATE_ZOMBIE) {
-                // Phase 13: route through klog FATAL + kpanic so the
-                // post-mortem ring carries the cause. Release the
-                // sched lock first — kpanic will not try to grab it,
-                // but a stuck lock could complicate cleanup if any
-                // future kpanic helper ever does.
-                klog(KLOG_FATAL, SUBSYS_SCHED,
-                     "no runnable tasks (idle task is zombie)");
-                sched_lock.owner = (uint64_t)-1;
-                sched_lock.count = 0;
-                __atomic_clear(&sched_lock.locked, __ATOMIC_RELEASE);
-                kpanic("no runnable tasks");
+        spinlock_release(&sched_lock);
+    }
+
+    // Phase 20: per-CPU runq.current is the authoritative "running task on
+    // this CPU". BSP pre-AP-release used global current_task_index; on APs
+    // we always have a per-CPU idle task pre-installed.
+    runq_t *rq = &g_cpu_locals[cpu_id].runq;
+    task_t *cur = rq->current;
+    if (!cur) {
+        // First dispatch on this CPU. Fall through to BSP's idle task
+        // (only happens on BSP before AP-idle tasks are created).
+        cur = task_ptrs[current_task_index];
+    }
+
+    // Save outgoing regs + handle CPU-budget bookkeeping. No global lock
+    // needed: cur is THIS CPU's task, no other CPU touches its regs (work-
+    // stealing only takes READY tasks off the ready list, never RUNNING).
+    bool starved = false;
+    bool need_audit_starvation = false;
+    uint64_t starvation_used_ns = 0;
+    int32_t starvation_pid = -1;
+    uint64_t starvation_budget = 0;
+    if (cur) {
+        cur->regs = *frame;
+        if (cur->state == TASK_STATE_RUNNING) {
+            if (!cur->is_idle && cur->cpu_time_slice_budget_ns > 0 &&
+                cur->last_ran_tsc != 0 && tsc_is_ready()) {
+                uint64_t now_tsc = rdtsc();
+                uint64_t elapsed_ns = tsc_to_ns(now_tsc - cur->last_ran_tsc);
+                int64_t remaining = rlimit_consume_cpu(cur, elapsed_ns);
+                if (remaining <= 0) {
+                    starved = true;
+                    uint64_t epoch_now = g_timer_ticks / 100u;
+                    if (cur->last_starvation_epoch != epoch_now) {
+                        cur->last_starvation_epoch = epoch_now;
+                        starvation_used_ns = cur->cpu_time_slice_budget_ns;
+                        if (cur->cpu_budget_remaining_ns < 0) {
+                            starvation_used_ns += (uint64_t)(-cur->cpu_budget_remaining_ns);
+                        }
+                        starvation_pid = (int32_t)cur->id;
+                        starvation_budget = cur->cpu_time_slice_budget_ns;
+                        need_audit_starvation = true;
+                    }
+                }
             }
-            (*task_ptrs[0]).state = TASK_STATE_RUNNING;
+            if (starved) {
+                spinlock_acquire(&rq->lock);
+                runq_push_starved(rq, cur);
+                spinlock_release(&rq->lock);
+            } else {
+                cur->state = TASK_STATE_READY;
+                if (!cur->is_idle) {
+                    sched_enqueue_ready(cur);
+                }
+            }
+            rlimit_refill_io_tokens(cur);
         }
     }
 
-    // Update TSS RSP0
-    g_cpu_locals[cpu_id].tss.rsp0 = (*task_ptrs[current_task_index]).kernel_stack_top;
+    // Pick next task from this CPU's runq under rq->lock. If empty,
+    // attempt a work-steal (uses trylock — never blocks). Falls through
+    // to per-CPU idle if both fail.
+    spinlock_acquire(&rq->lock);
+    task_t *next = runq_dequeue_ready(rq);
+    if (!next) {
+        if (sched_steal_from_busiest(rq) > 0) {
+            next = runq_dequeue_ready(rq);
+        }
+    }
+    spinlock_release(&rq->lock);
 
-    // Switch address space if needed
+    if (!next) {
+        next = rq->idle_task;
+        if (!next) next = task_ptrs[0];  // pre-init bootstrap fallback only
+        if (!next || next->state == TASK_STATE_ZOMBIE) {
+            kpanic("no runnable tasks");
+        }
+    }
+
+    next->state = TASK_STATE_RUNNING;
+    rq->current = next;
+    rq->context_switches++;
+    next->last_ran_cpu = (uint32_t)cpu_id;
+    next->last_ran_tsc = rdtsc();
+    context_switches++;
+
+    // Best-effort legacy field (single-CPU code paths that haven't migrated
+    // to sched_get_current_task yet). Racy under SMP, used only as a fallback.
+    if (cpu_id == 0) current_task_index = next->id;
+
+    // Phase 7d: signal delivery. If it terminates the task, pull a
+    // replacement off the runq.
+    if (sched_deliver_signals(next)) {
+        spinlock_acquire(&rq->lock);
+        task_t *replacement = runq_dequeue_ready(rq);
+        spinlock_release(&rq->lock);
+        if (!replacement) {
+            replacement = rq->idle_task;
+            if (!replacement) replacement = task_ptrs[0];
+        }
+        if (!replacement || replacement->state == TASK_STATE_ZOMBIE) {
+            kpanic("no runnable tasks post-signal");
+        }
+        if (cpu_id == 0) current_task_index = replacement->id;
+        replacement->state = TASK_STATE_RUNNING;
+        rq->current = replacement;
+        next = replacement;
+    }
+
+    // TSS rsp0 + CR3 switch — outside any global lock.
+    g_cpu_locals[cpu_id].tss.rsp0 = next->kernel_stack_top;
+
     uint64_t current_cr3;
-    asm volatile ("mov %%cr3, %0" : "=r"(current_cr3));
-    if (current_cr3 != (*task_ptrs[current_task_index]).cr3) {
-        // Log CR3 switch (only first time per task)
-        static uint8_t task_cr3_switched[MAX_TASKS] = {0};
-        if (!task_cr3_switched[current_task_index]) {
-            task_cr3_switched[current_task_index] = 1;
-            klog(KLOG_INFO, SUBSYS_SCHED, "[SCHED] Switching CR3 to 0x0x%lx for task %lu", (unsigned long)((*task_ptrs[current_task_index]).cr3), (unsigned long)(current_task_index));
-        }
-        vmm_switch_address_space_phys((*task_ptrs[current_task_index]).cr3);
+    asm volatile("mov %%cr3, %0" : "=r"(current_cr3));
+    if (current_cr3 != next->cr3) {
+        vmm_switch_address_space_phys(next->cr3);
     }
 
-    // Release the scheduler lock properly
-    sched_lock.owner = (uint64_t)-1;
-    sched_lock.count = 0;
-    
-    // Memory barrier
-    asm volatile("mfence" ::: "memory");
-    
-    __atomic_clear(&sched_lock.locked, __ATOMIC_RELEASE);
+    *frame = next->regs;
 
-    // Restore new task context
-    *frame = (*task_ptrs[current_task_index]).regs;
+    // Audit starvation OUTSIDE the hot path — audit_write_rlimit_cpu can
+    // do disk I/O and would otherwise stall the dispatcher.
+    if (need_audit_starvation) {
+        audit_write_rlimit_cpu(starvation_pid, starvation_budget,
+                               starvation_used_ns);
+    }
 }
 
 // These functions are safe - not called from interrupt context
 task_t* sched_get_current_task(void) {
+    // Phase 20: per-CPU aware. runq.current is the authoritative "what is
+    // this CPU running right now", which is correct even after work-stealing
+    // has migrated tasks across CPUs. Falls back to the old task_ptrs[]
+    // lookup for the pre-U14 BSP-only path (runq.current can be NULL in
+    // very early boot before the first dispatch).
+    uint32_t cpu = smp_get_current_cpu();
+    task_t *rq_current = g_cpu_locals[cpu].runq.current;
+    if (rq_current) return rq_current;
+
+    // Fallback: pre-scheduler boot or a CPU that hasn't dispatched yet.
     if (current_task_index >= MAX_TASKS || current_task_index >= next_task_id) {
         return NULL;
     }
@@ -673,6 +874,8 @@ void sched_reap_zombie(int task_id) {
     if (task_id < 0 || task_id >= next_task_id || task_id >= MAX_TASKS) return;
     if (!task_ptrs[task_id]) return;  // Already reaped / never allocated.
     if ((*task_ptrs[task_id]).state != TASK_STATE_ZOMBIE) return;
+    klog(KLOG_INFO, SUBSYS_SCHED, "[REAP] task_id=%d entering",
+         task_id);
 
     // Free kernel stack
     uint64_t kstack_base = (*task_ptrs[task_id]).kernel_stack_top - KERNEL_STACK_SIZE;
@@ -701,10 +904,31 @@ void sched_reap_zombie(int task_id) {
     // already; this call reconciles refcount bookkeeping on the VMO side.
     vmo_cleanup_task((int32_t)(*task_ptrs[task_id]).id);
 
+    // Phase 21: if the dying task owned any PCI devices via the userdrv
+    // framework, reap that ownership: PIC-mask the IRQ line, mark IRQ
+    // channels dead, revoke MMIO/IRQ/downstream caps, audit, clear entries.
+    extern void userdrv_on_owner_death(int32_t pid);
+    userdrv_on_owner_death((int32_t)(*task_ptrs[task_id]).id);
+
+    // Phase 22: if the dying task had published any /sys/net/* names in
+    // the rawnet registry (e.g. e1000d published /sys/net/rawframe, netd
+    // published /sys/net/service), clear those entries so the next spawn
+    // sees -ENOENT and reconnects cleanly after republish.
+    extern void rawnet_on_peer_death(int32_t pid);
+    rawnet_on_peer_death((int32_t)(*task_ptrs[task_id]).id);
+
+    // Phase 20: remove from PID hash and global list before releasing to the
+    // slab. mem_pages_used counter is zeroed since vmm_destroy_address_space_by_cr3
+    // released the underlying frames; per-task accounting is now consistent.
+    pid_hash_remove(task_ptrs[task_id]);
+    task_ptrs[task_id]->mem_pages_used = 0;
+    if (g_task_count > 0) g_task_count--;
+
     // Phase 14: return the task_t to the slab; slot goes empty.
     // No need to memset — slab alloc zeroes on next use.
     kmem_cache_free(task_cache, task_ptrs[task_id]);
     task_ptrs[task_id] = NULL;
+    klog(KLOG_INFO, SUBSYS_SCHED, "[REAP] task_id=%d done", task_id);
 }
 
 // Get task by ID including zombies (needed for wait/reap operations)
@@ -831,9 +1055,11 @@ int sched_send_signal(int pid, int signal) {
 
         spinlock_acquire(&sched_lock);
         target->exit_status = 128 + SIGKILL;
-        target->state = TASK_STATE_ZOMBIE;
         sched_orphan_children(pid);
         wake_waiting_parent(pid);
+        // ZOMBIE LAST so a parent reaper on another CPU can't free
+        // task_ptrs[pid] mid-cleanup. See SYS_EXIT for the same pattern.
+        __atomic_store_n((volatile int *)&target->state, (int)TASK_STATE_ZOMBIE, __ATOMIC_RELEASE);
         spinlock_release(&sched_lock);
         return 0;
     }
@@ -841,10 +1067,14 @@ int sched_send_signal(int pid, int signal) {
     // Set the pending signal bit and wake blocked tasks under lock
     spinlock_acquire(&sched_lock);
     target->pending_signals |= (1 << signal);
+    bool signal_woke = false;
     if (target->state == TASK_STATE_BLOCKED) {
         target->state = TASK_STATE_READY;
+        signal_woke = true;
     }
     spinlock_release(&sched_lock);
+    // Phase 20: runq insertion outside sched_lock.
+    if (signal_woke) sched_enqueue_ready(target);
 
     klog(KLOG_INFO, SUBSYS_SCHED, "[SIGNAL] Signal %lu sent to pid=%lu", (unsigned long)(signal), (unsigned long)(pid));
 
@@ -894,9 +1124,10 @@ int sched_deliver_signals(task_t *task) {
             klog(KLOG_INFO, SUBSYS_SCHED, "[SIGNAL] Default action (terminate) for signal %lu on pid=%lu", (unsigned long)(sig), (unsigned long)(task->id));
 
             task->exit_status = 128 + sig;
-            task->state = TASK_STATE_ZOMBIE;
             sched_orphan_children(task->id);
             wake_waiting_parent(task->id);
+            // ZOMBIE LAST — same use-after-free hazard as SYS_EXIT.
+            __atomic_store_n((volatile int *)&task->state, (int)TASK_STATE_ZOMBIE, __ATOMIC_RELEASE);
             return 1; // Task was terminated
         }
 
@@ -976,6 +1207,11 @@ int sched_snapshot_processes(state_process_t *out, int max_count) {
                                 (*task_ptrs[i]).brk - (*task_ptrs[i]).heap_start : 0;
         out[count].pending_signals = (*task_ptrs[i]).pending_signals;
         out[count].exit_status = (*task_ptrs[i]).exit_status;
+        // Phase 21.1: copy pledge mask for gash `ps` PLEDGE column.
+        out[count].pledge_mask = (*task_ptrs[i]).pledge_mask.raw;
+        out[count]._pad_pledge[0] = 0;
+        out[count]._pad_pledge[1] = 0;
+        out[count]._pad_pledge[2] = 0;
         count++;
     }
 
@@ -1010,12 +1246,16 @@ void sched_enqueue_cap_event(int32_t pid, const state_cap_event_t *event) {
     }
 
     // Wake up if blocked waiting for events
+    bool event_woke = false;
     if (task->event_waiting && task->state == TASK_STATE_BLOCKED) {
         task->state = TASK_STATE_READY;
         task->event_waiting = 0;
+        event_woke = true;
     }
 
     spinlock_release(&sched_lock);
+    // Phase 20: runq insertion outside sched_lock.
+    if (event_woke) sched_enqueue_ready(task);
 }
 
 // Phase 8d: Dequeue one CAN event from a process's event queue
@@ -1039,6 +1279,24 @@ int sched_dequeue_cap_event(int task_id, state_cap_event_t *out) {
 
     spinlock_release(&sched_lock);
     return 1;
+}
+
+// Phase 20: epoch task. Pinned to CPU 0 (set by sched_create_task's default).
+// Sleeps via `sti; hlt`, checks g_timer_ticks every wake. Fires
+// rlimit_epoch_tick once per epoch boundary (100 ticks @ 100 Hz = 1 s).
+// Uses a local "last seen" counter to edge-trigger rather than
+// level-trigger; doesn't matter if we skip a tick due to long-running
+// scheduler work on CPU 0, we just fire at the next boundary.
+void sched_epoch_task_entry(void) {
+    uint64_t last_epoch_id = g_timer_ticks / 100u;
+    while (1) {
+        asm volatile("sti; hlt");
+        uint64_t now_epoch = g_timer_ticks / 100u;
+        if (now_epoch != last_epoch_id) {
+            last_epoch_id = now_epoch;
+            rlimit_epoch_tick();
+        }
+    }
 }
 
 // Phase 8d: Get pending event count for a process
@@ -1130,10 +1388,14 @@ task_t *sched_wake_one_on_channel(struct task_struct **list_head,
     *list_head = (task_t *)t->wait_next;
     t->wait_next   = NULL;
     t->wait_result = wait_result;
-    if (t->state == TASK_STATE_CHAN_WAIT) {
+    bool waking = (t->state == TASK_STATE_CHAN_WAIT);
+    if (waking) {
         t->state = TASK_STATE_READY;
     }
     spinlock_release(&sched_lock);
+    // Phase 20: runq insertion happens outside sched_lock to keep the
+    // hierarchy flat (sched_lock → runq.lock; never inverted).
+    if (waking) sched_enqueue_ready(t);
     return t;
 }
 
@@ -1141,6 +1403,11 @@ int sched_wake_all_on_channel(struct task_struct **list_head,
                               int32_t wait_result) {
     if (!list_head) return 0;
     int count = 0;
+    // Drain the waiter list into a local chain under sched_lock, then flip
+    // states + enqueue onto the runq outside the lock. This preserves the
+    // sched_lock → runq.lock ordering invariant.
+    task_t *to_wake_head = NULL;
+    task_t *to_wake_tail = NULL;
     spinlock_acquire(&sched_lock);
     task_t *t = *list_head;
     *list_head = NULL;
@@ -1150,10 +1417,27 @@ int sched_wake_all_on_channel(struct task_struct **list_head,
         t->wait_result = wait_result;
         if (t->state == TASK_STATE_CHAN_WAIT) {
             t->state = TASK_STATE_READY;
+            // Reuse runq_next as a temporary chain pointer until we enqueue.
+            t->runq_next = NULL;
+            if (to_wake_tail) {
+                to_wake_tail->runq_next = t;
+            } else {
+                to_wake_head = t;
+            }
+            to_wake_tail = t;
         }
         count++;
         t = next;
     }
     spinlock_release(&sched_lock);
+
+    // Phase 20: enqueue drained waiters onto runq(s) outside sched_lock.
+    task_t *w = to_wake_head;
+    while (w) {
+        task_t *next = w->runq_next;
+        w->runq_next = NULL;  // reset before enqueue
+        sched_enqueue_ready(w);
+        w = next;
+    }
     return count;
 }

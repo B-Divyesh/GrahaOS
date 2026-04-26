@@ -19,6 +19,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "../arch/x86_64/cpu/gdt.h"  // struct gdt_entry, struct tss
+#include "../arch/x86_64/cpu/sched/runq.h"  // Phase 20 per-CPU runq
 
 // --- Slab-allocator magazine constants ---
 // KMEM_MAGAZINE_CAPACITY is the spec-fixed 8-object cache per (CPU, slab cache).
@@ -66,15 +67,17 @@ typedef struct percpu {
     // === Magazines (cache-line aligned) === //
     kmem_magazine_t     magazines[KMEM_MAX_CACHES]; // gs:256, 32*72 = 2304 bytes
 
-    // === Phase 20 scheduler hooks (reserved, NULL in Phase 14) === //
-    struct task        *sched_rq_head;       // gs:2560
-    struct task        *sched_rq_tail;       // gs:2568
+    // === Phase 20 scheduler === //
+    // Inlined per-CPU runqueue at offset 2560 (where Phase 14 reserved
+    // sched_rq_head/tail as placeholders). Full definition in runq.h.
+    // Size: 128 bytes → ends at gs:2688.
+    runq_t              runq;                // gs:2560..2687
 
     // === Reserved for Phase 17 (channels), 18 (streams), 20 (stats) === //
-    uint8_t             future[384];         // gs:2576..2959
+    uint8_t             future[256];         // gs:2688..2943
 
-    // === Tail pad to 64-byte alignment (2960 + 48 = 3008 = 47 * 64) === //
-    uint8_t             _tail_pad[48];
+    // === Tail pad to 64-byte alignment (2944 + 64 = 3008 = 47 * 64) === //
+    uint8_t             _tail_pad[64];
 } __attribute__((aligned(64))) percpu_t;
 
 // Offset contracts enforced at compile time. These close spec risk #1 and
@@ -94,6 +97,8 @@ _Static_assert(offsetof(percpu_t, numa_node) == 176,
                "percpu_t Phase 14 fields drifted into the cpu_local_t prefix area");
 _Static_assert(offsetof(percpu_t, magazines) == 256,
                "percpu_t.magazines[] must be cache-line aligned at offset 256");
+_Static_assert(offsetof(percpu_t, runq) == 2560,
+               "percpu_t.runq must land at offset 2560 (replaces Phase 14 placeholders)");
 _Static_assert(sizeof(percpu_t) % 64 == 0,
                "percpu_t total size must be a multiple of 64 bytes");
 

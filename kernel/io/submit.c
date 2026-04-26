@@ -24,6 +24,7 @@
 #include "../mm/vmo.h"
 #include "../audit.h"
 #include "../log.h"
+#include "../resource/rlimit.h"
 #include "../../arch/x86_64/cpu/sched/sched.h"
 
 // Access to the ring metadata page. Duplicated in stream.c; tiny helper —
@@ -160,6 +161,26 @@ int stream_submit_batch(stream_t *s, uint32_t n_to_submit, int32_t caller_pid) {
         s->active_jobs++;
         s->total_submitted++;
         spinlock_release(&s->lock);
+
+        // --- U12: IO token-bucket gate -------------------------------
+        // For bulk data ops we debit the submitter's io_tokens by snap.len.
+        // On insufficient tokens the job chains on submitter->io_pending_head
+        // (via worker_next — the job is not on the worker queue while
+        // pending). rlimit_refill_io_tokens in schedule() re-submits when
+        // enough tokens accumulate. SENDMSG and the stub ops don't move
+        // bulk data — they bypass the bucket.
+        bool needs_tokens = (snap.op == OP_READ_VMO || snap.op == OP_WRITE_VMO);
+        if (needs_tokens && snap.len > 0) {
+            int io_rc = rlimit_check_io(submitter, snap.len);
+            if (io_rc == RLIMIT_EAGAIN_INTERNAL) {
+                // Chain on submitter's pending head. worker_next doubles as
+                // the chain link because a pending job never hits the
+                // worker queue until drained.
+                job->worker_next = (stream_job_t *)submitter->io_pending_head;
+                submitter->io_pending_head = (void *)job;
+                continue;  // don't enqueue on worker yet
+            }
+        }
 
         // --- Hand off to worker --------------------------------------
         stream_worker_enqueue(job);

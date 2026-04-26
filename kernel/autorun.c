@@ -16,7 +16,13 @@ extern volatile uint64_t g_timer_ticks;
 // can stash the pointer.
 #define AUTORUN_PATH_CAP 72
 static char s_path_buf[AUTORUN_PATH_CAP];
-static const char *s_path_default = "bin/gash";
+// Phase 22 closeout (G2 / P21.1.8): default autorun is now `bin/init`, the
+// userspace supervisor that reads /etc/init.conf and spawns the e1000d +
+// netd daemons before launching gash as the autorun child.  `make test`
+// still passes `autorun=ktest` on the cmdline, so the test harness path
+// is unchanged.  Booting with no autorun= now gives a fully-up TCP/IP
+// stack from the gash prompt onward.
+static const char *s_path_default = "bin/init";
 static int  s_init_pid = -1;
 
 static void copy_prefixed_name(const char *name) {

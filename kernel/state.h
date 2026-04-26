@@ -12,6 +12,8 @@
 #define STATE_CAT_SYSTEM     3
 #define STATE_CAT_DRIVERS        4
 #define STATE_CAT_CAPABILITIES   5
+// Phase 21: per-userspace-driver telemetry (drvctl backend).
+#define STATE_CAT_USERDRV        6
 #define STATE_CAT_ALL            255
 
 // Limits (must match kernel defines)
@@ -44,6 +46,11 @@
 #define STATE_DRIVER_OTHER    255
 
 // --- Per-process snapshot ---
+// Phase 21.1: added `pledge_mask` (uint16) + 2 bytes padding so gash `ps`
+// can render a PLEDGE column without an out-of-band syscall. Producer is
+// `sched_snapshot_processes` which copies from `task_t.pledge_mask.raw`.
+// `state_snapshot_t.version` bumps from 2 → 3 to signal the widening to
+// any future generic-snapshot consumer.
 typedef struct state_process {
     int32_t  pid;
     int32_t  parent_pid;
@@ -56,6 +63,8 @@ typedef struct state_process {
     uint64_t heap_used;
     uint32_t pending_signals;
     int32_t  exit_status;
+    uint16_t pledge_mask;       // Phase 21.1: matches task_t.pledge_mask.raw
+    uint16_t _pad_pledge[3];    // round struct to 8-byte alignment for arrays
 } state_process_t;
 
 // --- Process list snapshot ---
@@ -97,9 +106,22 @@ typedef struct {
     uint32_t bsp_lapic_id;
     uint32_t schedule_count;
     uint32_t context_switches;
+    // Phase 20 U17: per-CPU runq telemetry. Fields added after `active`:
+    //   runq_depth        - current ready_count on that CPU's runq
+    //   current_pid       - pid of rq.current (0 for BSP idle, -1 if none)
+    //   ctx_switches      - per-CPU context switch counter (runq.context_switches)
+    //   steal_successes   - count of successful work-steals AS THIEF on this CPU
+    //   steal_failures    - trylock failures during work-steal attempts
+    // Older userspace that reads only lapic_id+active keeps working; the
+    // psinfo --per-cpu builtin in gash reads the full struct.
     struct {
         uint32_t lapic_id;
         uint32_t active;
+        uint32_t runq_depth;
+        int32_t  current_pid;
+        uint64_t ctx_switches;
+        uint64_t steal_successes;
+        uint64_t steal_failures;
     } cpus[STATE_MAX_CPUS];
     uint32_t cpu_entries;
     uint32_t _pad;
@@ -107,6 +129,13 @@ typedef struct {
     // tooling like ktest can implement per-test timeouts without a
     // dedicated SYS_GETTIME syscall. LAPIC timer ticks at 100 Hz.
     uint64_t uptime_ticks;
+    // Phase 20: TSC snapshot for sub-microsecond timing in userspace
+    // (schedbench p99 wakeup latency, perf experiments). tsc_ns_now is
+    // tsc_to_ns(rdtsc()) at the time of the syscall — monotonic + high
+    // resolution. tsc_hz is the calibrated Hz (g_tsc_hz). Both 0 if
+    // tsc_init hasn't run.
+    uint64_t tsc_ns_now;
+    uint64_t tsc_hz;
 } state_system_t;
 
 // --- Driver operation descriptor ---
@@ -176,6 +205,31 @@ typedef struct {
     uint32_t new_state;          // New CAP_STATE_*
     char     cap_name[32];       // Name of capability (for user convenience)
 } __attribute__((packed)) state_cap_event_t;
+
+// --- Phase 21: per-userspace-driver entry (STATE_CAT_USERDRV) ---
+#define STATE_MAX_USERDRV  16
+
+typedef struct state_userdrv_entry {
+    uint32_t pci_addr;          // bus<<16 | dev<<8 | func
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint8_t  device_class;
+    uint8_t  device_subclass;
+    uint8_t  irq_vector;
+    uint8_t  is_claimable;
+    uint8_t  _pad[4];
+    int32_t  driver_owner_pid;  // 0 = unclaimed
+    uint64_t irq_count;
+    uint64_t registered_at_tsc;
+    uint64_t bar_phys;
+    uint64_t bar_size;
+} state_userdrv_entry_t;
+
+typedef struct {
+    uint32_t count;
+    uint32_t _pad;
+    state_userdrv_entry_t entries[STATE_MAX_USERDRV];
+} state_userdrv_list_t;
 
 // --- Combined full snapshot ---
 typedef struct {

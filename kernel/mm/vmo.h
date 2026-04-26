@@ -29,6 +29,11 @@
 #define VMO_PINNED       0x4u   // Pages cannot be evicted (all current VMOs)
 #define VMO_COW_CHILD    0x8u   // This is a child of a COW clone
 #define VMO_MMIO         0x10u  // Backing is device MMIO (no pmm)
+#define VMO_CONTIGUOUS   0x20u  // Phase 21: backing is N contiguous physical
+                                // pages allocated via pmm_alloc_pages. Used by
+                                // userspace driver daemons for DMA descriptor
+                                // rings + buffer pools where the device needs
+                                // a stable bus-master address range.
 
 // --- Limits --------------------------------------------------------------
 #define VMO_MAX_SIZE    (256ull * 1024 * 1024)  // 256 MiB per VMO
@@ -103,6 +108,17 @@ int vmo_unmap(struct task_struct *t, uint64_t vaddr, uint64_t len);
 // Writes in either side trigger vmo_cow_fault.
 vmo_t *vmo_clone_cow(vmo_t *src, int32_t owner_pid);
 
+// --- Shared clone (Phase 22) ---------------------------------------------
+// Produce a SHARED child VMO. Both parent and child map the same physical
+// frames with RW rights: writes from either side are immediately visible to
+// the other. Used by driver daemons (e1000d) to share DMA rings with
+// consumers (netd) — the kernel-proxy pattern moving into userspace. Unlike
+// vmo_clone_cow, neither side's mappings are write-protected, and there is
+// no page-fault-on-first-write machinery. The child's `parent` pointer is
+// retained and the parent's refcount is bumped so pages stay alive until
+// both sides unmap.
+vmo_t *vmo_clone_shared(vmo_t *src, int32_t owner_pid);
+
 // --- Page fault handler --------------------------------------------------
 // Returns 0 if the fault was handled (caller should resume). Negative
 // otherwise. Registered into vmm's PF hook via vmm_install_pf_handler at
@@ -117,6 +133,14 @@ void vmo_cap_deactivate(struct cap_object *obj);
 // Called from sched_reap_zombie to release any residual VMO mappings held
 // by the exiting task. Idempotent; no-op if the task had no mappings.
 void vmo_cleanup_task(int32_t task_id);
+
+// Phase 21: physical-address discovery for driver daemons. Returns the
+// physical address backing page `page_idx` of the VMO, or 0 if the page is
+// not yet allocated (VMO_ONDEMAND case) or page_idx is out of range.
+// Used by SYS_MMIO_VMO_CREATE op=PHYS_QUERY (cap-gated by
+// CAP_KIND_DRIVER_REGISTRAR) so e1000d can program TDBAL/RDBAL with the
+// bus-master address of its descriptor ring.
+uint64_t vmo_get_phys(vmo_t *v, uint32_t page_idx);
 
 // PROT_* bits (userspace-visible mirror in user/syscalls.h).
 #define PROT_READ   0x1u

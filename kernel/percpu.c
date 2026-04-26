@@ -54,8 +54,9 @@ void percpu_init(uint32_t cpu_id) {
         }
     }
 
-    p->sched_rq_head = (struct task *)0;
-    p->sched_rq_tail = (struct task *)0;
+    // Phase 20: the per-CPU runqueue lives where sched_rq_head/tail used to.
+    // Full initialisation (magic, lock, counters, lists) via runq_init.
+    runq_init(&p->runq, cpu_id);
 
     for (unsigned i = 0; i < sizeof(p->future); ++i) {
         p->future[i] = 0;

@@ -15,6 +15,7 @@
 #include "../cap/object.h"
 #include "../audit.h"
 #include "../log.h"
+#include "../resource/rlimit.h"
 
 // --- Global state --------------------------------------------------------
 static kmem_cache_t *g_vmo_cache = NULL;
@@ -90,6 +91,38 @@ vmo_t *vmo_create(uint64_t size_bytes, uint32_t flags,
     }
     memset(v->pages, 0, sizeof(uint64_t) * npages);
 
+    // Phase 21: VMO_CONTIGUOUS uses pmm_alloc_pages to get N contiguous
+    // physical pages in one shot. Must NOT be combined with VMO_ONDEMAND
+    // (the whole point is up-front contiguous DMA backing). Capped at 64
+    // pages — the bitmap scan is O(total_pages * npages) so anything larger
+    // becomes pathological. e1000d's largest single VMO is 256 RX or TX
+    // buffers (256 * 2 KiB = 128 pages) but it allocates two pools so any
+    // single VMO is ≤ 64 pages.
+    if (flags & VMO_CONTIGUOUS) {
+        if (flags & VMO_ONDEMAND) {  // semantically incoherent
+            kfree(v->pages);
+            kmem_cache_free(g_vmo_cache, v);
+            return NULL;
+        }
+        if (npages > 64) {
+            kfree(v->pages);
+            kmem_cache_free(g_vmo_cache, v);
+            return NULL;
+        }
+        void *pa = pmm_alloc_pages(npages);
+        if (!pa) {
+            kfree(v->pages);
+            kmem_cache_free(g_vmo_cache, v);
+            return NULL;
+        }
+        uint64_t base = (uint64_t)pa;
+        for (uint64_t p = 0; p < npages; p++) {
+            v->pages[p] = base + p * 4096ull;
+            if (flags & VMO_ZEROED) memset(phys_to_kv(v->pages[p]), 0, 4096);
+        }
+        return v;
+    }
+
     // Eager allocation unless VMO_ONDEMAND is set.
     if (!(flags & VMO_ONDEMAND)) {
         for (uint64_t p = 0; p < npages; p++) {
@@ -111,6 +144,12 @@ vmo_t *vmo_create(uint64_t size_bytes, uint32_t flags,
     return v;
 }
 
+uint64_t vmo_get_phys(vmo_t *v, uint32_t page_idx) {
+    if (!vmo_check(v)) return 0;
+    if (page_idx >= v->npages) return 0;
+    return v->pages[page_idx];
+}
+
 // --- vmo_free ------------------------------------------------------------
 void vmo_free(vmo_t *v) {
     if (!vmo_check(v)) return;
@@ -120,8 +159,18 @@ void vmo_free(vmo_t *v) {
         v->parent = NULL;
     }
     if (v->pages) {
-        for (uint32_t p = 0; p < v->npages; p++) {
-            if (v->pages[p]) pmm_page_unref((void *)v->pages[p]);
+        // Phase 21: MMIO VMOs back PCI-BAR physical addresses; pmm doesn't
+        // own those frames. Skip the unref loop entirely.
+        if (v->flags & VMO_MMIO) {
+            // Nothing to free at the pmm layer; just drop the pages array.
+        } else if (v->flags & VMO_CONTIGUOUS) {
+            // Single bulk free — pages[] is one contiguous run starting at
+            // pages[0]. pmm_free_pages decrements each frame's refcount.
+            if (v->pages[0]) pmm_free_pages((void *)v->pages[0], v->npages);
+        } else {
+            for (uint32_t p = 0; p < v->npages; p++) {
+                if (v->pages[p]) pmm_page_unref((void *)v->pages[p]);
+            }
         }
         kfree(v->pages);
         v->pages = NULL;
@@ -209,17 +258,54 @@ uint64_t vmo_map(vmo_t *v, task_t *t,
         pte_flags &= ~PTE_WRITABLE;
     }
 
+    // Phase 21: MMIO VMOs map device registers; cache must be disabled and
+    // write-through forced so writes hit silicon immediately and reads see
+    // the device's current value (no CPU-cache shadowing).
+    if (v->flags & VMO_MMIO) {
+        pte_flags |= PTE_CACHEDISABLE | PTE_WRITETHROUGH;
+    }
+
     for (uint64_t p = 0; p < npages; p++) {
         uint64_t phys = v->pages[start_page + p];
+        // MMIO VMOs always have phys != 0 (set at create time); skip the
+        // on-demand allocation + rlimit_check_mem block entirely.
+        if (phys != 0 && (v->flags & VMO_MMIO)) {
+            // Just map; don't pmm_page_ref (page is not pmm-tracked).
+            if (!vmm_map_page_by_cr3(t->cr3, vaddr + p * 4096, phys, pte_flags)) {
+                for (uint64_t q = 0; q < p; q++) {
+                    vmm_unmap_page_by_cr3(t->cr3, vaddr + q * 4096);
+                }
+                spinlock_release(&g_vmo_map_lock);
+                return 0;
+            }
+            continue;
+        }
         if (phys == 0) {
+            // Phase 20 U10b: on-demand allocation counts against the task's
+            // mem_limit_pages. Charges 1 page per fresh frame; shared frames
+            // (phys != 0) are not charged because the original owner already
+            // accounts for them. On limit denial, fail the map cleanly with
+            // the same rollback path used for pmm exhaustion.
+            int mrc = rlimit_check_mem(t, 1);
+            if (mrc < 0) {
+                for (uint64_t q = 0; q < p; q++) {
+                    vmm_unmap_page_by_cr3(t->cr3, vaddr + q * 4096);
+                    pmm_page_unref((void *)(v->pages[start_page + q]));
+                    rlimit_account_free_mem(t, 1);
+                }
+                spinlock_release(&g_vmo_map_lock);
+                return 0;
+            }
             // On-demand page — allocate now. (Simple eager-on-first-map for
             // Phase 17; true demand-paging can land in Phase 18.)
             void *pa = pmm_alloc_page();
             if (!pa) {
+                rlimit_account_free_mem(t, 1);  // refund our own reservation
                 // Roll back the partial map.
                 for (uint64_t q = 0; q < p; q++) {
                     vmm_unmap_page_by_cr3(t->cr3, vaddr + q * 4096);
                     pmm_page_unref((void *)(v->pages[start_page + q]));
+                    rlimit_account_free_mem(t, 1);
                 }
                 spinlock_release(&g_vmo_map_lock);
                 return 0;
@@ -268,11 +354,19 @@ int vmo_unmap(task_t *t, uint64_t vaddr, uint64_t len) {
     }
     vmo_t *v = m->vmo;
     uint64_t start_page = m->offset / 4096;
+    bool is_mmio = (v->flags & VMO_MMIO) != 0;
     for (uint32_t p = 0; p < m->len_pages; p++) {
         uint64_t va = m->vaddr + (uint64_t)p * 4096;
         uint64_t phys = v->pages[start_page + p];
         vmm_unmap_page_by_cr3(t->cr3, va);
-        if (phys) pmm_page_unref((void *)phys);
+        if (phys && !is_mmio) {
+            pmm_page_unref((void *)phys);
+            // Phase 20 U10b: refund mem accounting for the page that was
+            // counted on map. Only the original owner of the VMO had the
+            // pages charged; secondary maps of shared frames don't decrement
+            // here either (they balance against pmm_page_ref bumps in map).
+            rlimit_account_free_mem(t, 1);
+        }
     }
     m->vaddr = 0;
     m->vmo   = NULL;
@@ -335,6 +429,62 @@ vmo_t *vmo_clone_cow(vmo_t *src, int32_t owner_pid) {
     return child;
 }
 
+// --- vmo_clone_shared ----------------------------------------------------
+// Phase 22 Stage B: produce a SHARED child VMO. Same physical pages, no
+// COW machinery — both parent and child have RW access and writes are
+// immediately visible to the other side. Critical for the e1000d→netd DMA
+// ring handoff: e1000d owns the RX ring as the producer; netd must read
+// (possibly simultaneously with the producer's write). Symmetric for TX.
+//
+// Distinct from vmo_clone_cow in two ways:
+//   (1) Parent mappings are NOT downgraded to read-only.
+//   (2) The child's VMO_COW_CHILD flag is NOT set, so vmo_pf_dispatch does
+//       not try to make private copies on write.
+//
+// Page refcounts are incremented on every shared page so the backing
+// storage outlives the first side to close. The parent's vmo refcount is
+// also bumped; when the child is freed, vmo_free will drop the parent
+// reference.
+vmo_t *vmo_clone_shared(vmo_t *src, int32_t owner_pid) {
+    if (!vmo_check(src)) return NULL;
+
+    vmo_t *child = (vmo_t *)kmem_cache_alloc(g_vmo_cache);
+    if (!child) return NULL;
+    child->magic       = VMO_MAGIC;
+    // Inherit flags but clear VMO_ZEROED (source's pages are NOT re-zeroed)
+    // and VMO_COW_CHILD (this is a SHARED child, not a COW child).
+    child->flags       = src->flags & ~(VMO_ZEROED | VMO_COW_CHILD);
+    child->id          = next_vmo_id();
+    child->size_bytes  = src->size_bytes;
+    child->npages      = src->npages;
+    child->refcount    = 1;
+    child->parent      = src;
+    child->owner_pid   = owner_pid;
+    child->cap_object_idx = 0;
+    spinlock_init(&child->lock, "vmo");
+
+    child->pages = (uint64_t *)kmalloc(sizeof(uint64_t) * src->npages, SUBSYS_MM);
+    if (!child->pages) {
+        kmem_cache_free(g_vmo_cache, child);
+        return NULL;
+    }
+
+    // Share pages and bump page refcounts. Bump parent vmo refcount too —
+    // both sides hold their own live reference to the underlying pages via
+    // pmm_page_ref, but the child's ->parent pointer keeps src alive for
+    // the lifetime of the child (needed because vmo_free derefs the parent).
+    spinlock_acquire(&src->lock);
+    for (uint32_t p = 0; p < src->npages; p++) {
+        child->pages[p] = src->pages[p];
+        if (child->pages[p]) pmm_page_ref((void *)child->pages[p]);
+    }
+    src->refcount++;
+    spinlock_release(&src->lock);
+
+    // No mapping downgrade — this is the point of the shared clone.
+    return child;
+}
+
 // --- vmo_pf_dispatch -----------------------------------------------------
 int vmo_pf_dispatch(uint64_t fault_va, uint64_t error_code) {
     // We only handle user-mode write faults on present pages.
@@ -378,9 +528,21 @@ int vmo_pf_dispatch(uint64_t fault_va, uint64_t error_code) {
         return -1;
     }
 
+    // Phase 20 U10b: COW first-write counts the freshly-allocated private
+    // page against the faulting task's mem_limit. The shared parent page
+    // doesn't decrement on the child here (it's still mapped by the parent
+    // — the symmetric refund happens when the parent unmaps).
+    int mrc_cow = rlimit_check_mem(cur, 1);
+    if (mrc_cow < 0) {
+        spinlock_release(&g_vmo_map_lock);
+        audit_write_vmo_fault(cur->id, v->cap_object_idx, fault_va,
+                              CAP_V2_ENOMEM, "cow rlimit denied");
+        return -1;
+    }
     // Allocate a private copy.
     void *new_pa = pmm_alloc_page();
     if (!new_pa) {
+        rlimit_account_free_mem(cur, 1);  // refund our reservation
         spinlock_release(&g_vmo_map_lock);
         audit_write_vmo_fault(cur->id, v->cap_object_idx, fault_va,
                               CAP_V2_ENOMEM, "cow alloc failed");

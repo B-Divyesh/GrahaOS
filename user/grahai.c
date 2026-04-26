@@ -4,6 +4,7 @@
 //   - AI Agent: reads ai_prompt.txt, calls Gemini API, validates & executes plan
 #include "syscalls.h"
 #include "json.h"
+#include "libhttp/libhttp.h"
 #include "../kernel/state.h"
 #include "../kernel/fs/grahafs.h"
 
@@ -22,28 +23,13 @@ void print_int(int n) {
     while (i > 0) { buf[0] = tmp[--i]; syscall_putc(buf[0]); }
 }
 
-int strcmp(const char *s1, const char *s2) {
-    while (*s1 && (*s1 == *s2)) { s1++; s2++; }
-    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
-}
-
-int strncmp(const char *s1, const char *s2, size_t n) {
-    while (n && *s1 && (*s1 == *s2)) { s1++; s2++; n--; }
-    if (n == 0) return 0;
-    return *(unsigned char *)s1 - *(unsigned char *)s2;
-}
-
-size_t strlen(const char *s) {
-    size_t i = 0;
-    while (s[i]) i++;
-    return i;
-}
-
-char *strcpy(char *dest, const char *src) {
-    char *ret = dest;
-    while ((*dest++ = *src++));
-    return ret;
-}
+// Phase 22 Stage E U21c: strcmp/strncmp/strlen/strcpy now come from libc
+// (pulled in via libhttp's transitive deps). Local definitions deleted to
+// avoid multiple-definition link errors.
+extern int strcmp(const char *s1, const char *s2);
+extern int strncmp(const char *s1, const char *s2, size_t n);
+extern size_t strlen(const char *s);
+extern char *strcpy(char *dest, const char *src);
 
 void *memset_local(void *ptr, int val, size_t n) {
     uint8_t *p = (uint8_t *)ptr;
@@ -395,37 +381,72 @@ static void run_ai_mode(const char *user_prompt) {
 
     print("grahai: Calling Gemini API...\n");
 
-    // 6. HTTP POST
+    // 6. HTTP POST via libhttp (Phase 22 Stage E migration; pre-Phase-22
+    //    this called SYS_HTTP_POST directly).
+    //
+    //    NOTE: until P22.D.2 lands the Mongoose TLS extraction, http_post
+    //    over https:// returns -EPROTO. We surface a clear error so the
+    //    rest of the agent path remains debuggable; callers can rerun
+    //    after extraction lands.
     char response[8192];
     memset_local(response, 0, sizeof(response));
-    int ret = syscall_http_post(url, body, b, response, sizeof(response));
+    int ret = 0;
+    int response_len = 0;
 
-    // Handle 429 rate limit
-    if (ret > 0) {
+    {
+        http_response_t resp;
+        memset_local(&resp, 0, sizeof(resp));
+        int rc = http_post(&resp, url,
+                           (const uint8_t *)body, (uint32_t)b,
+                           "application/json",
+                           /*timeout_ms=*/15000);
+
+        // Handle 429 rate limit by inspecting the body for "429".
         int is_429 = 0;
-        for (int i = 0; i < ret - 2; i++) {
-            if (response[i] == '4' && response[i+1] == '2' && response[i+2] == '9') {
-                is_429 = 1; break;
+        if (rc == 0 && resp.body && resp.body_len >= 3) {
+            for (uint32_t i = 0; i + 2 < resp.body_len; i++) {
+                if (resp.body[i] == '4' && resp.body[i+1] == '2' && resp.body[i+2] == '9') {
+                    is_429 = 1; break;
+                }
             }
         }
         if (is_429) {
             print("grahai: Rate limited, retrying in 2s...\n");
             for (volatile int d = 0; d < 200000000; d++) {}
-            memset_local(response, 0, sizeof(response));
-            ret = syscall_http_post(url, body, b, response, sizeof(response));
+            http_response_free(&resp);
+            memset_local(&resp, 0, sizeof(resp));
+            rc = http_post(&resp, url,
+                           (const uint8_t *)body, (uint32_t)b,
+                           "application/json", /*timeout_ms=*/15000);
         }
-    }
 
-    if (ret < 0) {
-        print("grahai: HTTP POST failed (error ");
-        print_int(ret);
-        print(")\n");
-        return;
+        if (rc < 0) {
+            print("grahai: HTTP POST failed (error ");
+            print_int(rc);
+            print(")\n");
+            http_response_free(&resp);
+            return;
+        }
+        if (resp.body == 0 || resp.body_len == 0) {
+            print("grahai: empty response\n");
+            http_response_free(&resp);
+            return;
+        }
+
+        // Copy body into the existing fixed buffer so the rest of the
+        // function (jsmn_parse, scanning for "text", etc.) keeps working
+        // unchanged. body_len is capped by libhttp's LIBHTTP_MAX_BODY_BYTES
+        // (128 KiB); we further cap to the local buffer.
+        uint32_t copy_len = resp.body_len;
+        if (copy_len > sizeof(response) - 1) copy_len = sizeof(response) - 1;
+        memcpy_local(response, resp.body, copy_len);
+        response[copy_len] = '\0';
+        response_len = (int)copy_len;
+        ret = response_len;
+
+        http_response_free(&resp);
     }
-    if (ret == 0) {
-        print("grahai: empty response\n");
-        return;
-    }
+    (void)response_len;
 
     // 7. Parse Gemini response (outer JSON)
     jsmn_parser parser;
