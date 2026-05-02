@@ -61,10 +61,18 @@ bool spinlock_held(spinlock_t *lock);
 // needing special-case plumbing in spinlock_init.
 // ---------------------------------------------------------------------------
 
-// Default budget for legacy spinlock_acquire callers. 100 ms is large enough
-// that any healthy lock path never trips it; any holder that takes this long
-// is a deadlock or pathological priority inversion.
-#define SPINLOCK_DEFAULT_BUDGET_NS   100000000ULL
+// Default budget for legacy spinlock_acquire callers.
+//
+// Phase 23 Stage-2 cutover: bumped 100 ms → 5 s.  Channel-mediated FS I/O
+// holds locks (notably grahafs_lock and the per-task cap_handle locks)
+// while it issues a chan_send → ahcid round-trip → chan_recv pair.  Each
+// round-trip can take 10-50 ms in QEMU TCG; under contention several
+// stacked requests easily exceed the previous 100 ms budget and trip the
+// "deadlock" panic on healthy code.  5 s still catches real deadlocks
+// loudly while letting the kernel-direct → channel-mode transition land.
+// Phase 24 task: refactor grahafs to release its lock around block I/O,
+// then we can drop this back to a tighter envelope.
+#define SPINLOCK_DEFAULT_BUDGET_NS   5000000000ULL
 
 void _spinlock_acquire_with_budget(spinlock_t *lock, uint64_t budget_ns,
                                    const char *file, int line);

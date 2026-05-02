@@ -38,11 +38,6 @@ extern void *memcpy(void *, const void *, size_t);
 
 #define BLK_TEST_DMA_SZ 4096u
 
-static void spin_ms_approx(uint64_t ms) {
-    uint64_t loops = ms * 100000ull;
-    for (volatile uint64_t i = 0; i < loops; i++) { }
-}
-
 // FNV-1a 64-bit (matches kernel manifest_type_known + ahcid daemon).
 static uint64_t fnv1a64(const char *s) {
     uint64_t h = 0xCBF29CE484222325ull;

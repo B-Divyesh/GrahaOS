@@ -52,11 +52,14 @@ void _start(void) {
     cap_token_u_t t_display  = lookup("display");
     cap_token_u_t t_keyboard = lookup("keyboard_input");
     cap_token_u_t t_e1000    = lookup("e1000_nic");
-    cap_token_u_t t_disk     = lookup("disk");
+    cap_token_u_t t_disk     = lookup("disk");  /* Phase 24a W10: 0 (stripped) */
     TAP_ASSERT(t_display.raw  != 0, "SYS_CAN_LOOKUP resolves 'display'");
     TAP_ASSERT(t_keyboard.raw != 0, "SYS_CAN_LOOKUP resolves 'keyboard_input'");
     TAP_ASSERT(t_e1000.raw    != 0, "SYS_CAN_LOOKUP resolves 'e1000_nic'");
-    TAP_ASSERT(t_disk.raw     != 0, "SYS_CAN_LOOKUP resolves 'disk'");
+    /* Phase 24a W10: kernel-resident "disk" CAN cap stripped — ahcid owns
+     * the HBA via SYS_DRV_REGISTER + /sys/blk/service.  Skip with reason. */
+    tap_skip("SYS_CAN_LOOKUP resolves 'disk'",
+             "Phase 24a W10: kernel AHCI + 'disk' CAN cap stripped");
 
     // =======================================================================
     // G2: SYS_CAN_LOOKUP returns 0 on unknown name (1 assert)
@@ -70,7 +73,11 @@ void _start(void) {
     TAP_ASSERT(kb_active()    == 1, "keyboard is active at test start");
     TAP_ASSERT(fb_active()    == 1, "framebuffer is active at test start");
     TAP_ASSERT(e1000_act()    == 1, "e1000 is active at test start");
-    TAP_ASSERT(ahci_act()     == 1, "ahci is active at test start");
+    /* Phase 24a W10: kernel-resident AHCI driver stripped; the "disk" CAN
+     * cap and DEBUG_AHCI_IS_ACTIVE syscall are gone (ahcid owns the HBA).
+     * Skip with reason — the ahcid daemon is the post-strip authority. */
+    tap_skip("ahci is active at test start",
+             "Phase 24a W10: kernel AHCI stripped; ahcid owns HBA");
     // Phase 21.1: register-level reads no longer reachable from kernel — the
     // E1000 MMIO is owned by /bin/e1000d. Skip and rely on cap-state asserts
     // below to verify CAN deactivate/activate semantics.
@@ -121,26 +128,19 @@ void _start(void) {
              "Phase 21.1: e1000_debug_read_reg removed (daemon owns MMIO)");
 
     // =======================================================================
-    // G7: deactivate disk -> port CMD.ST cleared (3 asserts)
-    // =======================================================================
-    uint32_t cmd_before = ahci_port_cmd(0);
-    r = syscall_can_deactivate_t(t_disk);
-    // AHCI deactivate can return -CAP_ERR_BUSY (-18) if the refuse hook
-    // trips on a concurrent command — acceptable flake on a busy disk.
-    TAP_ASSERT(r >= 1 || r == -18,
-               "SYS_CAN_DEACTIVATE_T(disk) returns cascade count or -EBUSY");
-    if (r >= 1) {
-        TAP_ASSERT((ahci_port_cmd(0) & 0x0001) == 0,
-                   "AHCI port 0 CMD.ST cleared after deactivate");
-        // Reactivate
-        r = syscall_can_activate_t(t_disk);
-        TAP_ASSERT(r == 0, "SYS_CAN_ACTIVATE_T(disk) succeeds");
-    } else {
-        // Refuse path: state stayed ON.
-        TAP_ASSERT((ahci_port_cmd(0) & 0x0001) == (cmd_before & 0x0001),
-                   "AHCI CMD.ST unchanged on refuse path");
-        TAP_ASSERT(ahci_act() == 1, "ahci still active after refuse");
-    }
+    // G7: deactivate disk -> port CMD.ST cleared (3 asserts).  Phase 24a
+    // W10: the kernel-resident "disk" CAN cap was stripped (no
+    // cap_register("disk", ...) anywhere) and ahci_debug_port_cmd /
+    // ahci_is_active return -ENOSYS now.  Skip with reason — the disk
+    // is owned by /bin/ahcid and exercised by ahcid_register +
+    // ahcid_basic_io tests instead.
+    (void)t_disk;
+    tap_skip("SYS_CAN_DEACTIVATE_T(disk) returns cascade count or -EBUSY",
+             "Phase 24a W10: kernel AHCI + 'disk' CAN cap stripped");
+    tap_skip("AHCI port 0 CMD.ST cleared after deactivate",
+             "same — ahcid owns HBA registers post-strip");
+    tap_skip("SYS_CAN_ACTIVATE_T(disk) succeeds",
+             "same — 'disk' CAN cap no longer exists");
 
     // =======================================================================
     // G8: Seven deprecated syscalls all return -EDEPRECATED (-78) (7 asserts)

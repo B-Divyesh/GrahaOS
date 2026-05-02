@@ -470,13 +470,37 @@ bool vmm_protect_page_by_cr3(uint64_t cr3, uint64_t virt, uint64_t new_flags) {
 // Installed page-fault handler (Phase 17). NULL until vmo_init runs.
 static vmm_pf_handler_t g_pf_handler = NULL;
 
+// Phase 24 W15: snap COW handler tried BEFORE g_pf_handler. NULL until
+// snap_init runs cow_init(). Aligned 8-byte writes are atomic on x86_64.
+static vmm_pf_handler_t g_snap_pf_handler = NULL;
+
 void vmm_install_pf_handler(vmm_pf_handler_t fn) {
-    // Single aligned 8-byte write is atomic on x86_64; no lock needed.
     g_pf_handler = fn;
 }
 
+void vmm_install_snap_pf_handler(vmm_pf_handler_t fn) {
+    g_snap_pf_handler = fn;
+}
+
 int vmm_dispatch_pf(uint64_t fault_va, uint64_t error_code) {
+    // Try snap COW handler first; it returns 0 only if the faulting page
+    // is recorded in the cow_page_tracker hash. For everything else (no
+    // tracker, kernel mode, fault-not-write, etc.) it returns negative
+    // and we fall through to vmo_pf_dispatch.
+    vmm_pf_handler_t snap = g_snap_pf_handler;
+    if (snap) {
+        int rc = snap(fault_va, error_code);
+        if (rc == 0) return 0;
+    }
     vmm_pf_handler_t fn = g_pf_handler;
     if (!fn) return -1;
     return fn(fault_va, error_code);
+}
+
+uint64_t vmm_get_pte(uint64_t cr3, uint64_t virt) {
+    uint64_t *pte = vmm_walk_pte(cr3, virt);
+    if (!pte) return 0;
+    uint64_t v = *pte;
+    if (!(v & PTE_PRESENT)) return 0;
+    return v;
 }

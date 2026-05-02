@@ -26,7 +26,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot
 
 # Phase 12: TAP 1.4 test binaries. Each lives at user/tests/NAME.c
 # and is copied to initrd as /bin/tests/NAME.tap by the top-level
@@ -44,6 +44,9 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/fstest_v2 tests/schedtest tests/rlimittest \
              tests/userdrv tests/e1000dtest \
              tests/chantest_named \
+             tests/snaptest \
+             tests/snap_stress_cycle \
+             tests/snap_cow_storm \
              tests/netd_arp tests/netd_ipv4 tests/netd_tcp tests/netd_dhcp \
              tests/netd_dns tests/netd_service \
              tests/libhttp_parse \
@@ -69,6 +72,13 @@ TAP_TESTS += tests/ahcid_register
 TAP_TESTS += tests/blk_stress_kheap
 TAP_TESTS += tests/blk_stress_random_read
 TAP_TESTS += tests/userdrv_respawn_100
+# Phase 24a PRE: blk_micro_latency — measurement ruler for the 7-layer IPC
+# optimization stack (W1 doorbell IPI, W2 chan_send fastpath, W3 batching,
+# W5 SPSC ring, W6 zero-copy DMA, W7 same-CPU affinity, W8 lockless audit).
+# Profiling tool, NOT in gate. Run interactively from
+# `gash> ktest blk_micro_latency` after each layer commit; capture printf
+# output to problems/phase24a/baselines.json.
+TAP_TESTS += tests/blk_micro_latency
 # Phase 23 P23.deferred.1 cutover validation: ahcid_basic_io exercises the
 # end-to-end I/O path (connect → handshake with VMO handle → BLK_OP_READ
 # → response → DMA verification). Wraps cap_deactivate("disk") around the
@@ -402,6 +412,13 @@ drivers/ahcid: drivers/ahcid.o libdriver.o $(LIBC)
 blkctl: blkctl.o $(LIBC)
 	@echo "Linking blkctl"
 	@$(LD) $(LDFLAGS) -o $@ blkctl.o $(LIBC)
+
+# Phase 24 W19.6: /bin/snapshot — COW snapshot CLI. Dispatches by argv[0]
+# basename so cp'd aliases (snapshots / restore / snap-delete) reuse the
+# same binary.
+snapshot: snapshot.o $(LIBC)
+	@echo "Linking snapshot"
+	@$(LD) $(LDFLAGS) -o $@ snapshot.o $(LIBC)
 
 # Phase 22 Stage A/B: /bin/netd — userspace TCP/IP daemon. Stage A proves
 # publish/connect rendezvous with e1000d. Stage B layers ARP (already

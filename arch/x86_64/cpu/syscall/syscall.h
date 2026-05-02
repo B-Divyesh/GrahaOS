@@ -260,6 +260,36 @@
                                     //   (bad user pointer), -EPIPE (publisher
                                     //   has died and cleanup has not yet run).
 
+// Phase 24 W19: snapshot syscalls. Spec originally proposed 1086-1089 but
+// those slots were already taken (SPAWN_EX, DRV_REGISTER, DRV_IRQ_WAIT,
+// MMIO_VMO_CREATE) — plan reconciled to 1093-1096.
+#define SYS_SNAP_CREATE   1093  // RDI = uint32_t scope_flags (SNAP_SCOPE_*)
+                                //   RSI = const char *name (≤31 chars + NUL,
+                                //         user ptr; NULL permitted).
+                                // Pledge: SYS_CONTROL + SYS_QUERY.
+                                // Returns: cap_handle slot >= 0 on success,
+                                //   negative -errno (-EINVAL, -EPERM, -ENOMEM,
+                                //   -EBUSY, -ETIME).
+#define SYS_SNAP_RESTORE  1094  // RDI = uint32_t handle.
+                                // Pledge: SYS_CONTROL.
+                                // Returns 0 on success, -EINVAL, -EPERM,
+                                //   -ESTALE, -ETIME. (W14 partial: -ENOSYS
+                                //   until W16 lands the restore body.)
+#define SYS_SNAP_DELETE   1095  // RDI = uint32_t handle.
+                                // Pledge: SYS_CONTROL.
+                                // Returns 0 on success, -EINVAL, -EPERM,
+                                //   -EBUSY (snapshot is RESTORING).
+#define SYS_SNAP_LIST     1096  // RDI = snap_info_t *user_buf
+                                //   RSI = size_t count.
+                                // Pledge: SYS_QUERY.
+                                // Returns count of snap_info_t records
+                                //   written, or -EINVAL / -EPERM.
+
+// Phase 24 sub-phase H.1: TSC frequency query.
+#define SYS_TSC_HZ_QUERY  1097  // No args.  No pledge required.
+                                // Returns g_tsc_hz (in Hz) or 0 if the
+                                // TSC has not been calibrated yet.
+
 // Resource identifiers for SYS_SETRLIMIT / SYS_GETRLIMIT.
 #define RLIMIT_MEM            1     // pages (4 KiB each); 0 = unlimited
 #define RLIMIT_CPU            2     // ns per 1-second epoch (max 1_000_000_000); 0 = unlimited

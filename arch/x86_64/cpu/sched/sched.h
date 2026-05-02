@@ -58,7 +58,13 @@ typedef enum {
     // its budget and moves it back to ready_tail. Distinct from BLOCKED so
     // psinfo can count it separately and fairness auditing (AUDIT_SCHED_
     // STARVATION) can identify starvation-vs-deliberate-block cases.
-    TASK_STATE_STARVED
+    TASK_STATE_STARVED,
+    // Phase 24 W14: parked off-CPU during a snap_create barrier. The task
+    // is linked into g_snap_barrier.parked_head via task->barrier_next;
+    // snap_end_barrier walks that list and re-enqueues each entry as
+    // READY. While in this state the task is NOT on any runq; schedule()
+    // dispatches the per-CPU idle task instead.
+    TASK_STATE_BARRIER_WAIT
 } task_state_t;
 
 // Phase 17: reason a task entered TASK_STATE_CHAN_WAIT.
@@ -244,6 +250,13 @@ typedef struct task_struct {
     // the scheduler visits the same starvation condition dozens of times
     // during the exhaust window.
     uint64_t last_starvation_epoch;
+
+    // Phase 24 W14: snapshot-barrier parked-list link. Set by schedule()
+    // when it parks this task in TASK_STATE_BARRIER_WAIT during a
+    // snap_create barrier; cleared by snap_end_barrier when the task is
+    // pulled off the parked list and re-enqueued onto its runq. NULL
+    // outside the barrier window.
+    struct task_struct *barrier_next;
 } task_t;
 
 /**
@@ -298,6 +311,19 @@ int sched_block_on_channel(void *channel, uint8_t dir, uint64_t timeout_ns,
 // if the list was empty.
 task_t *sched_wake_one_on_channel(struct task_struct **list_head,
                                   int32_t wait_result);
+
+// Phase 24a W2: voluntary yield from a non-blocking caller (caller stays
+// READY; runq head gets dispatched). See sched.c for full rationale.
+// Caller must not hold spinlocks. Used by chan_send / chan_recv after
+// waking a same-CPU peer to deliver microsecond IPC roundtrip.
+void sched_yield_now(void);
+
+// Phase 20: place a READY task onto a per-CPU runqueue. Used by every
+// state→READY transition (creation, wake, deadline expiry). Routes by
+// cpu_pinned / last_ran_cpu / 0. Public so kernel/snap/barrier.c can
+// re-enqueue tasks released from the snapshot barrier window.
+struct task_struct;
+void sched_enqueue_ready(struct task_struct *task);
 
 // Wake every task on the list (channel teardown / EPIPE). Each gets the
 // given wait_result. Returns the count of woken tasks.

@@ -96,6 +96,22 @@ typedef struct channel {
     int32_t  owner_pid;              // 112..115 creator pid
     uint32_t _pad1;                  // 116..119
     spinlock_t lock;                 // 120..167 48-byte spinlock_t
+    // ---- Phase 24 W18 (snapshot integration). The fields below are 0 in
+    // every freshly-created channel; chan_freeze sets frozen_at_snap, and
+    // chan_send / chan_recv return CAP_V2_EFROZEN while it is non-zero.
+    // saved_head / saved_tail let chan_thaw rewind the ring to the state
+    // captured at snap time so a snap_restore observes the original
+    // queue head/tail rather than whatever advanced afterwards.
+    uint64_t   frozen_at_snap;       // 168..175  0 = live, else snap_id
+    uint32_t   saved_head;           // 176..179  ring head at freeze
+    uint32_t   saved_tail;           // 180..183  ring tail at freeze
+    uint32_t   saved_msgcount;       // 184..187  msgcount at freeze
+    uint32_t   _pad2;                // 188..191
+    // Global registry linkage (W18). Inserted on chan_create / chan_create_kernel,
+    // unlinked on chan_free. Walked by chan_lookup_by_id() so snapshot
+    // capture can resolve a chan_endpoint_t back to its channel_t.
+    struct channel *reg_next;        // 192..199
+    struct channel *reg_prev;        // 200..207
 } channel_t;
 
 // --- Endpoint payload ----------------------------------------------------
@@ -151,6 +167,32 @@ int chan_recv(channel_t *c, struct task_struct *receiver,
 //  bit 0 = readable (has messages), bit 1 = writable (has space),
 //  bit 2 = closed-peer (EPIPE on further I/O).
 uint32_t chan_poll_probe(channel_t *c);
+
+// --- W18: snapshot freeze/thaw integration ------------------------------
+// Walk the global channel registry and return the channel_t whose `id`
+// matches `chan_id`, or NULL if none. Used by chan_freeze / chan_thaw to
+// resolve the ID stored in a snapshot_chan_entry_t back to the live
+// channel object. The returned pointer is borrowed (no refcount bump).
+channel_t *chan_lookup_by_id(uint64_t chan_id);
+
+// Apply / clear the freeze flag with full lock + waiter-wake semantics.
+// chan_freeze_locked is called from kernel/snap/chan_freeze.c::chan_freeze.
+// Returns CAP_V2_OK on success, CAP_V2_EBUSY if already frozen at a
+// different snap_id, CAP_V2_EINVAL on garbage input.
+int chan_freeze_locked(channel_t *c, uint64_t snap_id);
+int chan_thaw_locked(channel_t *c, uint32_t restore_head, uint32_t restore_tail);
+
+// Phase 24 W14.6 — walk the global channel registry and freeze every live
+// channel against snap_id. Idempotent for channels already frozen by the
+// same snap_id; channels frozen by a different snap_id are silently
+// skipped (best-effort; the new snap won't observe their queue but the
+// existing freeze still holds). Lock order: g_chan_reg_lock -> c->lock
+// (matches chan_destroy / chan_lookup_by_id).
+int chan_freeze_all_locked(uint64_t snap_id);
+
+// Symmetric: walk and thaw every channel frozen by snap_id. Used by
+// snap_restore (FREEZE_ALL_CHANS path) and snap_delete cleanup.
+int chan_thaw_all_locked(uint64_t snap_id);
 
 // --- Handle-transfer helpers (kernel-internal) ---------------------------
 // Extract a channel_t* from a cap_token_t if the handle resolves to a

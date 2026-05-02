@@ -168,6 +168,12 @@ void rawnet_on_peer_death(int32_t pid);
 const rawnet_publish_entry_t *rawnet_lookup_locked(const char *name,
                                                    uint32_t name_len);
 
+// Phase 23 Stage 2 cutover: kernel-context probe. Acquires the registry lock
+// internally; returns true iff a matching name is currently registered.
+// Used by blk_client's polling loop (kernel task spinning waiting for
+// /sys/blk/service to publish).
+bool rawnet_name_exists(const char *name, uint32_t name_len);
+
 // --- Validation helpers (visible for tests) ------------------------------
 
 // Returns true iff the name is syntactically valid (leading '/',

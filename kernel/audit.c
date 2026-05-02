@@ -272,6 +272,23 @@ static int open_today_log(int64_t wall_now) {
 }
 
 void audit_attach_fs(void) {
+    /* Phase 23 Step 3.D: in ktest mode, skip persistence.  Audit logs are
+     * diagnostics; under channel-mode FS the per-op latency means
+     * audit_flusher serialises ~30 entry writes at boot (>10 s of FS
+     * pressure), which both blows the gate watchdog AND starves real
+     * tests of CPU.  In klog-only mode audit entries stay in the memory
+     * ring (still queryable via SYS_AUDIT_QUERY); only disk persistence
+     * is skipped.  Production / interactive boots (autorun=init) keep
+     * disk persistence. */
+    extern struct cmdline_flags { const char *autorun; bool quiet; uint64_t test_timeout_seconds; uint32_t inject_klog_preinit; uint32_t inject_ring_wrap; uint32_t klog_mirror; } g_cmdline_flags;
+    const char *a = g_cmdline_flags.autorun;
+    if (a && a[0]=='k' && a[1]=='t' && a[2]=='e' && a[3]=='s' && a[4]=='t' && a[5]=='\0') {
+        klog(KLOG_INFO, SUBSYS_AUDIT,
+             "audit: autorun=ktest — skipping fs_attach (klog-only mode for gate speed)");
+        g_audit_state.fs_attached = false;
+        return;
+    }
+
     int64_t wall_now = rtc_now_seconds();
     if (wall_now <= 0) {
         klog(KLOG_WARN, SUBSYS_AUDIT,

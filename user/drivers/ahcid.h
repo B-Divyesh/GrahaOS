@@ -177,6 +177,17 @@ typedef struct {
         uint64_t  resp_chan;     /* Channel handle (full 64-bit cap_token) */
         uint64_t  start_tsc;
         uint32_t  bytes;
+        /* Phase 24a W5 Phase 2: response-side ring path.
+         * `spsc_ring` is the per-client mapped ring (NULL = legacy path; IRQ
+         * sends a full blk_resp_msg_t via resp_chan). `ring_slot_idx` is the
+         * index 0..63 within that ring (matches the kernel's waiter slot,
+         * derived from req->vmo_offset / 4096 at issue time). `cli_idx` is
+         * the index into g_ahcid.clients[]; used to coalesce the per-IRQ
+         * doorbell to one chan_send per client (N completions → 1 doorbell). */
+        void     *spsc_ring;
+        uint32_t  ring_slot_idx;
+        uint8_t   cli_idx;
+        uint8_t   _pad2[3];
     } slot[32];
 } ahcid_port_state_t;
 
@@ -185,12 +196,22 @@ typedef struct {
 // fields and dma_vmo_handle MUST hold the full 64-bit token (idx + flags +
 // generation) — truncating to uint32_t loses generation, which the kernel
 // then rejects on the next syscall as a stale-handle mismatch.
+//
+// Phase 24a W5: optional `spsc_vmo_handle` field. When non-zero, ahcid
+// polls a 4 KiB shared SPSC ring for incoming requests instead of
+// receiving them via chan_recv on client_chan_read. spsc_ring is a
+// userspace-virt pointer to the mapped VMO; iff non-NULL, ahcid polls the
+// 64 slots each main-loop iteration. Responses still go via the legacy
+// chan_send on client_chan_write (Phase 1 of W5; Phase 2 will move
+// responses to the ring + a 1-byte chan_send doorbell).
 typedef struct {
     uint8_t  in_use;
     uint8_t  _pad[3];
     uint64_t client_chan_read;   /* We receive blk_req here (full 64-bit) */
     uint64_t client_chan_write;  /* We send blk_resp here (full 64-bit) */
     uint64_t dma_vmo_handle;     /* Caller's shared DMA VMO (full 64-bit) */
+    uint64_t spsc_vmo_handle;    /* W5: SPSC ring VMO (0 = legacy path) */
+    void    *spsc_ring;          /* W5: mapped ring (NULL = legacy path) */
     int32_t  client_pid;         /* For audit + cleanup */
     uint32_t reqs_handled;
 } ahcid_client_t;

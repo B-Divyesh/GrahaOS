@@ -64,7 +64,13 @@ typedef struct cap_token {
 // Phase 17: channel-endpoint rights.
 #define RIGHT_SEND        0x0000000000000200ULL  // CHANNEL write-end
 #define RIGHT_RECV        0x0000000000000400ULL  // CHANNEL read-end
-// 0x0000000000000800ULL .. reserved for higher kind-specific rights.
+// Phase 24 W19.4: CAP_KIND_SNAPSHOT-specific rights. RIGHT_RESTORE allows
+// SYS_SNAP_RESTORE; RIGHT_DELETE allows SYS_SNAP_DELETE. Held in the
+// creator's token; diminishing-derive can drop them to issue read-only or
+// restore-only sub-tokens. RIGHT_INSPECT covers SYS_SNAP_LIST visibility.
+#define RIGHT_RESTORE     0x0000000000000800ULL  // CAP_KIND_SNAPSHOT
+#define RIGHT_DELETE      0x0000000000001000ULL  // CAP_KIND_SNAPSHOT
+// 0x0000000000002000ULL .. reserved for higher kind-specific rights.
 #define RIGHTS_ALL        0xFFFFFFFFFFFFFFFFULL
 
 // ------------------------------------------------------------------------
@@ -116,6 +122,17 @@ typedef struct cap_token {
 // Phase 19: GrahaFS v2 errors.
 #define CAP_V2_EBADFS     -126  // Superblock magic/CRC bad; or unknown FS version.
 #define CAP_V2_EROFS      -127  // Write attempted on read-only mount (v1 compat).
+
+// Phase 24 W18: channel frozen at snapshot. chan_send / chan_recv return
+// this when the target channel has frozen_at_snap != 0. Cleared by
+// chan_thaw (called from snap_restore or snap_delete).
+#define CAP_V2_EFROZEN    -128
+
+// Phase 24 W18: resource currently held by an incompatible owner.
+// Returned by chan_freeze when the channel is already frozen at a
+// DIFFERENT snap_id (nested freeze for the same id is idempotent and
+// returns CAP_V2_OK).
+#define CAP_V2_EBUSY      -16
 
 // Null token: idx==0 is reserved slot, always fails resolve.
 #define CAP_TOKEN_NULL ((cap_token_t){.raw = 0})

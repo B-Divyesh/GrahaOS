@@ -130,6 +130,11 @@ void _start(void) {
     int pid = syscall_getpid();
     printf("# ktest starting, pid=%d\n", pid);
 
+    /* Phase 23 Step 3.C: ktest could spawn /bin/ahcid for channel mode
+     * but tests like clustertest/simtest do many FS ops and even with
+     * the IPI-wake fix in sched_enqueue_ready the per-test latency is
+     * ~60 s.  Gate watchdog is 90 s.  Strip blocked on this. */
+
     int n = load_manifest();
     if (n <= 0) {
         printf("# TAP DONE\n");

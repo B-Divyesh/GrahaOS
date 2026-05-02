@@ -67,6 +67,15 @@ const rawnet_publish_entry_t *rawnet_lookup_locked(const char *name,
     return find_entry_locked(name, name_len);
 }
 
+bool rawnet_name_exists(const char *name, uint32_t name_len) {
+    if (!g_rawnet_ready) return false;
+    if (!rawnet_name_validate(name, name_len)) return false;
+    spinlock_acquire(&g_rawnet_lock);
+    bool present = (find_entry_locked(name, name_len) != NULL);
+    spinlock_release(&g_rawnet_lock);
+    return present;
+}
+
 // ---------------------------------------------------------------------------
 // clear_entry_locked: zero an entry's runtime fields without touching
 // `name_len` (caller sets that to 0 to mark the slot free).
@@ -240,6 +249,33 @@ int rawnet_connect(int32_t connector_pid,
         cap_object_destroy(tok_obj_idx(wr_a));
         __atomic_fetch_sub(&accept_chan->refcount, 1, __ATOMIC_RELEASE);
         return rc;
+    }
+
+    /* Phase 23 Stage-2 cutover: expand audience on the FOUR endpoint
+     * cap_objects so the publisher (which receives the server-side handles
+     * via the accept message) can resolve them.  chan_create only added
+     * connector_pid; without this widening, the publisher's chan_resolve_
+     * endpoint returns CAP_V2_EBADF and recv silently returns -EPERM.
+     * Append publisher_pid to the audience_set if there's room. */
+    {
+        uint32_t per_conn_idx[4] = {
+            tok_obj_idx(rd_a), tok_obj_idx(wr_a),
+            tok_obj_idx(rd_b), tok_obj_idx(wr_b),
+        };
+        for (int i = 0; i < 4; i++) {
+            cap_object_t *obj = cap_object_get(per_conn_idx[i]);
+            if (!obj) continue;
+            bool already = false;
+            for (uint8_t k = 0; k < obj->audience_count &&
+                                k < CAP_AUDIENCE_MAX; k++) {
+                if (obj->audience_set[k] == publisher_pid) {
+                    already = true; break;
+                }
+            }
+            if (!already && obj->audience_count < CAP_AUDIENCE_MAX) {
+                obj->audience_set[obj->audience_count++] = publisher_pid;
+            }
+        }
     }
 
     // Build the staged channel message that we'll drop on the accept

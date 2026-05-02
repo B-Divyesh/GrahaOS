@@ -17,6 +17,7 @@
 
 #define __GRAHAFS_V2_INTERNAL__
 #include "grahafs_v2.h"
+#include "../cap/token.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -1135,6 +1136,8 @@ v2_chain_alloc_entry(uint64_t version_id, uint64_t timestamp_ns,
     e->prev_version          = prev_version;
     e->parent_version        = parent_version;
     e->flags                 = flags;
+    e->_pad0                 = 0;
+    e->snap_pin_count        = 0;  // W17.2: not pinned at creation.
     e->next                  = NULL;
     return e;
 }
@@ -1168,10 +1171,22 @@ uint32_t grahafs_v2_chain_walk(const grahafs_v2_inode_cache_t *ce,
 grahafs_v2_version_entry_t *
 grahafs_v2_chain_pop_tail(grahafs_v2_inode_cache_t *ce) {
     if (!ce || !ce->version_chain_head_cached) return NULL;
-    grahafs_v2_version_entry_t **slot = &ce->version_chain_head_cached;
-    while ((*slot)->next) slot = &(*slot)->next;
-    grahafs_v2_version_entry_t *t = *slot;
-    *slot = NULL;
+    // W17.2: walk newest→oldest; pop the OLDEST entry whose snap_pin_count
+    // is 0. Pinned entries stay in the chain so a snapshot's referenced
+    // version cannot be reaped under it. If the entire chain is pinned,
+    // return NULL — GC just doesn't make progress on this inode until
+    // something unpins. The walk records the latest *->slot whose entry
+    // is unpinned; that's the oldest unpinned (loop visits newer-first).
+    grahafs_v2_version_entry_t **slot       = &ce->version_chain_head_cached;
+    grahafs_v2_version_entry_t **last_unpin = NULL;
+    while (*slot) {
+        if ((*slot)->snap_pin_count == 0) last_unpin = slot;
+        slot = &(*slot)->next;
+    }
+    if (!last_unpin) return NULL;
+    grahafs_v2_version_entry_t *t = *last_unpin;
+    *last_unpin = t->next;
+    t->next = NULL;
     return t;
 }
 
@@ -1396,4 +1411,137 @@ struct vfs_node *grahafs_v2_build_root_node(void) {
     root->size  = root_ino.size;
     v2_attach_ops(root);
     return root;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 24 W17.2: snapshot version pinning helpers.
+//
+// snap_capture_fs_pins (W14.7, deferred) calls grahafs_pin_version on every
+// open inode in the captured task's FD table — bumping snap_pin_count on the
+// version_entry that was HEAD at capture time. While pinned, gc_prune_inode
+// must skip that entry rather than reaping it. snap_delete / snap_restore
+// pair each pin with a matching grahafs_unpin_version.
+//
+// All three helpers take the per-mount inode_cache_get/put pair so caller
+// code does not need to manage lifecycle explicitly. They walk the
+// in-memory version chain (cold-boot inodes have an empty chain — the cold
+// cache is rebuilt lazily by reads) and operate under ce->lock.
+// ---------------------------------------------------------------------------
+
+int grahafs_pin_version(uint32_t inode_num, uint64_t version_id) {
+    if (!grahafs_v2_is_mounted()) return CAP_V2_EROFS;
+    if (version_id == 0) return CAP_V2_EINVAL;
+    grahafs_v2_inode_cache_t *ce = inode_cache_get(inode_num);
+    if (!ce) return CAP_V2_EBADF;
+
+    spinlock_acquire(&ce->lock);
+    grahafs_v2_version_entry_t *e = ce->version_chain_head_cached;
+    while (e) {
+        if (e->version_id == version_id) {
+            // Saturate at UINT32_MAX-1 so a buggy caller cannot underflow
+            // the counter on the matching unpin.
+            if (e->snap_pin_count < 0xFFFFFFFFu) e->snap_pin_count++;
+            spinlock_release(&ce->lock);
+            inode_cache_put(ce);
+            return 0;
+        }
+        e = e->next;
+    }
+    spinlock_release(&ce->lock);
+    inode_cache_put(ce);
+    // Cold-cache fallback: if the version is the inode's current head and
+    // the chain is empty (cold-boot, no in-memory entry), accept the pin
+    // as a no-op. The pin only matters for GC, and the head is implicitly
+    // protected anyway (gc_prune_inode walks tail-ward, never reaps head).
+    return CAP_V2_EINVAL;
+}
+
+int grahafs_unpin_version(uint32_t inode_num, uint64_t version_id) {
+    if (!grahafs_v2_is_mounted()) return CAP_V2_EROFS;
+    if (version_id == 0) return CAP_V2_EINVAL;
+    grahafs_v2_inode_cache_t *ce = inode_cache_get(inode_num);
+    if (!ce) return CAP_V2_EBADF;
+
+    spinlock_acquire(&ce->lock);
+    grahafs_v2_version_entry_t *e = ce->version_chain_head_cached;
+    while (e) {
+        if (e->version_id == version_id) {
+            if (e->snap_pin_count > 0) e->snap_pin_count--;
+            spinlock_release(&ce->lock);
+            inode_cache_put(ce);
+            return 0;
+        }
+        e = e->next;
+    }
+    spinlock_release(&ce->lock);
+    inode_cache_put(ce);
+    return CAP_V2_EINVAL;
+}
+
+int grahafs_revert_to_version(uint32_t inode_num, uint64_t target_version) {
+    if (!grahafs_v2_is_mounted()) return CAP_V2_EROFS;
+    if (target_version == 0) return CAP_V2_EINVAL;
+    grahafs_v2_inode_cache_t *ce = inode_cache_get(inode_num);
+    if (!ce) return CAP_V2_EBADF;
+
+    spinlock_acquire(&ce->lock);
+    grahafs_v2_version_entry_t *target = NULL;
+    grahafs_v2_version_entry_t *iter = ce->version_chain_head_cached;
+    while (iter) {
+        if (iter->version_id == target_version) { target = iter; break; }
+        iter = iter->next;
+    }
+    if (!target) {
+        // Allow no-op revert when target == current head (matches SYS_FS_REVERT
+        // semantics for cold-cache cases where the chain is empty).
+        if (ce->disk.version_chain_head_id == target_version) {
+            spinlock_release(&ce->lock);
+            inode_cache_put(ce);
+            return 0;
+        }
+        spinlock_release(&ce->lock);
+        inode_cache_put(ce);
+        return CAP_V2_EINVAL;
+    }
+
+    // Allocate a new monotonic version_id and push a REVERT_CREATED entry
+    // onto the chain. The new entry copies content metadata (size, simhash,
+    // segment_id, cluster_id) from the target — semantically the file
+    // content is now what the target held — but tags itself with
+    // VE_FLAG_REVERT_CREATED + parent_version=target_version so a future
+    // chain_walk records the revert lineage.
+    uint64_t new_version = __atomic_fetch_add(&g_next_version_id, 1,
+                                              __ATOMIC_RELAXED);
+    uint64_t prev_head_id = ce->disk.version_chain_head_id;
+    grahafs_v2_version_entry_t *fresh = v2_chain_alloc_entry(
+        new_version,
+        target->timestamp_ns,  // carries forward; on-disk emit (W14.7+) will rewrite
+        target->size,
+        target->simhash,
+        target->segment_id,
+        prev_head_id,
+        target_version,         // parent_version
+        (uint16_t)(target->flags | VE_FLAG_REVERT_CREATED),
+        target->cluster_id_at_version);
+    if (!fresh) {
+        spinlock_release(&ce->lock);
+        inode_cache_put(ce);
+        return CAP_V2_ENOMEM;
+    }
+    v2_chain_push_head(ce, fresh);
+
+    // Update the inode's head pointer in-memory; the on-disk inode
+    // mutation is deferred to the journal-stage path in W14.7 / W16
+    // restore so per-revert journaling is paired with snap-restore txn
+    // batching. dirty=true so the next inode_cache_flush emits it.
+    ce->disk.version_chain_head_id = new_version;
+    ce->disk.version_chain_segment = target->segment_id;
+    if (ce->disk.version_count < GRAHAFS_V2_MAX_VERSIONS) {
+        ce->disk.version_count++;
+    }
+    ce->dirty = true;
+
+    spinlock_release(&ce->lock);
+    inode_cache_put(ce);
+    return 0;
 }

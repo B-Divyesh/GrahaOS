@@ -22,10 +22,17 @@ static kmem_cache_t *g_vmo_cache = NULL;
 static uint64_t g_next_vmo_id = 1;
 static spinlock_t g_vmo_id_lock = SPINLOCK_INITIALIZER("vmo_id");
 
-// Per-task mapping table. Indexed by task_id (max 64 tasks in MVP, matches
-// MAX_TASKS in sched.h). Each task has up to VMO_MAPPINGS_PER_TASK slots.
-// A slot with vaddr==0 is free.
-#define VMO_MAX_TASKS 64
+// Per-task mapping table. Indexed by task_id. Each task has up to
+// VMO_MAPPINGS_PER_TASK slots. A slot with vaddr==0 is free.
+//
+// Phase 23 Stage 2 cutover: bumped 64 → 256 because the cutover added a
+// kernel-side blk_client kt task that consumes a pid slot, which pushed
+// late-spawned daemons (e1000d etc.) past the previous 64-pid cap and
+// caused vmo_map → vmo_alloc_map_slot to silently return -1 (mapping the
+// MMIO BAR fails, daemon exits with status=2). 256 leaves headroom for
+// the gate's typical ~70-pid workload plus the new kt + ahcid + future
+// driver daemons. BSS impact: 256 * 8 * 32 B = 64 KB.
+#define VMO_MAX_TASKS 256
 static vmo_mapping_t g_vmo_task_maps[VMO_MAX_TASKS][VMO_MAPPINGS_PER_TASK];
 static spinlock_t g_vmo_map_lock = SPINLOCK_INITIALIZER("vmo_map");
 

@@ -34,6 +34,24 @@ static int                  g_segment_device_id = -1;
 static uint64_t             g_segment_table_lba = 0;
 static spinlock_t           g_segment_table_lock = SPINLOCK_INITIALIZER("seg_table");
 
+/* Phase 23 Stage-2 cutover (Step 1): sleep-aware single-in-flight gate for
+ * segment-header persists.  Channel-mode block I/O takes 10-50 ms per
+ * round-trip; holding g_segment_table_lock (a spinlock with a 5 s budget)
+ * across that I/O blew the budget under contention.  Pattern is the same as
+ * blk_client.c's blk_io_acquire/release: atomic-exchange to claim, sti;hlt
+ * on contention.  Acquire AFTER releasing the table lock; release AFTER the
+ * write.  See feedback_phase23_stage2_infra.md for the design rationale. */
+static volatile uint32_t g_segment_io_busy = 0;
+
+static inline void seg_io_acquire(void) {
+    while (__atomic_exchange_n(&g_segment_io_busy, 1u, __ATOMIC_ACQUIRE) != 0u) {
+        asm volatile("sti; hlt" ::: "memory");
+    }
+}
+static inline void seg_io_release(void) {
+    __atomic_store_n(&g_segment_io_busy, 0u, __ATOMIC_RELEASE);
+}
+
 // ---------------------------------------------------------------------------
 // On-disk helpers.
 // ---------------------------------------------------------------------------
@@ -41,31 +59,58 @@ static uint32_t segment_header_crc(const grahafs_v2_segment_header_t *hdr) {
     return crc32_buf(hdr, offsetof(grahafs_v2_segment_header_t, checksum_header));
 }
 
-static int segment_write_header(uint32_t seg_idx) {
-    if (seg_idx >= g_segment_count) return -5;  // -EIO.
+/* Snapshot the in-memory state of g_segments[seg_idx] into hdr_out.  Caller
+ * MUST hold g_segment_table_lock — this function reads multiple fields and
+ * relies on them being consistent.  Cheap (no I/O); safe to call inside the
+ * critical section. */
+static void segment_build_header(uint32_t seg_idx,
+                                 grahafs_v2_segment_header_t *hdr_out) {
     grahafs_v2_segment_t *s = &g_segments[seg_idx];
+    memset(hdr_out, 0, sizeof(*hdr_out));
+    hdr_out->magic                  = GRAHAFS_V2_SEGMENT_MAGIC;
+    hdr_out->segment_id             = s->segment_id;
+    hdr_out->creation_txn           = s->creation_txn;
+    hdr_out->size_blocks            = s->size_blocks;
+    hdr_out->state                  = s->state;
+    hdr_out->refcount               = s->refcount;
+    hdr_out->first_version_offset   = 0;
+    hdr_out->version_record_count   = s->version_record_count;
+    hdr_out->free_bytes_in_segment  = s->free_bytes_in_segment;
+    hdr_out->next_free_block_offset = s->next_free_block_offset;
+    hdr_out->checksum_header        = segment_header_crc(hdr_out);
+}
 
-    grahafs_v2_segment_header_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.magic                  = GRAHAFS_V2_SEGMENT_MAGIC;
-    hdr.segment_id             = s->segment_id;
-    hdr.creation_txn           = s->creation_txn;
-    hdr.size_blocks            = s->size_blocks;
-    hdr.state                  = s->state;
-    hdr.refcount               = s->refcount;
-    hdr.first_version_offset   = 0;
-    hdr.version_record_count   = s->version_record_count;
-    hdr.free_bytes_in_segment  = s->free_bytes_in_segment;
-    hdr.next_free_block_offset = s->next_free_block_offset;
-    hdr.checksum_header        = segment_header_crc(&hdr);
-
-    if (grahafs_block_write((uint8_t)g_segment_device_id, s->first_block, 1, &hdr) != 1) {
+/* Persist a pre-built header to disk.  Caller MUST NOT hold
+ * g_segment_table_lock — this function can block on channel I/O for tens of
+ * ms.  Internally serialises via g_segment_io_busy so concurrent persists
+ * don't collide on the kernel→ahcid request channel.  Callers that need to
+ * mutate further state after the write must reacquire the table lock. */
+static int segment_persist_header(uint64_t first_block,
+                                  const grahafs_v2_segment_header_t *hdr) {
+    seg_io_acquire();
+    int rc = grahafs_block_write((uint8_t)g_segment_device_id,
+                                 first_block, 1, hdr);
+    seg_io_release();
+    if (rc != 1) {
         klog(KLOG_ERROR, SUBSYS_FS,
-             "segment_write_header: grahafs_block_write seg=%u lba=%llu failed",
-             seg_idx, (unsigned long long)s->first_block);
+             "segment_persist_header: lba=%llu rc=%d",
+             (unsigned long long)first_block, rc);
         return -5;
     }
     return 0;
+}
+
+/* Convenience: build + persist in one call.  Caller may or may not hold the
+ * table lock — this helper does NOT touch the lock, so a caller that holds
+ * it will block other CPUs during the I/O.  Use only for init/shutdown
+ * paths where lock contention is not a concern (segment_subsystem_init,
+ * segment_subsystem_shutdown).  Runtime paths must use build + drop +
+ * persist explicitly. */
+static int segment_write_header(uint32_t seg_idx) {
+    if (seg_idx >= g_segment_count) return -5;
+    grahafs_v2_segment_header_t hdr;
+    segment_build_header(seg_idx, &hdr);
+    return segment_persist_header(g_segments[seg_idx].first_block, &hdr);
 }
 
 static int segment_read_header(uint32_t seg_idx) {
@@ -229,10 +274,14 @@ grahafs_v2_segment_t *segment_get(uint32_t segment_id) {
 uint32_t segment_allocate_for_write(uint32_t bytes_needed) {
     if (bytes_needed == 0) return 0xFFFFFFFFu;
 
-    spinlock_acquire(&g_segment_table_lock);
-
-    // Try the currently active segment first.
+    /* Phase 23 Stage-2: each loop iteration is now bracketed by an
+     * acquire+release of the table lock.  Block I/O happens AFTER the lock
+     * release, gated by g_segment_io_busy.  This shape allows concurrent
+     * allocators to make progress even while one is mid-write. */
     for (;;) {
+        spinlock_acquire(&g_segment_table_lock);
+
+        // Try the currently active segment first.
         uint32_t id = g_active_segment_id;
         if (id != 0xFFFFFFFFu) {
             grahafs_v2_segment_t *s = &g_segments[id];
@@ -242,16 +291,25 @@ uint32_t segment_allocate_for_write(uint32_t bytes_needed) {
                 s->refcount++;
                 s->free_bytes_in_segment -= bytes_needed;
                 s->next_free_block_offset += bytes_needed;
-                (void)segment_write_header(id);
+                grahafs_v2_segment_header_t hdr;
+                segment_build_header(id, &hdr);
+                uint64_t lba = s->first_block;
                 spinlock_release(&g_segment_table_lock);
+                (void)segment_persist_header(lba, &hdr);
                 return id;
             }
             // Active segment full — seal it.
             s->state = GRAHAFS_V2_SEG_SEALED;
-            (void)segment_write_header(id);
+            grahafs_v2_segment_header_t hdr;
+            segment_build_header(id, &hdr);
+            uint64_t lba = s->first_block;
             klog(KLOG_INFO, SUBSYS_FS,
                  "segment_allocate: seg=%u full, sealed", id);
             g_active_segment_id = 0xFFFFFFFFu;
+            spinlock_release(&g_segment_table_lock);
+            (void)segment_persist_header(lba, &hdr);
+            // Loop back to acquire and promote a new active.
+            continue;
         }
 
         // Promote first FREE to ACTIVE.
@@ -274,8 +332,12 @@ uint32_t segment_allocate_for_write(uint32_t bytes_needed) {
         s->next_free_block_offset = GRAHAFS_V2_BLOCK_SIZE;  // After header.
         s->free_bytes_in_segment =
             (GRAHAFS_V2_SEGMENT_BLOCKS - 1) * GRAHAFS_V2_BLOCK_SIZE;
-        (void)segment_write_header(new_active);
+        grahafs_v2_segment_header_t hdr;
+        segment_build_header(new_active, &hdr);
+        uint64_t lba = s->first_block;
         g_active_segment_id = new_active;
+        spinlock_release(&g_segment_table_lock);
+        (void)segment_persist_header(lba, &hdr);
         // Loop back to retry the allocation against the new ACTIVE segment.
     }
 }
@@ -284,14 +346,19 @@ int segment_seal(uint32_t segment_id) {
     if (segment_id >= g_segment_count) return -22;  // -EINVAL.
     spinlock_acquire(&g_segment_table_lock);
     grahafs_v2_segment_t *s = &g_segments[segment_id];
-    if (s->state == GRAHAFS_V2_SEG_ACTIVE) {
-        s->state = GRAHAFS_V2_SEG_SEALED;
-        if (g_active_segment_id == segment_id) {
-            g_active_segment_id = 0xFFFFFFFFu;
-        }
-        (void)segment_write_header(segment_id);
+    if (s->state != GRAHAFS_V2_SEG_ACTIVE) {
+        spinlock_release(&g_segment_table_lock);
+        return 0;
     }
+    s->state = GRAHAFS_V2_SEG_SEALED;
+    if (g_active_segment_id == segment_id) {
+        g_active_segment_id = 0xFFFFFFFFu;
+    }
+    grahafs_v2_segment_header_t hdr;
+    segment_build_header(segment_id, &hdr);
+    uint64_t lba = s->first_block;
     spinlock_release(&g_segment_table_lock);
+    (void)segment_persist_header(lba, &hdr);
     return 0;
 }
 
@@ -299,18 +366,26 @@ void segment_ref_inc(uint32_t segment_id) {
     if (segment_id >= g_segment_count) return;
     spinlock_acquire(&g_segment_table_lock);
     g_segments[segment_id].refcount++;
-    (void)segment_write_header(segment_id);
+    grahafs_v2_segment_header_t hdr;
+    segment_build_header(segment_id, &hdr);
+    uint64_t lba = g_segments[segment_id].first_block;
     spinlock_release(&g_segment_table_lock);
+    (void)segment_persist_header(lba, &hdr);
 }
 
 void segment_ref_dec(uint32_t segment_id) {
     if (segment_id >= g_segment_count) return;
     spinlock_acquire(&g_segment_table_lock);
-    if (g_segments[segment_id].refcount > 0) {
-        g_segments[segment_id].refcount--;
-        (void)segment_write_header(segment_id);
+    if (g_segments[segment_id].refcount == 0) {
+        spinlock_release(&g_segment_table_lock);
+        return;
     }
+    g_segments[segment_id].refcount--;
+    grahafs_v2_segment_header_t hdr;
+    segment_build_header(segment_id, &hdr);
+    uint64_t lba = g_segments[segment_id].first_block;
     spinlock_release(&g_segment_table_lock);
+    (void)segment_persist_header(lba, &hdr);
 }
 
 bool segment_reclaim_if_eligible(uint32_t segment_id) {
@@ -318,31 +393,39 @@ bool segment_reclaim_if_eligible(uint32_t segment_id) {
     spinlock_acquire(&g_segment_table_lock);
     grahafs_v2_segment_t *s = &g_segments[segment_id];
     // INVARIANT: ACTIVE segments are NEVER reclaimable (Plan §Tricky Bit #6).
-    if (s->state == GRAHAFS_V2_SEG_SEALED && s->refcount == 0) {
-        s->state = GRAHAFS_V2_SEG_RECLAIMABLE;
-        (void)segment_write_header(segment_id);
+    if (s->state != GRAHAFS_V2_SEG_SEALED || s->refcount != 0) {
         spinlock_release(&g_segment_table_lock);
-        klog(KLOG_INFO, SUBSYS_FS,
-             "segment_reclaim: seg=%u marked RECLAIMABLE", segment_id);
-        return true;
+        return false;
     }
+    s->state = GRAHAFS_V2_SEG_RECLAIMABLE;
+    grahafs_v2_segment_header_t hdr;
+    segment_build_header(segment_id, &hdr);
+    uint64_t lba = s->first_block;
     spinlock_release(&g_segment_table_lock);
-    return false;
+    (void)segment_persist_header(lba, &hdr);
+    klog(KLOG_INFO, SUBSYS_FS,
+         "segment_reclaim: seg=%u marked RECLAIMABLE", segment_id);
+    return true;
 }
 
 void segment_return_to_free(uint32_t segment_id) {
     if (segment_id >= g_segment_count) return;
     spinlock_acquire(&g_segment_table_lock);
     grahafs_v2_segment_t *s = &g_segments[segment_id];
-    if (s->state == GRAHAFS_V2_SEG_RECLAIMABLE) {
-        s->state = GRAHAFS_V2_SEG_FREE;
-        s->refcount = 0;
-        s->version_record_count = 0;
-        s->next_free_block_offset = 0;
-        s->free_bytes_in_segment = 0;
-        (void)segment_write_header(segment_id);
+    if (s->state != GRAHAFS_V2_SEG_RECLAIMABLE) {
+        spinlock_release(&g_segment_table_lock);
+        return;
     }
+    s->state = GRAHAFS_V2_SEG_FREE;
+    s->refcount = 0;
+    s->version_record_count = 0;
+    s->next_free_block_offset = 0;
+    s->free_bytes_in_segment = 0;
+    grahafs_v2_segment_header_t hdr;
+    segment_build_header(segment_id, &hdr);
+    uint64_t lba = s->first_block;
     spinlock_release(&g_segment_table_lock);
+    (void)segment_persist_header(lba, &hdr);
 }
 
 static uint32_t segment_count_by_state(uint8_t state) {

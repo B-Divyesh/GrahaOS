@@ -13,6 +13,9 @@ extern spinlock_t sched_lock;
 #include "../../../kernel/panic.h"
 #include "../../../kernel/vsnprintf.h"
 #include "../../../kernel/log.h"
+// Phase 24 W14.2: vector 48 reads g_snap_barrier.barrier_flag to decide
+// whether to call schedule(frame) outside the idle-only gate.
+#include "../../../kernel/snap/snapshot.h"
 
 // Global timer tick counter
 volatile uint64_t g_timer_ticks = 0;
@@ -380,11 +383,62 @@ void interrupt_handler(struct interrupt_frame *frame) {
                 }
                 break;
             case 48:
-                // Phase 20 IPI_VEC_WAKEUP: no-op handler. Its sole purpose
-                // is to force the target CPU out of hlt. The EOI is sent
-                // below at the end of the dispatch switch; on IRQ return
-                // the CPU executes iret and, if an interrupt is still
-                // pending on schedule (timer), lands there next.
+                /* Phase 24a W1 doorbell-IPI receiver (re-enabled with
+                 * stream_reap loop fix in place).  The original failure
+                 * mode (three gate variants reproducibly broke streamtest
+                 * "reap >= 10 completions") was rooted not in
+                 * schedule()-from-interrupt-context but in stream_reap()
+                 * itself: pre-fix it blocked exactly once and returned
+                 * whatever ready count it observed.  Without the IPI,
+                 * tick-quantum wake delivery accidentally accumulated
+                 * CQEs before the reaper ran; with the IPI, the reaper
+                 * woke immediately at ready=1 and the assertion failed.
+                 *
+                 * stream_reap now loops internally until min_complete OR
+                 * deadline OR error.  That makes the IPI safe: enabling
+                 * schedule(frame) here drops cross-CPU wake-to-run
+                 * latency from ~10 ms (next timer tick) to <1 µs (IPI
+                 * delivery + dispatch).  Sender (sched_maybe_doorbell_ipi
+                 * in sched.c) gates strictly on target_cpu->current ==
+                 * idle_task so we only preempt the idle thread, never
+                 * real work — the seL4 tcb_resume pattern (Lyons et al.
+                 * USENIX ATC 2018).  The receiver double-checks the same
+                 * gate to absorb the tiny race window between sender's
+                 * snapshot read and IPI delivery.
+                 *
+                 * Why double-gate.  By the time vector 48 fires, the
+                 * idle CPU may have already context-switched into a real
+                 * task via timer tick or another IPI.  Re-checking
+                 * current==idle here makes the schedule() call a no-op
+                 * in that case (we'd have rescheduled at the next tick
+                 * anyway, no work lost).
+                 *
+                 * Phase 24 W14.2: when a snapshot barrier is active,
+                 * vector 48 ALSO calls schedule() unconditionally — the
+                 * snap_create caller broadcasts vector 48 to every CPU
+                 * via snap_begin_barrier, and schedule() is responsible
+                 * for parking the running task into BARRIER_WAIT.  The
+                 * gate is a single relaxed atomic load so the original
+                 * idle-only behaviour is preserved when no barrier is
+                 * in flight. */
+                if (__atomic_load_n(&g_snap_barrier.barrier_flag,
+                                    __ATOMIC_RELAXED) != 0u ||
+                    percpu_get()->runq.current ==
+                    percpu_get()->runq.idle_task) {
+                    schedule(frame);
+                }
+                break;
+            case 49:
+                /* Phase 23 latency-opt: synchronous voluntary-yield vector.
+                 * Issued via `int $49` from sched_block_on_channel after the
+                 * caller has set state=CHAN_WAIT and released its locks.
+                 * Unlike vector 48 (async IPI from another CPU), this is
+                 * always synchronous — the caller has explicitly prepared
+                 * to lose the CPU, so calling schedule() here cannot race
+                 * with unrelated kernel-context work.  Cuts IPC wake-to-run
+                 * latency from ~10ms (tick quantum) to <1us, the L4
+                 * "direct process switch" / fast-path IPC technique. */
+                schedule(frame);
                 break;
             case 255: // Spurious interrupt from LAPIC
                 // Just return, no EOI needed for spurious

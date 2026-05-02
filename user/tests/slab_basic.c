@@ -24,7 +24,11 @@
 #include <stdint.h>
 #include <string.h>
 
-#define MAX_STATS 32
+// Phase 24 W14 added snapshot_t + cow_page_tracker_t slab caches; with the
+// existing 30-ish kernel-side caches the snapshot_stats array now overflows
+// the previous MAX_STATS=32 so kheap_2048 / kheap_spill drop off the
+// returned slice. Bump generously to leave room for future slab caches.
+#define MAX_STATS 64
 
 static kheap_stats_entry_u_t g_stats[MAX_STATS];
 

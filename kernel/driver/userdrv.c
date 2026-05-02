@@ -75,8 +75,21 @@ void userdrv_init(void) {
         e->device_subclass = p->subclass;
         e->is_claimable    = 0;        // Drivers must explicitly expose.
         e->driver_owner_pid = 0;
+        // Phase 23 Stage-2 cutover: pick the *largest* non-zero memory BAR
+        // as the device's "primary" MMIO region.  e1000 has BAR0 (128 KiB)
+        // and that's the only BAR; AHCI on QEMU has tiny BAR0..3 for
+        // legacy IDE compat plus BAR5 (the ABAR — AHCI 1.3 spec) which is
+        // the actually-useful 8 KiB MMIO region.  Picking the largest
+        // happens to select BAR0 for e1000 and BAR5 for AHCI without any
+        // class-specific knowledge.
         e->bar_phys        = p->bars[0];
         e->bar_size        = p->bar_sizes[0];
+        for (int b = 1; b < 6; b++) {
+            if (p->bar_sizes[b] > e->bar_size) {
+                e->bar_phys = p->bars[b];
+                e->bar_size = p->bar_sizes[b];
+            }
+        }
     }
     spinlock_release(&g_userdrv_registry_lock);
 

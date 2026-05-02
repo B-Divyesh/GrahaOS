@@ -21,6 +21,13 @@
 #include "../../../../kernel/audit.h"
 #include "../tsc.h"
 #include "work_steal.h"
+// Phase 24a W1: state-conditional doorbell IPI uses apic_send_ipi to nudge
+// idle target CPUs out of hlt on cross-CPU wake.
+#include "../../drivers/lapic/lapic.h"
+// Phase 24 W14.2: barrier hook reads g_snap_barrier and calls
+// snap_barrier_park_locked. The hot-path cost is one relaxed atomic load
+// of barrier_flag in the common case (no snapshot in flight).
+#include "../../../../kernel/snap/snapshot.h"
 
 // Phase 14: task_t objects now live in task_cache (Bonwick slab). The
 // scheduler still keeps a fixed-size index array for stable task ids
@@ -171,6 +178,101 @@ void sched_enqueue_ready(task_t *task) {
     spinlock_acquire(&rq->lock);
     runq_enqueue_ready(rq, task);
     spinlock_release(&rq->lock);
+}
+
+// Phase 24a W1: pick the CPU that sched_enqueue_ready will route `task` to.
+// Mirror of the routing logic in sched_enqueue_ready (lines 162-174). Used by
+// sched_maybe_doorbell_ipi to decide which target CPU to nudge with vector
+// 48 after a cross-CPU wake. Read-only; no locks.
+static uint32_t sched_doorbell_target_cpu(task_t *task) {
+    if (task->cpu_pinned >= 0 && (uint32_t)task->cpu_pinned < g_cpu_count) {
+        return (uint32_t)task->cpu_pinned;
+    }
+    if (task->last_ran_cpu != 0xFFFFFFFFu && task->last_ran_cpu < g_cpu_count) {
+        return task->last_ran_cpu;
+    }
+    return 0;
+}
+
+// Phase 24a W1: State-conditional doorbell IPI.  Cuts cross-CPU wake-to-run
+// latency from ~10 ms (next timer tick) to <1 µs (IPI delivery + receiver
+// schedule()).  Mirror of L1 INT 49 yield (sched_block_on_channel at line
+// ~1376) but on the WAKE side.
+//
+// Theory of operation.
+//   - Sender (this function): if target CPU's runq.current == runq.idle_task
+//     AND target_cpu != current CPU, send IPI_VEC_WAKEUP (48) via APIC.
+//   - Receiver (interrupts.c vector 48 case): re-checks the same gate.  If
+//     still idle, schedule(frame).  Else degenerate to no-op (matches
+//     pre-A.1 behaviour — race window absorbed by receiver-side gate).
+//
+// Why this is fundamentally different from prior failed variants T2-T4 in
+// problems/phase24a/audit_log.json::tried_and_reverted_variants:
+//   - T2 (unconditional wake-path IPI): no gate at all → broke streamtest.
+//   - T3 (enqueue IPI in sched_enqueue_ready): fired on every enqueue path
+//     including timer re-enqueue + work-stealing → IPI storm + acquisition
+//     race with holder_cpu=0xFFFFFFFF.
+//   - T4 (idle-preempt IPI in vector 48 with incomplete state gate): receiver
+//     checked `cur->is_idle` which is updated asynchronously by schedule()
+//     — could observe stale `false` for a tick after a context switch,
+//     fired schedule() against real work, broke streamtest's "reap >= 10".
+//
+// W1 gate uses runq.current (single atomic store at sched.c:766 inside
+// schedule()) compared to runq.idle_task (set once at AP boot, immutable).
+// Both fields are atomically consistent — if current == idle_task, the CPU
+// either is in or just left the idle hlt loop.  seL4 tcb_resume pattern
+// (Lyons et al. USENIX ATC 2018, formally verified).  L4 direct process
+// switch (Liedtke SOSP 1993) on the wake side.
+//
+// Race analysis (three cases):
+//   1) Sender reads idle, IPI sent, target picked real work mid-flight:
+//      receiver-side gate rejects → no harm.
+//   2) Sender reads non-idle: no IPI, target waits for next timer tick.
+//      Identical to current behaviour. No regression.
+//   3) Sender reads idle, target's schedule() concurrently picks a real
+//      task: see (1).
+//
+// IPI cost: a few hundred cycles when sent.  Worth it whenever the wake
+// would have otherwise waited a full ~10 ms tick.
+static inline void sched_maybe_doorbell_ipi(uint32_t target_cpu) {
+    if (target_cpu >= g_cpu_count) return;
+    /* No self-IPI: this CPU will run schedule() on its own next tick or
+     * via INT 49 anyway; an IPI would just spin the LAPIC ICR delivery
+     * busy-wait against ourselves. */
+    if (target_cpu == smp_get_current_cpu()) return;
+    /* Sender-side state gate.  Relaxed atomic — even a stale read is
+     * harmless because the receiver-side gate in vector 48 handler
+     * (interrupts.c) re-checks at delivery time. */
+    runq_t *trq = &g_cpu_locals[target_cpu].runq;
+    task_t *cur  = (task_t *)__atomic_load_n(&trq->current,   __ATOMIC_RELAXED);
+    task_t *idle = (task_t *)__atomic_load_n(&trq->idle_task, __ATOMIC_RELAXED);
+    if (cur != idle || idle == NULL) return;
+    apic_send_ipi(g_cpu_info[target_cpu].lapic_id, IPI_VEC_WAKEUP);
+}
+
+// Phase 24a W2: voluntary yield from a non-blocking caller.  Caller stays
+// READY (gets enqueued onto its own runq by schedule()'s normal RUNNING→
+// READY transition); the yield gives whichever ready task is at the head
+// of the runq the CPU.  Used by chan_send / chan_recv to hand off to a
+// freshly-woken target on the same CPU — turns kernel-mediated IPC from
+// "wait for next 10 ms timer tick" into "<1 µs same-CPU context switch"
+// (L4 fastpath / SkyBridge hot-pull pattern).
+//
+// Why same vector as sched_block_on_channel's L1 yield: the int $49
+// handler in interrupts.c just calls schedule(frame).  schedule() with
+// cur->state==RUNNING sets cur->state=READY and enqueues cur (line 809-811
+// of this file), then dispatches the runq head.  This is the standard
+// preemption path (timer tick uses the same code), so it is by definition
+// safe.  Distinct from W1 vector 48: that path enters schedule() with
+// cur=idle_task which exercises the same RUNNING→READY transition but
+// somehow corrupts streamtest reap timing — under investigation.  W2
+// path enters with cur=non-idle real task, which is exercised every timer
+// tick.
+//
+// Caller must not hold spinlocks at call site (yield → context switch
+// → potential indefinite delay before resume).
+void sched_yield_now(void) {
+    asm volatile("int $49" ::: "memory");
 }
 
 void sched_init(void) {
@@ -458,10 +560,19 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     (*task_ptrs[id]).id = id;
     (*task_ptrs[id]).state = TASK_STATE_BLOCKED;  // BLOCKED until fully initialized
     (*task_ptrs[id]).cr3 = cr3;
-    (*task_ptrs[id]).parent_id = (*task_ptrs[current_task_index]).id;
+    /* Phase 24a W1.7: must use per-CPU runq.current (not the BSP-only
+     * current_task_index global) for SMP-correct parent inheritance.
+     * With W1.7 + ahcid concurrent, this function is reached from any
+     * CPU; current_task_index can lag, point to a freed slot, or be
+     * task_ptrs[*]==NULL.  Falls through to -1/0 for the bootstrap
+     * case where no parent exists. */
+    {
+        task_t *parent_self = sched_get_current_task();
+        (*task_ptrs[id]).parent_id = parent_self ? parent_self->id  : -1;
+        (*task_ptrs[id]).pgid      = parent_self ? parent_self->pgid : 0;
+    }
     (*task_ptrs[id]).waiting_for_child = -1;
     (*task_ptrs[id]).exit_status = 0;
-    (*task_ptrs[id]).pgid = (*task_ptrs[current_task_index]).pgid; // Inherit parent's process group
     (*task_ptrs[id]).pending_signals = 0;
     (*task_ptrs[id]).name[0] = '\0';
     for (int s = 0; s < MAX_SIGNALS; s++) {
@@ -697,6 +808,18 @@ void schedule(struct interrupt_frame *frame) {
         cur = task_ptrs[current_task_index];
     }
 
+    // Phase 24 W14.2: snapshot barrier hook. The barrier_flag is a single
+    // atomic load (RELAXED) so the steady-state cost is one branch + one
+    // memory load. The fast path falls straight through.
+    bool barrier_active = (__atomic_load_n(&g_snap_barrier.barrier_flag,
+                                           __ATOMIC_RELAXED) != 0u);
+    if (barrier_active && cur == g_snap_barrier.owner_task) {
+        // Owner CPU stays running so snap_create can do its captures.
+        // Don't preempt — just return; the interrupt handler resumes
+        // the owner via the unchanged frame.
+        return;
+    }
+
     // Save outgoing regs + handle CPU-budget bookkeeping. No global lock
     // needed: cur is THIS CPU's task, no other CPU touches its regs (work-
     // stealing only takes READY tasks off the ready list, never RUNNING).
@@ -708,51 +831,71 @@ void schedule(struct interrupt_frame *frame) {
     if (cur) {
         cur->regs = *frame;
         if (cur->state == TASK_STATE_RUNNING) {
-            if (!cur->is_idle && cur->cpu_time_slice_budget_ns > 0 &&
-                cur->last_ran_tsc != 0 && tsc_is_ready()) {
-                uint64_t now_tsc = rdtsc();
-                uint64_t elapsed_ns = tsc_to_ns(now_tsc - cur->last_ran_tsc);
-                int64_t remaining = rlimit_consume_cpu(cur, elapsed_ns);
-                if (remaining <= 0) {
-                    starved = true;
-                    uint64_t epoch_now = g_timer_ticks / 100u;
-                    if (cur->last_starvation_epoch != epoch_now) {
-                        cur->last_starvation_epoch = epoch_now;
-                        starvation_used_ns = cur->cpu_time_slice_budget_ns;
-                        if (cur->cpu_budget_remaining_ns < 0) {
-                            starvation_used_ns += (uint64_t)(-cur->cpu_budget_remaining_ns);
+            if (barrier_active && !cur->is_idle) {
+                // Phase 24 W14.2: park non-idle non-owner tasks into the
+                // BARRIER_WAIT list. Do NOT call sched_enqueue_ready —
+                // the parked task is owned by snap_end_barrier, which
+                // re-enqueues every entry once the capture window ends.
+                snap_barrier_park_locked(cur);
+                // Skip rlimit/starve bookkeeping: we'll resume after the
+                // barrier and the inflated elapsed_ns would unfairly
+                // charge this task for the barrier window.
+            } else {
+                if (!cur->is_idle && cur->cpu_time_slice_budget_ns > 0 &&
+                    cur->last_ran_tsc != 0 && tsc_is_ready()) {
+                    uint64_t now_tsc = rdtsc();
+                    uint64_t elapsed_ns = tsc_to_ns(now_tsc - cur->last_ran_tsc);
+                    int64_t remaining = rlimit_consume_cpu(cur, elapsed_ns);
+                    if (remaining <= 0) {
+                        starved = true;
+                        uint64_t epoch_now = g_timer_ticks / 100u;
+                        if (cur->last_starvation_epoch != epoch_now) {
+                            cur->last_starvation_epoch = epoch_now;
+                            starvation_used_ns = cur->cpu_time_slice_budget_ns;
+                            if (cur->cpu_budget_remaining_ns < 0) {
+                                starvation_used_ns += (uint64_t)(-cur->cpu_budget_remaining_ns);
+                            }
+                            starvation_pid = (int32_t)cur->id;
+                            starvation_budget = cur->cpu_time_slice_budget_ns;
+                            need_audit_starvation = true;
                         }
-                        starvation_pid = (int32_t)cur->id;
-                        starvation_budget = cur->cpu_time_slice_budget_ns;
-                        need_audit_starvation = true;
                     }
                 }
-            }
-            if (starved) {
-                spinlock_acquire(&rq->lock);
-                runq_push_starved(rq, cur);
-                spinlock_release(&rq->lock);
-            } else {
-                cur->state = TASK_STATE_READY;
-                if (!cur->is_idle) {
-                    sched_enqueue_ready(cur);
+                if (starved) {
+                    spinlock_acquire(&rq->lock);
+                    runq_push_starved(rq, cur);
+                    spinlock_release(&rq->lock);
+                } else {
+                    cur->state = TASK_STATE_READY;
+                    if (!cur->is_idle) {
+                        sched_enqueue_ready(cur);
+                    }
                 }
+                rlimit_refill_io_tokens(cur);
             }
-            rlimit_refill_io_tokens(cur);
         }
     }
 
     // Pick next task from this CPU's runq under rq->lock. If empty,
     // attempt a work-steal (uses trylock — never blocks). Falls through
     // to per-CPU idle if both fail.
-    spinlock_acquire(&rq->lock);
-    task_t *next = runq_dequeue_ready(rq);
-    if (!next) {
-        if (sched_steal_from_busiest(rq) > 0) {
-            next = runq_dequeue_ready(rq);
+    //
+    // Phase 24 W14.2: while a barrier is active, every non-owner CPU
+    // must dispatch its idle task even if its runq has READY entries —
+    // snap_create's captures rely on every other CPU being idle. The
+    // ready entries will be picked up normally once snap_end_barrier
+    // clears the flag and the next schedule() runs.
+    task_t *next = NULL;
+    if (!barrier_active) {
+        spinlock_acquire(&rq->lock);
+        next = runq_dequeue_ready(rq);
+        if (!next) {
+            if (sched_steal_from_busiest(rq) > 0) {
+                next = runq_dequeue_ready(rq);
+            }
         }
+        spinlock_release(&rq->lock);
     }
-    spinlock_release(&rq->lock);
 
     if (!next) {
         next = rq->idle_task;
@@ -1010,17 +1153,29 @@ int sched_spawn_process(const char *path, int parent_id) {
         (*task_ptrs[pid]).pledge_mask = (*task_ptrs[parent_id]).pledge_mask;
     }
 
-    // Phase 10c: Only inherit FDs 0-2 (stdin/stdout/stderr)
-    // This prevents pipe FD leaks that would block EOF detection.
-    // Higher FDs (3+) remain UNUSED in the child.
-    for (int f = 0; f < 3; f++) {
-        uint8_t ptype = (*task_ptrs[parent_id]).fd_table[f].type;
-        (*task_ptrs[pid]).fd_table[f] = (*task_ptrs[parent_id]).fd_table[f];
-        if (ptype == FD_TYPE_PIPE_READ || ptype == FD_TYPE_PIPE_WRITE) {
-            pipe_ref_inc((*task_ptrs[pid]).fd_table[f].ref, ptype);
+    // Phase 10c: Only inherit FDs 0-2 (stdin/stdout/stderr) when the parent
+    // is a real, live task.  Phase 23 Stage-2 cutover added kernel-initiated
+    // spawns (the blk_client kt task spawning bin/ahcid) where parent_id is
+    // -1 / no real task; without this guard `task_ptrs[-1]` page-faulted.
+    // FDs 3-15 remain UNUSED either way (set by sched_create_user_process).
+    //
+    // Phase 23 Step 3.C: only inherit a parent FD slot if the parent's slot
+    // is something useful (CONSOLE / PIPE / FILE).  If parent's slot is
+    // FD_TYPE_UNUSED (which happens when the parent is a kernel task — kt
+    // task spawning bin/ahcid has no stdio FDs), KEEP the child's default
+    // CONSOLE FD that sched_create_user_process just installed.  Without
+    // this, ahcid's printf calls go to FD_TYPE_UNUSED and SYS_WRITE returns
+    // -1 — silent stdio breakage that masks real diagnostics.
+    if (parent_id >= 0 && parent_id < MAX_TASKS && task_ptrs[parent_id]) {
+        for (int f = 0; f < 3; f++) {
+            uint8_t ptype = (*task_ptrs[parent_id]).fd_table[f].type;
+            if (ptype == FD_TYPE_UNUSED) continue;  // keep child's default
+            (*task_ptrs[pid]).fd_table[f] = (*task_ptrs[parent_id]).fd_table[f];
+            if (ptype == FD_TYPE_PIPE_READ || ptype == FD_TYPE_PIPE_WRITE) {
+                pipe_ref_inc((*task_ptrs[pid]).fd_table[f].ref, ptype);
+            }
         }
     }
-    // FDs 3-15 remain UNUSED (set by sched_create_user_process)
 
     spinlock_release(&sched_lock);
 
@@ -1350,10 +1505,23 @@ int sched_block_on_channel(void *channel, uint8_t dir, uint64_t timeout_ns,
     cur->state         = TASK_STATE_CHAN_WAIT;
     spinlock_release(&sched_lock);
 
-    // Sleep until woken or deadline. sti allows the timer tick to run the
-    // scheduler, which will context-switch us out while state=CHAN_WAIT.
-    // The scheduler's per-tick deadline scan (in schedule()) flips our
-    // state to READY and stamps -ETIMEDOUT in wait_result on timeout.
+    // Phase 23 latency-opt: voluntary direct yield via software INT 49.
+    // We've set state=CHAN_WAIT and released sched_lock — the scheduler
+    // can safely deschedule us immediately.  Invoking schedule() now
+    // (instead of waiting for the next timer tick to do it) cuts the
+    // wake-to-run latency from ~10 ms (tick quantum) to <1 us.  This is
+    // the L4 "direct process switch" technique applied to channel-mode
+    // IPC.  Safe because: (a) the INT is synchronous from a path that
+    // has voluntarily prepared to block; (b) state is already CHAN_WAIT
+    // so schedule() will not re-add us to the ready queue; (c) when we
+    // are later woken via sched_wake_one_on_channel and re-dispatched,
+    // iretq returns us right after the INT instruction.
+    asm volatile("int $49" ::: "memory");
+
+    // Fallback spin-sleep loop.  Reached only if schedule() returned us
+    // immediately (e.g., no other runnable task and idle is already on
+    // this CPU — should not happen in practice because TASK_STATE_CHAN_WAIT
+    // is not READY-eligible).  Defensive — preserves prior behavior.
     while (cur->state == TASK_STATE_CHAN_WAIT) {
         asm volatile("sti; hlt" ::: "memory");
         asm volatile("cli" ::: "memory");
@@ -1395,7 +1563,16 @@ task_t *sched_wake_one_on_channel(struct task_struct **list_head,
     spinlock_release(&sched_lock);
     // Phase 20: runq insertion happens outside sched_lock to keep the
     // hierarchy flat (sched_lock → runq.lock; never inverted).
-    if (waking) sched_enqueue_ready(t);
+    if (waking) {
+        sched_enqueue_ready(t);
+        // Phase 24a W1: state-conditional doorbell IPI.  If t's target CPU
+        // is currently in its idle hlt loop (and is not us), nudge it via
+        // vector 48 so it picks up t immediately instead of waiting for
+        // its next 10 ms timer tick.  See sched_maybe_doorbell_ipi for
+        // the race analysis.  Cross-CPU IPC wake-to-run drops from ~10 ms
+        // (tick quantum) to <1 µs (IPI delivery + schedule).
+        sched_maybe_doorbell_ipi(sched_doorbell_target_cpu(t));
+    }
     return t;
 }
 

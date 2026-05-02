@@ -27,12 +27,13 @@ typedef enum {
 } blk_fs_state_t;
 
 // --- Client connection state --------------------------------------------
+// Phase 24a W10: KERNEL_DIRECT removed.  All FS I/O goes through channel
+// mode now.  States are linear: DISCONNECTED → CONNECTING → READY ↔ ERROR.
 typedef enum {
     BLK_CLIENT_DISCONNECTED  = 0,
     BLK_CLIENT_CONNECTING    = 1,
     BLK_CLIENT_READY         = 2,  /* /sys/blk/service connected, can issue */
     BLK_CLIENT_ERROR         = 3,  /* ahcid died; reconnect pending */
-    BLK_CLIENT_KERNEL_DIRECT = 4,  /* Transitional: legacy in-kernel AHCI active */
 } blk_client_state_t;
 
 // Initialize the singleton client. Called early in kmain (before any FS).
@@ -45,6 +46,32 @@ void blk_client_init(void);
 // In transitional mode (Phase 23 S4 first pass), this directly mounts
 // against the legacy in-kernel AHCI driver without polling.
 void blk_client_start_mount_task(int device_id);
+
+// Phase 23 Step 2: spawn the kernel-side blk_client task (kt task).
+// The kt task waits for kmain to set g_blk_mount_done, then in
+// init mode polls /sys/blk/service for publication by /bin/ahcid (spawned
+// by /etc/init.conf), connects via rawnet_connect, allocates a 256 KiB
+// shared DMA VMO, sends the BLK_PROTO handshake, and transitions state
+// to BLK_CLIENT_READY.  In ktest mode (autorun=ktest) the kt task parks
+// without doing any work — the gate exercises kernel-direct AHCI exclusively
+// and bringing up ahcid would corrupt PxCLB/PxFB.  Step 3 will widen
+// activation to ktest mode along with the kernel-direct strip.
+void blk_client_start_kt(void);
+
+// Phase 23 Step 2: synchronization flag set by kmain after the synchronous
+// grahafs mount completes.  The kt task waits on this to avoid racing
+// with mount-time block I/O via the legacy in-kernel AHCI driver.
+extern volatile uint32_t g_blk_mount_done;
+
+// Phase 23 Step 3: kt-task settled flag.  Set to 1 by the kt task once it
+// has either transitioned to BLK_CLIENT_READY (channel mode active) OR
+// committed to parking (handshake failed; channel mode unavailable).  kmain
+// blocks on this AFTER blk_client_start_kt() and BEFORE spawning the
+// autorun child, so userspace tests don't race with ahcid bring-up.  Even
+// in ktest mode (which spawns ahcid kernel-context from the kt task), the
+// settle handshake is the same — kmain unblocks once kt is ready or has
+// given up.
+extern volatile uint32_t g_blk_kt_settled;
 
 // State accessors.
 blk_client_state_t blk_client_state(void);
@@ -67,6 +94,26 @@ void               blk_fs_clear_error(void);
 int grahafs_block_read(uint8_t dev, uint64_t lba, uint32_t count, void *kbuf);
 int grahafs_block_write(uint8_t dev, uint64_t lba, uint32_t count, const void *kbuf);
 int grahafs_block_flush(uint8_t dev);
+
+// Phase 24a W3: batched read. Submits up to BLK_BATCH_MAX (= 6) reads in
+// one chan_send. Each kbufs[i] receives counts[i]*512 bytes from lbas[i].
+// Returns the number of successfully-completed reads (0..n) on the
+// channel-mode path, or -EAGAIN/-EIO if channel mode is unavailable
+// (caller should fall back to grahafs_block_read in a loop).
+//
+// For grahafs_compute_simhash and other speculative readers: best-effort
+// semantics — partial completion (return < n) is signalled by the
+// corresponding kbufs[i] being left untouched. Per-op error code is not
+// returned; if you need it, use grahafs_block_read in a loop.
+//
+// Multiplicative speedup with W2 chan_send fastpath: the entire batch is
+// one chan_send → ahcid issues all to PxCI in one MMIO store → AHCI HBA
+// processes in parallel (NCS=32 supports up to 32 concurrent).
+int grahafs_block_read_batch(uint8_t dev,
+                             const uint64_t *lbas,
+                             const uint32_t *counts,
+                             void *const *kbufs,
+                             uint32_t n);
 // grahafs_block_identify returns the cached 512-byte IDENTIFY DEVICE
 // payload for `dev` into `out_512`. Today this calls ahci's enum logic;
 // future channel mode delegates to ahcid's BLK_OP_IDENTIFY.

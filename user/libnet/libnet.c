@@ -120,17 +120,16 @@ int libnet_connect_service_with_retry(const char *name,
         // Back-off sleep via syscall_yield loop (we don't have nanosleep).
         // We approximate by yielding in a tight loop; under the scheduler
         // the caller will resume ~10 ms later. Multiply yields by the
-        // backoff budget.
+        // backoff budget. The pause-loop is fast in TCG (~1 µs/iter) and
+        // ~140 cycles/iter under Intel KVM, so the back-off is roughly
+        // proportional to backoff_ms in real time on KVM hosts; under TCG
+        // it remains a near-no-op (intentionally — TCG everything is slow
+        // and adding real waits would blow the gate budget).
         uint32_t wait_ms = backoff_ms;
         if (wait_ms > total_timeout_ms - elapsed_ms) {
             wait_ms = total_timeout_ms - elapsed_ms;
         }
         for (uint32_t i = 0; i < wait_ms * 100; i++) {
-            // pause instruction is a decent spinlock hint; an alternative
-            // here would be syscall_sleep(1ms), but the kernel doesn't
-            // expose nanosecond sleeps to userspace.  Phase 22 stays
-            // portable by using a busy loop; replace with sys_sleep() in
-            // a later phase.
             __asm__ __volatile__("pause" ::: "memory");
         }
         elapsed_ms += wait_ms;

@@ -46,6 +46,7 @@
 #include "ipc/manifest.h"
 #include "mm/vmo.h"
 #include "ipc/channel.h"
+#include "snap/snapshot.h"
 #include "io/stream.h"
 
 // --- Limine Requests ---
@@ -426,6 +427,17 @@ void kmain(void) {
     framebuffer_draw_string("Phase 17 Channels Ready.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
+    // Phase 24 W13: snapshot subsystem skeleton. Registers snapshot_t and
+    // cow_page_tracker_t slab caches and zeroes the global barrier state.
+    // Real capture/restore/COW logic arrives in W14-W19; W13 ships only
+    // snap_init plus -ENOSYS stubs so the kernel boots with the surface in
+    // place. Must run after vmo_init + channel_subsystem_init (the
+    // snapshot subsystem refcount-bumps both).
+    klog(KLOG_INFO, SUBSYS_CORE, "Phase 24 W13: snap_init...");
+    snap_init();
+    framebuffer_draw_string("Phase 24 W13 Snap Skeleton Ready.", 50, y_pos, COLOR_GREEN, 0x00101828);
+    y_pos += 20;
+
     // Phase 18: stream_subsystem_init must wait until after sched_init
     // because it spawns a kernel worker thread via sched_create_task. Its
     // call site is moved just after sched_init below.
@@ -598,73 +610,41 @@ void kmain(void) {
     }
     klog(KLOG_INFO, SUBSYS_CORE, "AHCI stabilized");
 
-    framebuffer_draw_string("Mounting GrahaFS filesystem...", 10, y_pos, COLOR_YELLOW, 0x00101828);
+    // Phase 24a W10: kernel-direct AHCI was stripped; FS mount happens in
+    // the blk_client kt task AFTER /bin/ahcid is up and the BLK_PROTO
+    // handshake completes (state=READY).  kmain just registers grahafs's
+    // CAN cap here; the actual mount + audit_attach_fs is deferred to
+    // blk_client_kt_entry which sets g_blk_mount_done=1 when done.
+    // kmain blocks on g_blk_mount_done after AP release before spawning
+    // user processes (so ktest/init never observe a NULL vfs_root).
+    klog(KLOG_INFO, SUBSYS_CORE,
+         "Phase 24a W10: skipping synchronous mount (kt task will mount "
+         "via channel mode after ahcid bring-up)");
+    framebuffer_draw_string("GrahaFS: deferred mount (channel-mode)",
+                            10, y_pos, COLOR_YELLOW, 0x00101828);
     y_pos += 20;
-
-    // Initialize GrahaFS driver
-    klog(KLOG_INFO, SUBSYS_CORE, "Initializing GrahaFS driver...");
+    klog(KLOG_INFO, SUBSYS_CORE, "Initializing GrahaFS driver (CAP only)...");
     grahafs_init();
-    klog(KLOG_INFO, SUBSYS_CORE, "GrahaFS driver initialized");
+    klog(KLOG_INFO, SUBSYS_CORE, "GrahaFS driver initialized (CAP registered; mount deferred)");
 
-    // Get first block device (disk 0)
-    klog(KLOG_INFO, SUBSYS_CORE, "About to call vfs_get_block_device(0)...");
-    block_device_t* hdd = vfs_get_block_device(0);
-    klog(KLOG_INFO, SUBSYS_CORE, "vfs_get_block_device(0) returned: 0x%lx", (unsigned long)((uint64_t)hdd));
+    // Phase 23 Step 2: spawn the kernel-side blk_client kt task.  In ktest
+    // mode it parks (kernel-direct AHCI continues to serve the gate); in
+    // init mode it polls /sys/blk/service for /bin/ahcid (spawned via
+    // /etc/init.conf) and completes the BLK_PROTO handshake, transitioning
+    // state to BLK_CLIENT_READY.  Step 3 will widen activation to ktest
+    // mode along with the kernel-direct strip + channel-mode dispatch in
+    // grahafs_block_*.
+    extern void blk_client_start_kt(void);
+    blk_client_start_kt();
+    /* Note: kmain CANNOT wait for the kt task here — the LAPIC timer is
+     * still off (see lapic_timer_init below).  Without timer ticks the
+     * kt task never gets scheduled, so a wait here would deadlock.  The
+     * race window between ahcid bring-up and kt-state=READY is closed
+     * inside the wrappers (grahafs_block_read/write/flush spin-wait on
+     * BLK_CLIENT_CONNECTING; see kernel/fs/blk_client.c). */
 
-    if (hdd) {
-        klog(KLOG_INFO, SUBSYS_CORE, "Block device found, drawing framebuffer msg...");
-        framebuffer_draw_string("Found block device 0", 10, y_pos, COLOR_GREEN, 0x00101828);
-        klog(KLOG_INFO, SUBSYS_CORE, "Framebuffer msg drawn");
-        y_pos += 20;
-
-        // Phase 19: try v2 first. If the disk is v2-formatted, grahafs_v2_mount
-        // succeeds; build root + wire workers. If it returns -126 (CAP_V2_EBADFS
-        // — not a v2 image), fall back to the v1 driver.
-        klog(KLOG_INFO, SUBSYS_CORE, "Phase 19: probing for grahafs v2...");
-        int v2_rc = grahafs_v2_mount(hdd->device_id);
-        vfs_node_t *root = NULL;
-        if (v2_rc == 0) {
-            klog(KLOG_INFO, SUBSYS_CORE, "grahafs_v2_mount: success, building root");
-            extern struct vfs_node *grahafs_v2_build_root_node(void);
-            root = grahafs_v2_build_root_node();
-            if (root) vfs_set_root(root);
-            extern void gc_init(void);
-            extern void recluster_init(void);
-            gc_init();
-            recluster_init();
-        } else {
-            klog(KLOG_INFO, SUBSYS_CORE,
-                 "grahafs_v2_mount rc=%d — falling back to v1", v2_rc);
-            klog(KLOG_INFO, SUBSYS_CORE, "About to call grahafs_mount (v1)...");
-            root = grahafs_mount(hdd);
-        }
-        klog(KLOG_INFO, SUBSYS_CORE, "grahafs_mount returned: 0x%lx", (unsigned long)((uint64_t)root));
-
-        if (root) {
-            klog(KLOG_INFO, SUBSYS_CORE, "Mount successful, drawing success msg...");
-            framebuffer_draw_string("GrahaFS mounted successfully on /", 10, y_pos, COLOR_GREEN, 0x00101828);
-            klog(KLOG_INFO, SUBSYS_CORE, "Success msg drawn");
-            y_pos += 20;
-
-            // Phase 15b: the FS is now live; attach the audit subsystem so
-            // future entries go to /var/audit and the early-boot entries in
-            // the in-memory queue get flushed to disk.
-            audit_attach_fs();
-        } else {
-            klog(KLOG_ERROR, SUBSYS_CORE, "Mount failed, drawing error msgs...");
-            framebuffer_draw_string("Failed to mount GrahaFS!", 10, y_pos, COLOR_RED, 0x00101828);
-            framebuffer_draw_string("Disk may need formatting with mkfs.gfs", 10, y_pos + 20, COLOR_YELLOW, 0x00101828);
-            klog(KLOG_ERROR, SUBSYS_CORE, "Error msgs drawn");
-            y_pos += 40;
-        }
-    } else {
-        klog(KLOG_ERROR, SUBSYS_CORE, "No block device found, drawing error msg...");
-        framebuffer_draw_string("No block device found!", 10, y_pos, COLOR_RED, 0x00101828);
-        klog(KLOG_ERROR, SUBSYS_CORE, "Error msg drawn");
-        y_pos += 20;
-    }
-
-    // --- USER SPACE INITIALIZATION ---
+    // --- USER SPACE INITIALIZATION (initrd only; init-process spawn moved
+    //     to blk_client_kt_entry post-mount per Phase 24a W10) ---
     klog(KLOG_INFO, SUBSYS_CORE, "=== USER SPACE INITIALIZATION ===");
     framebuffer_draw_string("=== Loading Interactive Shell ===", 50, y_pos, COLOR_WHITE, 0x00101828);
     y_pos += 30;
@@ -676,70 +656,19 @@ void kmain(void) {
     framebuffer_draw_string("Initrd initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
-    // Phase 12: init-process selection. autorun_decide() returns either
-    // "bin/gash" (default) or "bin/<name>" if the kernel command line
-    // supplied autorun=<name>.
-    const char *init_path = autorun_decide();
-    klog(KLOG_INFO, SUBSYS_CORE, "Looking up %s in initrd...", init_path);
-    size_t gash_size;
-    void *gash_data = initrd_lookup(init_path, &gash_size);
-    if (!gash_data) {
-        klog(KLOG_FATAL, SUBSYS_CORE, "FATAL: Could not find init binary in initrd: %s", init_path);
-        klog(KLOG_INFO, SUBSYS_CORE, "");
-        framebuffer_draw_string("FATAL: Could not find init binary in initrd!", 50, y_pos, COLOR_RED, 0x00101828);
-        hcf();
-    }
-    klog(KLOG_INFO, SUBSYS_CORE, "Found init binary, size=%lu", (unsigned long)(gash_size));
-    framebuffer_draw_string("Found init binary in initrd.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    y_pos += 20;
-
-    // Load shell ELF binary
-    klog(KLOG_INFO, SUBSYS_CORE, "About to call elf_load for init...");
-    uint64_t entry_point, cr3;
-    if (!elf_load(gash_data, &entry_point, &cr3)) {
-        klog(KLOG_FATAL, SUBSYS_CORE, "FATAL: elf_load failed!");
-        framebuffer_draw_string("FATAL: Failed to load shell ELF file!", 50, y_pos, COLOR_RED, 0x00101828);
-        hcf();
-    }
-    klog(KLOG_INFO, SUBSYS_CORE, "elf_load succeeded! entry_point=0x%lx cr3=0x%lx", (unsigned long)(entry_point), (unsigned long)(cr3));
-
-    klog(KLOG_INFO, SUBSYS_CORE, "Drawing 'Shell loaded' message...");
-    framebuffer_draw_string("Shell loaded successfully into memory.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    klog(KLOG_INFO, SUBSYS_CORE, "Message drawn");
-    y_pos += 20;
-
-    // Create shell process
-    klog(KLOG_INFO, SUBSYS_CORE, "Creating shell process...");
-    int process_id = sched_create_user_process(entry_point, cr3);
-    if (process_id < 0) {
-        klog(KLOG_ERROR, SUBSYS_CORE, "ERROR: Failed to create shell process!");
-        framebuffer_draw_string("FATAL: Failed to create shell process!", 50, y_pos, COLOR_RED, 0x00101828);
-        hcf();
-    }
-    klog(KLOG_INFO, SUBSYS_CORE, "Shell process created, ID=%lu", (unsigned long)(process_id));
-
-    // Phase 12: remember the init PID so SYS_EXIT can trigger shutdown
-    // when autorun is active.
-    autorun_register_init_pid(process_id);
-
-    // Set process name for the shell. Use the last '/'-separated
-    // component of init_path so `autorun=ktest` shows up as "ktest".
+    // Phase 24a W10: init-process spawn happens in blk_client_kt_entry
+    // AFTER FS mount (which itself happens after channel-mode bring-up).
+    // kmain only logs the chosen path for diagnostics; the actual spawn
+    // sees a fully mounted FS so simtest/fdtest's syscall_create works
+    // immediately on first call.
     {
-        task_t *shell_task = sched_get_task(process_id);
-        if (shell_task) {
-            const char *base = init_path;
-            for (const char *p = init_path; *p; p++) {
-                if (*p == '/') base = p + 1;
-            }
-            int j = 0;
-            while (base[j] && j < 31) { shell_task->name[j] = base[j]; j++; }
-            shell_task->name[j] = '\0';
-        }
+        const char *init_path = autorun_decide();
+        klog(KLOG_INFO, SUBSYS_CORE,
+             "init-process spawn deferred to kt task; autorun=%s",
+             init_path);
     }
-
-    klog(KLOG_INFO, SUBSYS_CORE, "Drawing 'Shell process created' message...");
-    framebuffer_draw_string("Shell process created.", 50, y_pos, COLOR_GREEN, 0x00101828);
-    klog(KLOG_INFO, SUBSYS_CORE, "Message drawn");
+    framebuffer_draw_string("init-process spawn deferred to kt task.",
+                            50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
     // Initialize keyboard hardware BEFORE creating the polling task

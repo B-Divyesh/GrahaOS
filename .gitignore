@@ -109,3 +109,7 @@ user/tests/kpf_test
 .disk_formatted
 limine.conf.bak
 .claude/
+
+# IDE / clangd compilation database (regenerate with `make compdb`)
+compile_commands.json
+.idea/

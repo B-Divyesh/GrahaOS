@@ -25,6 +25,7 @@ extern spinlock_t sched_lock;
 #include "../../../../kernel/fs/grahafs_v2.h"
 #include "../../drivers/e1000/e1000.h"
 #include "../../../../kernel/net/rawnet.h"
+#include "../../../../kernel/snap/snapshot.h"
 #include "../../../../kernel/fs/pipe.h"
 #include "../../../../kernel/fs/cluster.h"
 #include "../../../../kernel/autorun.h"
@@ -272,7 +273,6 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = -1;
                 break;
             }
-
             // Phase 10a: Allocate per-process FD wrapping global file table entry
             int global_fd = vfs_open(pathname_kernel);
             if (global_fd < 0) {
@@ -1782,8 +1782,12 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 break;
             }
             case DEBUG_AHCI_PORT_CMD: {
-                // RSI = int port_num. Returns port->cmd or 0 if missing.
-                frame->rax = (uint64_t)ahci_debug_port_cmd((int)frame->rsi);
+                // Phase 24a W10: kernel-resident AHCI driver stripped.
+                // ahcid owns the HBA; per-port CMD register no longer
+                // visible from kernel.  Return -ENOSYS so cantest_v2's
+                // disk-cap probes degrade to tap_skip.
+                (void)frame->rsi;
+                frame->rax = (uint64_t)(long)-38;  // -ENOSYS
                 break;
             }
             case DEBUG_E1000_READ_REG: {
@@ -1815,7 +1819,10 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 break;
             }
             case DEBUG_AHCI_IS_ACTIVE: {
-                frame->rax = ahci_is_active() ? 1 : 0;
+                // Phase 24a W10: kernel-resident AHCI driver stripped.
+                // The "ahci is active" flag was tied to CAN cap state
+                // for "disk", which is also gone.  Return -ENOSYS.
+                frame->rax = (uint64_t)(long)-38;  // -ENOSYS
                 break;
             }
             default:
@@ -3096,6 +3103,87 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             *out_wr_user = wr_tok;
             *out_rd_user = rd_tok;
             frame->rax = 0;
+            break;
+        }
+
+        // Phase 24 W19 (partial): snapshot lifecycle. Capture machinery
+        // (W14.1-W14.7) lands later; for now snap_create returns a valid
+        // cap_handle with an empty-payload snapshot, snap_delete frees the
+        // handle + body, snap_list enumerates the live list.
+        case SYS_SNAP_CREATE: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                        "pledge denied: sys_control")) break;
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY,
+                                        "pledge denied: sys_query")) break;
+            uint32_t scope_flags = (uint32_t)frame->rdi;
+            const char *name_user = (const char *)frame->rsi;
+
+            char kname[SNAP_NAME_MAX_LEN + 1];
+            kname[0] = '\0';
+            if (name_user) {
+                if (!is_user_pointer(name_user, 1)) {
+                    frame->rax = (uint64_t)(long)-14 /* EFAULT */;
+                    break;
+                }
+                size_t n = 0;
+                while (n < SNAP_NAME_MAX_LEN) {
+                    if (!is_user_pointer(name_user + n, 1)) {
+                        frame->rax = (uint64_t)(long)-14;
+                        break;
+                    }
+                    char c = name_user[n];
+                    kname[n++] = c;
+                    if (c == '\0') break;
+                }
+                kname[SNAP_NAME_MAX_LEN] = '\0';
+            }
+            int rc = snap_create(scope_flags, name_user ? kname : NULL);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        case SYS_SNAP_RESTORE: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                        "pledge denied: sys_control")) break;
+            uint32_t handle = (uint32_t)frame->rdi;
+            int rc = snap_restore(handle);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        case SYS_SNAP_DELETE: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                        "pledge denied: sys_control")) break;
+            uint32_t handle = (uint32_t)frame->rdi;
+            int rc = snap_delete(handle);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        case SYS_SNAP_LIST: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY,
+                                        "pledge denied: sys_query")) break;
+            snap_info_t *user_buf = (snap_info_t *)frame->rdi;
+            size_t       count    = (size_t)frame->rsi;
+            if (count > 0) {
+                if (!is_user_pointer(user_buf, count * sizeof(snap_info_t))) {
+                    frame->rax = (uint64_t)(long)-14 /* EFAULT */;
+                    break;
+                }
+            }
+            int rc = snap_list(user_buf, count);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        case SYS_TSC_HZ_QUERY: {
+            // No pledge required — TSC frequency is non-sensitive
+            // information already available to userspace via cpuid leaf
+            // 0x15 on modern CPUs. Returns 0 if calibration hasn't run
+            // yet (very early boot only); otherwise the calibrated
+            // ticks-per-second.
+            extern uint64_t g_tsc_hz;
+            frame->rax = (uint64_t)(long)g_tsc_hz;
             break;
         }
 

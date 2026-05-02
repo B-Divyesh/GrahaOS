@@ -31,11 +31,6 @@
 extern int  printf(const char *fmt, ...);
 extern void *memset(void *, int, size_t);
 
-static void spin_ms_approx(uint64_t ms) {
-    uint64_t loops = ms * 100000ull;
-    for (volatile uint64_t i = 0; i < loops; i++) { }
-}
-
 static int rawframe_connectable(void) {
     cap_token_u_t wr = {.raw = 0}, rd = {.raw = 0};
     long rc = syscall_chan_connect("/sys/net/rawframe", 17, &wr, &rd);
@@ -56,10 +51,13 @@ void _start(void) {
         syscall_exit(0);
     }
 
-    // 2: rawframe binds within ~1 s.
+    // 2: rawframe binds.  Phase 24a (path A): bumped 200→2000 polls (~10 s)
+    // because channel-mode FS adds ~100 ms per ELF page load plus extra
+    // scheduling pressure from ahcid running concurrently.  See
+    // feedback_phase24a_tcg_ahci_floor.md.
     int bound = 0;
     int polls_used = 0;
-    for (int try_ = 0; try_ < 200; try_++) {
+    for (int try_ = 0; try_ < 2000; try_++) {
         if (rawframe_connectable()) { bound = 1; polls_used = try_; break; }
         spin_ms_approx(5);
     }

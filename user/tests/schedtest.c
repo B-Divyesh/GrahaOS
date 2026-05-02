@@ -117,7 +117,7 @@ void _start(void) {
     long srq1 = 0;
     int progressed = 0;
     for (int attempt = 0; attempt < 200; attempt++) {
-        for (volatile int i = 0; i < 1000000; i++) { }
+        spin_ms(1);
         srq1 = syscall_get_system_state(STATE_CAT_SYSTEM, &sys1, sizeof(sys1));
         if (srq1 > 0 && sys1.uptime_ticks > sys0.uptime_ticks) {
             progressed = 1;

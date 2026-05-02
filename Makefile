@@ -47,9 +47,21 @@ OBJECTS     := $(C_OBJECTS) $(ASM_OBJECTS)
 DEPS := $(C_OBJECTS:.o=.d)
 
 # --- Build Targets ---
-.PHONY: all clean run help debug info userland test test-sentinel-meta qemu-interactive test-panic test-kernel-pf test-fault-injection
+.PHONY: all clean run help debug info userland test test-sentinel-meta qemu-interactive test-panic test-kernel-pf test-fault-injection compdb
 
 all: grahaos.iso format-disk-if-needed
+
+# Regenerate compile_commands.json at the repo root for IDE indexers
+# (CLion, clangd, ccls). Uses compiledb to parse `make --dry-run`
+# output, so it does not actually rebuild. Re-run after adding sources
+# or changing CFLAGS / -I paths.
+compdb:
+	@command -v compiledb >/dev/null 2>&1 || { \
+		echo "compiledb not found. Install with: pip install --user compiledb"; \
+		exit 1; \
+	}
+	@compiledb -n -f --full-path make -B >/dev/null
+	@echo "Wrote $(CURDIR)/compile_commands.json ($$(grep -c '"file":' compile_commands.json) entries)"
 
 # Phase 12 test harness — boots QEMU headless with autorun=ktest,
 # captures serial, parses TAP, writes summary.json. Exits 0 iff every
@@ -93,8 +105,13 @@ test-fault-injection:
 	@scripts/run_fault_injection.sh
 
 # Boot the production ISO interactively for manual debugging.
+# `taskset -c 0-3` HARD-CAPS QEMU at 4 host cores (out of 24); the host
+# stays usable on the other 20 cores.  `nice -n 5` keeps the 4 dedicated
+# cores responsive to host foreground work.  KVM intentionally not enabled
+# — see scripts/run_tests.sh for the rationale.
 qemu-interactive: all
-	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 \
+	@taskset -c 0-3 nice -n 5 ionice -c 2 -n 5 \
+		qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 \
 		-drive file=disk.img,format=raw,if=none,id=mydisk \
 		-device ich9-ahci,id=ahci \
 		-device ide-hd,drive=mydisk,bus=ahci.0 \
@@ -113,21 +130,43 @@ scripts/mkfs.gfs.v2: scripts/mkfs.gfs.v2.c kernel/fs/grahafs_v2.h kernel/lib/crc
 	@echo "Building host tool: mkfs.gfs.v2 (GrahaFS v2)..."
 	@$(HOST_CC) -o $@ $< kernel/lib/crc32.c -I.
 
-# Format the disk image with GrahaFS
+# Format the disk image with GrahaFS v1 (default).  Phase 23 Step 5 added
+# a working v2 formatter at scripts/mkfs.gfs.v2.c, but switching the gate
+# default to v2 currently regresses 29 assertions across clustertest /
+# simtest / metatest (v1-specific SimHash/cluster + AI-metadata syscalls
+# expect v1 layout) and fstest_v2 (3 G5.x version-chain asserts that need
+# v2 segments to be wired before the assertions trigger).  Default stays
+# at v1 until Phase 24 ports those tests; v2 formatter is invocable via
+# `make format-disk-v2` for interactive smoke testing.
 format-disk: scripts/mkfs.gfs disk.img
-	@echo "Formatting disk.img with GrahaFS..."
+	@echo "Formatting disk.img with GrahaFS v1..."
 	@./scripts/mkfs.gfs disk.img
 	@touch .disk_formatted
 
-# Verify disk has valid GrahaFS magic, format if not
+# Format with v2 (256 MB disk required — journal is 64 MB, plus metadata
+# and at least one segment).  Wires through scripts/mkfs.gfs.v2 which
+# already supports the full v2 layout (superblock, bitmap, inode table,
+# segment table, journal area, root directory).  Phase 24 is expected to
+# port the v1-specific test programs and then this becomes the default.
+format-disk-v2: scripts/mkfs.gfs.v2
+	@rm -f disk.img .disk_formatted
+	@echo "Creating 256 MB virtual hard disk for v2..."
+	@dd if=/dev/zero of=disk.img bs=1M count=256 2>/dev/null
+	@echo "Formatting disk.img with GrahaFS v2..."
+	@./scripts/mkfs.gfs.v2 disk.img
+	@touch .disk_formatted
+
+# Verify disk has valid GrahaFS magic (v1 OR v2), format if not.  Magics:
+#   v1 = 0x47524148414F5321 ("GRAHAOS!") — bytes 21534F4148415247 little-endian
+#   v2 = 0x47524148414F5322 ("GRAHAOS\"") — bytes 22534F4148415247 little-endian
 format-disk-if-needed: scripts/mkfs.gfs
 	@if [ ! -f disk.img ]; then \
-		echo "No disk.img found, creating and formatting..."; \
+		echo "No disk.img found, creating and formatting v1..."; \
 		$(MAKE) disk.img; \
 		./scripts/mkfs.gfs disk.img; \
 		touch .disk_formatted; \
-	elif ! xxd -l 8 -p disk.img 2>/dev/null | grep -qi "21534f4148415247"; then \
-		echo "Disk exists but has no valid GrahaFS magic, formatting..."; \
+	elif ! xxd -l 8 -p disk.img 2>/dev/null | grep -qiE "21534f4148415247|22534f4148415247"; then \
+		echo "Disk exists but has no valid GrahaFS magic, formatting v1..."; \
 		./scripts/mkfs.gfs disk.img; \
 		touch .disk_formatted; \
 	else \
@@ -367,6 +406,12 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json
 	@cp user/tests/tcp_stress_1000  initrd_root/bin/tests/tcp_stress_1000.tap
 	@# Phase 23 S1: userdrv MMIO/IRQ/chan synchronous-cleanup stress (P22.G.4).
 	@cp user/tests/userdrv_respawn_stress initrd_root/bin/tests/userdrv_respawn_stress.tap
+	@# Phase 24 W14/W19 (partial): snapshot lifecycle smoke test (create/delete/list).
+	@cp user/tests/snaptest                initrd_root/bin/tests/snaptest.tap
+	@# Phase 24 W20.3: 10000-iter snap_create + COW-fault + snap_delete leak test.
+	@cp user/tests/snap_stress_cycle       initrd_root/bin/tests/snap_stress_cycle.tap
+	@# Phase 24 W20.4: 30-second sustained COW-fault storm.
+	@cp user/tests/snap_cow_storm          initrd_root/bin/tests/snap_cow_storm.tap
 	@# Phase 23 S7.1: ahcid registration smoke test (interactive only;
 	@# spawns ahcid which competes with kernel AHCI — not in gate sequence).
 	@cp user/tests/ahcid_register   initrd_root/bin/tests/ahcid_register.tap
@@ -375,6 +420,9 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json
 	@cp user/tests/blk_stress_kheap        initrd_root/bin/tests/blk_stress_kheap.tap
 	@cp user/tests/blk_stress_random_read  initrd_root/bin/tests/blk_stress_random_read.tap
 	@cp user/tests/userdrv_respawn_100     initrd_root/bin/tests/userdrv_respawn_100.tap
+	@# Phase 24a PRE: blk_micro_latency — measurement ruler. Built + copied,
+	@# NOT in gate manifest. Run via `gash> ktest blk_micro_latency`.
+	@cp user/tests/blk_micro_latency       initrd_root/bin/tests/blk_micro_latency.tap
 	@# Phase 23 P23.deferred.1 cutover validation: ahcid end-to-end I/O.
 	@cp user/tests/ahcid_basic_io          initrd_root/bin/tests/ahcid_basic_io.tap
 	@cp user/tests/vmotest          initrd_root/bin/tests/vmotest.tap
@@ -438,6 +486,12 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json
 	@cp user/drivers/ahcid           initrd_root/bin/ahcid
 	@# Phase 23 S6: blkctl block-device CLI (twin of drvctl).
 	@cp user/blkctl                  initrd_root/bin/blkctl
+	@# Phase 24 W19.6: snapshot CLI. One binary; gash dispatches verbs
+	@# `snapshot`, `snapshots`, `restore`, `snap-delete` to it via argv[0].
+	@cp user/snapshot                initrd_root/bin/snapshot
+	@cp user/snapshot                initrd_root/bin/snapshots
+	@cp user/snapshot                initrd_root/bin/restore
+	@cp user/snapshot                initrd_root/bin/snap-delete
 	@# Phase 22 Stage A: netd userspace TCP/IP daemon skeleton. Spawned by
 	@# init when /etc/init.conf names it (default init.conf below doesn't
 	@# for `make test`); sits in initrd unused otherwise. Stage A content:
@@ -457,6 +511,12 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json
 	@echo "# /etc/init.conf — Phase 22 init supervisor configuration" > initrd_root/etc/init.conf
 	@echo "# daemon=<binary>:<pledge_csv>  (CSV is advisory until Phase 24)" >> initrd_root/etc/init.conf
 	@echo "# autorun=<binary>" >> initrd_root/etc/init.conf
+	@# Phase 23 Stage-2 cutover: ahcid spawns FIRST.  The kernel-side
+	@# blk_client kt task polls /sys/blk/service after boot; ahcid must be
+	@# alive for the kt task to transition to BLK_CLIENT_READY (channel
+	@# mode).  Kernel-direct AHCI remains as the boot-time fallback so
+	@# the synchronous grahafs_v2_mount in kmain still works pre-cutover.
+	@echo "daemon=bin/ahcid:storage_server,sys_control,sys_query,ipc_send,ipc_recv,compute" >> initrd_root/etc/init.conf
 	@echo "daemon=bin/e1000d:net_server,sys_control,sys_query,ipc_send,ipc_recv" >> initrd_root/etc/init.conf
 	@echo "daemon=bin/netd:net_server,net_client,ipc_send,ipc_recv,sys_query,fs_read,compute,time" >> initrd_root/etc/init.conf
 ifdef TEST_HARNESS
@@ -484,7 +544,17 @@ endif
 	@# this reordered layout.
 	@echo "clustertest" >> initrd_root/bin/tests/manifest.txt
 	@echo "simtest" >> initrd_root/bin/tests/manifest.txt
-	@echo "pipetest" >> initrd_root/bin/tests/manifest.txt
+	@# pipetest is intentionally NOT here — it has a documented bimodal
+	@# TCG-AHCI-floor flake (~70%-90% pass rate; project memory
+	@# feedback_phase24a_tcg_ahci_floor.md) that produces an INCOMPLETE
+	@# TAP block (test 10 starts then the kernel goes silent — looks
+	@# like a triple-fault under -no-reboot).  ktest's parser stops the
+	@# gate at the first INCOMPLETE, which would mask every test
+	@# scheduled after pipetest.  We move pipetest to the END of the
+	@# manifest so its flake costs only its own coverage, not the rest
+	@# of the gate.  Sub-phase H (KVM port + TSC calibration) is the
+	@# planned remediation; until then this ordering keeps the gate
+	@# signal honest.
 	@echo "fdtest" >> initrd_root/bin/tests/manifest.txt
 	@echo "metatest" >> initrd_root/bin/tests/manifest.txt
 	@echo "spawntest" >> initrd_root/bin/tests/manifest.txt
@@ -505,6 +575,21 @@ endif
 	@echo "kheap_basic" >> initrd_root/bin/tests/manifest.txt
 	@echo "percpu_basic" >> initrd_root/bin/tests/manifest.txt
 	@echo "mem_stress" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 24 W14/W16/W17/W19: snapshot lifecycle (create + capture +
+	@# restore + delete + list).  Placed AFTER slab_basic / kheap_basic /
+	@# mem_stress because snap_create's many kmalloc()s populate per-CPU
+	@# magazines for kheap_128 / 256 / 2048 with SUBSYS_CORE-tagged
+	@# objects; the slab/kheap tests assert that fresh allocs increment
+	@# subsys_counters[SUBSYS_TEST=9] >= 1, which only holds when the
+	@# magazine misses (the pop fast path doesn't touch the counter).
+	@# Running snaptest after the magazine-sensitive tests keeps both
+	@# signal sets clean.
+	@echo "snaptest" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 24 W20.3: 10K-iter snap stress (~5-15s wall in TCG).
+	@echo "snap_stress_cycle" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 24 W20.4: 30-second sustained COW-fault storm (resnap every
+	@# 256 writes to keep faulting fresh pages).
+	@echo "snap_cow_storm" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 15a: capability objects v2.
 	@echo "captest_v2" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 15b: pledge classes + audit log.
@@ -538,24 +623,25 @@ endif
 	@echo "libtls" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 22 closeout (G6): 1000-socket TCP stress.
 	@echo "tcp_stress_1000" >> initrd_root/bin/tests/manifest.txt
-	@# Phase 23 S1: userdrv_respawn_stress builds and is available as
-	@# bin/tests/userdrv_respawn_stress.tap, run interactively via
-	@# `gash> ktest userdrv_respawn_stress`. NOT in the gate sequence —
-	@# 10 back-to-back spawn-kill cycles of e1000d temporarily corrupt
-	@# kheap/PMM accounting in ways subsequent tests trip on (gate
-	@# isolation needs Phase 23 S1 production cutover before this test
-	@# can run inline).
-	@# Phase 23 P23.deferred.2 (partial): ahci_restore_after_userdrv_death
-	@# saves PxCLB/PxFB at port_rebase and restores them when an AHCI-class
-	@# userdrv owner dies. This makes the kernel-resident ahci_read/write
-	@# functional again after ahcid_register's spawn-kill cycle. Useful for
-	@# interactive use (`gash> ktest ahcid_register; gash> ktest fstest_v2`
-	@# now works back-to-back). Moving ahcid_register INTO the gate
-	@# manifest, however, exposes additional state-coupling (e1000dtest
-	@# subsequently saw a flake) — the full gate move requires the
-	@# Phase 23 production cutover to land first. For now ahcid_register
-	@# stays interactive-only; the mitigation lives in the kernel ready
-	@# for the cutover to leverage.
+	@# Phase 23 Stage-2 cutover: ahcid_register tested in-gate after
+	@# the userdrv largest-BAR fix; the spawn/kill cycle still leaves
+	@# subsequent FS-touching tests (vmotest, streamtest) flaky in
+	@# ~33% of runs due to grahafs/PMM accounting drift after the kill.
+	@# Stays interactive-only (`gash> ktest ahcid_register`).
+	@# Phase 23 S1: userdrv_respawn_stress (10-cycle spawn/kill of
+	@# e1000d) is still INTERACTIVE-ONLY.  Each cycle re-claims the same
+	@# PCI BAR; under stack-of-tests the kheap/PMM accounting trips
+	@# subsequent tests that spawn user processes.  Run as
+	@# `gash> ktest userdrv_respawn_stress` for the death-recovery
+	@# coverage; the kernel-side userdrv_force_release_mmio path it
+	@# exercises is the same one the gate already verifies via
+	@# userdrv assertions 8-10.
+	@# Phase 23 Stage-2 cutover: ahcid_basic_io stays interactive-only
+	@# (channel-mode end-to-end via the standalone test path).  The
+	@# kernel-side blk_client kt task already validates the same code
+	@# path on every boot — the wrappers transition to channel mode
+	@# whenever ahcid is up — so the standalone test is duplicate
+	@# coverage rather than additional gate value.
 	@echo "vmotest" >> initrd_root/bin/tests/manifest.txt
 	@echo "streamtest" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 19: versioned GrahaFS v2.
@@ -570,6 +656,22 @@ endif
 	@# kills + respawns to verify the death-cleanup path.
 	@cp user/tests/e1000dtest        initrd_root/bin/tests/e1000dtest.tap
 	@echo "e1000dtest" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 23 Step 4: userdrv_respawn_stress — 10-cycle spawn/kill of
+	@# e1000d.  Validates the userdrv_force_release_mmio synchronous-cleanup
+	@# path landed in Step 1.  Placed at the end of the manifest so the
+	@# kheap/PMM accounting drift the comment-block above describes can't
+	@# trip earlier tests that need fresh-state user spawns.
+	@echo "userdrv_respawn_stress" >> initrd_root/bin/tests/manifest.txt
+	@# pipetest at the very end (after every other test) so its bimodal
+	@# TCG flake at test 10 doesn't cut off the rest of the gate. See
+	@# the comment block earlier in this manifest for the rationale.
+	@echo "pipetest" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 23 Step 4: blk_stress_random_read NOT yet in gate — assertion 1
+	@# (/etc/gcp.json opens) trips at the late position the test would land
+	@# in, even though gcp_manifest opens the same file successfully ~14 s
+	@# earlier in the run.  Suspected FD-table exhaustion / vfs cache
+	@# pressure under stack-of-tests.  Stays interactive-only via
+	@# `gash> ktest blk_stress_random_read`.
 	@# Phase 23 P23.deferred.4: stress harness skeletons stay out-of-gate.
 	@# They build + copy to bin/tests/ but vfs_create/SYS_CREATE in v2 mount
 	@# under ktest mode is not yet wired the way the smoke loop expects;

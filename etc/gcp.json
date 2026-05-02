@@ -142,6 +142,38 @@
       "pledge": ["ipc_send", "ipc_recv"],
       "caps": [],
       "description": "Phase 22: connect to a published named channel by string name. Returns a fresh channel pair (write + read tokens) routed to the publisher; the publisher receives the peer-end via its accept handler. AUDIT_CHAN_NAME_CONNECT=40 emitted on success. -EBADF if no publisher / publisher dead. Used for /sys/net/rawframe (e1000d→netd) and /sys/net/service (netd→clients)."
+    },
+
+    "SYS_SNAP_CREATE": {
+      "number": 1093,
+      "pledge": ["sys_control", "sys_query"],
+      "caps": ["CAP_KIND_SNAPSHOT"],
+      "description": "Phase 24 W19: capture a coherent COW snapshot at scheduler-barrier instant. RDI = scope_flags (SNAP_SCOPE_SELF=0x1 / SNAP_SCOPE_GLOBAL=0x2 / SNAP_SCOPE_FREEZE_ALL_CHANS=0x4). RSI = optional name (≤31 chars, NUL-terminated). On success returns the cap_handle slot for a CAP_KIND_SNAPSHOT object (rights = INSPECT|REVOKE|DERIVE|RESTORE|DELETE). -EINVAL on bad scope; -ENOMEM on slab/heap exhaustion; -EPLEDGE if either pledge is dropped. Wave B partial: lifecycle is in tree; capture machinery (W14.1-W14.7) deferred."
+    },
+    "SYS_SNAP_RESTORE": {
+      "number": 1094,
+      "pledge": ["sys_control"],
+      "caps": ["CAP_KIND_SNAPSHOT"],
+      "description": "Phase 24 W19: atomically restore system state to the snapshot referenced by the caller's handle. RDI = handle. Requires RIGHT_RESTORE on the underlying cap_object. Currently returns -ENOSYS (-38) until W16 lands the restore orchestrator (depends on W14 captures)."
+    },
+    "SYS_SNAP_DELETE": {
+      "number": 1095,
+      "pledge": ["sys_control"],
+      "caps": ["CAP_KIND_SNAPSHOT"],
+      "description": "Phase 24 W19: release the snapshot, decrement COW page-tracker refcounts, free pages whose refcount hits 0, revoke + destroy the cap_object. RDI = handle. Requires RIGHT_DELETE on the underlying cap_object. -EINVAL on stale handle; -EBUSY if snapshot is currently being restored. Wave B partial: drops handle + cap_object today; W14 follow-on will add COW reclamation + grahafs_unpin_version + chan_thaw passes."
+    },
+    "SYS_SNAP_LIST": {
+      "number": 1096,
+      "pledge": ["sys_query"],
+      "caps": ["CAP_KIND_SNAPSHOT"],
+      "description": "Phase 24 W19: enumerate live snapshots whose cap_token is held in the caller's handle table. RDI = snap_info_t* user buffer; RSI = element count. Writes up to count snap_info_t records (88 bytes each, stable ABI: id, created_utc_ns, creator_pid, scope_flags, state, task_count, vmo_count, chan_count, pages_shared, pages_diverged, name[32]). Returns # written, or -EFAULT on bad pointer."
+    },
+
+    "SYS_TSC_HZ_QUERY": {
+      "number": 1097,
+      "pledge": [],
+      "caps": [],
+      "description": "Phase 24 sub-phase H.1: returns the calibrated TSC frequency (g_tsc_hz, in Hz) — the substrate userspace busy-wait loops need to switch from cycle-count loops (calibrated for QEMU TCG; collapse under KVM) to rdtsc-based delays that work on both. No args, no pledge. Returns 0 only during very early boot before tsc_init() has measured against the PIT."
     }
   },
 

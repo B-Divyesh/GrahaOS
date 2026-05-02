@@ -3,11 +3,13 @@
 #
 # Workflow:
 #   1. Build a test ISO whose limine.conf carries `cmdline: autorun=ktest
-#      quiet=1 test_timeout_seconds=90` (substituted in-place, restored
-#      on exit).
+#      quiet=1 test_timeout_seconds=300` (substituted in-place, restored
+#      on exit).  Phase 24a path (A): timeout bumped from 90→300 s to
+#      accommodate channel-mode FS I/O at ~100 ms/op (TCG AHCI emulation
+#      floor; see project memory feedback_phase24a_tcg_ahci_floor.md).
 #   2. Boot that ISO headless in QEMU with serial captured to a log.
 #   3. Wait for the kernel to shut itself down (ACPI after PID-1 exit)
-#      or for the outer `timeout 120s` wrapper to fire.
+#      or for the outer `timeout 360s` wrapper to fire.
 #   4. Run scripts/parse_tap.py on the captured log; write
 #      /tmp/grahaos_tests/summary.json and propagate the parser's exit
 #      code to the caller.
@@ -26,8 +28,8 @@ cd "$REPO_ROOT"
 LOG_DIR="${GRAHAOS_TEST_LOG_DIR:-/tmp/grahaos_tests}"
 SERIAL_LOG="${GRAHAOS_SERIAL_LOG:-/tmp/grahaos_test.log}"
 SUMMARY_JSON="$LOG_DIR/summary.json"
-MESON_FLAGS="${GRAHAOS_TEST_MESON_FLAGS:-autorun=ktest quiet=1 test_timeout_seconds=90}"
-QEMU_WALL_TIMEOUT_SEC="${GRAHAOS_TEST_WALL_TIMEOUT_SEC:-120}"
+MESON_FLAGS="${GRAHAOS_TEST_MESON_FLAGS:-autorun=ktest quiet=1 test_timeout_seconds=400}"
+QEMU_WALL_TIMEOUT_SEC="${GRAHAOS_TEST_WALL_TIMEOUT_SEC:-480}"
 
 mkdir -p "$LOG_DIR"
 rm -f "$SERIAL_LOG" "$SUMMARY_JSON"
@@ -80,8 +82,37 @@ echo "run_tests: launching QEMU (wall timeout ${QEMU_WALL_TIMEOUT_SEC}s)"
 # -no-reboot lets a triple-fault fallback exit cleanly; we do NOT pass
 # -no-shutdown (which would hang QEMU in a paused state after our ACPI
 # shutdown succeeds). Display is disabled; serial goes to a file.
+#
+# Host-CPU regulation (Phase 23 closeout — host PC was crashing/freezing
+# under unconstrained TCG):
+# - `taskset -c "$QEMU_CPUS"` HARD-LIMITS QEMU to a fixed set of host
+#   cores (default cores 0..3 = 4 of 24).  QEMU literally cannot use
+#   the other 20 cores; foreground host work (browser, IDE) on those
+#   cores is uncontested.  This is a kernel-level affinity, far stronger
+#   than nice priority alone.
+# - `nice -n 5` (mild) keeps the 4 dedicated cores responsive to host
+#   foreground work without slowing tests below the 300 s test_timeout
+#   watchdog (nice -n 10 caused gate INCOMPLETEs under host load).
+# - `ionice -c 2 -n 5` (best-effort, low-priority class) for I/O.
+# - Phase 24 sub-phase H: KVM enabled. The TCG-calibrated busy-waits
+#   (`spin_ms_approx`) have been replaced with TSC-calibrated `spin_us`
+#   in user/syscalls.h, so the gate tests (e1000dtest, ahcid_*,
+#   userdrv_respawn_*) wait the same wall-time on TCG and KVM. The
+#   spin_ms_approx compat helper in syscalls.h preserves the original
+#   ~400 µs/ms-unit behaviour to keep gate budgets unchanged.
+QEMU_CPUS="${GRAHAOS_TEST_QEMU_CPUS:-0-3}"
+
+# GRAHAOS_TEST_NO_KVM=1 to fall back to TCG (e.g., on hosts without KVM
+# support). Default: KVM if /dev/kvm is accessible.
+QEMU_KVM_FLAGS=""
+if [ -z "${GRAHAOS_TEST_NO_KVM:-}" ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    QEMU_KVM_FLAGS="-enable-kvm -cpu host"
+fi
+
 set +e
-timeout "${QEMU_WALL_TIMEOUT_SEC}s" qemu-system-x86_64 \
+taskset -c "$QEMU_CPUS" nice -n 5 ionice -c 2 -n 5 \
+    timeout "${QEMU_WALL_TIMEOUT_SEC}s" qemu-system-x86_64 \
+    $QEMU_KVM_FLAGS \
     -cdrom grahaos.iso \
     -m 512M -smp 4 \
     -drive file=disk.img,format=raw,if=none,id=mydisk \

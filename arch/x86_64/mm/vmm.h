@@ -188,8 +188,23 @@ typedef int (*vmm_pf_handler_t)(uint64_t fault_va, uint64_t error_code);
 void vmm_install_pf_handler(vmm_pf_handler_t fn);
 
 /**
+ * Phase 24 W15: install a second page-fault handler tried BEFORE the
+ * Phase 17 handler. Used by the COW snapshot subsystem so snap-tracked
+ * pages are resolved before falling through to vmo_pf_dispatch.
+ */
+void vmm_install_snap_pf_handler(vmm_pf_handler_t fn);
+
+/**
  * Invoke the installed page-fault handler. Called from the CPU exception
  * handler BEFORE the existing user-kill / kpanic fallback. Returns 0 if the
  * fault was resolved, negative otherwise.
  */
 int vmm_dispatch_pf(uint64_t fault_va, uint64_t error_code);
+
+/**
+ * Phase 24 W15: read the raw 64-bit PTE value for `virt` in `cr3`.
+ * Returns 0 if any intermediate page table is absent or the PTE itself
+ * is not present. Use PAGE_MASK to extract the physical address and the
+ * remaining bits to recover flags (PTE_USER, PTE_NX, etc.).
+ */
+uint64_t vmm_get_pte(uint64_t cr3, uint64_t virt);

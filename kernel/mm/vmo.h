@@ -37,7 +37,13 @@
 
 // --- Limits --------------------------------------------------------------
 #define VMO_MAX_SIZE    (256ull * 1024 * 1024)  // 256 MiB per VMO
-#define VMO_MAPPINGS_PER_TASK 8
+// Phase 23 Stage-2 cutover: bumped 8 → 64.  Each ahcid port allocates
+// 1 cmd_list + 1 FIS-receive + 32 cmd_tables = 34 VMO mappings; ahcid
+// also maps the IDENTIFY VMO + 4 channel-publish caches; total per-task
+// peak around ~40 mappings with one port active.  Keeping headroom for
+// multi-port + future drivers that touch more DMA buffers.  BSS impact
+// per task is 64 * 32 B = 2 KiB; full table = 256 * 2 KiB = 512 KiB.
+#define VMO_MAPPINGS_PER_TASK 64
 
 struct task_struct;  // forward decl — vmo_mapping_t holds no task pointer
 struct cap_object;   // forward decl — vmo_cap_deactivate only takes a pointer

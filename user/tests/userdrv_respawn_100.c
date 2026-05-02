@@ -33,11 +33,6 @@
 
 extern int  printf(const char *fmt, ...);
 
-static void spin_ms_approx(uint64_t ms) {
-    uint64_t loops = ms * 100000ull;
-    for (volatile uint64_t i = 0; i < loops; i++) { }
-}
-
 static int rawframe_connectable(void) {
     cap_token_u_t wr = {.raw = 0}, rd = {.raw = 0};
     long rc = syscall_chan_connect("/sys/net/rawframe", 17, &wr, &rd);

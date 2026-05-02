@@ -26,6 +26,10 @@
 // HHDM offset from arch/x86_64/mm/vmm.c.
 extern uint64_t g_hhdm_offset;
 
+// 100 Hz tick counter from arch/x86_64/cpu/timer.c — used by stream_reap to
+// compute its own deadline across multiple sched_block_on_channel calls.
+extern volatile uint64_t g_timer_ticks;
+
 // --- Subsystem globals ---------------------------------------------------
 static kmem_cache_t *g_stream_cache = NULL;
 static kmem_cache_t *g_streamjob_cache = NULL;
@@ -558,9 +562,21 @@ void stream_destroy(stream_t *s) {
 }
 
 // --- Reap ---------------------------------------------------------------
-// Return count of CQEs currently ready. Blocks up to timeout_ns for at
-// least min_complete to be ready. timeout_ns == 0 probes non-blocking.
-// timeout_ns == UINT64_MAX means wait forever.
+// Return count of CQEs currently ready. Blocks up to timeout_ns until at
+// least min_complete CQEs are available. timeout_ns == 0 probes non-blocking.
+// timeout_ns == UINT64_MAX waits forever.
+//
+// Loops internally on partial wakes: stream_wake_reapers pops one waiter per
+// CQE, but a single reap may need to observe many CQEs before returning. The
+// pre-W1 implementation blocked exactly once and returned whatever it saw,
+// relying on slow tick-based wake delivery to accidentally accumulate
+// completions before the first context-switch back. With W1 doorbell IPI
+// active, wakes are immediate (<1 µs), so a "block once" reap returns ready=1
+// instead of the requested count — same canary that broke streamtest in
+// Phase 23 T2-T4 and the three Phase 24a W1 receiver gate variants. Looping
+// here matches modern async I/O semantics (io_uring io_uring_wait_cqe_nr,
+// FreeBSD aio_waitcomplete) and is what the API contract should always have
+// been.
 int stream_reap(stream_t *s, uint32_t min_complete, uint64_t timeout_ns) {
     if (!s || s->magic != STREAM_MAGIC) return CAP_V2_EBADF;
     if (s->state == STREAM_STATE_DESTROYED) return CAP_V2_EBADF;
@@ -568,24 +584,51 @@ int stream_reap(stream_t *s, uint32_t min_complete, uint64_t timeout_ns) {
 
     volatile uint32_t *cq_tail = ring_tail_ptr(s->cq_meta_kva);
 
-    uint32_t ready = s->cq_head_kernel -
-                     __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
-    if (ready >= min_complete || timeout_ns == 0) {
-        return (int)ready;
+    // Compute deadline in 100 Hz timer ticks. timeout_ns == 0 → non-blocking
+    // probe; timeout_ns == UINT64_MAX → wait forever.
+    bool     has_deadline  = (timeout_ns != 0 && timeout_ns != (uint64_t)-1);
+    uint64_t deadline_tick = 0;
+    if (has_deadline) {
+        uint64_t dt = (timeout_ns + 9999999ULL) / 10000000ULL;  // round up to tick
+        if (dt == 0) dt = 1;
+        deadline_tick = g_timer_ticks + dt;
     }
 
-    // Block once; re-evaluate on wake. The waker (stream_post_cqe) calls
-    // stream_wake_reapers which pops one task off reap_waiters per CQE.
-    // Multiple CQEs may fire between enqueue-wake and context-switch;
-    // after wake, we always return the current ready count — if less than
-    // min_complete, the caller can loop at userspace level.
-    int r = sched_block_on_channel(/*channel=*/s, WAIT_STREAM_REAP,
-                                   timeout_ns, &s->reap_waiters);
-    ready = s->cq_head_kernel -
-            __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
-    if (r == CAP_V2_ETIMEDOUT && ready < min_complete) return CAP_V2_ETIMEDOUT;
-    if (r == CAP_V2_EPIPE) return (int)ready;  // stream destroyed mid-wait
-    return (int)ready;
+    for (;;) {
+        uint32_t ready = s->cq_head_kernel -
+                         __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
+        if (ready >= min_complete)               return (int)ready;
+        if (s->state == STREAM_STATE_DESTROYED)  return (int)ready;
+        if (timeout_ns == 0)                     return (int)ready;
+
+        // Compute remaining timeout for this block call.
+        uint64_t remain_ns;
+        if (timeout_ns == (uint64_t)-1) {
+            remain_ns = (uint64_t)-1;
+        } else {
+            uint64_t now = g_timer_ticks;
+            if (now >= deadline_tick) {
+                // Race: a wake may have completed the count exactly at
+                // deadline expiry — re-check before declaring timeout.
+                ready = s->cq_head_kernel -
+                        __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
+                if (ready >= min_complete) return (int)ready;
+                return CAP_V2_ETIMEDOUT;
+            }
+            uint64_t remain_ticks = deadline_tick - now;
+            remain_ns = remain_ticks * 10000000ULL;
+        }
+
+        int r = sched_block_on_channel(/*channel=*/s, WAIT_STREAM_REAP,
+                                       remain_ns, &s->reap_waiters);
+        if (r == CAP_V2_EPIPE) {
+            ready = s->cq_head_kernel -
+                    __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
+            return (int)ready;  // stream destroyed mid-wait
+        }
+        // r == 0 (normal wake) OR CAP_V2_ETIMEDOUT: re-evaluate ready
+        // count + deadline at top of loop.
+    }
 }
 
 // --- cap_object deactivate ----------------------------------------------

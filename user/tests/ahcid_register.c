@@ -24,11 +24,6 @@
 
 extern int  printf(const char *fmt, ...);
 
-static void spin_ms_approx(uint64_t ms) {
-    uint64_t loops = ms * 100000ull;
-    for (volatile uint64_t i = 0; i < loops; i++) { }
-}
-
 static int blk_service_connectable(void) {
     cap_token_u_t wr = {.raw = 0};
     cap_token_u_t rd = {.raw = 0};

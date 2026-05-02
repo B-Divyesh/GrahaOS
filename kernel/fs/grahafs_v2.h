@@ -342,7 +342,13 @@ typedef struct grahafs_v2_version_entry {
     uint64_t prev_version;
     uint64_t parent_version;
     uint16_t flags;
-    uint8_t  _pad[6];
+    uint16_t _pad0;
+    // Phase 24 W17.2: snapshot pin counter. Incremented by
+    // grahafs_pin_version (called from snap_capture_fs_pins, W14.7) and
+    // decremented by grahafs_unpin_version (snap_delete / snap_restore).
+    // gc_prune_inode skips entries with snap_pin_count > 0 so a snapshot's
+    // pinned version cannot be reaped while still referenced.
+    uint32_t snap_pin_count;
     struct grahafs_v2_version_entry *next;  // Newer-toward-older traversal.
 } grahafs_v2_version_entry_t;
 
@@ -416,6 +422,27 @@ const struct grahafs_v2_version_entry *grahafs_v2_chain_find(
 struct grahafs_v2_version_entry *grahafs_v2_chain_pop_tail(
     struct grahafs_v2_inode_cache *ce);
 int inode_cache_flush_dirty(struct grahafs_v2_inode_cache *e);
+
+// ---------------------------------------------------------------------------
+// Phase 24 W17.2: snapshot version pinning.
+//
+// grahafs_pin_version increments snap_pin_count on the in-memory version_entry
+// matching version_id. While snap_pin_count > 0, gc_prune_inode skips that
+// entry rather than reaping it. _unpin_version is the inverse.
+//
+// grahafs_revert_to_version makes target_version the new HEAD by allocating a
+// new version_id, pushing it onto the chain marked VE_FLAG_REVERT_CREATED with
+// parent_version=target_version, and updating the inode's
+// version_chain_head_id. This is the W16 snap_restore building block.
+//
+// All three return:
+//   0      on success
+//  -EINVAL bad inode or version not found in cache
+//  -EBADF  inode lookup failed
+// ---------------------------------------------------------------------------
+int grahafs_pin_version(uint32_t inode_num, uint64_t version_id);
+int grahafs_unpin_version(uint32_t inode_num, uint64_t version_id);
+int grahafs_revert_to_version(uint32_t inode_num, uint64_t target_version);
 
 // Block tree walker. Returns 0 if the logical block is sparse.
 uint32_t v2_block_index_to_lba(const grahafs_v2_inode_t *ino,

@@ -78,21 +78,20 @@ static char* get_next_path_component(char** path) {
 // Path traversal with proper error handling
 vfs_node_t* vfs_path_to_node(const char* path) {
     if (!path || !vfs_root) return NULL;
-    
+
     // Handle root directory
     if (vfs_strcmp(path, "/") == 0) {
         vfs_root->refcount++;
         return vfs_root;
     }
-    
+
     // Make a copy of the path for parsing
     char* path_copy = vfs_strdup(path);
     if (!path_copy) return NULL;
-    
     char* p = path_copy;
     vfs_node_t* current = vfs_root;
     current->refcount++;
-    
+
     char* component;
     while ((component = get_next_path_component(&p)) != NULL) {
         // Skip empty components (from //)
@@ -223,7 +222,6 @@ void vfs_set_root(vfs_node_t* root) {
 
 int vfs_open(const char *pathname) {
     spinlock_acquire(&vfs_lock);
-    
     vfs_node_t* node = vfs_path_to_node(pathname);
     if (!node) {
         // Try initrd as fallback

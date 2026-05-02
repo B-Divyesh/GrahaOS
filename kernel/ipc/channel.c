@@ -22,11 +22,51 @@ static kmem_cache_t *g_endpoint_cache = NULL;
 static uint64_t g_next_chan_id = 1;
 static spinlock_t g_chan_id_lock = SPINLOCK_INITIALIZER("chan_id");
 
+// Phase 24 W18: global doubly-linked registry of every live channel_t.
+// Used by chan_lookup_by_id (walked at snap_create time to resolve a
+// chan_endpoint_t back to its channel_t). Channels register on
+// chan_create / chan_create_kernel and unregister at chan_free.
+static channel_t *g_chan_reg_head = NULL;
+static spinlock_t g_chan_reg_lock = SPINLOCK_INITIALIZER("chan_reg");
+
+static void chan_reg_link(channel_t *c) {
+    spinlock_acquire(&g_chan_reg_lock);
+    c->reg_prev = NULL;
+    c->reg_next = g_chan_reg_head;
+    if (g_chan_reg_head) g_chan_reg_head->reg_prev = c;
+    g_chan_reg_head = c;
+    spinlock_release(&g_chan_reg_lock);
+}
+
+static void chan_reg_unlink(channel_t *c) {
+    spinlock_acquire(&g_chan_reg_lock);
+    if (c->reg_prev) c->reg_prev->reg_next = c->reg_next;
+    else if (g_chan_reg_head == c) g_chan_reg_head = c->reg_next;
+    if (c->reg_next) c->reg_next->reg_prev = c->reg_prev;
+    c->reg_prev = c->reg_next = NULL;
+    spinlock_release(&g_chan_reg_lock);
+}
+
 static uint64_t next_chan_id(void) {
     spinlock_acquire(&g_chan_id_lock);
     uint64_t id = g_next_chan_id++;
     spinlock_release(&g_chan_id_lock);
     return id;
+}
+
+channel_t *chan_lookup_by_id(uint64_t chan_id) {
+    if (chan_id == 0) return NULL;
+    spinlock_acquire(&g_chan_reg_lock);
+    channel_t *c = g_chan_reg_head;
+    while (c) {
+        if (c->id == chan_id) {
+            spinlock_release(&g_chan_reg_lock);
+            return c;
+        }
+        c = c->reg_next;
+    }
+    spinlock_release(&g_chan_reg_lock);
+    return NULL;
 }
 
 void channel_subsystem_init(void) {
@@ -76,6 +116,13 @@ int chan_create(uint64_t type_hash, uint32_t mode, uint32_t capacity,
     c->read_waiters  = NULL;
     c->write_waiters = NULL;
     spinlock_init(&c->lock, "channel");
+    // Phase 24 W18: snap-freeze fields default to "live".
+    c->frozen_at_snap = 0;
+    c->saved_head     = 0;
+    c->saved_tail     = 0;
+    c->saved_msgcount = 0;
+    c->reg_next       = NULL;
+    c->reg_prev       = NULL;
 
     c->ring = (channel_msg_t *)kmalloc(sizeof(channel_msg_t) * capacity, SUBSYS_CAP);
     if (!c->ring) {
@@ -84,6 +131,11 @@ int chan_create(uint64_t type_hash, uint32_t mode, uint32_t capacity,
     }
     memset(c->ring, 0, sizeof(channel_msg_t) * capacity);
 
+    // Phase 24 W18: link into the global registry so chan_lookup_by_id
+    // can resolve the freshly-allocated id. Done here, AFTER the ring
+    // alloc, so we never publish a half-initialised channel.
+    chan_reg_link(c);
+
     // Allocate endpoint payloads.
     chan_endpoint_t *rd_ep = (chan_endpoint_t *)kmem_cache_alloc(g_endpoint_cache);
     chan_endpoint_t *wr_ep = (chan_endpoint_t *)kmem_cache_alloc(g_endpoint_cache);
@@ -91,6 +143,7 @@ int chan_create(uint64_t type_hash, uint32_t mode, uint32_t capacity,
         if (rd_ep) kmem_cache_free(g_endpoint_cache, rd_ep);
         if (wr_ep) kmem_cache_free(g_endpoint_cache, wr_ep);
         kfree(c->ring);
+        chan_reg_unlink(c);
         kmem_cache_free(g_channel_cache, c);
         return CAP_V2_ENOMEM;
     }
@@ -116,6 +169,7 @@ int chan_create(uint64_t type_hash, uint32_t mode, uint32_t capacity,
         kmem_cache_free(g_endpoint_cache, rd_ep);
         kmem_cache_free(g_endpoint_cache, wr_ep);
         kfree(c->ring);
+        chan_reg_unlink(c);
         kmem_cache_free(g_channel_cache, c);
         return rd_idx;
     }
@@ -133,6 +187,7 @@ int chan_create(uint64_t type_hash, uint32_t mode, uint32_t capacity,
         cap_object_destroy((uint32_t)rd_idx);
         kmem_cache_free(g_endpoint_cache, wr_ep);
         kfree(c->ring);
+        chan_reg_unlink(c);
         kmem_cache_free(g_channel_cache, c);
         return wr_idx;
     }
@@ -146,6 +201,7 @@ int chan_create(uint64_t type_hash, uint32_t mode, uint32_t capacity,
         cap_object_destroy((uint32_t)rd_idx);
         cap_object_destroy((uint32_t)wr_idx);
         kfree(c->ring);
+        chan_reg_unlink(c);
         kmem_cache_free(g_channel_cache, c);
         return CAP_V2_EINVAL;
     }
@@ -160,6 +216,7 @@ int chan_create(uint64_t type_hash, uint32_t mode, uint32_t capacity,
         cap_object_destroy((uint32_t)rd_idx);
         cap_object_destroy((uint32_t)wr_idx);
         kfree(c->ring);
+        chan_reg_unlink(c);
         kmem_cache_free(g_channel_cache, c);
         return rd_ins;
     }
@@ -169,6 +226,7 @@ int chan_create(uint64_t type_hash, uint32_t mode, uint32_t capacity,
         cap_object_destroy((uint32_t)rd_idx);
         cap_object_destroy((uint32_t)wr_idx);
         kfree(c->ring);
+        chan_reg_unlink(c);
         kmem_cache_free(g_channel_cache, c);
         return wr_ins;
     }
@@ -188,6 +246,9 @@ int chan_create(uint64_t type_hash, uint32_t mode, uint32_t capacity,
 // --- Helpers -------------------------------------------------------------
 static void chan_free(channel_t *c) {
     if (!chan_check(c)) return;
+    // Phase 24 W18: drop from the global registry BEFORE freeing storage,
+    // so chan_lookup_by_id can never observe a dangling pointer.
+    chan_reg_unlink(c);
     if (c->ring) {
         kfree(c->ring);
         c->ring = NULL;
@@ -223,6 +284,13 @@ channel_t *chan_create_kernel(uint64_t type_hash, uint32_t mode,
     c->read_waiters  = NULL;
     c->write_waiters = NULL;
     spinlock_init(&c->lock, "channel");
+    // Phase 24 W18: snap-freeze fields default to "live".
+    c->frozen_at_snap = 0;
+    c->saved_head     = 0;
+    c->saved_tail     = 0;
+    c->saved_msgcount = 0;
+    c->reg_next       = NULL;
+    c->reg_prev       = NULL;
 
     c->ring = (channel_msg_t *)kmalloc(sizeof(channel_msg_t) * capacity, SUBSYS_CAP);
     if (!c->ring) {
@@ -230,6 +298,7 @@ channel_t *chan_create_kernel(uint64_t type_hash, uint32_t mode,
         return NULL;
     }
     memset(c->ring, 0, sizeof(channel_msg_t) * capacity);
+    chan_reg_link(c);
     return c;
 }
 
@@ -277,6 +346,13 @@ int chan_send(channel_t *c, task_t *sender, channel_msg_t *msg_kern,
 
     while (1) {
         spinlock_acquire(&c->lock);
+        // Phase 24 W18: snapshot freeze gate. While the channel is held in
+        // a snapshot the entire endpoint is paused; sends fail fast with
+        // EFROZEN until snap_thaw is called from snap_restore / _delete.
+        if (c->frozen_at_snap != 0) {
+            spinlock_release(&c->lock);
+            return CAP_V2_EFROZEN;
+        }
         if (c->msgcount < c->capacity) {
             // Space available — install and advance.
             channel_msg_t *slot = &c->ring[c->tail];
@@ -286,8 +362,27 @@ int chan_send(channel_t *c, task_t *sender, channel_msg_t *msg_kern,
             c->tail = (c->tail + 1) % c->capacity;
             c->msgcount++;
             c->total_sends++;
-            sched_wake_one_on_channel(&c->read_waiters, 0);
+            task_t *woken = sched_wake_one_on_channel(&c->read_waiters, 0);
             spinlock_release(&c->lock);
+            // Phase 24a W2: same-CPU IPC fastpath. If the woken receiver
+            // would land on this CPU, voluntarily yield via INT 49 so the
+            // scheduler hands it the CPU immediately instead of waiting
+            // for the next ~10 ms timer tick. Sender stays READY (gets
+            // enqueued onto our runq); when receiver eventually blocks
+            // or yields, we resume. Cuts same-CPU `chan_send` →
+            // `chan_recv` roundtrip from ~10 ms (tick limited) to <5 µs
+            // in TCG. L4 direct process switch on the wake side
+            // (Liedtke 1993 / SkyBridge ATC 2020).
+            if (woken && woken != sender) {
+                uint32_t target_cpu = (woken->cpu_pinned >= 0 &&
+                                       (uint32_t)woken->cpu_pinned < g_cpu_count)
+                                        ? (uint32_t)woken->cpu_pinned
+                                        : (woken->last_ran_cpu < g_cpu_count
+                                            ? woken->last_ran_cpu : 0);
+                if (target_cpu == smp_get_current_cpu()) {
+                    sched_yield_now();
+                }
+            }
             return 0;
         }
         // Full.
@@ -308,6 +403,12 @@ int chan_recv(channel_t *c, task_t *receiver, channel_msg_t *msg_kern,
 
     while (1) {
         spinlock_acquire(&c->lock);
+        // Phase 24 W18: snapshot freeze gate. Mirror of the chan_send gate
+        // — receivers also block until the channel is thawed.
+        if (c->frozen_at_snap != 0) {
+            spinlock_release(&c->lock);
+            return CAP_V2_EFROZEN;
+        }
         if (c->msgcount > 0) {
             channel_msg_t *slot = &c->ring[c->head];
             *msg_kern = *slot;
@@ -316,8 +417,23 @@ int chan_recv(channel_t *c, task_t *receiver, channel_msg_t *msg_kern,
             c->head = (c->head + 1) % c->capacity;
             c->msgcount--;
             c->total_recvs++;
-            sched_wake_one_on_channel(&c->write_waiters, 0);
+            task_t *woken = sched_wake_one_on_channel(&c->write_waiters, 0);
             spinlock_release(&c->lock);
+            // Phase 24a W2: same-CPU IPC fastpath — see chan_send for
+            // full rationale. The mirror case here is: a writer was
+            // blocked because the channel was full; we drained one slot
+            // and woke them so they can retry the insert. Yield to them
+            // if same-CPU.
+            if (woken && woken != receiver) {
+                uint32_t target_cpu = (woken->cpu_pinned >= 0 &&
+                                       (uint32_t)woken->cpu_pinned < g_cpu_count)
+                                        ? (uint32_t)woken->cpu_pinned
+                                        : (woken->last_ran_cpu < g_cpu_count
+                                            ? woken->last_ran_cpu : 0);
+                if (target_cpu == smp_get_current_cpu()) {
+                    sched_yield_now();
+                }
+            }
             return (int)msg_kern->header.inline_len;
         }
         // Empty.
@@ -345,6 +461,101 @@ uint32_t chan_poll_probe(channel_t *c) {
     if (c->refcount < 2) revents |= 0x4;
     spinlock_release(&c->lock);
     return revents;
+}
+
+// --- Phase 24 W18: snapshot freeze/thaw helpers --------------------------
+//
+// chan_freeze_locked: stamp the channel as held by a snapshot, save the
+// ring head/tail/msgcount so chan_thaw_locked can rewind, and wake every
+// blocked sender/receiver so they observe CAP_V2_EFROZEN and unwind.
+int chan_freeze_locked(channel_t *c, uint64_t snap_id) {
+    if (!chan_check(c) || snap_id == 0) return CAP_V2_EINVAL;
+    spinlock_acquire(&c->lock);
+    if (c->frozen_at_snap != 0 && c->frozen_at_snap != snap_id) {
+        // Already held by a different snapshot. Nested freezes for the
+        // SAME snap_id are idempotent (this happens when both endpoints
+        // are in scope and snap_capture_channels visits each end).
+        spinlock_release(&c->lock);
+        return CAP_V2_EBUSY;
+    }
+    c->frozen_at_snap = snap_id;
+    c->saved_head     = c->head;
+    c->saved_tail     = c->tail;
+    c->saved_msgcount = c->msgcount;
+    sched_wake_all_on_channel(&c->read_waiters,  CAP_V2_EFROZEN);
+    sched_wake_all_on_channel(&c->write_waiters, CAP_V2_EFROZEN);
+    spinlock_release(&c->lock);
+    return CAP_V2_OK;
+}
+
+// chan_thaw_locked: clear the freeze stamp and (optionally) rewind the
+// ring head/tail. restore_head == UINT32_MAX is the "leave-as-is" sentinel
+// — used when chan_thaw is called from snap_delete (drop the freeze, do
+// not rewind the queue). chan_thaw with concrete head/tail is used by
+// snap_restore which rolls the channel back to its captured state.
+#define CHAN_THAW_KEEP UINT32_MAX
+int chan_thaw_locked(channel_t *c, uint32_t restore_head, uint32_t restore_tail) {
+    if (!chan_check(c)) return CAP_V2_EINVAL;
+    spinlock_acquire(&c->lock);
+    if (c->frozen_at_snap == 0) {
+        spinlock_release(&c->lock);
+        return CAP_V2_EINVAL;  // not frozen
+    }
+    c->frozen_at_snap = 0;
+    if (restore_head != CHAN_THAW_KEEP && restore_tail != CHAN_THAW_KEEP) {
+        c->head = restore_head % c->capacity;
+        c->tail = restore_tail % c->capacity;
+        // msgcount derived from head/tail/capacity to stay consistent
+        // when the caller restored an active queue mid-flight.
+        if (c->tail >= c->head) c->msgcount = c->tail - c->head;
+        else                    c->msgcount = c->capacity - c->head + c->tail;
+    }
+    sched_wake_all_on_channel(&c->read_waiters,  0);
+    sched_wake_all_on_channel(&c->write_waiters, 0);
+    spinlock_release(&c->lock);
+    return CAP_V2_OK;
+}
+
+// chan_freeze_all_locked: walk the global registry under g_chan_reg_lock
+// and freeze every live channel against snap_id. Channels already frozen
+// by the same snap_id are no-ops (chan_freeze_locked returns CAP_V2_OK).
+// Channels frozen by a different snap_id return CAP_V2_EBUSY which we
+// silently swallow — best-effort. Lock order is g_chan_reg_lock -> c->lock
+// (the same order chan_destroy + chan_lookup_by_id already use).
+int chan_freeze_all_locked(uint64_t snap_id) {
+    if (snap_id == 0) return CAP_V2_EINVAL;
+    spinlock_acquire(&g_chan_reg_lock);
+    channel_t *c = g_chan_reg_head;
+    while (c) {
+        // chan_freeze_locked acquires c->lock briefly; we still hold
+        // g_chan_reg_lock so c can't be unlinked underneath us.
+        (void)chan_freeze_locked(c, snap_id);
+        c = c->reg_next;
+    }
+    spinlock_release(&g_chan_reg_lock);
+    return CAP_V2_OK;
+}
+
+// chan_thaw_all_locked: walk the registry and thaw every channel whose
+// frozen_at_snap matches snap_id. Channels frozen by a different snap_id
+// are skipped. Pairs with chan_freeze_all_locked.
+int chan_thaw_all_locked(uint64_t snap_id) {
+    if (snap_id == 0) return CAP_V2_EINVAL;
+    spinlock_acquire(&g_chan_reg_lock);
+    channel_t *c = g_chan_reg_head;
+    while (c) {
+        // Take c->lock to safely read frozen_at_snap, then release before
+        // re-acquiring inside chan_thaw_locked (which also takes c->lock).
+        spinlock_acquire(&c->lock);
+        bool match = (c->frozen_at_snap == snap_id);
+        spinlock_release(&c->lock);
+        if (match) {
+            (void)chan_thaw_locked(c, CHAN_THAW_KEEP, CHAN_THAW_KEEP);
+        }
+        c = c->reg_next;
+    }
+    spinlock_release(&g_chan_reg_lock);
+    return CAP_V2_OK;
 }
 
 // --- Marshaling + atomic handle transfer --------------------------------

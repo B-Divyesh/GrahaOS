@@ -113,6 +113,48 @@ typedef long ssize_t;
 #define SYS_CHAN_PUBLISH      1091
 #define SYS_CHAN_CONNECT      1092
 
+// Phase 24 W19: COW snapshot subsystem (slots reconciled to 1093-1096
+// because spec's original 1086-1089 collide with SPAWN_EX..MMIO_VMO_CREATE).
+#define SYS_SNAP_CREATE       1093
+#define SYS_SNAP_RESTORE      1094
+#define SYS_SNAP_DELETE       1095
+#define SYS_SNAP_LIST         1096
+
+// Phase 24 sub-phase H.1: TSC frequency query — substrate for replacing
+// userspace spin_ms_approx() loops (currently calibrated for QEMU TCG;
+// would collapse under KVM) with rdtsc-driven busy waits.  Returns the
+// TSC tick rate measured at boot (g_tsc_hz, in Hz).  Returns 0 if the
+// TSC has not been calibrated yet (very early boot only).
+#define SYS_TSC_HZ_QUERY      1097
+
+// SNAP_SCOPE_* must match kernel/snap/snapshot.h. Bitfield argument to
+// SYS_SNAP_CREATE.flags.
+#define SNAP_SCOPE_SELF             0x00000001u
+#define SNAP_SCOPE_GLOBAL           0x00000002u
+#define SNAP_SCOPE_FREEZE_ALL_CHANS 0x00000004u
+
+#define SNAP_NAME_MAX_LEN_USER  31u  // Max chars (excl NUL) in name.
+
+// SNAP_STATE_* must match kernel/snap/snapshot.h.
+#define SNAP_STATE_ACTIVE     1u
+#define SNAP_STATE_RESTORING  2u
+#define SNAP_STATE_DELETED    3u
+
+// snap_info_t — record returned by SYS_SNAP_LIST. Stable 88-byte ABI.
+typedef struct snap_info_user {
+    uint64_t id;                        //  0
+    uint64_t created_utc_ns;            //  8
+    int32_t  creator_pid;               // 16
+    uint32_t scope_flags;               // 20
+    uint32_t state;                     // 24
+    uint32_t task_count;                // 28
+    uint32_t vmo_count;                 // 32
+    uint32_t chan_count;                // 36
+    uint64_t pages_shared;              // 40
+    uint64_t pages_diverged;            // 48
+    char     name[32];                  // 56..87 (31 chars + NUL)
+} snap_info_user_t;
+
 // SYS_MMIO_VMO_CREATE op codes (in RDI).
 #define MMIO_VMO_OP_CREATE      0u
 #define MMIO_VMO_OP_PHYS_QUERY  1u
@@ -1213,6 +1255,112 @@ static inline long syscall_chan_connect(const char *name, uint32_t name_len,
           "d"(out_wr_req), "r"(out_rd_resp)
         : "rcx", "r10", "r11", "memory");
     return ret;
+}
+
+// Phase 24 W19 (partial): snapshot lifecycle wrappers. capture machinery
+// (W14.1-W14.7) lands later; for W19-partial these return -ENOSYS for
+// snap_restore and a valid handle for snap_create / 0 for snap_delete /
+// record count for snap_list against an empty-payload snapshot body.
+static inline long syscall_snap_create(uint32_t scope_flags, const char *name) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_SNAP_CREATE), "D"((uint64_t)scope_flags), "S"(name)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_snap_restore(uint32_t handle) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_SNAP_RESTORE), "D"((uint64_t)handle)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_snap_delete(uint32_t handle) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_SNAP_DELETE), "D"((uint64_t)handle)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_snap_list(snap_info_user_t *user_buf, uint64_t count) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_SNAP_LIST), "D"(user_buf), "S"(count)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Phase 24 sub-phase H.1: returns the calibrated TSC tick rate in Hz.
+// Userspace busy-wait loops can use this with rdtsc to synthesise a
+// frequency-independent delay (correct under both QEMU TCG and KVM).
+// Returns 0 if the TSC has not been calibrated (very early boot only).
+static inline uint64_t syscall_tsc_hz_query(void) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_TSC_HZ_QUERY)
+                 : "rcx", "r11", "memory");
+    return (uint64_t)ret;
+}
+
+// rdtsc + spin_us helpers — define here so any test that includes
+// syscalls.h gets them. The first call queries g_tsc_hz once; subsequent
+// calls reuse the cached value. Falls back to a calibration-based loop
+// if the syscall returns 0 (extremely early boot).
+static inline uint64_t spin_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+// Cached TSC frequency. 0 = uninitialised; on first spin_us call we
+// query the kernel and cache. Static-inline keeps this out of the user
+// program's binary unless something actually calls spin_us.
+static inline uint64_t spin_tsc_hz(void) {
+    static uint64_t cached = 0;
+    if (cached == 0) {
+        cached = syscall_tsc_hz_query();
+        if (cached == 0) cached = 3000000000ULL;  // 3 GHz fallback
+    }
+    return cached;
+}
+
+// Spin for approximately `us` microseconds using rdtsc. Frequency-
+// independent: works on TCG (slow rdtsc) and KVM (real rdtsc) alike.
+static inline void spin_us(uint64_t us) {
+    uint64_t hz = spin_tsc_hz();
+    uint64_t target_ticks = (us * hz) / 1000000ULL;
+    uint64_t start = spin_rdtsc();
+    while (spin_rdtsc() - start < target_ticks) {
+        __asm__ __volatile__("pause" ::: "memory");
+    }
+}
+
+static inline void spin_ms(uint64_t ms) {
+    spin_us(ms * 1000ULL);
+}
+
+// Compatibility helper for tests that previously implemented their own
+// `spin_ms_approx(N)` as a TCG-calibrated busy-loop (`for (i = 0; i <
+// N*100000; i++) {}`). The bare loop was actually waiting ~400 µs per
+// "ms unit" in TCG, NOT 1 ms.  Under KVM the cycles execute too fast,
+// so the test poll budgets collapse and races surface.  This TSC-
+// calibrated equivalent preserves the same observable wait-per-N
+// behaviour (~ms*400 µs) under both TCG and KVM, so existing test
+// poll budgets remain valid post sub-phase H.
+//
+// Use spin_ms(N) when you want a real-millisecond wait; use
+// spin_ms_approx(N) only when porting code that calibrated against
+// the old busy-loop timing.
+static inline void spin_ms_approx(uint64_t ms) {
+    spin_us(ms * 400ULL);
 }
 
 static inline long syscall_vmo_create(uint64_t size_bytes, uint32_t flags) {

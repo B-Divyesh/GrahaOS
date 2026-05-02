@@ -26,7 +26,7 @@ void _start(void) {
 
     // Some serial FIFO flushing before we yank the rug out from
     // under the kernel.
-    for (volatile int i = 0; i < 1000; i++) { /* spin */ }
+    spin_us(1);
 
     int r = syscall_debug(DEBUG_PANIC,
                           "phase13 controlled panic (panic_test)");
