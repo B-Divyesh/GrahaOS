@@ -1,0 +1,26 @@
+[package]
+name = "wasmd-spike-hello"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "spike_hello"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+lto = false
+panic = "abort"
+codegen-units = 1
+strip = false
+debug = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
+
+# Phase 26 Stage B.2 verdict: Wasmtime crate NO-GO under stable rustc + Fedora
+# rust-std + cross-linker. See problems/phase26/rust_spike_outcome.md.
+# Kept dep-free; this binary is a Day-1 reference only (no_std hello world).
+[dependencies]

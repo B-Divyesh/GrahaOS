@@ -26,7 +26,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot txnctl
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot txnctl assertpledge wasm
 
 # Phase 12: TAP 1.4 test binaries. Each lives at user/tests/NAME.c
 # and is copied to initrd as /bin/tests/NAME.tap by the top-level
@@ -52,6 +52,11 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/txn_basic_commit tests/txn_basic_abort \
              tests/txn_nested_basic tests/txn_nest_limit \
              tests/cap_system \
+             tests/pledge_narrow_exec \
+             tests/wasmtest \
+             tests/vsnprintftest \
+             tests/gash_txn_commit \
+             tests/gash_txn_abort \
              tests/txn_stress_basic tests/txn_stress_nested \
              tests/txn_stress_state_machine \
              tests/netd_arp tests/netd_ipv4 tests/netd_tcp tests/netd_dhcp \
@@ -169,6 +174,12 @@ LIBTLS := libtls-mg/libtls-mg.a
 $(LIBTLS): libtls-mg/libtls.o libtls-mg/libtls_shim.o libtls-mg/mongoose_tls_core.o libtls-mg/mg_stubs.o
 	@echo "Creating $@"
 	@$(AR) rcs $@ $^
+
+# Phase 26 Stage H.1: wasmtest links additionally against the loader.o
+# from user/wasmd/src/loader.c. Override of the generic TAP rule.
+tests/wasmtest: tests/wasmtest.o wasmd/src/loader.o $(LIBTAP) $(LIBC)
+	@echo "Linking TAP test (with wasmd loader): $@"
+	@$(LD) $(LDFLAGS) -o $@ tests/wasmtest.o wasmd/src/loader.o $(LIBTAP) $(LIBC)
 
 # Phase 12: generic rule for tests/NAME: tests/NAME.o libtap.a libc.a
 tests/%: tests/%.o $(LIBTAP) $(LIBC)
@@ -394,6 +405,19 @@ fsversions: fsversions.o $(LIBC)
 init: init.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
 	@$(LD) $(LDFLAGS) -o $@ init.o $(LIBC)
+
+# Phase 26 Stage D.4: tiny binary spawned by pledge_narrow_exec.tap to
+# verify post-narrow pledge_mask via SYS_DEBUG / DEBUG_READ_PLEDGE.
+assertpledge: assertpledge.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ assertpledge.o $(LIBC)
+
+# Phase 26 Stage E/G: bin/wasm operator CLI + minimal loader/validator.
+# Real execution is Phase 27+ scope; substrate ships header + import-section
+# parser cross-referenced against allowed-cap CSV.
+wasm: wasm.o wasmd/src/loader.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ wasm.o wasmd/src/loader.o $(LIBC)
 
 # Phase 21: /bin/drvctl — driver control CLI (list/info/kill).
 drvctl: drvctl.o $(LIBC)

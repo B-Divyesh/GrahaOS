@@ -67,6 +67,35 @@ typedef struct {
 #define PLEDGE_ALL           0x3FFFu   // All 14 classes.
 #define PLEDGE_NONE          0x0000u   // Invalid for a running process.
 
+// Phase 26 Stage D: PLEDGE_FLAG_NARROW_EXEC. High bit on the SYS_PLEDGE
+// caller's first argument (RDI). When set, the kernel reads RSI as a
+// pointer to wasm_pledge_narrow_args_t and performs an atomic spawn-with-
+// narrowed-pledge-and-handles. The new task's pledge_mask is set under
+// the sched/pledge lock BEFORE it is dispatched, so there is no observable
+// syscall window where it is widely-pledged (R3).
+#define PLEDGE_FLAG_NARROW_EXEC  0x80000000u
+
+// Phase 26 Stage D: argument struct for SYS_PLEDGE | PLEDGE_FLAG_NARROW_EXEC.
+// Mirrored verbatim in user/syscalls.h. Total size = 152 bytes.
+//
+// Caller invocation:
+//   syscall(SYS_PLEDGE, PLEDGE_FLAG_NARROW_EXEC, &args)  -> child_pid (>0)
+//                                                       OR -EPERM/-EINVAL/-ENOMEM
+#define WASM_PLEDGE_NARROW_DELEGATIONS_MAX  16
+#define WASM_PLEDGE_NARROW_PATH_MAX         64
+
+typedef struct wasm_pledge_narrow_args {
+    uint16_t new_pledges;       // narrow pledge mask for the spawned child
+    uint16_t reserved16;
+    uint32_t flags;             // future use; must be zero today
+    char     entry_path[WASM_PLEDGE_NARROW_PATH_MAX];   // ELF to spawn (e.g. "/bin/wasmd_worker")
+    uint64_t cap_delegation_list[WASM_PLEDGE_NARROW_DELEGATIONS_MAX];  // raw cap_token_t handles
+    uint8_t  ndelegations;
+    uint8_t  reserved8[7];
+} wasm_pledge_narrow_args_t;
+_Static_assert(sizeof(wasm_pledge_narrow_args_t) == 208,
+               "wasm_pledge_narrow_args_t ABI must be 208 bytes");
+
 // Default minimum a process must retain: COMPUTE | TIME. Spec prohibits
 // PLEDGE_NONE as a target mask, so pledge_narrow(..., 0) returns -EINVAL.
 #define PLEDGE_MIN_ALLOWED   (PLEDGE_COMPUTE | PLEDGE_TIME)

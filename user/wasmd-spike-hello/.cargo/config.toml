@@ -1,0 +1,22 @@
+# Phase 26 Stage B.1 — Day 1 spike build config.
+# Target x86_64-unknown-none (built-in target in stable Rust 1.94+).
+# Link with the GrahaOS userspace linker.ld so the resulting ELF
+# matches sched_create_user_process expectations (entry=_start, base=0x400000).
+
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+# Stable Fedora rust 1.94 ships libcore only for x86_64-unknown-linux-gnu.
+# We get bare-metal behaviour via #![no_std] #![no_main] in main.rs and a
+# custom linker script that drops everything Linux-specific.
+[target.x86_64-unknown-linux-gnu]
+linker = "/home/atman/GrahaOS/toolchain/bin/x86_64-elf-ld"
+rustflags = [
+  "-C", "link-arg=-T/home/atman/GrahaOS/user/linker.ld",
+  "-C", "link-arg=-nostdlib",
+  "-C", "link-arg=-static",
+  "-C", "link-arg=--build-id=none",
+  "-C", "relocation-model=static",
+  "-C", "code-model=small",
+  "-C", "panic=abort",
+]

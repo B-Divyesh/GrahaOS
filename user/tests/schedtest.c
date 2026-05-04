@@ -164,11 +164,11 @@ void _start(void) {
     // TAP-test footprint beyond schedtest's smoke-coverage role. Tracked
     // separately in the schedbench harness (user/schedbench.c).
     tap_skip("work-stealing-fires",
-             "verified via gash psinfo --per-cpu / schedbench, not via TAP");
+             "FU24.G: verified via gash psinfo --per-cpu / schedbench, not via TAP");
     tap_skip("1000-task balance convergence",
-             "stress fixture lives in user/schedbench.c, not in TAP smoke");
+             "FU24.G: stress fixture lives in user/schedbench.c, not in TAP smoke");
     tap_skip("10240-task stress",
-             "stress fixture lives in user/schedbench.c, not in TAP smoke");
+             "FU24.G: stress fixture lives in user/schedbench.c, not in TAP smoke");
 
     tap_done();
     syscall_exit(0);

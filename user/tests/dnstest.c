@@ -55,7 +55,7 @@ void _start(void) {
     if (!probe_netd()) {
         printf("  netd not reachable — skipping suite\n");
         for (int i = 0; i < 8; i++) {
-            tap_skip("dnstest assertion", "netd not running in test mode");
+            tap_skip("dnstest assertion", "FU24.G: netd not running in ktest mode (environmental)");
         }
         tap_done();
         exit(0);
@@ -75,7 +75,7 @@ void _start(void) {
             http_response_free(&probe);
             for (int i = 0; i < 8; i++) {
                 tap_skip("dnstest assertion",
-                         "host-side HTTP listener not reachable in test harness");
+                         "FU24.G: host-side HTTP listener not reachable in test harness (environmental)");
             }
             tap_done();
             exit(0);

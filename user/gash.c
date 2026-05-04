@@ -3318,8 +3318,110 @@ static int execute_builtin(char *argv[], int argc) {
     return 0; // Not a built-in
 }
 
+// FU25.A.2: gash script-mode helper. Reads commands from file line by line,
+// dispatches each via process_cmdline, then exits. Used by gash_txn_commit /
+// gash_txn_abort gate tests to drive `txn { } commit|abort` programmatically.
+// No prompt, no readline, no history.
+//
+// Two activation paths:
+//   (a) `bin/gash --script <path>` once SYS_SPAWN gains argv passthrough
+//       (FU25.A.4, post-Phase-26 entry-gate prerequisite).
+//   (b) Sentinel file at /tmp/.gash-script (v1, used by Phase 26 closeout
+//       gate tests). gash auto-runs the sentinel on startup, then truncates
+//       the file (so subsequent gash spawns are interactive).
+//
+// Note: process_cmdline tokenises in-place (destroys its input), so each
+// line is copied to a stable buffer before dispatch.
+#define GASH_SCRIPT_SENTINEL "/.gash-script"
+
+static void run_script_mode(const char *path) {
+    int fd = syscall_open(path);
+    if (fd < 0) {
+        print("gash --script: cannot open ");
+        print(path);
+        print("\n");
+        syscall_exit(1);
+    }
+    char line_buf[256];
+    char exec_buf[256];
+    size_t line_len = 0;
+    char ch;
+    ssize_t r;
+    while ((r = syscall_read(fd, &ch, 1)) > 0) {
+        if (ch == '\n') {
+            line_buf[line_len] = '\0';
+            for (size_t i = 0; i <= line_len; i++) exec_buf[i] = line_buf[i];
+            print("> ");
+            print(exec_buf);
+            print("\n");
+            if (exec_buf[0] != '\0') process_cmdline(exec_buf);
+            line_len = 0;
+            continue;
+        }
+        if (line_len + 1 >= sizeof(line_buf)) {
+            line_buf[line_len] = '\0';
+            for (size_t i = 0; i <= line_len; i++) exec_buf[i] = line_buf[i];
+            print("> ");
+            print(exec_buf);
+            print("\n");
+            if (exec_buf[0] != '\0') process_cmdline(exec_buf);
+            line_len = 0;
+        }
+        line_buf[line_len++] = ch;
+    }
+    if (line_len > 0) {
+        line_buf[line_len] = '\0';
+        for (size_t i = 0; i <= line_len; i++) exec_buf[i] = line_buf[i];
+        print("> ");
+        print(exec_buf);
+        print("\n");
+        process_cmdline(exec_buf);
+    }
+    syscall_close(fd);
+    // Self-clean the sentinel so subsequent gash spawns are interactive.
+    int clean_fd = syscall_open(GASH_SCRIPT_SENTINEL);
+    if (clean_fd >= 0) {
+        (void)syscall_truncate(clean_fd);
+        syscall_close(clean_fd);
+    }
+    int drain_iters = 0;
+    while (bg_count > 0 && drain_iters < 1000) {
+        bg_check_completed();
+        spin_us(1000);
+        drain_iters++;
+    }
+    syscall_exit(0);
+}
+
+// FU25.A.2 sentinel check: runs at the very top of _start. Returns 1 if a
+// non-empty sentinel was found (and run_script_mode was invoked, which
+// doesn't return). Returns 0 if no sentinel — gash continues to interactive.
+static int try_run_script_sentinel(void) {
+    int fd = syscall_open(GASH_SCRIPT_SENTINEL);
+    if (fd < 0) return 0;
+    char first_byte;
+    ssize_t n = syscall_read(fd, &first_byte, 1);
+    syscall_close(fd);
+    if (n <= 0) return 0;  // empty sentinel = no script
+    run_script_mode(GASH_SCRIPT_SENTINEL);
+    return 1;  // unreachable; run_script_mode exits.
+}
+
 // Main shell
-void _start(void) {
+void _start(int argc, char **argv) {
+    // FU25.A.2 (a) future-proofing: --script <path> if SYS_SPAWN ever gains
+    // argv passthrough. Currently SYS_SPAWN doesn't propagate argv, so this
+    // branch is inert in practice — kept so the post-FU25.A.4 transition
+    // is a one-line change in the spawning test.
+    if (argc >= 3 && argv != NULL && argv[1] != NULL && argv[2] != NULL
+        && strcmp(argv[1], "--script") == 0) {
+        run_script_mode(argv[2]);
+    }
+
+    // FU25.A.2 (b) v1 path: sentinel file. gash_txn_* tests stage the
+    // sentinel before spawning gash; gash auto-runs and self-cleans.
+    (void)try_run_script_sentinel();  // doesn't return on success.
+
     print("=== GrahaOS Shell v4.0 ===\n");
     print("Type 'help' for commands.\n\n");
 

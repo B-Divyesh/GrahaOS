@@ -1,18 +1,31 @@
 // kernel/vsnprintf.h
 // Phase 13: minimal kernel-space formatted output for klog and panic paths.
+// FU26.C (Phase 26 closeout): width + flags parser added. Float still off.
 //
-// Scope is deliberately narrow. Supported conversions:
+// Supported conversions:
 //   %d %ld      signed int / long
 //   %u %lu      unsigned int / long
 //   %x %lx      unsigned hex
-//   %p          pointer, always "0x" + 16 hex digits
+//   %p          pointer, always "0x" + 16 hex digits (width ignored)
 //   %s          null-terminated string
 //   %.*s        precision-bounded string (klog_write uses this)
 //   %c          char
 //   %%          literal percent
 //
-// No width flags, no padding, no floats — keep the binary small and the
-// format path re-entrant enough that kpanic can rely on it.
+// FU26.C width/flags subset:
+//   %5d         right-align in field of width 5 (space pad)
+//   %-5d        left-align in field of width 5 (space pad on right)
+//   %04x        zero-padded 4-digit hex
+//   %08x        zero-padded 8-digit hex
+//   %02u        zero-padded 2-digit unsigned (used by rtc.c timestamps)
+//   %+d         force sign on non-negative
+//   % d         space prefix on non-negative
+//   %*d         width consumed from va_arg (negative width = left-align)
+//   any combination (e.g. %-+5d, %05ld, %-10s)
+//
+// No floats, no length specifiers beyond `l/ll` (both 64-bit), no `%n`.
+// Width and flags before unrecognised conversion type still consume the
+// va_args correctly, so subsequent slots don't slip (FU26.A trap fixed).
 #pragma once
 
 #include <stdarg.h>

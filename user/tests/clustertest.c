@@ -56,11 +56,9 @@ void _start(void) {
     // the other channel-mode FS races (FU24.B/C). Tests 4+5 still pass
     // via the FS-prime block below which retries /cl_alpha2's simhash.
     tap_skip("2. SimHash triggers auto-clustering (new cluster created)",
-             "Phase 25 Stage A: substrate ported but cl_alpha dirent settle "
-             "issue is a deeper v2 journal-app timing race; deferred to "
-             "pre-Phase-28 sweep");
+             "FU24.B/C: v2 dirent settle race; deferred to pre-Phase-28 sweep");
     tap_skip("3. Identical content -> same cluster",
-             "Phase 25 Stage A: depends on cl_alpha simhash (skipped above)");
+             "FU24.B/C: depends on cl_alpha simhash (skipped above)");
 
     // FS-prime work block: even though tests 2 + 3 are skipped, do the
     // /cl_alpha + /cl_alpha2 file creates anyway. The original (pre-W10)

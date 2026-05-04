@@ -59,7 +59,7 @@ void _start(void) {
     /* Phase 24a W10: kernel-resident "disk" CAN cap stripped — ahcid owns
      * the HBA via SYS_DRV_REGISTER + /sys/blk/service.  Skip with reason. */
     tap_skip("SYS_CAN_LOOKUP resolves 'disk'",
-             "Phase 24a W10: kernel AHCI + 'disk' CAN cap stripped");
+             "FU24.G/Phase24a-W10: kernel AHCI + 'disk' CAN cap stripped");
 
     // =======================================================================
     // G2: SYS_CAN_LOOKUP returns 0 on unknown name (1 assert)
@@ -77,12 +77,12 @@ void _start(void) {
      * cap and DEBUG_AHCI_IS_ACTIVE syscall are gone (ahcid owns the HBA).
      * Skip with reason — the ahcid daemon is the post-strip authority. */
     tap_skip("ahci is active at test start",
-             "Phase 24a W10: kernel AHCI stripped; ahcid owns HBA");
+             "FU24.G/Phase24a-W10: kernel AHCI stripped; ahcid owns HBA");
     // Phase 21.1: register-level reads no longer reachable from kernel — the
     // E1000 MMIO is owned by /bin/e1000d. Skip and rely on cap-state asserts
     // below to verify CAN deactivate/activate semantics.
     tap_skip("E1000_RCTL.EN is set initially",
-             "Phase 21.1: e1000_debug_read_reg removed (daemon owns MMIO)");
+             "FU24.G/Phase21.1: e1000_debug_read_reg removed (daemon owns MMIO)");
 
     // =======================================================================
     // G4: deactivate keyboard -> flag off, PIC mask bit set (3 asserts)
@@ -117,15 +117,15 @@ void _start(void) {
     // Phase 21.1: the kernel can no longer read E1000 registers. The
     // CAN-state assertions below cover deactivate/activate semantics.
     tap_skip("E1000_RCTL.EN cleared after deactivate",
-             "Phase 21.1: e1000_debug_read_reg removed (daemon owns MMIO)");
+             "FU24.G/Phase21.1: e1000_debug_read_reg removed (daemon owns MMIO)");
     tap_skip("E1000_TCTL.EN cleared after deactivate",
-             "Phase 21.1: e1000_debug_read_reg removed (daemon owns MMIO)");
+             "FU24.G/Phase21.1: e1000_debug_read_reg removed (daemon owns MMIO)");
     TAP_ASSERT(e1000_act() == 0, "e1000_act() reports cap OFF after deactivate");
 
     r = syscall_can_activate_t(t_e1000);
     TAP_ASSERT(r == 0, "SYS_CAN_ACTIVATE_T(e1000) succeeds");
     tap_skip("E1000_RCTL.EN set after reactivate",
-             "Phase 21.1: e1000_debug_read_reg removed (daemon owns MMIO)");
+             "FU24.G/Phase21.1: e1000_debug_read_reg removed (daemon owns MMIO)");
 
     // =======================================================================
     // G7: deactivate disk -> port CMD.ST cleared (3 asserts).  Phase 24a
@@ -136,11 +136,11 @@ void _start(void) {
     // ahcid_basic_io tests instead.
     (void)t_disk;
     tap_skip("SYS_CAN_DEACTIVATE_T(disk) returns cascade count or -EBUSY",
-             "Phase 24a W10: kernel AHCI + 'disk' CAN cap stripped");
+             "FU24.G/Phase24a-W10: kernel AHCI + 'disk' CAN cap stripped");
     tap_skip("AHCI port 0 CMD.ST cleared after deactivate",
-             "same — ahcid owns HBA registers post-strip");
+             "FU24.G/Phase24a-W10: ahcid owns HBA registers post-strip");
     tap_skip("SYS_CAN_ACTIVATE_T(disk) succeeds",
-             "same — 'disk' CAN cap no longer exists");
+             "FU24.G/Phase24a-W10: 'disk' CAN cap no longer exists");
 
     // =======================================================================
     // G8: Seven deprecated syscalls all return -EDEPRECATED (-78) (7 asserts)

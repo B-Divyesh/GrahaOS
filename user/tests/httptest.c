@@ -53,8 +53,8 @@ static void ip_octets(uint32_t ip, uint8_t out[4]) {
 static void test_stack_running(void) {
     printf("\n=== Group 1: Stack Status ===\n");
     if (!probe_netd()) {
-        tap_skip("1. net_query(STATUS) succeeds", "netd not running");
-        tap_skip("2. TCP/IP stack is running", "netd not running");
+        tap_skip("1. net_query(STATUS) succeeds", "FU24.G: netd not running in ktest mode (environmental)");
+        tap_skip("2. TCP/IP stack is running", "FU24.G: netd not running in ktest mode (environmental)");
         return;
     }
     libnet_net_query_resp_t resp;
@@ -66,7 +66,7 @@ static void test_stack_running(void) {
 static void test_ip_address(void) {
     printf("\n=== Group 2: IP Configuration ===\n");
     if (!probe_netd()) {
-        tap_skip("3. IP address is 10.0.2.15", "netd not running");
+        tap_skip("3. IP address is 10.0.2.15", "FU24.G: netd not running in ktest mode (environmental)");
         return;
     }
     libnet_net_query_resp_t resp;
@@ -83,7 +83,7 @@ static void test_ip_address(void) {
 static void test_netmask(void) {
     printf("\n=== Group 3: Netmask ===\n");
     if (!probe_netd()) {
-        tap_skip("4. Netmask is 255.255.255.0", "netd not running");
+        tap_skip("4. Netmask is 255.255.255.0", "FU24.G: netd not running in ktest mode (environmental)");
         return;
     }
     libnet_net_query_resp_t resp;
@@ -100,7 +100,7 @@ static void test_netmask(void) {
 static void test_gateway(void) {
     printf("\n=== Group 4: Gateway ===\n");
     if (!probe_netd()) {
-        tap_skip("5. Gateway is 10.0.2.2", "netd not running");
+        tap_skip("5. Gateway is 10.0.2.2", "FU24.G: netd not running in ktest mode (environmental)");
         return;
     }
     libnet_net_query_resp_t resp;

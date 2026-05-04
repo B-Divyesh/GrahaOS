@@ -47,7 +47,7 @@ void _start(void) {
     if (pid <= 0) {
         for (int i = 2; i <= 5; i++) {
             tap_skip("ahcid_register",
-                     "spawn failed; cannot continue");
+                     "FU24.G: ahcid spawn failed (environmental)");
         }
         tap_done();
         syscall_exit(0);

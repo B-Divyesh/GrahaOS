@@ -93,7 +93,13 @@
 #define AUDIT_TXN_COMMIT              42  // SYS_TXN_COMMIT: replay completed; snapshot discarded
 #define AUDIT_TXN_ABORT               43  // SYS_TXN_ABORT: buffer dropped + snapshot restored
 #define AUDIT_TXN_PARTIAL_EXTERNAL    44  // commit-then-abort or task_exit mid-txn — N msgs were already on the wire
-#define AUDIT_EVENT_MAX               44
+// Phase 26: WebAssembly sandbox lifecycle + PLEDGE_FLAG_NARROW_EXEC.
+#define AUDIT_WASM_CAP_DENIED         45  // module ran a host import that referenced an absent cap
+#define AUDIT_WASM_TRAP               46  // module trapped (div by zero, OOB access, ...)
+#define AUDIT_WASM_CRASHED            47  // wasmd_worker process died unexpectedly mid-execution
+#define AUDIT_WASM_OUT_OF_FUEL        48  // fuel exhaustion (Wasmtime) / wall-clock deadline (wasm3)
+#define AUDIT_PLEDGE_NARROW_EXEC      49  // SYS_PLEDGE | PLEDGE_FLAG_NARROW_EXEC: child spawned with narrowed bundle
+#define AUDIT_EVENT_MAX               49
 
 // Source of the event.
 #define AUDIT_SRC_NATIVE  0   // Native v2 API.
@@ -411,6 +417,22 @@ void audit_write_txn_partial_external(int32_t caller_pid, uint32_t obj_idx,
                                       uint64_t txn_id, uint32_t delivered,
                                       uint32_t remaining,
                                       uint8_t force_drop);
+
+// Phase 26 writers. Each emits an audit_entry_t with the matching event_type.
+// PLEDGE_NARROW_EXEC carries (parent_pid, child_pid, old_mask=parent's, new_mask=narrowed).
+// Other WASM events take (parent_pid=wasmd, obj_idx=cap_kind_wasm_instance index, detail).
+void audit_write_pledge_narrow_exec(int32_t parent_pid, int32_t child_pid,
+                                    uint16_t parent_pledges,
+                                    uint16_t child_pledges,
+                                    const char *entry_path);
+void audit_write_wasm_cap_denied(int32_t parent_pid, uint32_t obj_idx,
+                                 const char *denied_op);
+void audit_write_wasm_trap(int32_t parent_pid, uint32_t obj_idx,
+                           const char *trap_kind);
+void audit_write_wasm_crashed(int32_t parent_pid, uint32_t obj_idx,
+                              int32_t exit_code);
+void audit_write_wasm_out_of_fuel(int32_t parent_pid, uint32_t obj_idx,
+                                  uint64_t fuel_consumed);
 
 // ---------------------------------------------------------------------------
 // Query path. Backs SYS_AUDIT_QUERY.

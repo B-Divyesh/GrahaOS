@@ -406,6 +406,13 @@ void kmain(void) {
         cap_system_init();
     }
 
+    // Phase 26 Stage D: CAP_KIND_WASM_INSTANCE substrate.
+    {
+        extern void cap_wasm_instance_init(void);
+        klog(KLOG_INFO, SUBSYS_CORE, "Phase 26 Stage D: cap_wasm_instance_init...");
+        cap_wasm_instance_init();
+    }
+
     // Phase 15b: initialize the audit queue BEFORE the first cap_register
     // so every bootstrap cap's registration emits an audit entry. The
     // flusher isn't running yet; entries queue in memory until attach_fs +

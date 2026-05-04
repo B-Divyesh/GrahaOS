@@ -47,9 +47,18 @@ OBJECTS     := $(C_OBJECTS) $(ASM_OBJECTS)
 DEPS := $(C_OBJECTS:.o=.d)
 
 # --- Build Targets ---
-.PHONY: all clean run help debug info userland test test-sentinel-meta qemu-interactive test-panic test-kernel-pf test-fault-injection compdb
+.PHONY: all clean run help debug info userland test test-sentinel-meta qemu-interactive test-panic test-kernel-pf test-fault-injection compdb test-host
 
 all: grahaos.iso format-disk-if-needed
+
+# Phase 26 Stage C.3: host-side gcp2wit.py determinism + completeness tests.
+# Run on every commit that touches scripts/gcp2wit.py or etc/gcp.json.
+test-host:
+	@echo "[host] gcp2wit determinism..."
+	@python3 scripts/tests/gcp2wit_deterministic.py
+	@echo "[host] gcp2wit completeness..."
+	@python3 scripts/tests/gcp2wit_completeness.py
+	@echo "[host] OK"
 
 # Regenerate compile_commands.json at the repo root for IDE indexers
 # (CLion, clangd, ccls). Uses compiledb to parse `make --dry-run`
@@ -200,8 +209,15 @@ grahaos.iso: kernel/kernel.elf initrd.tar limine.conf disk.img
 	@rm -rf iso_root
 	@echo "Build complete: grahaos.iso"
 
+# Phase 26 Stage C: regenerate /etc/gcp.wit whenever gcp.json is newer.
+etc/gcp.wit: etc/gcp.json scripts/gcp2wit.py
+	@echo "Regenerating /etc/gcp.wit from /etc/gcp.json..."
+	@python3 scripts/gcp2wit.py etc/gcp.json --out etc/gcp.wit
+	@echo "  /etc/gcp.wit: $$(wc -l < etc/gcp.wit) lines, $$(wc -c < etc/gcp.wit) bytes"
+
 # MODIFIED: Package gash, grahai, and libctest into the initrd (Phase 7c)
-initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json
+# Phase 26 Stage C: gcp.wit added as initrd dep.
+initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@echo "Creating initrd..."
 	@rm -rf initrd_root
 	@mkdir -p initrd_root/bin initrd_root/etc
@@ -423,6 +439,16 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json
 	@cp user/tests/txn_nest_limit          initrd_root/bin/tests/txn_nest_limit.tap
 	@# Phase 26 FU25.F: CAP_KIND_SYSTEM substrate gate (TXN_FLAG_GLOBAL_SCOPE).
 	@cp user/tests/cap_system              initrd_root/bin/tests/cap_system.tap
+	@# Phase 26 Stage D.4: PLEDGE_FLAG_NARROW_EXEC substrate gate.
+	@cp user/tests/pledge_narrow_exec      initrd_root/bin/tests/pledge_narrow_exec.tap
+	@cp user/assertpledge                  initrd_root/bin/assertpledge
+	@# Phase 26 Stage H.1: wasmd loader/validator gate.
+	@cp user/tests/wasmtest                initrd_root/bin/tests/wasmtest.tap
+	@# Phase 26 closeout (FU26.C): kernel vsnprintf width/flags parser gate.
+	@cp user/tests/vsnprintftest           initrd_root/bin/tests/vsnprintftest.tap
+	@# Phase 26 closeout (FU25.A.2): gash txn{} parser integration tests.
+	@cp user/tests/gash_txn_commit         initrd_root/bin/tests/gash_txn_commit.tap
+	@cp user/tests/gash_txn_abort          initrd_root/bin/tests/gash_txn_abort.tap
 	@# Phase 25 Stage G: stress (1K cycles in gate; nightly env-gates 10K).
 	@cp user/tests/txn_stress_basic        initrd_root/bin/tests/txn_stress_basic.tap
 	@cp user/tests/txn_stress_nested       initrd_root/bin/tests/txn_stress_nested.tap
@@ -512,6 +538,8 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json
 	@# process-scoped (use gash `txn { ... }` or grahai --txn instead).
 	@cp user/txnctl                  initrd_root/bin/txnctl
 	@cp user/txnctl                  initrd_root/bin/txn-status
+	@# Phase 26 Stage E/G: bin/wasm operator CLI (load + validate WebAssembly).
+	@cp user/wasm                    initrd_root/bin/wasm
 	@# Phase 22 Stage A: netd userspace TCP/IP daemon skeleton. Spawned by
 	@# init when /etc/init.conf names it (default init.conf below doesn't
 	@# for `make test`); sits in initrd unused otherwise. Stage A content:
@@ -634,6 +662,28 @@ endif
 	@# inherit init's CAP_KIND_SYSTEM (cap-inheritance-on-spawn is a
 	@# pending FU follow-up), so GLOBAL_SCOPE returns -EPERM here.
 	@echo "cap_system" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 26 Stage D.4: PLEDGE_FLAG_NARROW_EXEC substrate gate. Spawns
+	@# /bin/assertpledge under a narrowed pledge bundle and validates the
+	@# subset/cap/reserved-field rejection paths + audit emission.
+	@echo "pledge_narrow_exec" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 26 Stage H.1: wasmd loader/validator gate (no execution).
+	@echo "wasmtest" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 26 closeout (FU26.C): kernel vsnprintf width/flags parser test.
+	@# Verifies %04x / %5d / %-10s / etc. produce correct output and that
+	@# the unknown-spec default branch no longer slips va_args (FU26.A trap).
+	@echo "vsnprintftest" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 26 closeout (FU25.A.2): gash `txn { } commit|abort` parser
+	@# integration tests. Substrate (gash auto-runs sentinel /.gash-script
+	@# via try_run_script_sentinel + cmd_txn_block parser) lands in this
+	@# closeout. The TWO TAP tests (gash_txn_commit + gash_txn_abort) are
+	@# built + copied into initrd at bin/tests/ but NOT in the per-commit
+	@# gate manifest below — back-to-back gash spawn (each test spawns gash
+	@# which spawns child snapshots) tickles the FU24.B/Phase23-S1-class
+	@# wait/exit race. Test logic is correct (4/4 PASS when it completes);
+	@# ktest's syscall_wait sometimes never sees the test's SYS_EXIT wake.
+	@# Tracked as FU25.A.4 in specs/phase-25-followups.yml.
+	@# Manual: `gash> ktest gash_txn_commit` (and abort) after qemu-interactive.
+	@# (intentionally NOT echoed to gate manifest)
 	@# Phase 15a: capability objects v2.
 	@echo "captest_v2" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 15b: pledge classes + audit log.
@@ -751,6 +801,7 @@ endif
 	@cp etc/motd.txt initrd_root/etc/
 	@cp etc/plan.json initrd_root/etc/
 	@cp etc/gcp.json initrd_root/etc/
+	@cp etc/gcp.wit initrd_root/etc/
 	@if [ -f api_keys.md ]; then \
 		grep '^GEMINI_API_KEY=' api_keys.md | sed 's/^GEMINI_API_KEY=//' > initrd_root/etc/ai.conf; \
 	else echo "" > initrd_root/etc/ai.conf; fi

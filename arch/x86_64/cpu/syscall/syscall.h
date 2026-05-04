@@ -346,6 +346,13 @@
 #define DEBUG_FB_IS_ACTIVE    65  // no args; returns 1/0.
 #define DEBUG_E1000_IS_ACTIVE 66  // no args; returns 1/0.
 #define DEBUG_AHCI_IS_ACTIVE  67  // no args; returns 1/0.
+// FU26.C (Phase 26 closeout): kernel ksnprintf reachable from user/tests.
+//   RSI = const char *fmt (user, NUL-term, max 255)
+//   RDX = uint64_t arg1
+//   R10 = uint64_t arg2
+//   R8  = char *out (user, must be 256 bytes)
+// Returns vsnprintf-convention byte count or -EFAULT on copy failure.
+#define DEBUG_VSNPRINTF       68
 
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);

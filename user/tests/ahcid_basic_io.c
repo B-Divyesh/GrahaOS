@@ -62,7 +62,7 @@ void _start(void) {
     cap_token_u_t t_disk = syscall_can_lookup("disk", 4);
     if (t_disk.raw == 0) {
         for (int i = 1; i <= 7; i++) {
-            tap_skip("ahcid_basic_io", "disk cap not found");
+            tap_skip("ahcid_basic_io", "FU24.G: disk cap not found (environmental)");
         }
         tap_done();
         syscall_exit(0);
@@ -73,7 +73,7 @@ void _start(void) {
     if (deact_rc < 1) {
         // Refused: kernel is busy; can't safely run.
         for (int i = 2; i <= 7; i++) {
-            tap_skip("ahcid_basic_io", "disk cap busy; skipping I/O test");
+            tap_skip("ahcid_basic_io", "FU24.G: disk cap busy; skipping I/O test (environmental)");
         }
         tap_done();
         syscall_exit(0);
@@ -85,7 +85,7 @@ void _start(void) {
     TAP_ASSERT(spawned, "2. /bin/ahcid spawns successfully");
     if (!spawned) {
         for (int i = 3; i <= 7; i++) {
-            tap_skip("ahcid_basic_io", "ahcid spawn failed");
+            tap_skip("ahcid_basic_io", "FU24.G: ahcid spawn failed (environmental)");
         }
         // Try to reactivate the disk cap before exit (best-effort).
         (void)syscall_can_activate_t(t_disk);
@@ -102,7 +102,7 @@ void _start(void) {
         syscall_kill(pid, 9);
         int s = 0; (void)syscall_wait(&s);
         for (int i = 4; i <= 7; i++) {
-            tap_skip("ahcid_basic_io", "service did not publish");
+            tap_skip("ahcid_basic_io", "FU24.G: service did not publish (environmental)");
         }
         (void)syscall_can_activate_t(t_disk);
         tap_done();
@@ -117,7 +117,7 @@ void _start(void) {
     if (!connected) {
         syscall_kill(pid, 9);
         int s = 0; (void)syscall_wait(&s);
-        for (int i = 5; i <= 7; i++) tap_skip("ahcid_basic_io", "no chan");
+        for (int i = 5; i <= 7; i++) tap_skip("ahcid_basic_io", "FU24.G: no chan (environmental)");
         (void)syscall_can_activate_t(t_disk);
         tap_done();
         syscall_exit(0);
@@ -133,7 +133,7 @@ void _start(void) {
     if (!vmo_ok) {
         syscall_kill(pid, 9);
         int s = 0; (void)syscall_wait(&s);
-        for (int i = 6; i <= 7; i++) tap_skip("ahcid_basic_io", "no vmo");
+        for (int i = 6; i <= 7; i++) tap_skip("ahcid_basic_io", "FU24.G: no vmo (environmental)");
         (void)syscall_can_activate_t(t_disk);
         tap_done();
         syscall_exit(0);
@@ -203,7 +203,7 @@ void _start(void) {
         TAP_ASSERT(any_nonzero || has_magic,
                    "7. LBA 0 contents present in DMA buffer");
     } else {
-        tap_skip("ahcid_basic_io", "vmo_map failed");
+        tap_skip("ahcid_basic_io", "FU24.G: vmo_map failed (environmental)");
     }
 
     // Cleanup. Kill ahcid; the kernel's ahci_restore_after_userdrv_death

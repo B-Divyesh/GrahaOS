@@ -260,6 +260,8 @@ typedef struct {
 #define DEBUG_FB_IS_ACTIVE     65
 #define DEBUG_E1000_IS_ACTIVE  66
 #define DEBUG_AHCI_IS_ACTIVE   67
+// FU26.C: kernel-side ksnprintf reachable from user/tests/vsnprintftest.c.
+#define DEBUG_VSNPRINTF        68
 #define DEBUG_SET_WALL       51
 
 // Phase 15a: Capability Objects v2 constants (mirror kernel/cap/token.h).
@@ -362,6 +364,12 @@ typedef struct {
 #define AUDIT_CAP_GRANT               5
 #define AUDIT_CAP_VIOLATION           6
 #define AUDIT_PLEDGE_NARROW           7
+// Phase 26 mirrors of kernel/audit.h codes 45-49.
+#define AUDIT_WASM_CAP_DENIED        45
+#define AUDIT_WASM_TRAP              46
+#define AUDIT_WASM_CRASHED           47
+#define AUDIT_WASM_OUT_OF_FUEL       48
+#define AUDIT_PLEDGE_NARROW_EXEC     49
 #define AUDIT_SPAWN                   8
 #define AUDIT_KILL                    9
 #define AUDIT_FS_WRITE_CRITICAL      10
@@ -395,7 +403,12 @@ typedef struct {
 #define AUDIT_DRV_DIED               36
 #define AUDIT_MMIO_DENIED            37
 #define AUDIT_IRQ_DROPPED            38
-#define AUDIT_EVENT_MAX              38
+// Phase 25: transaction lifecycle events.
+#define AUDIT_TXN_BEGIN              41
+#define AUDIT_TXN_COMMIT             42
+#define AUDIT_TXN_ABORT              43
+#define AUDIT_TXN_PARTIAL_EXTERNAL   44
+#define AUDIT_EVENT_MAX              49  // Phase 26: AUDIT_PLEDGE_NARROW_EXEC + WASM_*
 
 #define AUDIT_SRC_NATIVE  0
 #define AUDIT_SRC_SHIM    1
@@ -983,6 +996,30 @@ static inline long syscall_debug3(int op, long a1, long a2) {
     return ret;
 }
 
+// FU26.C: SYS_DEBUG wrapper for DEBUG_VSNPRINTF.
+//   fmt:  user format string (NUL-terminated, max 255 bytes).
+//   a1, a2: caller-defined uint64_t args, passed through to ksnprintf.
+//   out:  user-side 256-byte buffer to receive the formatted output.
+// Returns the number of bytes the formatted output would consume
+// (vsnprintf convention) or -EFAULT on copy failure.
+static inline long syscall_debug_vsnprintf(const char *fmt,
+                                           uint64_t a1, uint64_t a2,
+                                           char *out) {
+    long ret;
+    register uint64_t r10 asm("r10") = a2;
+    register uint64_t r8  asm("r8")  = (uint64_t)(uintptr_t)out;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_DEBUG),
+          "D"((uint64_t)DEBUG_VSNPRINTF),
+          "S"((uint64_t)(uintptr_t)fmt),
+          "d"(a1),
+          "r"(r10),
+          "r"(r8)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
 // Phase 14: kheap_stats_entry_t — must mirror kernel/mm/kheap.h exactly.
 typedef struct kheap_stats_entry_u {
     char     name[32];
@@ -1107,6 +1144,37 @@ static inline long syscall_pledge(uint16_t new_mask) {
     asm volatile("syscall"
         : "=a"(ret)
         : "a"(SYS_PLEDGE), "D"((uint64_t)new_mask)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Phase 26 Stage D — PLEDGE_FLAG_NARROW_EXEC. Userspace mirror of
+// kernel/cap/pledge.h. wasmd uses this to spawn its worker process with
+// the narrowed pledge bundle + delegated capability handles already
+// installed atomically (no observable wide-pledged window).
+#define PLEDGE_FLAG_NARROW_EXEC_U  0x80000000u
+#define WASM_PLEDGE_NARROW_DELEGATIONS_MAX_U  16
+#define WASM_PLEDGE_NARROW_PATH_MAX_U         64
+
+typedef struct wasm_pledge_narrow_args_u {
+    uint16_t new_pledges;
+    uint16_t reserved16;
+    uint32_t flags;
+    char     entry_path[WASM_PLEDGE_NARROW_PATH_MAX_U];
+    uint64_t cap_delegation_list[WASM_PLEDGE_NARROW_DELEGATIONS_MAX_U];
+    uint8_t  ndelegations;
+    uint8_t  reserved8[7];
+} wasm_pledge_narrow_args_u_t;
+
+// SYS_PLEDGE | PLEDGE_FLAG_NARROW_EXEC: returns child PID on success,
+// negative -CAP_V2_* on failure.
+static inline long syscall_pledge_narrow_exec(const wasm_pledge_narrow_args_u_t *args) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_PLEDGE),
+          "D"((uint64_t)PLEDGE_FLAG_NARROW_EXEC_U),
+          "S"((uint64_t)(uintptr_t)args)
         : "rcx", "r11", "memory");
     return ret;
 }

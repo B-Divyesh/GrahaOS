@@ -1062,6 +1062,12 @@ void sched_reap_zombie(int task_id) {
     extern void txn_task_exit_cleanup(task_t *dying);
     txn_task_exit_cleanup(task_ptrs[task_id]);
 
+    // Phase 26 Stage D: revoke any CAP_KIND_WASM_INSTANCE owned by the
+    // dying task (either as the worker process or as the wasmd parent).
+    // Mirrors the txn cleanup pattern (R5).
+    extern void cap_wasm_task_exit_cleanup(int32_t dying_pid);
+    cap_wasm_task_exit_cleanup((int32_t)(*task_ptrs[task_id]).id);
+
     // Phase 22: if the dying task had published any /sys/net/* names in
     // the rawnet registry (e.g. e1000d published /sys/net/rawframe, netd
     // published /sys/net/service), clear those entries so the next spawn

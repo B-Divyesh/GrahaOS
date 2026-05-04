@@ -67,7 +67,7 @@ void _start(void) {
     TAP_ASSERT(fd >= 0, "1. /etc/gcp.json opens");
     if (fd < 0) {
         for (int i = 2; i <= 5; i++) {
-            tap_skip("blk_stress_random_read", "scratch file unavailable");
+            tap_skip("blk_stress_random_read", "FU24.G: scratch file unavailable (environmental)");
         }
         tap_done();
         syscall_exit(0);
@@ -96,8 +96,12 @@ void _start(void) {
 
     // 4: compute mean + p99. Sort ascending, p99 = sample at index .99*N.
     if (valid == 0) {
-        for (int i = 4; i <= 5; i++) tap_skip("blk_stress_random_read",
-                                              "no valid samples");
+        // FU24.G: was silent tap_skip for "no valid samples". Now hard-fail
+        // so the gate is loud — if all samples failed to read, that's a real
+        // bug (not a measurement gap), and silent-skip masked it.
+        printf("# FU24.G: no valid samples — all syscall_read calls failed\n");
+        TAP_ASSERT(0, "4. p99 latency under ~50 ms (loose envelope)");
+        TAP_ASSERT(0, "5. throughput >= 95 reads/sec (spec gate target)");
         tap_done();
         syscall_exit(0);
     }
@@ -128,7 +132,11 @@ void _start(void) {
         TAP_ASSERT(reads_per_sec >= 95ull,
                    "5. throughput >= 95 reads/sec (spec gate target)");
     } else {
-        tap_skip("blk_stress_random_read", "zero mean tsc — unreliable");
+        // FU24.G: was silent tap_skip for "zero mean tsc". A zero mean would
+        // mean the rdtsc calls returned identical timestamps — implies a
+        // clock anomaly, not a gap in test design. Hard-fail so we notice.
+        printf("# FU24.G: zero mean TSC — clock anomaly (rdtsc returned identical samples)\n");
+        TAP_ASSERT(0, "5. throughput >= 95 reads/sec (spec gate target)");
     }
 
     tap_done();

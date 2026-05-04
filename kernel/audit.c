@@ -991,6 +991,89 @@ void audit_write_txn_partial_external(int32_t caller_pid, uint32_t obj_idx,
 }
 
 // ---------------------------------------------------------------------------
+// Phase 26 writers — wasm sandbox lifecycle + atomic-narrow-spawn.
+// ---------------------------------------------------------------------------
+void audit_write_pledge_narrow_exec(int32_t parent_pid, int32_t child_pid,
+                                    uint16_t parent_pledges,
+                                    uint16_t child_pledges,
+                                    const char *entry_path) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_PLEDGE_NARROW_EXEC, parent_pid, AUDIT_SRC_NATIVE);
+    e.pledge_old = parent_pledges;
+    e.pledge_new = child_pledges;
+    e.result_code = 0;
+    char buf[160];
+    // FU26.A history: this format string used `%04x` for parent/narrow
+    // masks. Pre-FU26.C, kernel/vsnprintf.c did NOT parse width specs —
+    // the parser emitted "%04x" literally and consumed ZERO va_args, so
+    // subsequent %s read parent_pledges (0x3FFF) as a string pointer →
+    // kernel page fault at write_str. Worked around by switching to %x
+    // (FU26.A close).
+    // FU26.C closeout: parser now handles width + flags + precision per
+    // ANSI subset (see kernel/vsnprintf.c). %04x is restored — pledge
+    // masks are zero-padded to 4 hex digits for consistent log columns.
+    ksnprintf(buf, sizeof(buf),
+              "child=%d parent_mask=0x%04x narrow_mask=0x%04x path=%s",
+              (int)child_pid,
+              (unsigned)parent_pledges,
+              (unsigned)child_pledges,
+              entry_path ? entry_path : "?");
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_wasm_cap_denied(int32_t parent_pid, uint32_t obj_idx,
+                                 const char *denied_op) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_WASM_CAP_DENIED, parent_pid, AUDIT_SRC_NATIVE);
+    e.object_idx = obj_idx;
+    e.result_code = -1;
+    char buf[160];
+    ksnprintf(buf, sizeof(buf), "denied_op=%s",
+              denied_op ? denied_op : "?");
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_wasm_trap(int32_t parent_pid, uint32_t obj_idx,
+                           const char *trap_kind) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_WASM_TRAP, parent_pid, AUDIT_SRC_NATIVE);
+    e.object_idx = obj_idx;
+    e.result_code = -1;
+    char buf[160];
+    ksnprintf(buf, sizeof(buf), "trap=%s",
+              trap_kind ? trap_kind : "?");
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_wasm_crashed(int32_t parent_pid, uint32_t obj_idx,
+                              int32_t exit_code) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_WASM_CRASHED, parent_pid, AUDIT_SRC_NATIVE);
+    e.object_idx = obj_idx;
+    e.result_code = exit_code;
+    char buf[160];
+    ksnprintf(buf, sizeof(buf), "exit_code=%d", (int)exit_code);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_wasm_out_of_fuel(int32_t parent_pid, uint32_t obj_idx,
+                                  uint64_t fuel_consumed) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_WASM_OUT_OF_FUEL, parent_pid, AUDIT_SRC_NATIVE);
+    e.object_idx = obj_idx;
+    e.result_code = -1;
+    char buf[160];
+    ksnprintf(buf, sizeof(buf), "fuel_consumed=%lu",
+              (unsigned long)fuel_consumed);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+// ---------------------------------------------------------------------------
 // Query. Walks the in-memory ring from oldest still-resident entry to newest,
 // filtering by time window and event_mask. Reads from kernel memory only —
 // the caller (syscall dispatcher) is responsible for user-buffer copy.

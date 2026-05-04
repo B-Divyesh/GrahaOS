@@ -30,6 +30,7 @@ extern spinlock_t sched_lock;
 #include "../../../../kernel/fs/cluster.h"
 #include "../../../../kernel/autorun.h"
 #include "../../../../kernel/log.h"
+#include "../../../../kernel/vsnprintf.h"  // FU26.C: DEBUG_VSNPRINTF subop
 #include "../../../../kernel/mm/kheap.h"
 #include "../../../../kernel/percpu.h"
 #include "../../../../kernel/cap/pledge.h"
@@ -1840,6 +1841,40 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = (uint64_t)(long)-38;  // -ENOSYS
                 break;
             }
+            // FU26.C: exercise the kernel vsnprintf parser from userspace so
+            // user/tests/vsnprintftest.c can verify width/flags/precision
+            // handling without depending on klog format strings.
+            //   RDI = DEBUG_VSNPRINTF (op)
+            //   RSI = const char *fmt   (user pointer, NUL-terminated, max 255)
+            //   RDX = uint64_t arg1     (caller-defined, passed through)
+            //   R10 = uint64_t arg2     (caller-defined, passed through)
+            //   R8  = char *out         (user pointer, must be 256 bytes)
+            // Returns: number of bytes the formatted output would consume
+            // (vsnprintf convention) or -EFAULT on copy failure.
+            case DEBUG_VSNPRINTF: {
+                const char *user_fmt = (const char *)frame->rsi;
+                uint64_t a1 = frame->rdx;
+                uint64_t a2 = frame->r10;
+                char *user_out = (char *)frame->r8;
+                char fmt_local[256];
+                if (copy_string_from_user(user_fmt, fmt_local,
+                                          sizeof(fmt_local)) <= 0) {
+                    frame->rax = (uint64_t)(long)-14;  // -EFAULT
+                    break;
+                }
+                if (!is_user_pointer(user_out, 256)) {
+                    frame->rax = (uint64_t)(long)-14;
+                    break;
+                }
+                char result[256];
+                int n = ksnprintf(result, sizeof(result),
+                                  fmt_local, a1, a2);
+                for (size_t i = 0; i < sizeof(result); i++) {
+                    user_out[i] = result[i];
+                }
+                frame->rax = (uint64_t)(long)n;
+                break;
+            }
             default:
                 frame->rax = (uint64_t)-1;
                 break;
@@ -2049,6 +2084,137 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = (uint64_t)(long)CAP_V2_EPERM;
                 break;
             }
+
+            // Phase 26 Stage D: PLEDGE_FLAG_NARROW_EXEC branch. High bit on
+            // RDI signals "atomically spawn child at args.entry_path with
+            // narrowed pledges + delegated cap handles". RSI = user pointer
+            // to wasm_pledge_narrow_args_t.
+            if (frame->rdi & PLEDGE_FLAG_NARROW_EXEC) {
+                const wasm_pledge_narrow_args_t *user_args =
+                    (const wasm_pledge_narrow_args_t *)frame->rsi;
+                if (!user_args) {
+                    frame->rax = (uint64_t)(long)CAP_V2_EFAULT;
+                    break;
+                }
+                wasm_pledge_narrow_args_t a;
+                {
+                    const uint8_t *src = (const uint8_t *)user_args;
+                    uint8_t *dst = (uint8_t *)&a;
+                    for (size_t i = 0; i < sizeof(a); i++) dst[i] = src[i];
+                }
+                // Reserved fields must be zero (forward-compatibility lock).
+                if (a.reserved16 != 0 || a.flags != 0) {
+                    frame->rax = (uint64_t)(long)CAP_V2_EINVAL;
+                    break;
+                }
+                if (a.ndelegations > WASM_PLEDGE_NARROW_DELEGATIONS_MAX) {
+                    frame->rax = (uint64_t)(long)CAP_V2_EINVAL;
+                    break;
+                }
+                // Subset check: child's pledges must be a strict subset of
+                // caller's. (Equality is allowed; widening is rejected.)
+                pledge_mask_t parent_mask = cur->pledge_mask;
+                uint16_t child_mask = a.new_pledges & PLEDGE_ALL;
+                if (child_mask == 0) {
+                    frame->rax = (uint64_t)(long)CAP_V2_EINVAL;
+                    break;
+                }
+                if ((parent_mask.raw & child_mask) != child_mask) {
+                    audit_write_pledge_violation(cur->id,
+                                                 parent_mask.raw,
+                                                 child_mask,
+                                                 "narrow_exec widen attempt");
+                    frame->rax = (uint64_t)(long)CAP_V2_EPERM;
+                    break;
+                }
+                // entry_path must be NUL-terminated within the buffer.
+                int term = 0;
+                for (int i = 0; i < WASM_PLEDGE_NARROW_PATH_MAX; i++) {
+                    if (a.entry_path[i] == '\0') { term = 1; break; }
+                }
+                if (!term) {
+                    frame->rax = (uint64_t)(long)CAP_V2_EINVAL;
+                    break;
+                }
+
+                // Pre-validate every delegated cap_token resolves in caller's
+                // table. Failing fast here yields a clean -EPERM without
+                // having spawned a child that we'd then have to kill.
+                uint32_t resolved_obj_idx[WASM_PLEDGE_NARROW_DELEGATIONS_MAX] = {0};
+                uint8_t  resolved_token_flags[WASM_PLEDGE_NARROW_DELEGATIONS_MAX] = {0};
+                int validation_failed = 0;
+                for (int i = 0; i < a.ndelegations; i++) {
+                    cap_token_t tok = { .raw = a.cap_delegation_list[i] };
+                    cap_object_t *obj = cap_token_resolve(cur->id, tok, 0);
+                    if (!obj) {
+                        validation_failed = 1;
+                        break;
+                    }
+                    // Index back from object pointer.
+                    uint32_t idx = 0;
+                    for (uint32_t k = 1; k < CAP_OBJECT_CAPACITY; k++) {
+                        if (g_cap_object_ptrs[k] == obj) { idx = k; break; }
+                    }
+                    if (idx == 0) {
+                        validation_failed = 1;
+                        break;
+                    }
+                    resolved_obj_idx[i] = idx;
+                    resolved_token_flags[i] = cap_token_flags(tok);
+                }
+                if (validation_failed) {
+                    frame->rax = (uint64_t)(long)CAP_V2_EPERM;
+                    break;
+                }
+
+                // Spawn the child. sched_spawn_process loads the ELF and
+                // sets the child's initial pledge_mask = parent's (inherit).
+                int child_pid = sched_spawn_process(a.entry_path, cur->id);
+                if (child_pid < 0) {
+                    frame->rax = (uint64_t)(long)child_pid;
+                    break;
+                }
+
+                // Narrow the child's pledge_mask to the requested subset.
+                // Done IMMEDIATELY post-spawn so the child cannot finish
+                // booting and call a sensitive syscall under wider pledges.
+                // Phase 26 v1 limitation: there is a multi-CPU race window
+                // (matching SYS_SPAWN_EX semantics); a tighter spawn-with-
+                // attrs path is on the pre-Phase-28 sweep punch list.
+                task_t *child = pid_hash_lookup(child_pid);
+                if (child) {
+                    pledge_mask_t cm = { .raw = child_mask };
+                    spinlock_acquire(&child->pledge_lock);
+                    child->pledge_mask = cm;
+                    spinlock_release(&child->pledge_lock);
+
+                    // Install delegated handles into the child's handle
+                    // table. Each handle is "shared" — the parent retains
+                    // its slot; the child gets a fresh slot pointing at
+                    // the same cap_object_t.
+                    for (int i = 0; i < a.ndelegations; i++) {
+                        if (resolved_obj_idx[i] == 0) continue;
+                        uint32_t new_slot = 0;
+                        (void)cap_handle_insert(&child->cap_handles,
+                                                resolved_obj_idx[i],
+                                                resolved_token_flags[i],
+                                                &new_slot);
+                    }
+                }
+
+                // FU26.A re-enable: the prior crash was a vsnprintf-format
+                // mismatch (`%04x` not parsed; subsequent `%s` slipped a
+                // vararg slot). Helper now uses `%x` and works.
+                audit_write_pledge_narrow_exec(cur->id,
+                                               (int32_t)child_pid,
+                                               parent_mask.raw,
+                                               child_mask,
+                                               a.entry_path);
+                frame->rax = (uint64_t)(long)child_pid;
+                break;
+            }
+
+            // Standard self-narrow path (Phase 15b unchanged).
             pledge_mask_t new_mask = (pledge_mask_t){.raw = (uint16_t)frame->rdi};
             int rc = pledge_narrow(cur, new_mask);
             frame->rax = (uint64_t)(long)rc;

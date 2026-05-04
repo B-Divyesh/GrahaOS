@@ -20,7 +20,7 @@ void _start(void) {
 
     TAP_ASSERT(strcmp("grahaos", "grahaos") == 0, "strcmp equal strings");
 
-    tap_skip("nonexistent feature", "not implemented in Phase 12");
+    tap_skip("nonexistent feature", "FU24.G/self-test: deliberate skip exercising tap_skip framework");
 
     // Counters reflect what we did: plan=5, passed=4 so far (ok 1, ok 2,
     // ok 3, skip 4 which counts as passed). tap_get_* refreshes after

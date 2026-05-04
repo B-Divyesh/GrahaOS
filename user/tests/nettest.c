@@ -45,7 +45,7 @@ static int run_query(uint32_t field, libnet_net_query_resp_t *out) {
 static void test_query_all(void) {
     printf("\n=== Group 1: net_query (FIELD_ALL) ===\n");
     if (!probe_netd()) {
-        tap_skip("1. net_query(ALL) succeeds", "netd not running");
+        tap_skip("1. net_query(ALL) succeeds", "FU24.G: netd not running in ktest mode (environmental)");
         return;
     }
     libnet_net_query_resp_t resp;
@@ -56,8 +56,8 @@ static void test_query_all(void) {
 static void test_mac_address(void) {
     printf("\n=== Group 2: MAC Address ===\n");
     if (!probe_netd()) {
-        tap_skip("2. MAC address is non-zero", "netd not running");
-        tap_skip("3. MAC OUI matches QEMU (52:54:00)", "netd not running");
+        tap_skip("2. MAC address is non-zero", "FU24.G: netd not running in ktest mode (environmental)");
+        tap_skip("3. MAC OUI matches QEMU (52:54:00)", "FU24.G: netd not running in ktest mode (environmental)");
         return;
     }
     libnet_net_query_resp_t resp;
@@ -78,7 +78,7 @@ static void test_mac_address(void) {
 static void test_link_status(void) {
     printf("\n=== Group 3: Link Status ===\n");
     if (!probe_netd()) {
-        tap_skip("4. Link status is UP", "netd not running");
+        tap_skip("4. Link status is UP", "FU24.G: netd not running in ktest mode (environmental)");
         return;
     }
     libnet_net_query_resp_t resp;
