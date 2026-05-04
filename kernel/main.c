@@ -396,6 +396,16 @@ void kmain(void) {
     framebuffer_draw_string("Phase 15a Cap Objects Ready.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
+    // Phase 26 FU25.F: CAP_KIND_SYSTEM bootcap. Created here so that the
+    // very next phase init steps can rely on a CAP_KIND_SYSTEM root being
+    // present. cap_system_install_to_pid is invoked later from
+    // autorun_register_init_pid once init's PID is known.
+    {
+        extern void cap_system_init(void);
+        klog(KLOG_INFO, SUBSYS_CORE, "Phase 26 FU25.F: cap_system_init...");
+        cap_system_init();
+    }
+
     // Phase 15b: initialize the audit queue BEFORE the first cap_register
     // so every bootstrap cap's registration emits an audit entry. The
     // flusher isn't running yet; entries queue in memory until attach_fs +

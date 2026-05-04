@@ -421,6 +421,8 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json
 	@cp user/tests/txn_basic_abort         initrd_root/bin/tests/txn_basic_abort.tap
 	@cp user/tests/txn_nested_basic        initrd_root/bin/tests/txn_nested_basic.tap
 	@cp user/tests/txn_nest_limit          initrd_root/bin/tests/txn_nest_limit.tap
+	@# Phase 26 FU25.F: CAP_KIND_SYSTEM substrate gate (TXN_FLAG_GLOBAL_SCOPE).
+	@cp user/tests/cap_system              initrd_root/bin/tests/cap_system.tap
 	@# Phase 25 Stage G: stress (1K cycles in gate; nightly env-gates 10K).
 	@cp user/tests/txn_stress_basic        initrd_root/bin/tests/txn_stress_basic.tap
 	@cp user/tests/txn_stress_nested       initrd_root/bin/tests/txn_stress_nested.tap
@@ -626,6 +628,12 @@ endif
 	@echo "txn_basic_abort" >> initrd_root/bin/tests/manifest.txt
 	@echo "txn_nested_basic" >> initrd_root/bin/tests/manifest.txt
 	@echo "txn_nest_limit" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 26 FU25.F: CAP_KIND_SYSTEM bootcap + GLOBAL_SCOPE gate. Verifies
+	@# the substrate is in tree and txn_begin's GLOBAL_SCOPE check goes
+	@# through cap_system_resolve. Negative-path test: ktest doesn't
+	@# inherit init's CAP_KIND_SYSTEM (cap-inheritance-on-spawn is a
+	@# pending FU follow-up), so GLOBAL_SCOPE returns -EPERM here.
+	@echo "cap_system" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 15a: capability objects v2.
 	@echo "captest_v2" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 15b: pledge classes + audit log.

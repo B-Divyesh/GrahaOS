@@ -52,6 +52,27 @@ const char *autorun_decide(void) {
 void autorun_register_init_pid(int pid) {
     s_init_pid = pid;
     klog(KLOG_INFO, SUBSYS_CORE, "autorun: init pid=%lu", (unsigned long)((uint64_t)pid));
+
+    // Phase 26 FU25.F: install a CAP_KIND_SYSTEM sub-token in init's handle
+    // table. Init can derive narrowed sub-caps to trusted daemons (wasmd,
+    // future system-monitor) without sharing RIGHTS_ALL. Best-effort: if the
+    // bootcap doesn't exist (cap_system_init failed at boot) or insertion
+    // fails (handle table OOM), log and continue — init runs without the
+    // privileged cap; only TXN_FLAG_GLOBAL_SCOPE and similar paths are
+    // affected, and they'd return -EPERM until the cap is granted.
+    {
+        extern int cap_system_install_to_pid(int pid, unsigned long long rights_subset);
+        // RIGHT_INSPECT(0x20) | RIGHT_REVOKE(0x10) | RIGHT_DERIVE(0x8) |
+        // RIGHT_INVOKE(0x10000) — keeps init in lockstep with the bootcap's
+        // own rights mask so cap_object_derive doesn't reject.
+        int rc = cap_system_install_to_pid(pid, 0x10038ULL);
+        if (rc != 0) {
+            klog(KLOG_WARN, SUBSYS_CORE,
+                 "autorun: cap_system_install_to_pid pid=%d failed rc=%d",
+                 pid, rc);
+        }
+    }
+
     // Phase 12: arm the TEST_TIMEOUT watchdog iff autorun is active.
     // Interactive boots have timeout_seconds > 0 too (defaults to 60),
     // but the watchdog only fires when autorun was requested — we

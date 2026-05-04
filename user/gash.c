@@ -2344,6 +2344,142 @@ static void execute_pipeline(char *left_str, char *right_str) {
 }
 
 // Process a complete command line (handles pipes, redirects, background, vars)
+// Forward declaration — cmd_txn_block calls process_cmdline recursively.
+static void process_cmdline(char *line);
+
+// Phase 26 FU25.A: txn { ... } commit|abort block syntax.
+//
+// Detects the txn-block form on the leading position of an expanded command
+// line, parses the body between the matched braces, calls SYS_TXN_BEGIN,
+// recursively processes the body via process_cmdline, then calls
+// SYS_TXN_COMMIT or SYS_TXN_ABORT depending on the trailing qualifier.
+//
+// v1 is intentionally narrow (R2 in the plan):
+//   - Single-line input only (multi-line block syntax is Phase 27 follow-up).
+//   - Depth=1 only — nested `txn { txn { … } commit }` rejected.
+//   - Pipeline-internal braces rejected (only the leading `txn {` is honored;
+//     trailing `}` must end the block).
+//   - Body is passed verbatim to process_cmdline; multi-statement bodies via
+//     `;` separator deferred (the kernel txn nesting is what handles the
+//     real work).
+//
+// Returns:
+//   0  — line was not a txn-block; caller should fall through to normal
+//        dispatch.
+//   1  — line was a txn-block and was handled (success or txn-level error).
+//   -1 — line was a txn-block but had a syntax error (already reported);
+//        caller should NOT fall through.
+static int cmd_txn_block(char *expanded) {
+    // Skip leading whitespace.
+    char *p = expanded;
+    while (*p == ' ' || *p == '\t') p++;
+
+    // Match leading "txn" keyword followed by whitespace and '{'.
+    if (p[0] != 't' || p[1] != 'x' || p[2] != 'n') return 0;
+    if (p[3] != ' ' && p[3] != '\t' && p[3] != '{') return 0;
+    p += 3;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '{') return 0;  // not a txn-block — caller may dispatch `txn` as a regular command if any
+    p++;
+
+    // Find matching '}' at depth 1. Reject nested '{'.
+    char *body_start = p;
+    int depth = 1;
+    while (*p) {
+        if (*p == '{') {
+            print("gash: txn { ... } v1 — nested braces not supported\n");
+            return -1;
+        }
+        if (*p == '}') {
+            depth--;
+            if (depth == 0) break;
+        }
+        p++;
+    }
+    if (depth != 0) {
+        print("gash: txn { ... — missing closing '}'\n");
+        return -1;
+    }
+
+    // Null-terminate body (in-place).
+    *p = '\0';
+    p++;
+
+    // Trim trailing whitespace from body.
+    {
+        int blen = (int)strlen(body_start);
+        while (blen > 0 && (body_start[blen - 1] == ' ' || body_start[blen - 1] == '\t')) {
+            body_start[--blen] = '\0';
+        }
+        while (*body_start == ' ' || *body_start == '\t') body_start++;
+    }
+
+    // Skip whitespace after '}', expect "commit" or "abort".
+    while (*p == ' ' || *p == '\t') p++;
+    int do_commit;
+    if (p[0] == 'c' && p[1] == 'o' && p[2] == 'm' && p[3] == 'm' && p[4] == 'i' && p[5] == 't'
+        && (p[6] == '\0' || p[6] == ' ' || p[6] == '\t' || p[6] == '\n')) {
+        do_commit = 1;
+    } else if (p[0] == 'a' && p[1] == 'b' && p[2] == 'o' && p[3] == 'r' && p[4] == 't'
+               && (p[5] == '\0' || p[5] == ' ' || p[5] == '\t' || p[5] == '\n')) {
+        do_commit = 0;
+    } else {
+        print("gash: txn { ... } — must be followed by 'commit' or 'abort'\n");
+        return -1;
+    }
+
+    // Begin the txn (SCOPE_SELF; default 4 MiB buffer).
+    long h = syscall_txn_begin(TXN_FLAG_SELF_SCOPE, "gash-block");
+    if (h < 0) {
+        print("gash: txn_begin failed\n");
+        return -1;
+    }
+
+    // Execute the body inside the active txn frame on this gash process.
+    // process_cmdline is reentrant: it parses and dispatches a single line.
+    // Nested txn-blocks inside the body are rejected by the depth-1 check
+    // above (we never get here with a nested '{').
+    if (*body_start) {
+        // Copy to a stable buffer so process_cmdline's in-place tokenisation
+        // doesn't corrupt the caller's buffer.
+        char body_copy[256];
+        size_t i = 0;
+        for (; body_start[i] != '\0' && i < sizeof(body_copy) - 1; i++) {
+            body_copy[i] = body_start[i];
+        }
+        body_copy[i] = '\0';
+        process_cmdline(body_copy);
+    }
+
+    // Commit or abort.
+    long rc;
+    if (do_commit) {
+        rc = syscall_txn_commit((uint32_t)h);
+        if (rc == 0) {
+            print("txn: committed\n");
+        } else {
+            print("txn: commit failed (");
+            char rcbuf[12];
+            int_to_string((int)rc, rcbuf);
+            print(rcbuf);
+            print(")\n");
+        }
+    } else {
+        rc = syscall_txn_abort((uint32_t)h);
+        if (rc == 0) {
+            print("txn: aborted\n");
+        } else {
+            print("txn: abort failed (");
+            char rcbuf[12];
+            int_to_string((int)rc, rcbuf);
+            print(rcbuf);
+            print(")\n");
+        }
+    }
+
+    return 1;
+}
+
 static void process_cmdline(char *line) {
     // Skip empty lines
     if (line[0] == '\0') return;
@@ -2351,6 +2487,13 @@ static void process_cmdline(char *line) {
     // Step 1: Expand environment variables
     char expanded[512];
     expand_variables(line, expanded, sizeof(expanded));
+
+    // Phase 26 FU25.A: txn { ... } commit|abort block syntax. Must come
+    // before pipe + redirect parsing — txn-blocks are top-level only.
+    {
+        int rc = cmd_txn_block(expanded);
+        if (rc != 0) return;  // handled (success or syntax error)
+    }
 
     // Step 2: Check for background operator (&)
     int background = 0;

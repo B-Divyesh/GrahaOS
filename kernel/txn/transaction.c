@@ -126,14 +126,20 @@ int txn_begin(uint32_t flags, const char *name, task_t *caller) {
     if (!(flags & (TXN_FLAG_SELF_SCOPE | TXN_FLAG_GLOBAL_SCOPE))) {
         flags |= TXN_FLAG_SELF_SCOPE;
     }
-    // Spec: GLOBAL requires CAP_KIND_SYSTEM. Phase 25 v1 doesn't implement
-    // a separate "system" cap; document the limitation and reject GLOBAL.
-    // Once Phase 26 lands a system-cap check, this becomes a real gate.
+    // Phase 26 FU25.F: GLOBAL_SCOPE gated by CAP_KIND_SYSTEM with
+    // RIGHT_INVOKE. Bootcap installed in init's handle table at boot;
+    // init derives narrowed sub-caps to trusted daemons. Non-privileged
+    // callers see -EPERM; substrate is identical to Phase 25 v1 in that
+    // respect, but the cap-bearing path now actually opens up for init
+    // and its sub-cap recipients.
     if (flags & TXN_FLAG_GLOBAL_SCOPE) {
-        klog(KLOG_WARN, SUBSYS_CORE,
-             "txn_begin: GLOBAL_SCOPE requested but CAP_KIND_SYSTEM gating "
-             "isn't yet wired — refusing for safety");
-        return TXN_EPERM;
+        extern int cap_system_resolve(int caller_pid, unsigned long long rights);
+        if (cap_system_resolve(caller->id, 0x10000ULL /*RIGHT_INVOKE*/) != 0) {
+            klog(KLOG_WARN, SUBSYS_CORE,
+                 "txn_begin: GLOBAL_SCOPE pid=%d lacks CAP_KIND_SYSTEM/RIGHT_INVOKE",
+                 (int)caller->id);
+            return TXN_EPERM;
+        }
     }
 
     if (caller->active_txn.stack_depth >= TXN_MAX_NESTING) {

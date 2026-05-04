@@ -49,6 +49,7 @@ typedef struct cap_token {
 #define CAP_KIND_IRQ_CHANNEL       11
 #define CAP_KIND_MMIO_REGION       12
 #define CAP_KIND_TRANSACTION       13   // Phase 25 — wraps a snapshot + buffered external sends
+#define CAP_KIND_SYSTEM            14   // Phase 26 FU25.F — system-privileged ops (TXN_FLAG_GLOBAL_SCOPE etc.)
 
 // ------------------------------------------------------------------------
 // Rights bitmap (cap_object_t.rights_bitmap — 64 bits).
@@ -76,7 +77,14 @@ typedef struct cap_token {
 // cancel a subordinate's long-running transaction) or only RIGHT_COMMIT.
 #define RIGHT_COMMIT      0x0000000000002000ULL  // CAP_KIND_TRANSACTION
 #define RIGHT_ABORT       0x0000000000004000ULL  // CAP_KIND_TRANSACTION
-// 0x0000000000008000ULL .. reserved for higher kind-specific rights.
+// Phase 26: CAP_KIND_WASM_INSTANCE-specific rights.
+#define RIGHT_TERMINATE   0x0000000000008000ULL  // CAP_KIND_WASM_INSTANCE
+// Phase 26 FU25.F: CAP_KIND_SYSTEM-specific rights. RIGHT_INVOKE gates
+// system-privileged operations (TXN_FLAG_GLOBAL_SCOPE; future: WASM
+// privileged module instantiation, etc.). Diminishing-derive sub-tokens
+// may carry only RIGHT_INSPECT (for monitoring) without RIGHT_INVOKE.
+#define RIGHT_INVOKE      0x0000000000010000ULL  // CAP_KIND_SYSTEM
+// 0x0000000000020000ULL .. reserved for higher kind-specific rights.
 #define RIGHTS_ALL        0xFFFFFFFFFFFFFFFFULL
 
 // ------------------------------------------------------------------------

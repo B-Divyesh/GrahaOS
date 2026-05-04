@@ -51,6 +51,7 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/txn_buffer_send \
              tests/txn_basic_commit tests/txn_basic_abort \
              tests/txn_nested_basic tests/txn_nest_limit \
+             tests/cap_system \
              tests/txn_stress_basic tests/txn_stress_nested \
              tests/txn_stress_state_machine \
              tests/netd_arp tests/netd_ipv4 tests/netd_tcp tests/netd_dhcp \
