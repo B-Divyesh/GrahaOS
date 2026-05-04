@@ -438,6 +438,20 @@ void kmain(void) {
     framebuffer_draw_string("Phase 24 W13 Snap Skeleton Ready.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
+    // Phase 25 Stage D: transactional speculation. txn_begin allocates an
+    // implicit snapshot via snap_create_internal; subsequent chan_send
+    // calls (Stage E) are intercepted while the txn is active. txn_init
+    // must run AFTER snap_init so the snap_cache slab exists before the
+    // first txn_begin allocates a backing snapshot.
+    {
+        extern void txn_init(void);
+        klog(KLOG_INFO, SUBSYS_CORE, "Phase 25 Stage D: txn_init...");
+        txn_init();
+        framebuffer_draw_string("Phase 25 Txn Skeleton Ready.",
+                                 50, y_pos, COLOR_GREEN, 0x00101828);
+        y_pos += 20;
+    }
+
     // Phase 18: stream_subsystem_init must wait until after sched_init
     // because it spawns a kernel worker thread via sched_create_task. Its
     // call site is moved just after sched_init below.

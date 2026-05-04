@@ -26,7 +26,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot txnctl
 
 # Phase 12: TAP 1.4 test binaries. Each lives at user/tests/NAME.c
 # and is copied to initrd as /bin/tests/NAME.tap by the top-level
@@ -47,6 +47,12 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/snaptest \
              tests/snap_stress_cycle \
              tests/snap_cow_storm \
+             tests/snap_restore_self \
+             tests/txn_buffer_send \
+             tests/txn_basic_commit tests/txn_basic_abort \
+             tests/txn_nested_basic tests/txn_nest_limit \
+             tests/txn_stress_basic tests/txn_stress_nested \
+             tests/txn_stress_state_machine \
              tests/netd_arp tests/netd_ipv4 tests/netd_tcp tests/netd_dhcp \
              tests/netd_dns tests/netd_service \
              tests/libhttp_parse \
@@ -419,6 +425,14 @@ blkctl: blkctl.o $(LIBC)
 snapshot: snapshot.o $(LIBC)
 	@echo "Linking snapshot"
 	@$(LD) $(LDFLAGS) -o $@ snapshot.o $(LIBC)
+
+# Phase 25 Stage H: /bin/txnctl — informational CLI for transaction
+# substrate. Dispatches by argv[0] basename so cp'd aliases (txn-status)
+# reuse the same binary. Transactions are process-scoped, so the CLI
+# can only inspect / explain — see comment in user/txnctl.c.
+txnctl: txnctl.o $(LIBC)
+	@echo "Linking txnctl"
+	@$(LD) $(LDFLAGS) -o $@ txnctl.o $(LIBC)
 
 # Phase 22 Stage A/B: /bin/netd — userspace TCP/IP daemon. Stage A proves
 # publish/connect rendezvous with e1000d. Stage B layers ARP (already

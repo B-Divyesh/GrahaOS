@@ -63,8 +63,16 @@
 
 // ---------------------------------------------------------------------------
 // Restore captured pages into a live task's CR3.
+//
+// Phase 25 / FU24.I: `skip_page_va` (page-aligned VA, or 0 for "skip
+// nothing") names a page that MUST NOT be touched. SCOPE_SELF caller-page
+// restore passes the active stack page (current->syscall_frame_ptr->user_rsp
+// rounded down) so the in-flight syscall's user-mode return frame stays
+// intact. Pre-FU24.I callers passed 0; the SCOPE_SELF caller branch in
+// snap_restore now passes a real VA.
 // ---------------------------------------------------------------------------
-static int restore_pages(snapshot_task_entry_t *te, task_t *live) {
+static int restore_pages(snapshot_task_entry_t *te, task_t *live,
+                         uint64_t skip_page_va) {
     if (!te || !live) return -R_EINVAL;
     if (te->page_count == 0) return 0;
 
@@ -73,11 +81,18 @@ static int restore_pages(snapshot_task_entry_t *te, task_t *live) {
     uint64_t replaced = 0;
     uint64_t reflags  = 0;
     uint64_t skipped  = 0;
+    uint64_t skipped_active_stack = 0;
 
     for (uint32_t i = 0; i < te->page_count; i++) {
         snap_captured_page_t *cap = &te->pages[i];
         // Sanity: skip entries pointing at clearly bogus addresses.
         if (cap->phys == 0) { skipped++; continue; }
+        // Phase 25 / FU24.I: skip the active stack page (in-flight syscall
+        // return frame lives here; rewriting would corrupt iretq's pop).
+        if (skip_page_va != 0 && cap->virt == skip_page_va) {
+            skipped_active_stack++;
+            continue;
+        }
 
         uint64_t live_pte = vmm_get_pte(cr3, cap->virt);
         uint64_t live_phys = live_pte & PHYS_ADDR_MASK;
@@ -128,10 +143,11 @@ static int restore_pages(snapshot_task_entry_t *te, task_t *live) {
     }
 
     klog(KLOG_INFO, SUBSYS_CORE,
-         "snap_restore: pid=%d pages=%u replaced=%lu reflagged=%lu skipped=%lu",
+         "snap_restore: pid=%d pages=%u replaced=%lu reflagged=%lu "
+         "skipped=%lu skipped_active_stack=%lu",
          (int)live->id, (unsigned)te->page_count,
          (unsigned long)replaced, (unsigned long)reflags,
-         (unsigned long)skipped);
+         (unsigned long)skipped, (unsigned long)skipped_active_stack);
     return 0;
 }
 
@@ -152,18 +168,14 @@ static void restore_regs_and_fds(snapshot_task_entry_t *te, task_t *live) {
 // ---------------------------------------------------------------------------
 // snap_restore (declared in snapshot.h).
 // ---------------------------------------------------------------------------
-int snap_restore(uint32_t handle) {
-    task_t *current = sched_get_current_task();
-    if (!current) return -R_EPERM;
-
-    cap_handle_entry_t *entry = cap_handle_lookup(&current->cap_handles, handle);
-    if (!entry) return -R_EINVAL;
-
-    cap_object_t *obj = cap_object_get(entry->object_idx);
-    if (!obj || obj->kind != CAP_KIND_SNAPSHOT) return -R_EINVAL;
-
-    snapshot_t *s = (snapshot_t *)obj->kind_data;
-    if (!s) return -R_EINVAL;
+// snap_restore_internal — Phase 25 kernel-internal entry. Same restore
+// semantics as snap_restore but operates on a snapshot_t* rather than a
+// cap_handle slot. Used by txn_abort which holds a CAP_KIND_TRANSACTION
+// token (not CAP_KIND_SNAPSHOT). Caller must hold the snapshot alive
+// across this call.
+// ---------------------------------------------------------------------------
+int snap_restore_internal(snapshot_t *s, task_t *current) {
+    if (!s || !current) return -R_EINVAL;
     if (s->state != SNAP_STATE_ACTIVE) return -R_EBUSY;
 
     s->state = SNAP_STATE_RESTORING;
@@ -174,23 +186,22 @@ int snap_restore(uint32_t handle) {
         return barrier_rc;
     }
 
-    // Walk every captured task; restore regs + FDs (non-caller) + pages.
+    // Walk every captured task; restore regs + FDs + pages.
     //
-    // CRITICAL v1 limitation: the caller's user-half pages are NOT
-    // restored. The caller is currently executing snap_restore via a
-    // syscall; its userspace stack pages contain the live syscall return
-    // frame (post snap_restore call site) and any local variables. If we
-    // overwrite those pages with snap-time content, the userspace RSP
-    // continues to point at the pre-restore physical address — but the
-    // bytes there are now snap-time bytes, so the next `ret` pops a
-    // bogus return address and the user task triple-faults.
+    // Phase 25 / FU24.I unblocks SCOPE_SELF caller-page restore. The
+    // caller is mid-syscall; its kernel-stack syscall_frame holds the
+    // user RSP that iretq will pop. Touching the active stack page would
+    // corrupt that frame — but every OTHER captured page (heap, BSS,
+    // text, lower stack pages) is safe to restore. After replaying pages,
+    // we copy the captured FD table + pledge mask. We do NOT swizzle the
+    // syscall_frame's general-purpose regs in v1: the userspace caller
+    // gets snap_restore's normal "return 0" semantics and continues
+    // executing from the instruction after SYS_SNAP_RESTORE, but with
+    // its non-stack memory rolled back to snap-time content.
     //
-    // Restoring the caller requires either (a) a syscall_set_user_frame
-    // helper that swizzles the in-kernel syscall_frame to match the
-    // captured regs, or (b) treating SCOPE_SELF restore as a userspace
-    // re-spawn. v1 documents this limitation: SCOPE_SELF restore is a
-    // no-op for the caller; the FS revert + non-caller restores still
-    // happen so the system-wide effect is real.
+    // For non-caller tasks under SNAP_SCOPE_GLOBAL, regs are restored
+    // verbatim — they are parked in TASK_STATE_BARRIER_WAIT and dispatched
+    // from task->regs on resume.
     for (uint32_t i = 0; i < s->task_count; i++) {
         snapshot_task_entry_t *te = &s->tasks[i];
         if (te->pid <= 0) continue;
@@ -202,10 +213,28 @@ int snap_restore(uint32_t handle) {
             continue;
         }
         if ((task_t *)live == current) {
-            // Caller — see file-header note. Skip page + reg restore.
+            // Caller — Phase 25 / FU24.I: replay heap/BSS/lower-stack
+            // pages but skip the active stack page (in-flight syscall
+            // return frame). Identify it via syscall_frame_ptr->user_rsp;
+            // round down to a page boundary.
+            uint64_t skip_va = 0;
+            if (current->syscall_frame_ptr != NULL) {
+                skip_va = current->syscall_frame_ptr->user_rsp &
+                          ~((uint64_t)0xFFFu);
+            }
+            (void)restore_pages(te, (task_t *)live, skip_va);
+            // Copy FD table + pledge mask. Safe to do for the caller
+            // because these don't affect iretq. Do NOT touch regs (the
+            // syscall_frame on the kernel stack must keep its iretq path
+            // intact).
+            if (te->fd_table_copy) {
+                memcpy(live->fd_table, te->fd_table_copy,
+                       sizeof(live->fd_table));
+            }
+            ((task_t *)live)->pledge_mask.raw = te->pledge_snapshot;
             continue;
         }
-        (void)restore_pages(te, (task_t *)live);
+        (void)restore_pages(te, (task_t *)live, /*skip_page_va=*/0);
         restore_regs_and_fds(te, (task_t *)live);
     }
 
@@ -247,10 +276,30 @@ int snap_restore(uint32_t handle) {
     s->state = SNAP_STATE_ACTIVE;
 
     klog(KLOG_INFO, SUBSYS_CORE,
-         "snap_restore: id=%lu pid=%d tasks=%u fs_pins=%u chans=%u",
+         "snap_restore_internal: id=%lu pid=%d tasks=%u fs_pins=%u chans=%u",
          (unsigned long)s->id, current->id,
          (unsigned)s->task_count, (unsigned)s->fs_pin_count,
          (unsigned)s->chan_count);
 
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// snap_restore — Phase 24 syscall entry. Resolves the cap_handle and
+// dispatches to snap_restore_internal.
+// ---------------------------------------------------------------------------
+int snap_restore(uint32_t handle) {
+    task_t *current = sched_get_current_task();
+    if (!current) return -R_EPERM;
+
+    cap_handle_entry_t *entry = cap_handle_lookup(&current->cap_handles, handle);
+    if (!entry) return -R_EINVAL;
+
+    cap_object_t *obj = cap_object_get(entry->object_idx);
+    if (!obj || obj->kind != CAP_KIND_SNAPSHOT) return -R_EINVAL;
+
+    snapshot_t *s = (snapshot_t *)obj->kind_data;
+    if (!s) return -R_EINVAL;
+
+    return snap_restore_internal(s, current);
 }

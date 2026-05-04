@@ -231,6 +231,28 @@ void snap_init(void);
 // EBUSY, ETIME). W14 implementation; W13 stub returns -ENOSYS.
 int snap_create(uint32_t scope_flags, const char *name);
 
+// Phase 25 — kernel-internal entry. Same capture semantics as snap_create
+// but does NOT create a cap_object + does NOT insert a handle into the
+// caller's table. Returns 0 on success with *out_snap pointing at the
+// fresh snapshot_t (already linked into g_snap_live_head); negative
+// -errno on failure. Used by txn_begin which manages its own
+// CAP_KIND_TRANSACTION token rather than handing the caller a separate
+// CAP_KIND_SNAPSHOT.
+int snap_create_internal(uint32_t scope_flags, const char *name,
+                         struct snapshot **out_snap);
+
+// Phase 25 — kernel-internal counterpart of snap_delete.
+// Drops the snapshot's live-list entry, reclaims captured pages via
+// snap_destroy_captures, and frees the body. Caller has already
+// dropped any cap_handle / cap_object linkage (txn_commit /
+// txn_abort do this themselves).
+void snap_destroy_internal(struct snapshot *s);
+
+// Phase 25 — kernel-internal counterpart of snap_restore.
+// Identical to the syscall path but operates on a snapshot_t* rather
+// than a cap_handle slot. Caller must hold the snapshot alive.
+int snap_restore_internal(struct snapshot *s, struct task_struct *caller);
+
 // Atomically restore system state to the snapshot referenced by the
 // caller's handle. W16 implementation; W13 stub returns -ENOSYS.
 int snap_restore(uint32_t handle);

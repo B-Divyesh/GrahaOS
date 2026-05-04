@@ -212,6 +212,13 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         asm volatile("cli; hlt");
     }
 
+    // Phase 25 / FU24.I: syscalls that need the live syscall_frame (today
+    // SYS_SNAP_RESTORE; future SYS_TXN_ABORT) call sched_get_current_task
+    // INSIDE their case arm and stash frame on current->syscall_frame_ptr
+    // there. Doing it dispatcher-wide cost ~2 rdmsr per syscall (per-CPU
+    // lookup) and tipped snap_stress_cycle past the gate budget. Localised
+    // is essentially free.
+
     uint64_t syscall_num = frame->int_no;
     
     switch (syscall_num) {
@@ -1539,7 +1546,15 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = 0;
                 break;
             }
-            frame->rax = grahafs_compute_simhash(sh_node->inode);
+            // Phase 25 / FU24.A: dispatch to v2 when v2 is mounted. v1's
+            // grahafs_compute_simhash returns 0 immediately when fs_mounted
+            // is false (true under v2 mount), which broke clustertest 2+3
+            // before the v2 path was wired.
+            if (grahafs_v2_is_mounted()) {
+                frame->rax = grahafs_v2_compute_simhash(sh_node->inode);
+            } else {
+                frame->rax = grahafs_compute_simhash(sh_node->inode);
+            }
             break;
         }
 
@@ -3146,7 +3161,13 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
                                         "pledge denied: sys_control")) break;
             uint32_t handle = (uint32_t)frame->rdi;
+            // Phase 25 / FU24.I: stash frame on current->syscall_frame_ptr
+            // so snap_restore's SCOPE_SELF caller branch can find user_rsp
+            // and skip the active stack page. Cleared after the call.
+            task_t *cur_for_frame = sched_get_current_task();
+            if (cur_for_frame) cur_for_frame->syscall_frame_ptr = frame;
             int rc = snap_restore(handle);
+            if (cur_for_frame) cur_for_frame->syscall_frame_ptr = NULL;
             frame->rax = (uint64_t)(long)rc;
             break;
         }
@@ -3184,6 +3205,73 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             // ticks-per-second.
             extern uint64_t g_tsc_hz;
             frame->rax = (uint64_t)(long)g_tsc_hz;
+            break;
+        }
+
+        // ----------------------------------------------------------
+        // Phase 25 transactional speculation. txn_begin allocates an
+        // implicit snapshot via snap_create_internal + pushes a frame
+        // on the caller's task; chan_send while a txn is active is
+        // intercepted into the txn buffer (Stage E). Stage D ships
+        // begin/commit/abort with a -ENOSYS commit-on-non-empty-buffer
+        // stub; Stage F lands the full replay.
+        // ----------------------------------------------------------
+        case SYS_TXN_BEGIN: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                        "pledge denied: sys_control")) break;
+            extern int txn_begin(uint32_t flags, const char *name,
+                                 task_t *caller);
+            uint32_t flags = (uint32_t)frame->rdi;
+            const char *name_user = (const char *)frame->rsi;
+
+            char kname[32];
+            kname[0] = '\0';
+            if (name_user) {
+                if (!is_user_pointer(name_user, 1)) {
+                    frame->rax = (uint64_t)(long)-14 /* EFAULT */;
+                    break;
+                }
+                size_t n = 0;
+                while (n < sizeof(kname) - 1) {
+                    if (!is_user_pointer(name_user + n, 1)) {
+                        frame->rax = (uint64_t)(long)-14;
+                        break;
+                    }
+                    char c = name_user[n];
+                    kname[n++] = c;
+                    if (c == '\0') break;
+                }
+                kname[sizeof(kname) - 1] = '\0';
+            }
+            task_t *cur = sched_get_current_task();
+            int rc = txn_begin(flags, name_user ? kname : NULL, cur);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        case SYS_TXN_COMMIT: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                        "pledge denied: sys_control")) break;
+            extern int txn_commit(uint32_t handle, task_t *caller);
+            uint32_t handle = (uint32_t)frame->rdi;
+            task_t *cur = sched_get_current_task();
+            int rc = txn_commit(handle, cur);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        case SYS_TXN_ABORT: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                        "pledge denied: sys_control")) break;
+            extern int txn_abort(uint32_t handle, task_t *caller);
+            uint32_t handle = (uint32_t)frame->rdi;
+            task_t *cur = sched_get_current_task();
+            // Phase 25 / FU24.I: txn_abort calls snap_restore_internal which
+            // needs user_rsp for SCOPE_SELF caller-page restore.
+            if (cur) cur->syscall_frame_ptr = frame;
+            int rc = txn_abort(handle, cur);
+            if (cur) cur->syscall_frame_ptr = NULL;
+            frame->rax = (uint64_t)(long)rc;
             break;
         }
 

@@ -1378,6 +1378,137 @@ void grahafs_v2_close(struct vfs_node *node) {
 }
 
 // ===========================================================================
+// §SIMHASH_ON_DEMAND — Phase 25 / FU24.A.
+//
+// On-demand SimHash compute path triggered by SYS_COMPUTE_SIMHASH. The v2
+// close-path (above) computes simhash automatically + journals it as part
+// of the version_record; this function exists for tools that want to
+// recompute on demand (e.g. clustertest, the gash `simhash` command).
+//
+// Differences from the close-path:
+//   * No version_record is allocated. Just updates ai_embedding[0] in place
+//     and journals the inode.
+//   * Sample budget is 48 KiB (matches v1) rather than 1 MiB — keeps the
+//     BSS sample buffer small enough for the kernel image without
+//     introducing a kmalloc/kfree pair on every call.
+//   * cluster_assign is invoked SYNCHRONOUSLY (not via recluster_enqueue)
+//     so the test in user/tests/clustertest.c sees the new cluster on
+//     syscall return.
+// ===========================================================================
+uint64_t grahafs_v2_compute_simhash(uint32_t inode_num) {
+    if (!grahafs_v2_is_mounted()) return 0;
+    if (inode_num == 0) return 0;
+
+    grahafs_v2_inode_cache_t *ce = inode_cache_get(inode_num);
+    if (!ce) return 0;
+
+    grahafs_v2_inode_t work;
+    spinlock_acquire(&ce->lock);
+    work = ce->disk;
+    spinlock_release(&ce->lock);
+
+    if (work.type != GRAHAFS_V2_TYPE_FILE || work.size == 0) {
+        inode_cache_put(ce);
+        return 0;
+    }
+
+    // 48 KiB sample budget — matches v1. Static BSS keeps it off the
+    // kernel stack and out of kheap allocation churn.
+    static uint8_t sh_sample_buf[12 * GRAHAFS_V2_BLOCK_SIZE];
+
+    uint64_t bytes_to_sample = work.size;
+    if (bytes_to_sample > sizeof(sh_sample_buf)) bytes_to_sample = sizeof(sh_sample_buf);
+    uint32_t blocks = (uint32_t)((bytes_to_sample + GRAHAFS_V2_BLOCK_SIZE - 1) /
+                                  GRAHAFS_V2_BLOCK_SIZE);
+    int dev_id = grahafs_v2_device_id();
+    uint32_t sampled = 0;
+
+    for (uint32_t i = 0; i < blocks; i++) {
+        uint32_t lba = v2_block_index_to_lba(&work, i);
+        if (lba == 0) continue;
+        uint8_t blk[GRAHAFS_V2_BLOCK_SIZE];
+        if (grahafs_block_read((uint8_t)dev_id, lba, 1, blk) != 1) break;
+        uint32_t copy = GRAHAFS_V2_BLOCK_SIZE;
+        if ((uint64_t)sampled + copy > bytes_to_sample) {
+            copy = (uint32_t)(bytes_to_sample - sampled);
+        }
+        memcpy(sh_sample_buf + sampled, blk, copy);
+        sampled += copy;
+    }
+
+    uint64_t hash = 0;
+    if (sampled > 0) hash = simhash_auto(sh_sample_buf, sampled);
+
+    // Mirror v1's filename lookup: walk root directory's first block,
+    // scan dirents for a record matching inode_num, copy out the name.
+    // cluster_assign uses this to label the cluster member; passing an
+    // empty/null name would NULL-deref cl_strncpy in cluster.c.
+    char found_name[28] = {0};
+    {
+        const grahafs_v2_superblock_t *sb = grahafs_v2_sb();
+        uint32_t root_inode = sb ? sb->root_inode : 0;
+        if (root_inode != 0) {
+            grahafs_v2_inode_cache_t *root_ce = inode_cache_get(root_inode);
+            if (root_ce) {
+                uint32_t root_db0 = 0;
+                spinlock_acquire(&root_ce->lock);
+                root_db0 = root_ce->disk.direct_blocks[0];
+                spinlock_release(&root_ce->lock);
+                if (root_db0 != 0) {
+                    uint8_t dir_blk[GRAHAFS_V2_BLOCK_SIZE];
+                    if (grahafs_block_read((uint8_t)dev_id, root_db0, 1, dir_blk) == 1) {
+                        v2_dirent_t *entries = (v2_dirent_t *)dir_blk;
+                        for (size_t i = 0; i < V2_DIRENTS_PER_BLOCK; i++) {
+                            if (entries[i].inode_num == inode_num) {
+                                size_t n = 0;
+                                while (n < 27 && entries[i].name[n] != '\0') {
+                                    found_name[n] = entries[i].name[n];
+                                    n++;
+                                }
+                                found_name[n] = '\0';
+                                break;
+                            }
+                        }
+                    }
+                }
+                inode_cache_put(root_ce);
+            }
+        }
+    }
+    if (found_name[0] == '\0') {
+        // Synthetic placeholder so cluster_assign's strncpy has something
+        // to copy. Real callers will typically have a name from the dir
+        // walk above; this is a safety net for inodes outside the root
+        // directory (sub-directory contents won't be found here).
+        found_name[0] = '?';
+        found_name[1] = '\0';
+    }
+
+    // Synchronous cluster assignment. Test clustertest tests 2+3 expect
+    // the cluster to be visible on SYS_COMPUTE_SIMHASH return — going via
+    // recluster_enqueue (async work queue) would race the test.
+    uint32_t cid = cluster_assign(inode_num, hash, found_name);
+
+    // Persist hash + cluster_id into the inode + journal it.
+    spinlock_acquire(&ce->lock);
+    ce->disk.ai_embedding[0] = hash;
+    ce->disk.ai_flags |= 0x04u;  // HAS_EMBEDDING (matches close-path bit).
+    if (cid != 0) {
+        ce->disk.ai_reserved[0] = (uint8_t)(cid & 0xFF);
+        ce->disk.ai_reserved[1] = (uint8_t)((cid >> 8) & 0xFF);
+        ce->disk.ai_reserved[2] = (uint8_t)((cid >> 16) & 0xFF);
+        ce->disk.ai_reserved[3] = (uint8_t)((cid >> 24) & 0xFF);
+    }
+    ce->dirty = true;
+    spinlock_release(&ce->lock);
+
+    (void)inode_cache_flush_dirty(ce);
+
+    inode_cache_put(ce);
+    return hash;
+}
+
+// ===========================================================================
 // §VFS_OPS — assemble a vfs_node so it routes into v2 for all operations.
 // ===========================================================================
 static void v2_attach_ops(struct vfs_node *n) {

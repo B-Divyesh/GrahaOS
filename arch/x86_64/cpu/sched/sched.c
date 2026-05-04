@@ -1053,6 +1053,15 @@ void sched_reap_zombie(int task_id) {
     extern void userdrv_on_owner_death(int32_t pid);
     userdrv_on_owner_death((int32_t)(*task_ptrs[task_id]).id);
 
+    // Phase 25 / Stage D: walk this task's active_txn stack and force-drop
+    // every transaction (NOT a normal abort — the dying task's address
+    // space is mid-teardown; calling snap_restore_internal here would
+    // touch already-freed pages). txn_force_drop drops the buffer +
+    // destroys the snapshot WITHOUT restoring + revokes the cap_object +
+    // emits AUDIT_TXN_PARTIAL_EXTERNAL.
+    extern void txn_task_exit_cleanup(task_t *dying);
+    txn_task_exit_cleanup(task_ptrs[task_id]);
+
     // Phase 22: if the dying task had published any /sys/net/* names in
     // the rawnet registry (e.g. e1000d published /sys/net/rawframe, netd
     // published /sys/net/service), clear those entries so the next spawn

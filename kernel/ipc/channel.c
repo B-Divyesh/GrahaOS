@@ -14,6 +14,7 @@
 #include "../cap/handle_table.h"
 #include "../audit.h"
 #include "../log.h"
+#include "../txn/transaction.h"
 #include "../../arch/x86_64/cpu/sched/sched.h"
 
 // --- Subsystem globals ---------------------------------------------------
@@ -149,8 +150,10 @@ int chan_create(uint64_t type_hash, uint32_t mode, uint32_t capacity,
     }
     rd_ep->channel   = c;
     rd_ep->direction = CHAN_ENDPOINT_READ;
+    rd_ep->current_holder_pid = caller_pid;
     wr_ep->channel   = c;
     wr_ep->direction = CHAN_ENDPOINT_WRITE;
+    wr_ep->current_holder_pid = caller_pid;
 
     // Create cap_objects. Audience = [caller_pid] only.
     int32_t audience[CAP_AUDIENCE_MAX + 1];
@@ -342,6 +345,42 @@ int chan_send(channel_t *c, task_t *sender, channel_msg_t *msg_kern,
         audit_write_chan_type_mismatch(sender->id, c->write_cap_idx,
                                        c->type_hash, msg_kern->header.type_hash);
         return CAP_V2_EPROTOTYPE;
+    }
+
+    // Phase 25 Stage E: txn-aware routing. If the sender is inside one or
+    // more transactions AND we are not currently replaying a buffer (Stage F
+    // sets replay_in_progress while txn_replay_all is delivering), walk the
+    // active_txn stack from innermost outward; for each txn whose scope
+    // EXCLUDES the peer, append the message to that txn's buffer. If at
+    // least one external txn buffered the send, we suppress the live
+    // delivery (the message will be replayed by txn_commit or dropped by
+    // txn_abort). Plan-agent Q4: the buffer-at-every-external-layer rule.
+    //
+    // Fast path when sender->active_txn.current == NULL is one cmp+branch.
+    if (sender->active_txn.current && !sender->replay_in_progress) {
+        struct transaction *tcur = sender->active_txn.current;
+        bool any_external = false;
+        while (tcur) {
+            if (txn_is_external_peer(c, tcur, sender)) {
+                int rc = txn_buffer_append(tcur, c->id, msg_kern, /*flags=*/0);
+                if (rc < 0) {
+                    // Buffer full or alloc failure — surface up so caller
+                    // can either commit/abort the txn and retry, or report
+                    // the error.
+                    return rc;
+                }
+                any_external = true;
+            }
+            tcur = tcur->parent_txn;
+        }
+        if (any_external) {
+            // Buffered at every external layer; do NOT deliver to the live
+            // ring. Sender sees success; receiver sees nothing until the
+            // outermost commit replays.
+            return 0;
+        }
+        // No external txn buffered the message — fall through to the
+        // normal delivery path so the in-scope peer receives it now.
     }
 
     while (1) {
@@ -644,6 +683,16 @@ int chan_marshal_recv(task_t *receiver,
         uint32_t ogen = o ? __atomic_load_n(&o->generation, __ATOMIC_ACQUIRE) : 0;
         user_msg->handles[i] = cap_token_pack(ogen, obj_idx, 0);
         inserted[inserted_count++] = new_slot;
+
+        // Phase 25 Q2: handle-passing transferred a CHANNEL endpoint —
+        // update its kind_data->current_holder_pid so future txn-aware
+        // chan_send calls correctly identify the new holder. Channels
+        // are point-to-point, so the holder is "the receiver" now.
+        if (o && o->kind == CAP_KIND_CHANNEL && o->kind_data) {
+            chan_endpoint_t *ep = (chan_endpoint_t *)o->kind_data;
+            __atomic_store_n(&ep->current_holder_pid, receiver->id,
+                             __ATOMIC_RELEASE);
+        }
     }
 
     audit_write_handle_transfer((int32_t)slot->header.sender_pid,

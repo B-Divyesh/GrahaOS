@@ -257,6 +257,38 @@ typedef struct task_struct {
     // pulled off the parked list and re-enqueued onto its runq. NULL
     // outside the barrier window.
     struct task_struct *barrier_next;
+
+    // Phase 25 / FU24.I: pointer to the live syscall_frame on the kernel
+    // stack while a syscall is executing. Set by syscall_dispatcher at
+    // entry; cleared at exit. NULL outside a syscall. Used by
+    // SYS_SNAP_RESTORE (and future txn_abort) for SCOPE_SELF caller-page
+    // restore: the user's RSP at the time of the snap_restore call lives
+    // in syscall_frame_ptr->user_rsp; rounding down to a page gives the
+    // active stack page that restore_pages must skip (writing to it would
+    // corrupt the in-flight syscall return frame).
+    struct syscall_frame *syscall_frame_ptr;
+
+    // Phase 25 transaction frame. active_txn.current names the innermost
+    // active transaction for this task; chan_send walks the stack from
+    // innermost outward and may intercept the send into a per-txn buffer
+    // (Stage E lands the interception). stack_depth is the count of
+    // transactions currently held; bounded by TXN_MAX_NESTING.
+    //
+    // replay_in_progress is a per-task bypass flag set by txn_replay_all
+    // (Stage F) so chan_send_internal calls during commit-replay don't
+    // re-buffer the messages they're delivering. Cleared on replay exit.
+    //
+    // The struct is defined inline to avoid a circular include between
+    // sched.h and txn/transaction.h. transaction.h has its own
+    // task_txn_frame_t typedef with identical layout — they alias by
+    // first-member rule (struct transaction *current; uint32_t depth;
+    // uint32_t reserved;).
+    struct {
+        struct transaction *current;
+        uint32_t            stack_depth;
+        uint32_t            reserved;
+    } active_txn;
+    uint8_t replay_in_progress;
 } task_t;
 
 /**

@@ -113,6 +113,17 @@ typedef long ssize_t;
 #define SYS_CHAN_PUBLISH      1091
 #define SYS_CHAN_CONNECT      1092
 
+// Phase 25 transactional speculation. Slots 1098-1100 (1090-1097 are
+// reserved by Phase 22-24 syscalls). SYS_TXN_BEGIN implicitly creates a
+// Phase-24 snapshot via snap_create_internal and pushes a transaction
+// frame onto the caller's task; chan_send while a txn is active is
+// intercepted (Stage E). SYS_TXN_COMMIT replays buffered external sends
+// in original order then discards the snapshot; SYS_TXN_ABORT drops the
+// buffer and restores the snapshot.
+#define SYS_TXN_BEGIN         1098
+#define SYS_TXN_COMMIT        1099
+#define SYS_TXN_ABORT         1100
+
 // Phase 24 W19: COW snapshot subsystem (slots reconciled to 1093-1096
 // because spec's original 1086-1089 collide with SPAWN_EX..MMIO_VMO_CREATE).
 #define SYS_SNAP_CREATE       1093
@@ -1254,6 +1265,51 @@ static inline long syscall_chan_connect(const char *name, uint32_t name_len,
         : "a"(SYS_CHAN_CONNECT), "D"(name), "S"((uint64_t)name_len),
           "d"(out_wr_req), "r"(out_rd_resp)
         : "rcx", "r10", "r11", "memory");
+    return ret;
+}
+
+// Phase 25 transactional speculation. SYS_TXN_BEGIN allocates an implicit
+// snapshot via snap_create_internal + pushes a transaction frame on the
+// caller's task. Subsequent chan_send-while-active intercepts go into
+// the txn's buffer; SYS_TXN_COMMIT replays in original order, SYS_TXN_ABORT
+// drops them.
+//
+// Flag bits (see kernel/txn/transaction.h for full definition):
+//   TXN_FLAG_SELF_SCOPE   = 0x1  (default)
+//   TXN_FLAG_GLOBAL_SCOPE = 0x2  (requires CAP_KIND_SYSTEM — Phase 26+)
+//   TXN_FLAG_BUFFER_2MB   = 0x10
+//   TXN_FLAG_BUFFER_4MB   = 0x20 (default)
+//   TXN_FLAG_BUFFER_8MB   = 0x40
+#define TXN_FLAG_SELF_SCOPE   0x00000001u
+#define TXN_FLAG_GLOBAL_SCOPE 0x00000002u
+#define TXN_FLAG_BUFFER_2MB   0x00000010u
+#define TXN_FLAG_BUFFER_4MB   0x00000020u
+#define TXN_FLAG_BUFFER_8MB   0x00000040u
+
+static inline long syscall_txn_begin(uint32_t flags, const char *name) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_TXN_BEGIN), "D"((uint64_t)flags), "S"(name)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_txn_commit(uint32_t handle) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_TXN_COMMIT), "D"((uint64_t)handle)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_txn_abort(uint32_t handle) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_TXN_ABORT), "D"((uint64_t)handle)
+                 : "rcx", "r11", "memory");
     return ret;
 }
 

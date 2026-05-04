@@ -920,6 +920,77 @@ void audit_write_chan_name_connect(int32_t connector_pid,
 }
 
 // ---------------------------------------------------------------------------
+// Phase 25 — transactional speculation lifecycle writers.
+// ---------------------------------------------------------------------------
+void audit_write_txn_begin(int32_t caller_pid, uint32_t obj_idx,
+                           uint64_t txn_id, uint32_t nesting,
+                           const char *name) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_TXN_BEGIN, caller_pid, AUDIT_SRC_NATIVE);
+    e.object_idx = obj_idx;
+    e.result_code = 0;
+    char buf[160];
+    ksnprintf(buf, sizeof(buf),
+              "txn_id=%lu nesting=%u name=%s",
+              (unsigned long)txn_id,
+              (unsigned)nesting,
+              name ? name : "?");
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_txn_commit(int32_t caller_pid, uint32_t obj_idx,
+                            uint64_t txn_id, uint32_t delivered) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_TXN_COMMIT, caller_pid, AUDIT_SRC_NATIVE);
+    e.object_idx = obj_idx;
+    e.result_code = 0;
+    char buf[160];
+    ksnprintf(buf, sizeof(buf),
+              "txn_id=%lu delivered=%u",
+              (unsigned long)txn_id,
+              (unsigned)delivered);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_txn_abort(int32_t caller_pid, uint32_t obj_idx,
+                           uint64_t txn_id, uint32_t delivered,
+                           uint32_t remaining) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_TXN_ABORT, caller_pid, AUDIT_SRC_NATIVE);
+    e.object_idx = obj_idx;
+    e.result_code = 0;
+    char buf[160];
+    ksnprintf(buf, sizeof(buf),
+              "txn_id=%lu delivered=%u dropped=%u",
+              (unsigned long)txn_id,
+              (unsigned)delivered,
+              (unsigned)remaining);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+void audit_write_txn_partial_external(int32_t caller_pid, uint32_t obj_idx,
+                                      uint64_t txn_id, uint32_t delivered,
+                                      uint32_t remaining,
+                                      uint8_t force_drop) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_TXN_PARTIAL_EXTERNAL, caller_pid, AUDIT_SRC_NATIVE);
+    e.object_idx = obj_idx;
+    e.result_code = -1;  // signal that some side effects are unrecoverable
+    char buf[160];
+    ksnprintf(buf, sizeof(buf),
+              "txn_id=%lu delivered=%u remaining=%u force_drop=%u",
+              (unsigned long)txn_id,
+              (unsigned)delivered,
+              (unsigned)remaining,
+              (unsigned)force_drop);
+    copy_detail(e.detail, buf);
+    audit_enqueue(&e);
+}
+
+// ---------------------------------------------------------------------------
 // Query. Walks the in-memory ring from oldest still-resident entry to newest,
 // filtering by time window and event_mask. Reads from kernel memory only —
 // the caller (syscall dispatcher) is responsible for user-buffer copy.

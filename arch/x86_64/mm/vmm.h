@@ -208,3 +208,31 @@ int vmm_dispatch_pf(uint64_t fault_va, uint64_t error_code);
  * remaining bits to recover flags (PTE_USER, PTE_NX, etc.).
  */
 uint64_t vmm_get_pte(uint64_t cr3, uint64_t virt);
+
+/**
+ * Phase 25 / FU24.H — deep-clone the user-half of parent_cr3's page-table
+ * tree into a fresh PML4. Kernel-half PML4 entries (256..511) are copied
+ * verbatim — they share the system's kernel address space. User-half
+ * (0..255) non-leaf entries (PDPT/PD/PT pages) are deep-cloned (each gets
+ * a fresh pmm_alloc_page; parent's pointers are translated to the new
+ * tables). Leaf PTEs are copied verbatim — same phys, same flags. Caller
+ * is responsible for clearing PTE_WRITABLE on leaf entries (via
+ * vmm_protect_page_by_cr3 with cr3=*out_clone_cr3) if real W^X COW is
+ * desired; the snap_walk_user_half pass does this for cr3_original, and
+ * a parallel pass on the snapshot tree does it for cr3_snapshot.
+ *
+ * Returns 0 on success, -1 on PMM exhaustion (any partially-cloned tree
+ * is freed before returning so there are no leaks). Stores the new PML4's
+ * physical address in *out_clone_cr3.
+ */
+int vmm_clone_user_pml4(uint64_t parent_cr3, uint64_t *out_clone_cr3);
+
+/**
+ * Phase 25 / FU24.H — free a tree previously allocated by
+ * vmm_clone_user_pml4. Recursively walks PML4[0..255] → PDPT → PD → PT,
+ * pmm_free_page on every non-leaf table page (the cloned ones owned by
+ * us). Leaf phys pages mapped at user VAs are NOT freed — they belong
+ * to parent / cow_page_tracker. Kernel-half entries (256..511) are NOT
+ * touched. The PML4 page itself is freed last.
+ */
+void vmm_free_cloned_pml4(uint64_t clone_cr3);

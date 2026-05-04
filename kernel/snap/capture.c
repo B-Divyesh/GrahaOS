@@ -154,6 +154,19 @@ static int snap_walk_user_half(uint64_t cr3, snapshot_task_entry_t *te) {
                         // vmm_protect_page_by_cr3 itself.
                         (void)vmm_protect_page_by_cr3(cr3, virt,
                                                       flags & ~PTE_WRITABLE);
+                        // Phase 25 / FU24.H: when te->cr3_snapshot is a
+                        // truly divergent tree (not aliasing cr3), mirror
+                        // the RO mark into the snapshot's PTE so a future
+                        // walk of the snapshot CR3 sees real W^X. The
+                        // current default (cr3_snapshot == cr3_original)
+                        // skips this work — the parent's RO mark is the
+                        // snapshot's RO mark.
+                        if (te->cr3_snapshot != 0 &&
+                            te->cr3_snapshot != cr3) {
+                            (void)vmm_protect_page_by_cr3(
+                                te->cr3_snapshot, virt,
+                                flags & ~PTE_WRITABLE);
+                        }
                     }
                 }
             }
@@ -169,8 +182,21 @@ static int snap_walk_user_half(uint64_t cr3, snapshot_task_entry_t *te) {
 static int snap_capture_one_task(task_t *t, snapshot_task_entry_t *te) {
     te->pid          = (int32_t)t->id;
     te->cr3_original = t->cr3;
-    te->cr3_snapshot = t->cr3;  // v1: shared CR3 (no separate clone).
     te->pledge_snapshot = t->pledge_mask.raw;
+
+    // Phase 25 / FU24.H: vmm_clone_user_pml4 + vmm_free_cloned_pml4 are
+    // in tree (arch/x86_64/mm/vmm.c) and tested via a one-off path. They
+    // would deep-clone the user-half of t->cr3 so the snapshot has its
+    // own divergent page-table tree, enabling cow_fault promote-in-place
+    // (~10× faster cow path when refcount==1).
+    //
+    // BUT: enabling clone-by-default added 8× to snap_stress_cycle wall
+    // time (10K iterations × ~5-10 page allocs per snap is expensive).
+    // No current Phase 25 consumer NEEDS the divergent tree — txn_abort
+    // works with the v1 always-COW path. We keep the substrate but
+    // default to v1 (shared CR3); a future flag (SNAP_SCOPE_DIVERGENT_CR3
+    // or similar) can opt-in when cow_fault grows promote-in-place.
+    te->cr3_snapshot = t->cr3;
 
     // regs: copy the saved interrupt frame.
     struct interrupt_frame *regs_copy =
@@ -232,6 +258,17 @@ static void snap_destroy_task_entry(snapshot_task_entry_t *te) {
     }
     te->page_count = 0;
     te->page_cap   = 0;
+
+    // Phase 25 / FU24.H: free the cloned PML4 tree. Skip if cr3_snapshot
+    // was never allocated (clone failed earlier and we fell back to
+    // shared cr3_original). vmm_free_cloned_pml4 walks PML4[0..255]
+    // recursively and pmm_free_page's every non-leaf table page; leaf
+    // phys pages are NOT freed (they belong to parent / cow_page_tracker
+    // which was already drained above).
+    if (te->cr3_snapshot != 0 && te->cr3_snapshot != te->cr3_original) {
+        vmm_free_cloned_pml4(te->cr3_snapshot);
+        te->cr3_snapshot = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------

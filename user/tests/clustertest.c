@@ -43,32 +43,30 @@ void _start(void) {
         initial_count = (int)list.count;
     }
 
-    // Tests 2 + 3 SKIPPED post-Phase 24a W10. The race is deeper than a
-    // userspace fsync barrier can close: vfs_path_to_node("/cl_alpha")
-    // returns NULL or sh_node->inode == 0 under channel-mode FS even
-    // ~10 s after a fsync'd create. Other tests' create_file pairs
-    // (cl_sima/cl_simb, cl_diffx/cl_diffy) work because by the time
-    // they run the directory inode has rebound. Phase 24 closeout Step 5
-    // attempted an unskip with fsync added to create_file; failed
-    // empirically (gate flaked). Root cause appears to be in
-    // kernel/fs/blk_client.c::blk_chan_write not durably committing
-    // before returning OR a stale dirent cache in vfs. Sub-phase H
-    // (KVM + W6 zero-copy DMA) should close the race window;
-    // alternatively a kernel-side write-completion barrier in the
-    // channel-mode FS path would fix it.
+    // Tests 2 + 3 SKIPPED — Phase 25 Stage A (FU24.A) ported simhash to
+    // grahafs_v2 (substrate done; SYS_COMPUTE_SIMHASH now dispatches to
+    // grahafs_v2_compute_simhash when v2 is mounted, exercised by simtest
+    // 1/10 and 2/10 which pass). However, /cl_alpha's dirent does NOT
+    // settle within ~100 retries × spin_us(200) under channel-mode v2 —
+    // /cl_alpha2 (created immediately after) DOES settle. Hypothesis:
+    // a journal-application ordering bug in v2 where the dirent block's
+    // pre-/cl_alpha-create read is cached by the second create, causing
+    // the second's add_entry to overwrite /cl_alpha's slot. This is NOT
+    // a Phase 25 issue; assigning forward to pre-Phase-28 sweep alongside
+    // the other channel-mode FS races (FU24.B/C). Tests 4+5 still pass
+    // via the FS-prime block below which retries /cl_alpha2's simhash.
     tap_skip("2. SimHash triggers auto-clustering (new cluster created)",
-             "Phase 24a W10: cl_alpha simhash race vs channel-mode FS — "
-             "fsync barrier insufficient; needs sub-phase H or kernel-side "
-             "write-completion fix");
+             "Phase 25 Stage A: substrate ported but cl_alpha dirent settle "
+             "issue is a deeper v2 journal-app timing race; deferred to "
+             "pre-Phase-28 sweep");
     tap_skip("3. Identical content -> same cluster",
-             "Phase 24a W10: depends on cl_alpha simhash (skipped above)");
+             "Phase 25 Stage A: depends on cl_alpha simhash (skipped above)");
 
     // FS-prime work block: even though tests 2 + 3 are skipped, do the
     // /cl_alpha + /cl_alpha2 file creates anyway. The original (pre-W10)
     // version of these tests took ~2 ms of spin_us(200) retries; without
     // that, test 4 below races against the channel-mode FS that hasn't
-    // yet bound /cl_sima or /cl_simb's directory entries. Doing a couple
-    // of best-effort simhash retries here primes the dirent cache.
+    // yet bound /cl_sima or /cl_simb's directory entries.
     {
         const char *text = "clustering test file alpha data";
         create_file("/cl_alpha", text, strlen(text));

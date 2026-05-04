@@ -88,7 +88,12 @@
 // Phase 22: named channel registry for rawframe + service.
 #define AUDIT_CHAN_NAME_PUBLISH       39  // rawnet_publish success: a daemon claimed a name
 #define AUDIT_CHAN_NAME_CONNECT       40  // rawnet_connect success: a client connected to a name
-#define AUDIT_EVENT_MAX          40
+// Phase 25: transactional speculation lifecycle.
+#define AUDIT_TXN_BEGIN               41  // SYS_TXN_BEGIN: implicit snapshot + active_txn frame pushed
+#define AUDIT_TXN_COMMIT              42  // SYS_TXN_COMMIT: replay completed; snapshot discarded
+#define AUDIT_TXN_ABORT               43  // SYS_TXN_ABORT: buffer dropped + snapshot restored
+#define AUDIT_TXN_PARTIAL_EXTERNAL    44  // commit-then-abort or task_exit mid-txn — N msgs were already on the wire
+#define AUDIT_EVENT_MAX               44
 
 // Source of the event.
 #define AUDIT_SRC_NATIVE  0   // Native v2 API.
@@ -379,6 +384,33 @@ void audit_write_chan_name_publish(int32_t publisher_pid, const char *name,
 void audit_write_chan_name_connect(int32_t connector_pid,
                                    int32_t publisher_pid,
                                    const char *name);
+
+// Phase 25 writers.
+// TXN_BEGIN fires on successful SYS_TXN_BEGIN. obj_idx is the
+// CAP_KIND_TRANSACTION cap_object index. txn_id is the monotonic id;
+// nesting is the caller's stack depth POST-push (1..TXN_MAX_NESTING).
+void audit_write_txn_begin(int32_t caller_pid, uint32_t obj_idx,
+                           uint64_t txn_id, uint32_t nesting,
+                           const char *name);
+// TXN_COMMIT fires AFTER the last buffered message has been replayed
+// (per Plan-agent Q9 ordering — never before, so a crash mid-replay
+// leaves no false success record). delivered = total replayed; remaining
+// = 0 on full success.
+void audit_write_txn_commit(int32_t caller_pid, uint32_t obj_idx,
+                            uint64_t txn_id, uint32_t delivered);
+// TXN_ABORT fires on successful SYS_TXN_ABORT entry. delivered counts
+// any messages already replayed before the abort (commit-then-abort
+// retry path); remaining is the count dropped from the buffer on abort.
+void audit_write_txn_abort(int32_t caller_pid, uint32_t obj_idx,
+                           uint64_t txn_id, uint32_t delivered,
+                           uint32_t remaining);
+// TXN_PARTIAL_EXTERNAL fires when a commit-then-abort or task_exit-mid-
+// txn leaves messages already on the wire that cannot be recalled.
+// force_drop = 1 means task_exit teardown; 0 means user-initiated abort.
+void audit_write_txn_partial_external(int32_t caller_pid, uint32_t obj_idx,
+                                      uint64_t txn_id, uint32_t delivered,
+                                      uint32_t remaining,
+                                      uint8_t force_drop);
 
 // ---------------------------------------------------------------------------
 // Query path. Backs SYS_AUDIT_QUERY.

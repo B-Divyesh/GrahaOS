@@ -379,6 +379,162 @@ void vmm_destroy_address_space_by_cr3(uint64_t cr3) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 25 / FU24.H — PML4 deep-clone for divergent snapshot CR3.
+//
+// vmm_clone_user_pml4 / vmm_free_cloned_pml4: see vmm.h for full contract.
+//
+// Discipline: parent_cr3's tables are READ ONLY here (we never modify the
+// parent's PTEs). The clone tree is built from fresh pmm_alloc_page'd
+// pages whose physical addresses are stored in the cloned PML4/PDPT/PD
+// entries. Leaf PT entries copy parent's phys + flags verbatim.
+//
+// PHYS_ADDR_MASK strips bits 52-63 (NX + protection keys) so HHDM
+// arithmetic stays canonical (matches kernel/snap/cow_fault.c +
+// kernel/snap/capture.c discipline). PAGE_MASK in this file's headers
+// keeps NX (bit 63), which on data pages would produce a non-canonical
+// HHDM address.
+// ---------------------------------------------------------------------------
+#define VMM_CLONE_PHYS_ADDR_MASK 0x000FFFFFFFFFF000ULL
+
+// Forward declaration so vmm_clone_user_pml4 can roll back partial state.
+void vmm_free_cloned_pml4(uint64_t clone_cr3);
+
+int vmm_clone_user_pml4(uint64_t parent_cr3, uint64_t *out_clone_cr3) {
+    if (!out_clone_cr3) return -1;
+    *out_clone_cr3 = 0;
+
+    void *clone_pml4_phys = pmm_alloc_page();
+    if (!clone_pml4_phys) return -1;
+    uint64_t *clone_pml4 =
+        (uint64_t *)((uint64_t)clone_pml4_phys + g_hhdm_offset);
+    vmm_memset(clone_pml4, 0, PAGE_SIZE);
+
+    uint64_t *parent_pml4 = (uint64_t *)(parent_cr3 + g_hhdm_offset);
+
+    // Kernel-half (256..511): shared with the system kernel space.
+    for (int i = 256; i < 512; i++) {
+        clone_pml4[i] = parent_pml4[i];
+    }
+
+    // User-half (0..255): deep-clone every present non-large entry.
+    for (int i = 0; i < 256; i++) {
+        uint64_t pml4e = parent_pml4[i];
+        if (!(pml4e & PTE_PRESENT)) continue;
+
+        // Allocate fresh PDPT page for the clone tree.
+        void *clone_pdpt_phys = pmm_alloc_page();
+        if (!clone_pdpt_phys) goto rollback;
+        uint64_t *clone_pdpt =
+            (uint64_t *)((uint64_t)clone_pdpt_phys + g_hhdm_offset);
+        vmm_memset(clone_pdpt, 0, PAGE_SIZE);
+
+        clone_pml4[i] = ((uint64_t)clone_pdpt_phys & VMM_CLONE_PHYS_ADDR_MASK) |
+                        (pml4e & ~VMM_CLONE_PHYS_ADDR_MASK);
+
+        uint64_t *parent_pdpt =
+            (uint64_t *)((pml4e & VMM_CLONE_PHYS_ADDR_MASK) + g_hhdm_offset);
+
+        for (int j = 0; j < 512; j++) {
+            uint64_t pdpte = parent_pdpt[j];
+            if (!(pdpte & PTE_PRESENT)) continue;
+            // 1 GiB pages — skip (matches snap_walk_user_half discipline).
+            if (pdpte & PTE_LARGEPAGE) continue;
+
+            void *clone_pd_phys = pmm_alloc_page();
+            if (!clone_pd_phys) goto rollback;
+            uint64_t *clone_pd =
+                (uint64_t *)((uint64_t)clone_pd_phys + g_hhdm_offset);
+            vmm_memset(clone_pd, 0, PAGE_SIZE);
+
+            clone_pdpt[j] = ((uint64_t)clone_pd_phys & VMM_CLONE_PHYS_ADDR_MASK) |
+                            (pdpte & ~VMM_CLONE_PHYS_ADDR_MASK);
+
+            uint64_t *parent_pd =
+                (uint64_t *)((pdpte & VMM_CLONE_PHYS_ADDR_MASK) + g_hhdm_offset);
+
+            for (int k = 0; k < 512; k++) {
+                uint64_t pde = parent_pd[k];
+                if (!(pde & PTE_PRESENT)) continue;
+                // 2 MiB pages — skip.
+                if (pde & PTE_LARGEPAGE) continue;
+
+                void *clone_pt_phys = pmm_alloc_page();
+                if (!clone_pt_phys) goto rollback;
+                uint64_t *clone_pt =
+                    (uint64_t *)((uint64_t)clone_pt_phys + g_hhdm_offset);
+                vmm_memset(clone_pt, 0, PAGE_SIZE);
+
+                clone_pd[k] = ((uint64_t)clone_pt_phys & VMM_CLONE_PHYS_ADDR_MASK) |
+                              (pde & ~VMM_CLONE_PHYS_ADDR_MASK);
+
+                uint64_t *parent_pt =
+                    (uint64_t *)((pde & VMM_CLONE_PHYS_ADDR_MASK) + g_hhdm_offset);
+
+                // Leaf PT: copy each entry verbatim (same phys + flags).
+                for (int l = 0; l < 512; l++) {
+                    clone_pt[l] = parent_pt[l];
+                }
+            }
+        }
+    }
+
+    *out_clone_cr3 = (uint64_t)clone_pml4_phys;
+    return 0;
+
+rollback:
+    // Reconstruct a tree-walk over what we built so far so we can free
+    // it consistently. vmm_free_cloned_pml4 handles partial trees because
+    // every PRESENT entry in our clone tree was allocated by us — any
+    // not-yet-built branch has its PML4/PDPT/PD entry == 0 from the
+    // initial vmm_memset.
+    *out_clone_cr3 = (uint64_t)clone_pml4_phys;
+    vmm_free_cloned_pml4(*out_clone_cr3);
+    *out_clone_cr3 = 0;
+    return -1;
+}
+
+void vmm_free_cloned_pml4(uint64_t clone_cr3) {
+    if (clone_cr3 == 0) return;
+    uint64_t *pml4 = (uint64_t *)(clone_cr3 + g_hhdm_offset);
+
+    // User-half only — kernel-half (256..511) is shared and must NOT be
+    // freed. Mirrors vmm_destroy_address_space's discipline; see line ~328.
+    for (int i = 0; i < 256; i++) {
+        if (!(pml4[i] & PTE_PRESENT)) continue;
+
+        uint64_t pdpt_phys = pml4[i] & VMM_CLONE_PHYS_ADDR_MASK;
+        uint64_t *pdpt = (uint64_t *)(pdpt_phys + g_hhdm_offset);
+
+        for (int j = 0; j < 512; j++) {
+            if (!(pdpt[j] & PTE_PRESENT)) continue;
+            if (pdpt[j] & PTE_LARGEPAGE) continue;
+
+            uint64_t pd_phys = pdpt[j] & VMM_CLONE_PHYS_ADDR_MASK;
+            uint64_t *pd = (uint64_t *)(pd_phys + g_hhdm_offset);
+
+            for (int k = 0; k < 512; k++) {
+                if (!(pd[k] & PTE_PRESENT)) continue;
+                if (pd[k] & PTE_LARGEPAGE) continue;
+
+                // Free the cloned PT page (NOT the leaf phys pages it
+                // points at — those belong to parent / cow_page_tracker).
+                uint64_t pt_phys = pd[k] & VMM_CLONE_PHYS_ADDR_MASK;
+                pmm_free_page((void *)pt_phys);
+            }
+
+            // Free the cloned PD page.
+            pmm_free_page((void *)pd_phys);
+        }
+
+        // Free the cloned PDPT page.
+        pmm_free_page((void *)pdpt_phys);
+    }
+
+    // Free the PML4 page itself.
+    pmm_free_page((void *)clone_cr3);
+}
+
 void vmm_unmap_page_by_cr3(uint64_t cr3, uint64_t virt) {
     // Calculate indices for each page table level
     uint64_t pml4_index = (virt >> 39) & 0x1FF;

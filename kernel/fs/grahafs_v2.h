@@ -444,6 +444,20 @@ int grahafs_pin_version(uint32_t inode_num, uint64_t version_id);
 int grahafs_unpin_version(uint32_t inode_num, uint64_t version_id);
 int grahafs_revert_to_version(uint32_t inode_num, uint64_t target_version);
 
+// ---------------------------------------------------------------------------
+// Phase 25 / FU24.A — on-demand SimHash compute for v2 inodes.
+//
+// Mirror of kernel/fs/grahafs.c::grahafs_compute_simhash but operating on
+// v2's inode_cache + block-tree walker. Reads up to 48 KiB (matching v1's
+// budget), computes simhash_auto, persists into inode.ai_embedding[0],
+// synchronously calls cluster_assign so callers (SYS_COMPUTE_SIMHASH) see
+// the cluster on syscall return.
+//
+// Returns the 64-bit SimHash; 0 on any failure (not-mounted, bad inode,
+// non-FILE, zero-size, all-block-reads-failed).
+// ---------------------------------------------------------------------------
+uint64_t grahafs_v2_compute_simhash(uint32_t inode_num);
+
 // Block tree walker. Returns 0 if the logical block is sparse.
 uint32_t v2_block_index_to_lba(const grahafs_v2_inode_t *ino,
                                uint32_t logical_block);

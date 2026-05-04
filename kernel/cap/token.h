@@ -48,6 +48,7 @@ typedef struct cap_token {
 #define CAP_KIND_DRIVER_REGISTRAR  10
 #define CAP_KIND_IRQ_CHANNEL       11
 #define CAP_KIND_MMIO_REGION       12
+#define CAP_KIND_TRANSACTION       13   // Phase 25 — wraps a snapshot + buffered external sends
 
 // ------------------------------------------------------------------------
 // Rights bitmap (cap_object_t.rights_bitmap — 64 bits).
@@ -70,7 +71,12 @@ typedef struct cap_token {
 // restore-only sub-tokens. RIGHT_INSPECT covers SYS_SNAP_LIST visibility.
 #define RIGHT_RESTORE     0x0000000000000800ULL  // CAP_KIND_SNAPSHOT
 #define RIGHT_DELETE      0x0000000000001000ULL  // CAP_KIND_SNAPSHOT
-// 0x0000000000002000ULL .. reserved for higher kind-specific rights.
+// Phase 25: CAP_KIND_TRANSACTION-specific rights. Diminishing-derive
+// sub-tokens may carry only RIGHT_ABORT (e.g., a supervisor authorised to
+// cancel a subordinate's long-running transaction) or only RIGHT_COMMIT.
+#define RIGHT_COMMIT      0x0000000000002000ULL  // CAP_KIND_TRANSACTION
+#define RIGHT_ABORT       0x0000000000004000ULL  // CAP_KIND_TRANSACTION
+// 0x0000000000008000ULL .. reserved for higher kind-specific rights.
 #define RIGHTS_ALL        0xFFFFFFFFFFFFFFFFULL
 
 // ------------------------------------------------------------------------

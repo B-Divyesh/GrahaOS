@@ -116,10 +116,18 @@ typedef struct channel {
 
 // --- Endpoint payload ----------------------------------------------------
 // Stored at cap_object.kind_data via heap allocation. One per endpoint cap.
+//
+// Phase 25 Q2: current_holder_pid records which task currently holds this
+// endpoint in its handle table. Maintained by chan_create (initial holder
+// is the channel's creator) and chan_marshal_recv (handle-passing transfers
+// the holder to the receiver). Used by txn_is_external_peer to decide
+// whether a chan_send peer is in-scope or external for an active txn.
+// Value -1 means "orphan" (no live holder — endpoint was destroyed).
 typedef struct chan_endpoint {
-    channel_t *channel;  // backing channel (held under channel refcount)
-    uint8_t    direction;  // CHAN_ENDPOINT_READ or _WRITE
-    uint8_t    _pad[7];
+    channel_t *channel;            //  0..7   backing channel (held under refcount)
+    uint8_t    direction;          //  8      CHAN_ENDPOINT_READ or _WRITE
+    uint8_t    _pad[3];            //  9..11  align to 4
+    int32_t    current_holder_pid; // 12..15  Phase 25: holder PID, -1=orphan
 } chan_endpoint_t;
 
 _Static_assert(sizeof(chan_endpoint_t) == 16, "chan_endpoint_t must be 16 bytes");

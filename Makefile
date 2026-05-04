@@ -412,6 +412,19 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json
 	@cp user/tests/snap_stress_cycle       initrd_root/bin/tests/snap_stress_cycle.tap
 	@# Phase 24 W20.4: 30-second sustained COW-fault storm.
 	@cp user/tests/snap_cow_storm          initrd_root/bin/tests/snap_cow_storm.tap
+	@# Phase 25 Stage C: SCOPE_SELF caller-page restore (FU24.I).
+	@cp user/tests/snap_restore_self       initrd_root/bin/tests/snap_restore_self.tap
+	@# Phase 25 Stage E: chan_send interception substrate (in-scope guarantee).
+	@cp user/tests/txn_buffer_send         initrd_root/bin/tests/txn_buffer_send.tap
+	@# Phase 25 Stage F: txn_commit / txn_abort state machine + replay engine.
+	@cp user/tests/txn_basic_commit        initrd_root/bin/tests/txn_basic_commit.tap
+	@cp user/tests/txn_basic_abort         initrd_root/bin/tests/txn_basic_abort.tap
+	@cp user/tests/txn_nested_basic        initrd_root/bin/tests/txn_nested_basic.tap
+	@cp user/tests/txn_nest_limit          initrd_root/bin/tests/txn_nest_limit.tap
+	@# Phase 25 Stage G: stress (1K cycles in gate; nightly env-gates 10K).
+	@cp user/tests/txn_stress_basic        initrd_root/bin/tests/txn_stress_basic.tap
+	@cp user/tests/txn_stress_nested       initrd_root/bin/tests/txn_stress_nested.tap
+	@cp user/tests/txn_stress_state_machine initrd_root/bin/tests/txn_stress_state_machine.tap
 	@# Phase 23 S7.1: ahcid registration smoke test (interactive only;
 	@# spawns ahcid which competes with kernel AHCI — not in gate sequence).
 	@cp user/tests/ahcid_register   initrd_root/bin/tests/ahcid_register.tap
@@ -492,6 +505,11 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json
 	@cp user/snapshot                initrd_root/bin/snapshots
 	@cp user/snapshot                initrd_root/bin/restore
 	@cp user/snapshot                initrd_root/bin/snap-delete
+	@# Phase 25 Stage H: txnctl CLI. argv[0] dispatch — `txn-status` reuses
+	@# the same binary. Strictly informational; transactions are
+	@# process-scoped (use gash `txn { ... }` or grahai --txn instead).
+	@cp user/txnctl                  initrd_root/bin/txnctl
+	@cp user/txnctl                  initrd_root/bin/txn-status
 	@# Phase 22 Stage A: netd userspace TCP/IP daemon skeleton. Spawned by
 	@# init when /etc/init.conf names it (default init.conf below doesn't
 	@# for `make test`); sits in initrd unused otherwise. Stage A content:
@@ -590,6 +608,24 @@ endif
 	@# Phase 24 W20.4: 30-second sustained COW-fault storm (resnap every
 	@# 256 writes to keep faulting fresh pages).
 	@echo "snap_cow_storm" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 25 Stage C (FU24.I): SCOPE_SELF caller-page restore — exercises
+	@# restore_pages's skip_page_va path so the caller's BSS + heap revert
+	@# but its active stack page (in-flight syscall return frame) does not.
+	@echo "snap_restore_self" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 25 Stage E: chan_send txn-aware prologue. In-scope sends (peer
+	@# == sender PID) must NOT be buffered; this test verifies the prologue
+	@# falls through correctly to the live ring on SCOPE_SELF self-channel
+	@# sends, and that empty-buffer abort/commit are clean.
+	@echo "txn_buffer_send" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 25 Stage F: state-machine + commit/abort substrate. These four
+	@# tests exercise the empty-buffer fast path, the snap_restore_internal
+	@# revert through txn_abort, the nesting stack, and the TXN_MAX_NESTING
+	@# enforcement. External-peer replay coverage lands at Stage I via
+	@# multi-process gash + grahai integration tests.
+	@echo "txn_basic_commit" >> initrd_root/bin/tests/manifest.txt
+	@echo "txn_basic_abort" >> initrd_root/bin/tests/manifest.txt
+	@echo "txn_nested_basic" >> initrd_root/bin/tests/manifest.txt
+	@echo "txn_nest_limit" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 15a: capability objects v2.
 	@echo "captest_v2" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 15b: pledge classes + audit log.
@@ -666,6 +702,13 @@ endif
 	@# TCG flake at test 10 doesn't cut off the rest of the gate. See
 	@# the comment block earlier in this manifest for the rationale.
 	@echo "pipetest" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 25 Stage G: stress (each ~0.5-2 s wall in TCG; well within
+	@# budget). Placed AFTER pipetest because they're tolerant of any
+	@# residual fallout from pipetest's flake (they don't depend on pipe
+	@# state).
+	@echo "txn_stress_basic" >> initrd_root/bin/tests/manifest.txt
+	@echo "txn_stress_nested" >> initrd_root/bin/tests/manifest.txt
+	@echo "txn_stress_state_machine" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 23 Step 4: blk_stress_random_read NOT yet in gate — assertion 1
 	@# (/etc/gcp.json opens) trips at the late position the test would land
 	@# in, even though gcp_manifest opens the same file successfully ~14 s

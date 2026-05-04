@@ -290,6 +290,30 @@
                                 // Returns g_tsc_hz (in Hz) or 0 if the
                                 // TSC has not been calibrated yet.
 
+// Phase 25 transactional speculation. Slots 1098-1100 (1090-1097 are
+// reserved by Phase 22-24 syscalls). SYS_TXN_BEGIN allocates an implicit
+// snapshot via snap_create_internal + pushes a transaction frame on the
+// caller's task. chan_send while a txn is active is intercepted into the
+// txn's per-txn buffer (Stage E lands the interception). SYS_TXN_COMMIT
+// replays buffered external sends in original order then discards the
+// snapshot; SYS_TXN_ABORT drops the buffer + restores the snapshot.
+#define SYS_TXN_BEGIN     1098  // RDI = uint32_t flags (TXN_FLAG_*),
+                                //   RSI = const char *name (≤31 + NUL).
+                                // Pledge: SYS_CONTROL.
+                                // Returns: cap_handle slot >= 0 on success,
+                                //   negative -errno (-EINVAL, -EPERM,
+                                //   -ENOMEM, -ENESTED, -EBUSY).
+#define SYS_TXN_COMMIT    1099  // RDI = uint32_t handle.
+                                // Pledge: SYS_CONTROL.
+                                // Returns: 0 on full commit; -ETXNREPLAY
+                                //   if replay stalled mid-sequence (caller
+                                //   may retry or abort); -EINVAL/-EPERM/
+                                //   -EBUSY otherwise.
+#define SYS_TXN_ABORT     1100  // RDI = uint32_t handle.
+                                // Pledge: SYS_CONTROL.
+                                // Returns: 0 on successful abort; -EINVAL,
+                                //   -EPERM, -ESTALE.
+
 // Resource identifiers for SYS_SETRLIMIT / SYS_GETRLIMIT.
 #define RLIMIT_MEM            1     // pages (4 KiB each); 0 = unlimited
 #define RLIMIT_CPU            2     // ns per 1-second epoch (max 1_000_000_000); 0 = unlimited
