@@ -124,6 +124,13 @@ typedef struct task_struct {
     int exit_status;
     // Track what child we're waiting for (-1 = any child)
     int waiting_for_child;
+    // FU24.B / FU25.A.4 S1a: F1 atomic-flag pattern. Set to 1 atomically
+    // BEFORE the SYS_WAIT polling loop's hlt; cleared AFTER the loop exits.
+    // wake_waiting_parent acquires this and re-enqueues the parent so a
+    // child's exit gets a sub-tick-latency wake instead of waiting for the
+    // next timer tick. Volatile + __ATOMIC_RELEASE/ACQUIRE pairs the wake
+    // with the parent's pre-block decision (lost-wakeup-race-free).
+    volatile uint32_t wait_for_child_active;
 
     // Heap management (Phase 7c)
     uint64_t heap_start;     // Start of heap region

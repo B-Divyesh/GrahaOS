@@ -918,6 +918,19 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             // sets BLOCKED with no future waker → hang. Polling avoids this:
             // every iteration takes a snapshot under sched_lock, so any zombie
             // visible after our last check is found on the next iteration.
+            //
+            // FU24.B / FU25.A.4 S1a: F1 atomic-flag pattern. Set
+            // wait_for_child_active=1 with __ATOMIC_RELEASE BEFORE the first
+            // sched_lock check (and before the per-iter hlt). wake_waiting_parent
+            // does an __ATOMIC_ACQUIRE load and, on hit, sends a no-gate IPI
+            // to this CPU — bringing this hlt out within microseconds rather
+            // than waiting for the next 10 ms timer tick. The release/acquire
+            // pair guarantees the wake is never missed: if the waker observes
+            // wait_active=1, the parent's first poll iteration is guaranteed
+            // to observe any state stored before make_predicate_ready by the
+            // child's exit path.
+            __atomic_store_n(&current->wait_for_child_active, 1u,
+                             __ATOMIC_RELEASE);
             int child_pid = -1;
             int exit_status = 0;
             int has_children = 0;
@@ -963,8 +976,19 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 }
                 // No zombie yet, wait for the next tick. sti+hlt yields to
                 // schedule(); when we resume here, re-check.
+                // FU24.B / FU25.A.4 S1a: hlt resumes on any interrupt
+                // (timer or IPI from wake_waiting_parent). The atomic
+                // acquire fence pairs with the wake_waiting_parent's
+                // wait_for_child_active acquire-load + child's ZOMBIE
+                // store-release in SYS_EXIT.
                 asm volatile("sti; hlt; cli" ::: "memory");
+                __atomic_thread_fence(__ATOMIC_ACQUIRE);
             }
+
+            // Clear the wait-active flag now that the polling loop has
+            // exited (either zombie found, no children, or future error).
+            __atomic_store_n(&current->wait_for_child_active, 0u,
+                             __ATOMIC_RELEASE);
 
             if (child_pid >= 0) {
                 if (status_ptr) {
