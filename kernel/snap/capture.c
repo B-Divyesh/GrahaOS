@@ -377,6 +377,49 @@ static int snap_capture_fs_pins_for_task(task_t *t, snapshot_t *snap) {
     return 0;
 }
 
+// Pre-Phase-28 sweep B.3 (FU25.A.3) — append-pin entry-point used by
+// SYS_TXN_PIN_PATH so userspace can extend a SNAP_STATE_ACTIVE snapshot's
+// fs_pins[] mid-flight. snap_capture_fs_pins_for_task above only sees
+// FDs OPEN at txn_begin time; this surface lets gash's cmd_echo /
+// cmd_touch capture pins for files opened-and-closed inside the txn
+// body, which is what FU25.A.3 needs for `txn { echo X > /a } abort`
+// to actually revert /a's content (the FD is closed by the time the
+// abort fires; without this, no pin is recorded for /a).
+int snap_add_fs_pin(snapshot_t *snap, uint64_t inode_id,
+                    uint64_t version_id) {
+    if (!snap) return -CAP_EINVAL;
+    if (snap->state != SNAP_STATE_ACTIVE) return -CAP_EINVAL;
+    if (inode_id == 0 || version_id == 0) return -CAP_EINVAL;
+    if (snap->fs_pin_count >= SNAP_FSPINS_PER_TASK_MAX *
+                              (uint32_t)SNAP_TASKS_MAX) {
+        return -CAP_E2BIG;
+    }
+    /* De-duplicate: if this (inode, version) is already pinned, no-op
+     * success. (Multiple cmd_echo > /file calls inside one txn body. */
+    for (uint32_t i = 0; i < snap->fs_pin_count; i++) {
+        if (snap->fs_pins[i].inode_id == inode_id &&
+            snap->fs_pins[i].pinned_version_id == version_id) {
+            return 0;
+        }
+    }
+    int rc = grahafs_pin_version((uint32_t)inode_id, version_id);
+    if (rc < 0) return rc;
+    if (snap->fs_pins == NULL) {
+        snap->fs_pins = (snapshot_fs_pin_t *)kmalloc(
+            sizeof(snapshot_fs_pin_t) *
+                (SNAP_FSPINS_PER_TASK_MAX * SNAP_TASKS_MAX),
+            SUBSYS_CORE);
+        if (!snap->fs_pins) {
+            grahafs_unpin_version((uint32_t)inode_id, version_id);
+            return -CAP_ENOMEM;
+        }
+    }
+    snap->fs_pins[snap->fs_pin_count].inode_id = inode_id;
+    snap->fs_pins[snap->fs_pin_count].pinned_version_id = version_id;
+    snap->fs_pin_count++;
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // W14.8 orchestrator — invoked by snap_create after snap_begin_barrier.
 // Returns 0 on success; on partial failure the caller calls

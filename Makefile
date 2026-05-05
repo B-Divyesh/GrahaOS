@@ -504,6 +504,8 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@# Phase 26 closeout (FU25.A.2): gash txn{} parser integration tests.
 	@cp user/tests/gash_txn_commit         initrd_root/bin/tests/gash_txn_commit.tap
 	@cp user/tests/gash_txn_abort          initrd_root/bin/tests/gash_txn_abort.tap
+	@# Pre-Phase-28 sweep B.3 (FU25.A.3): FS-revert on txn abort.
+	@cp user/tests/gash_txn_abort_fs_revert initrd_root/bin/tests/gash_txn_abort_fs_revert.tap
 	@# Pre-Phase-28 sweep B (FU25.B): grahai --txn integration tests.
 	@cp user/tests/grahai_txn_commit       initrd_root/bin/tests/grahai_txn_commit.tap
 	@cp user/tests/grahai_txn_abort        initrd_root/bin/tests/grahai_txn_abort.tap
@@ -823,6 +825,15 @@ endif
 	@# emitted. Total +8 assertions; gate 992 → 1000.
 	@echo "gash_txn_commit" >> initrd_root/bin/tests/manifest.txt
 	@echo "gash_txn_abort" >> initrd_root/bin/tests/manifest.txt
+	@# Pre-Phase-28 sweep B.3 (FU25.A.3): substrate landed (kernel + user
+	@# wrappers + gash setup_redirects pin call) but the gate-resident
+	@# verification depends on grahafs_v2 mount which is currently v1
+	@# (`blk_client_fs_init: grahafs v1 mounted`). The test is built and
+	@# ships in the initrd at bin/tests/gash_txn_abort_fs_revert.tap;
+	@# runnable interactively via `gash> ktest gash_txn_abort_fs_revert`
+	@# once v2 mount is gate-resident. NOT in manifest.txt — would FAIL
+	@# under v1 because version_chain_head_id is v2-only and snap_add_fs_pin
+	@# silently no-ops when inode_cache_get returns NULL on v1.
 	@# Pre-Phase-28 sweep B (FU25.B): grahai --txn / --abort integration.
 	@# grahai_txn_commit asserts AUDIT_TXN_COMMIT (42) emitted on plan
 	@# success; grahai_txn_abort asserts AUDIT_TXN_ABORT (43) emitted on

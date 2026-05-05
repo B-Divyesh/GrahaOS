@@ -461,6 +461,10 @@ void cmd_cat(const char* filename) {
 }
 
 void cmd_touch(const char* filename) {
+    /* Pre-Phase-28 sweep B.3 (FU25.A.3): if running inside a txn body,
+     * capture a pre-modification pin so abort reverts. No-op when no
+     * active txn (the syscall handles that branch). */
+    (void)syscall_txn_pin_path(filename);
     if (syscall_create(filename, 0644) < 0) {
         print("touch: cannot create '");
         print(filename);
@@ -499,10 +503,17 @@ void cmd_echo(char* argv[], int argc) {
     if (redirect_index > 0 && redirect_index < argc - 1) {
         // Write to file
         const char* filename = argv[redirect_index + 1];
-        
+
+        /* Pre-Phase-28 sweep B.3 (FU25.A.3): pin pre-write version if
+         * running inside a txn body. No-op when no active txn. Must
+         * happen BEFORE syscall_create so the version_chain_head_id
+         * we capture is the pre-modification HEAD; create itself
+         * bumps the version. */
+        (void)syscall_txn_pin_path(filename);
+
         // Create or truncate file
         syscall_create(filename, 0644);
-        
+
         int fd = syscall_open(filename);
         if (fd < 0) {
             print("echo: cannot open file\n");
@@ -2179,6 +2190,12 @@ static int setup_redirects(char *argv[], int argc,
         if (strcmp(argv[i], ">") == 0 && i + 1 < argc) {
             // Output redirect (overwrite — truncate first)
             const char *filename = argv[i + 1];
+            /* Pre-Phase-28 sweep B.3 (FU25.A.3): if running inside a
+             * txn body, capture pre-write version pin so abort reverts
+             * the file content. Must happen BEFORE syscall_create so
+             * the version_chain_head_id we pin is the pre-write HEAD.
+             * No-op when no active txn (the syscall handles that). */
+            (void)syscall_txn_pin_path(filename);
             syscall_create(filename, 0644);
             int fd = syscall_open(filename);
             if (fd < 0) {

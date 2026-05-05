@@ -142,6 +142,7 @@ typedef long ssize_t;
 #define SYS_MANIFEST_EXPORT         1112
 // Pre-Phase-28 sweep C.1 (FU25.A.3 substrate): expose grahafs_pin_version.
 #define SYS_GRAHAFS_PIN_VERSION     1113
+#define SYS_TXN_PIN_PATH            1114
 
 // Phase 24 W19: COW snapshot subsystem (slots reconciled to 1093-1096
 // because spec's original 1086-1089 collide with SPAWN_EX..MMIO_VMO_CREATE).
@@ -1753,6 +1754,25 @@ static inline long syscall_grahafs_pin_version(uint32_t inode_num,
     asm volatile("syscall"
                  : "=a"(ret)
                  : "a"(SYS_GRAHAFS_PIN_VERSION), "r"(r_inode), "r"(r_ver)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+/* Pre-Phase-28 sweep B.3 (FU25.A.3) — path-aware, txn-aware "pin if
+ * active txn, else no-op". Resolves path to inode + current version
+ * chain head id, then captures a pin under the caller's active_txn
+ * backing snapshot via snap_add_fs_pin. On txn_abort the kernel
+ * walks fs_pins[] and calls grahafs_revert_to_version on each, so a
+ * pre-write pin restores the file to its pre-modification state.
+ * Gash's cmd_echo / cmd_touch call this unconditionally; the syscall
+ * silently no-ops when no active txn is present, when the file
+ * doesn't exist, or when the file is on the v1 (non-versioned) FS. */
+static inline long syscall_txn_pin_path(const char *path) {
+    long ret;
+    register const char *r_path asm("rdi") = path;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_TXN_PIN_PATH), "r"(r_path)
                  : "rcx", "r11", "memory");
     return ret;
 }

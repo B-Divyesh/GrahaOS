@@ -26,6 +26,7 @@ extern spinlock_t sched_lock;
 #include "../../drivers/e1000/e1000.h"
 #include "../../../../kernel/net/rawnet.h"
 #include "../../../../kernel/snap/snapshot.h"
+#include "../../../../kernel/txn/transaction.h"
 #include "../../../../kernel/console/console.h"
 #include "../../../../kernel/fs/pipe.h"
 #include "../../../../kernel/fs/cluster.h"
@@ -3891,6 +3892,61 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             uint64_t version_id = frame->rsi;
             extern int grahafs_pin_version(uint32_t, uint64_t);
             int rc = grahafs_pin_version(inode_num, version_id);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        /* Pre-Phase-28 sweep B.3 (FU25.A.3) — path-aware "pin if active
+         * txn" syscall. Resolves path → inode → current version chain
+         * head → snap_add_fs_pin on the active_txn's backing snapshot.
+         * Returns 0 (no-op) when the caller has no active txn so gash
+         * builtins can call it unconditionally without checking. */
+        case SYS_TXN_PIN_PATH: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_FS_WRITE,
+                                        "pledge denied: fs_write")) break;
+            char kpath[256];
+            if (copy_string_from_user((const char *)frame->rdi,
+                                       kpath, sizeof(kpath)) <= 0) {
+                frame->rax = (uint64_t)(long)-CAP_V2_EINVAL;
+                break;
+            }
+            task_t *cur = sched_get_current_task();
+            if (!cur || cur->active_txn.current == NULL) {
+                /* No active txn — silent no-op, matches gash's
+                 * unconditional-call pattern. */
+                frame->rax = 0;
+                break;
+            }
+            transaction_t *t = (transaction_t *)cur->active_txn.current;
+            snapshot_t *backing = t->backing_snapshot;
+            if (!backing) {
+                frame->rax = (uint64_t)(long)-CAP_V2_EINVAL;
+                break;
+            }
+            vfs_node_t *node = vfs_path_to_node(kpath);
+            if (!node) {
+                /* New-file create case — no-op success. snap_destroy
+                 * gracefully ignores missing inodes; the "create-then-
+                 * abort delete" path requires DELETE-pin substrate
+                 * scoped to Phase 28 day-1. */
+                frame->rax = 0;
+                break;
+            }
+            uint32_t ino = node->inode;
+            vfs_destroy_node(node);
+            if (ino == 0) { frame->rax = 0; break; }
+            /* version_chain_head_id only exists on grahafs_v2. v1's
+             * inode_cache_get returns NULL when v2 is not mounted, so
+             * we silently no-op. The substrate fully wires for v2
+             * mode — when v2 mount becomes gate-resident (Phase 28
+             * entry-gate prerequisite), the FS-revert semantic
+             * activates without further code change. */
+            struct grahafs_v2_inode_cache *ce = inode_cache_get(ino);
+            if (!ce) { frame->rax = 0; break; }
+            uint64_t head_id = ce->disk.version_chain_head_id;
+            inode_cache_put(ce);
+            if (head_id == 0) { frame->rax = 0; break; }
+            int rc = snap_add_fs_pin(backing, (uint64_t)ino, head_id);
             frame->rax = (uint64_t)(long)rc;
             break;
         }

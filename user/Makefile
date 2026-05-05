@@ -74,6 +74,7 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/cap_recursive_inherit_child \
              tests/gash_txn_commit \
              tests/gash_txn_abort \
+             tests/gash_txn_abort_fs_revert \
              tests/grahai_txn_commit \
              tests/grahai_txn_abort \
              tests/txn_stress_basic tests/txn_stress_nested \

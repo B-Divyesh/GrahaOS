@@ -382,6 +382,17 @@
 #define SYS_GRAHAFS_PIN_VERSION    1113  // RDI = uint32_t inode_num, RSI = uint64_t version_id
                                          // returns 0 on success, negative -CAP_V2_* on failure.
 
+// Pre-Phase-28 sweep B.3 (FU25.A.3 wiring) — SYS_TXN_PIN_PATH wraps a
+// path resolution + version_chain_head_id lookup + snap_add_fs_pin call
+// into one syscall, so gash's cmd_echo / cmd_touch can request a pin
+// without inode/version awareness. No-op (returns 0) when the caller
+// has no active txn — gash calls it unconditionally and gets the
+// "txn-aware" semantic only when running inside a txn body. Pledge:
+// FS_WRITE (it modifies how subsequent FS writes are revertable).
+#define SYS_TXN_PIN_PATH           1114  // RDI = const char *path
+                                         // returns 0 on success / no-active-txn,
+                                         // negative on resolution / pin failure.
+
 // Resource identifiers for SYS_SETRLIMIT / SYS_GETRLIMIT.
 #define RLIMIT_MEM            1     // pages (4 KiB each); 0 = unlimited
 #define RLIMIT_CPU            2     // ns per 1-second epoch (max 1_000_000_000); 0 = unlimited

@@ -289,6 +289,18 @@ void snap_barrier_park_locked(struct task_struct *cur);
 int  snap_run_capture(struct snapshot *snap, struct task_struct *self);
 void snap_destroy_captures(struct snapshot *snap);
 
+// Pre-Phase-28 sweep B.3 (FU25.A.3) — append a single (inode, version)
+// pin to a SNAP_STATE_ACTIVE snapshot's fs_pins[] mid-flight. Used by the
+// SYS_TXN_PIN_PATH syscall so userspace can request a pin captured for
+// files opened-then-written-then-closed inside a txn body (the original
+// snap_capture_fs_pins_for_task only walks open FDs at txn_begin time).
+// Lazy-allocates the fs_pins array on first call; calls grahafs_pin_
+// version internally so the version_entry is held alive until snap_
+// destroy_captures unwinds it. Returns 0 on success, -CAP_E2BIG if the
+// snapshot is full, -CAP_EINVAL on bad inputs.
+int snap_add_fs_pin(struct snapshot *snap, uint64_t inode_id,
+                    uint64_t version_id);
+
 // COW page-fault entry point (W15). Called from arch/x86_64/mm/vmm.c
 // when error_code indicates "write to present, read-only page".
 int  cow_fault_handle(uint64_t fault_addr, uint64_t error_code,
