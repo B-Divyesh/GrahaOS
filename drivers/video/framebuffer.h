@@ -146,9 +146,11 @@ void framebuffer_force_draw_sprite(uint32_t pixel_x, uint32_t pixel_y,
                                    const uint8_t glyph[16],
                                    uint32_t fg_color, uint32_t bg_color);
 
-// Phase 27 Stage B1 — composite an RGBA pixel onto the framebuffer at
-// (pixel_x, pixel_y). Bypasses g_fbd_alive. Used by overlay damage-rect
-// composite path. Alpha blending is FU27.X.alpha_blend; for now the
-// high byte (alpha) is dropped so the call writes opaque RGB.
+// Phase 27 Stage B1 + FU27.X.alpha_blend — composite an RGBA pixel onto
+// the framebuffer at (pixel_x, pixel_y). Bypasses g_fbd_alive. Used by
+// overlay damage-rect composite path. Source pixel format is 0xAARRGGBB.
+// Fast paths for src_a == 0xFF (opaque write, no read) and src_a == 0
+// (transparent, no-op). Otherwise reads dst pixel and performs the
+// standard 8-bit alpha blend per channel.
 void framebuffer_force_blit_pixel(uint32_t pixel_x, uint32_t pixel_y,
                                   uint32_t argb);

@@ -506,12 +506,42 @@ void framebuffer_force_draw_sprite(uint32_t pixel_x, uint32_t pixel_y,
     if (!in_intr) spinlock_release(&fb_lock);
 }
 
-// Phase 27 Stage B1: write one pixel from the overlay buffer to the FB.
+// Phase 27 Stage B1 + FU27.X.alpha_blend: write one pixel from the overlay
+// buffer to the FB with proper RGBA alpha blending. Source pixel format is
+// 0xAARRGGBB. Fast paths for fully opaque (alpha=0xFF) and fully
+// transparent (alpha=0x00). Otherwise performs the standard 8-bit alpha
+// blend out = (src*src_a + dst*(255-src_a) + 128) / 255 per channel; the
+// "+128 / 255" form rounds to nearest without dividing twice and keeps the
+// math fully integer (no division per output channel beyond a constant
+// /255 the compiler folds into a multiply). No precompute table is needed
+// for the line rates this function sees (typical overlay damage rect is
+// O(thousands) pixels per frame, not O(millions)).
 void framebuffer_force_blit_pixel(uint32_t pixel_x, uint32_t pixel_y, uint32_t argb) {
     if (!fb_addr) return;
     if (pixel_x >= fb_width || pixel_y >= fb_height) return;
-    // Drop alpha; FU27.X.alpha_blend will respect it.
-    fb_addr[pixel_y * (fb_pitch / 4) + pixel_x] = argb & 0x00FFFFFFu;
+    uint8_t src_a = (uint8_t)((argb >> 24) & 0xFFu);
+    uint32_t *slot = &fb_addr[pixel_y * (fb_pitch / 4) + pixel_x];
+    if (src_a == 0xFF) {
+        // Fully opaque source: skip the read-modify-write.
+        *slot = argb & 0x00FFFFFFu;
+        return;
+    }
+    if (src_a == 0) {
+        // Fully transparent source: leave dst pixel unchanged.
+        return;
+    }
+    uint32_t dst = *slot;
+    uint8_t dst_r = (uint8_t)((dst >> 16) & 0xFFu);
+    uint8_t dst_g = (uint8_t)((dst >>  8) & 0xFFu);
+    uint8_t dst_b = (uint8_t)((dst      ) & 0xFFu);
+    uint8_t src_r = (uint8_t)((argb >> 16) & 0xFFu);
+    uint8_t src_g = (uint8_t)((argb >>  8) & 0xFFu);
+    uint8_t src_b = (uint8_t)((argb      ) & 0xFFu);
+    uint32_t inv_a = 255u - src_a;
+    uint8_t out_r = (uint8_t)(((uint32_t)src_r * src_a + (uint32_t)dst_r * inv_a + 128u) / 255u);
+    uint8_t out_g = (uint8_t)(((uint32_t)src_g * src_a + (uint32_t)dst_g * inv_a + 128u) / 255u);
+    uint8_t out_b = (uint8_t)(((uint32_t)src_b * src_a + (uint32_t)dst_b * inv_a + 128u) / 255u);
+    *slot = ((uint32_t)out_r << 16) | ((uint32_t)out_g << 8) | (uint32_t)out_b;
 }
 
 uint32_t framebuffer_get_width(void) {

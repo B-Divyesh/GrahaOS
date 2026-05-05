@@ -29,11 +29,17 @@ void _start(void) {
     if (cap_idx <= 0) printf("# gfx_enable cap_idx=%ld\n", cap_idx);
     TAP_ASSERT(cap_idx > 0, "1. gfx_enable returns positive cap_idx");
 
-    // 2. Fill 32x32 rect at (0,0) with red (0x00FF0000).
+    // 2. Fill 32x32 rect at (0,0) with opaque red (0xFFFF0000).
+    // Pre-FU27.X.alpha_blend the high byte was dropped, so this test
+    // historically used 0x00FF0000 — that means "alpha=0 (transparent)
+    // red" under the new blend semantics, which would no-op the composite
+    // and the test would observe whatever the cell's bg is. Set alpha to
+    // 0xFF for an opaque overwrite the composite path takes via the
+    // src_a==0xFF fast path.
     long rc = syscall_debug_console_gfx_fill(/*console_id*/ 0,
                                              /*x*/ 0, /*y*/ 0,
                                              /*w*/ 32, /*h*/ 32,
-                                             /*color*/ 0x00FF0000u);
+                                             /*color*/ 0xFFFF0000u);
     if (rc != 0) printf("# gfx_fill rc=%ld\n", rc);
     TAP_ASSERT(rc == 0, "2. gfx_fill writes pixel data");
 
