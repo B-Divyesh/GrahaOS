@@ -172,6 +172,16 @@ typedef struct task_struct {
     // "woke on channel close" (-EPIPE).
     int32_t             wait_result;
 
+    // Pre-Phase-28 sweep A.3b: per-task wait queue used by SYS_WAIT to block
+    // on child-exit. Resolves FU24.B (rlimittest mallocbomb hang) +
+    // FU25.A.4 (gash_txn TAP gate-INCOMPLETE) by replacing the bare-hlt
+    // polling with a proper sched_block_on_channel wait. F1 invariant:
+    // SYS_EXIT sets child->state=ZOMBIE (release) BEFORE calling
+    // wake_waiting_parent → sched_wake_one_on_channel(&parent->wait_for_child_head).
+    // The polling loop in SYS_WAIT re-checks ZOMBIE on every wake/timeout
+    // (10 ms periodic), so a lost wake is bounded at one tick.
+    struct task_struct *wait_for_child_head;
+
     // ---------------------------------------------------------------------
     // Phase 20: per-CPU runq linkage + CPU affinity.
     // ---------------------------------------------------------------------

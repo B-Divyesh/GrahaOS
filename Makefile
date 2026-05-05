@@ -811,18 +811,15 @@ endif
 	@# binary (NOT in manifest.txt — harness only auto-runs items listed
 	@# here; the parent invokes the child directly via syscall_spawn).
 	@echo "cap_recursive_inheritance" >> initrd_root/bin/tests/manifest.txt
-	@# Phase 26 closeout (FU25.A.2): gash `txn { } commit|abort` parser
-	@# integration tests. Substrate (gash auto-runs sentinel /.gash-script
-	@# via try_run_script_sentinel + cmd_txn_block parser) lands in this
-	@# closeout. The TWO TAP tests (gash_txn_commit + gash_txn_abort) are
-	@# built + copied into initrd at bin/tests/ but NOT in the per-commit
-	@# gate manifest below — back-to-back gash spawn (each test spawns gash
-	@# which spawns child snapshots) tickles the FU24.B/Phase23-S1-class
-	@# wait/exit race. Test logic is correct (4/4 PASS when it completes);
-	@# ktest's syscall_wait sometimes never sees the test's SYS_EXIT wake.
-	@# Tracked as FU25.A.4 in specs/phase-25-followups.yml.
-	@# Manual: `gash> ktest gash_txn_commit` (and abort) after qemu-interactive.
-	@# (intentionally NOT echoed to gate manifest)
+	@# Pre-Phase-28 sweep A.5 (resolves FU25.A.4): gash_txn_commit + gash_txn_abort
+	@# promoted to gate. Previously held back due to FU24.B/C wait/exit race
+	@# (intermittent INCOMPLETE on ~33-50% of TCG iters when ktest's syscall_wait
+	@# missed the test's SYS_EXIT wake). Pre-Phase-28 sweep A.3 fixed the race
+	@# via F1-pattern sched_block_on_channel in SYS_WAIT polling + pipe_read.
+	@# Each test asserts 4: sentinel staged, gash spawn OK, exit 0, AUDIT_TXN_*
+	@# emitted. Total +8 assertions; gate 992 → 1000.
+	@echo "gash_txn_commit" >> initrd_root/bin/tests/manifest.txt
+	@echo "gash_txn_abort" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 15a: capability objects v2.
 	@echo "captest_v2" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 15b: pledge classes + audit log.

@@ -99,21 +99,20 @@ int pipe_read(int idx, void *buf, int count) {
         spinlock_release(&c->lock);
         if (read_total > 0) return read_total;
         if (g_pipes[idx].writers == 0) return 0;
-        // FU24.C S1.E diagnostic instrumentation: count busy-wait
-        // iterations so the serial log shows long-stall behaviour on the
-        // next intermittent pipetest flake. Pure logging; no semantic
-        // change to the busy-wait pattern (FU24.C still pending; a real
-        // sched_block_on_channel rewrite is the proper fix). Counter is
-        // file-local + volatile so concurrent CPUs each contribute.
-        static volatile uint32_t debug_pipe_read_iter = 0;
-        uint32_t this_iter = __atomic_add_fetch(&debug_pipe_read_iter, 1u,
-                                                 __ATOMIC_RELAXED);
-        if ((this_iter & 0xFFu) == 0u) {
-            klog(KLOG_DEBUG, SUBSYS_SYSCALL,
-                 "[pipe_read] busy-wait iter=%lu pipe_idx=%d",
-                 (unsigned long)this_iter, idx);
-        }
-        asm volatile("sti; hlt; cli");
+        // Pre-Phase-28 sweep A.3a: F1 block via sched_block_on_channel.
+        // Resolves FU24.C (pipe_read busy-wait). Replaces bare `sti; hlt; cli`
+        // which only resumed on next 10 ms timer tick + did NOT register
+        // on c->read_waiters — meaning the writer's
+        // sched_wake_one_on_channel(&c->read_waiters, 0) at pipe.c:152 hit
+        // an empty list. This call registers `current` on c->read_waiters,
+        // so the writer's wake fires the reader directly via INT 49 (<1 µs
+        // wake-to-run). The 10 ms periodic timeout matches the prior tick
+        // semantics for lost-wake recovery (matches blk_wait_response F1
+        // pattern at kernel/fs/blk_client.c:310-335).
+        (void)sched_block_on_channel(
+            c, CHAN_WAIT_READ,
+            10ULL * 1000 * 1000,  /* 10 ms = 1 tick */
+            (struct task_struct **)&c->read_waiters);
     }
     return read_total;
 }

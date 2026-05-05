@@ -92,6 +92,7 @@ task_t *sched_create_idle_for_cpu(uint32_t cpu_id) {
     t->state = TASK_STATE_RUNNING;  // about to run on target CPU
     t->parent_id = 0;
     t->waiting_for_child = -1;
+    t->wait_for_child_head = NULL;
     t->pgid = 0;
     t->pending_signals = 0;
     t->name[0] = 'i'; t->name[1] = 'd'; t->name[2] = 'l'; t->name[3] = 'e';
@@ -311,6 +312,7 @@ void sched_init(void) {
     (*task_ptrs[0]).cr3 = vmm_get_pml4_phys(vmm_get_kernel_space());
     (*task_ptrs[0]).parent_id = -1;
     (*task_ptrs[0]).waiting_for_child = -1;
+    (*task_ptrs[0]).wait_for_child_head = NULL;
     (*task_ptrs[0]).pgid = 0;
     (*task_ptrs[0]).pending_signals = 0;
     (*task_ptrs[0]).name[0] = 'k'; (*task_ptrs[0]).name[1] = 'e'; (*task_ptrs[0]).name[2] = 'r';
@@ -430,6 +432,7 @@ int sched_create_task(void (*entry_point)(void)) {
     (*task_ptrs[id]).state = TASK_STATE_BLOCKED;  // BLOCKED until fully initialized
     (*task_ptrs[id]).parent_id = current_task_index >= 0 ? (*task_ptrs[current_task_index]).id : -1;
     (*task_ptrs[id]).waiting_for_child = -1;
+    (*task_ptrs[id]).wait_for_child_head = NULL;
     (*task_ptrs[id]).pgid = current_task_index >= 0 ? (*task_ptrs[current_task_index]).pgid : 0;
     (*task_ptrs[id]).pending_signals = 0;
     (*task_ptrs[id]).name[0] = '\0';
@@ -572,6 +575,7 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
         (*task_ptrs[id]).pgid      = parent_self ? parent_self->pgid : 0;
     }
     (*task_ptrs[id]).waiting_for_child = -1;
+    (*task_ptrs[id]).wait_for_child_head = NULL;
     (*task_ptrs[id]).exit_status = 0;
     (*task_ptrs[id]).pending_signals = 0;
     (*task_ptrs[id]).name[0] = '\0';
@@ -792,12 +796,18 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
 void wake_waiting_parent(int child_id) {
     // NO FRAMEBUFFER CALLS - might be called from interrupt context
     //
-    // SMP-safe: don't dereference task_ptrs[child_id]. The caller (SYS_EXIT
-    // / PF / exception kill paths) already set the child's state to ZOMBIE
-    // before us, which means a parent on another CPU may have already raced
-    // through SYS_WAIT, called sched_reap_zombie, and zeroed task_ptrs[child_id].
-    // Use the child's parent_id captured at task-creation time, not via a
-    // re-read. Pass it through a separate snapshot below.
+    // Pre-Phase-28 sweep A.3b: F1 pattern wake. The caller MUST have set
+    // child->state=ZOMBIE (with __ATOMIC_RELEASE) BEFORE invoking this
+    // function. Parent's SYS_WAIT polling loop calls sched_block_on_channel
+    // on its own wait_for_child_head queue with a 10 ms periodic timeout;
+    // each wake/timeout re-checks ZOMBIE state under sched_lock. The wake
+    // here pops the parent off its wait queue; if the wake races the
+    // ZOMBIE store, the parent's next polling iteration (within 10 ms)
+    // observes ZOMBIE and returns. Pre-Phase-28 ordering invariant:
+    // ZOMBIE-store → wake (matches blk_wait_response F1 pattern at
+    // kernel/fs/blk_client.c:310-335). The legacy state==BLOCKED check is
+    // gone; parent state during polling is CHAN_WAIT or RUNNING, never
+    // BLOCKED.
     if (child_id < 0 || child_id >= next_task_id || child_id >= MAX_TASKS) {
         return;
     }
@@ -816,17 +826,11 @@ void wake_waiting_parent(int child_id) {
     task_t *parent = task_ptrs[parent_id];
     if (!parent) return;
 
-    // Check if parent is waiting for this child or any child
-    if (parent->state == TASK_STATE_BLOCKED &&
-        (parent->waiting_for_child == child_id ||
-         parent->waiting_for_child == -1)) {
-
-        // Wake up the parent
-        parent->state = TASK_STATE_READY;
-        parent->waiting_for_child = -1;
-        // Phase 20: state → READY must be paired with runq insertion.
-        sched_enqueue_ready(parent);
-    }
+    // F1 wake. sched_wake_one_on_channel is a no-op if the queue is empty
+    // (parent isn't blocking) — the polling loop will pick up ZOMBIE on
+    // its next check. wait_result=0 = "woke on data" (i.e., child exited).
+    (void)sched_wake_one_on_channel(
+        (struct task_struct **)&parent->wait_for_child_head, 0);
 }
 
 // CRITICAL: This function is called from interrupt context

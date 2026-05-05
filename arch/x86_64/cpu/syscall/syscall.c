@@ -854,24 +854,36 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             // (which fires from the same exit path) calls rawnet_on_peer_death
             // to GC named-channel publish slots.
 
-            // SMP-safe ordering: do all the bookkeeping FIRST, then publish
-            // ZOMBIE state LAST. The parent's SYS_WAIT poll loop only reaps
-            // tasks observed in ZOMBIE state, so as long as we publish that
-            // state after sched_orphan_children + wake_waiting_parent have
-            // completed, the reaper cannot free task_ptrs[id] out from under
-            // us. (Setting state earlier — as the original code did — opened
-            // a use-after-free window where wake_waiting_parent dereferenced
-            // an already-freed task_ptrs slot — observed crash, sched.c:606.)
-            // FU24.B/A.4 S1.E diagnostic: also log parent's pid + state at
-            // the moment of wake_waiting_parent so the next intermittent hang
-            // serial log shows whether the wake observed a BLOCKED parent
-            // (legacy path) or a RUNNING one (polling path; current default).
-            // task_ptrs[] is static-internal to sched.c so we resolve parent
-            // via pid_hash_lookup which IS exported.
+            // Pre-Phase-28 sweep A.3b: F1 ordering. Set child's ZOMBIE state
+            // FIRST (atomic release), THEN wake parent. The parent's SYS_WAIT
+            // polling loop now blocks via sched_block_on_channel on its own
+            // wait_for_child_head queue with a 10 ms periodic timeout. The
+            // ordering ensures: any wake the parent receives observes ZOMBIE
+            // already set (parent's polling re-check immediately succeeds);
+            // a lost wake is recovered within 10 ms by the periodic timeout.
+            // This replaces the prior "wake before ZOMBIE" ordering, which
+            // was correct for the bare-hlt polling design but creates a
+            // 10 ms latency hit under the new F1 design.
+            //
+            // SMP safety: wake_waiting_parent reads task_ptrs[child_id] just
+            // to look up parent_id. If the parent reaps the child between
+            // ZOMBIE-store and wake (because parent observed ZOMBIE on its
+            // own polling iteration AFTER the store), task_ptrs[child_id]
+            // is NULL and wake_waiting_parent returns early — the wake is
+            // simply unnecessary, not unsafe.
+            //
+            // FU24.B/A.4 S1.E diagnostic instrumentation kept: log parent's
+            // pid + state pre-wake so the serial log shows the F1 path is
+            // exercising correctly. parent_state should now be CHAN_WAIT
+            // (parent in sched_block_on_channel) or RUNNING (parent between
+            // re-check iterations); never BLOCKED.
             klog(KLOG_INFO, SUBSYS_SYSCALL, "[SYS_EXIT] pid=%lu status=%d entering",
                  (unsigned long)current->id, status);
             current->exit_status = status;
             sched_orphan_children(current->id);
+            // F1 step 1: publish ZOMBIE BEFORE wake.
+            __atomic_store_n((volatile int *)&current->state, (int)TASK_STATE_ZOMBIE,
+                             __ATOMIC_RELEASE);
             int dbg_parent_id = current->parent_id;
             int dbg_parent_state = -1;
             if (dbg_parent_id >= 0) {
@@ -881,10 +893,9 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             klog(KLOG_INFO, SUBSYS_SYSCALL,
                  "[SYS_EXIT] pid=%lu pre-wake parent_id=%d parent_state=%d",
                  (unsigned long)current->id, dbg_parent_id, dbg_parent_state);
+            // F1 step 2: wake parent (any task blocked on parent's wait_for_child_head).
             wake_waiting_parent(current->id);
-            __atomic_store_n((volatile int *)&current->state, (int)TASK_STATE_ZOMBIE,
-                             __ATOMIC_RELEASE);
-            klog(KLOG_INFO, SUBSYS_SYSCALL, "[SYS_EXIT] pid=%lu set ZOMBIE, returning",
+            klog(KLOG_INFO, SUBSYS_SYSCALL, "[SYS_EXIT] pid=%lu post-wake, returning",
                  (unsigned long)current->id);
 
             framebuffer_draw_string("Process exited", 10, 600, COLOR_YELLOW, 0x00101828);
@@ -987,9 +998,23 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                          (unsigned long)wait_iter,
                          has_children);
                 }
-                // No zombie yet, wait for the next tick. sti+hlt yields to
-                // schedule(); when we resume here, re-check.
-                asm volatile("sti; hlt; cli" ::: "memory");
+                // Pre-Phase-28 sweep A.3b: F1 block. Replaces bare
+                // `sti; hlt; cli` (which only resumed on the next 10 ms
+                // timer tick — under load could miss ZOMBIE observation
+                // windows). sched_block_on_channel registers `current` on
+                // its own wait_for_child_head queue; SYS_EXIT's wake_waiting_parent
+                // (after publishing ZOMBIE with __ATOMIC_RELEASE) calls
+                // sched_wake_one_on_channel(&parent->wait_for_child_head, 0)
+                // which immediately schedules the parent. Periodic 10 ms
+                // timeout bounds lost-wake recovery to one tick (matches
+                // blk_wait_response F1 pattern at blk_client.c:310-335).
+                // The polling loop's outer re-check on every iteration is
+                // the F1 invariant: even on lost wake, the timeout-driven
+                // re-check observes ZOMBIE within 10 ms.
+                (void)sched_block_on_channel(
+                    current, CHAN_WAIT_READ,
+                    10ULL * 1000 * 1000,  /* 10 ms = 1 tick */
+                    (struct task_struct **)&current->wait_for_child_head);
             }
 
             if (child_pid >= 0) {
