@@ -17,6 +17,7 @@
 #include "../audit.h"
 #include "../log.h"
 #include "../sync/spinlock.h"
+#include "../pid_hash.h"
 #include "../../arch/x86_64/cpu/sched/sched.h"
 
 // ---------------------------------------------------------------------------
@@ -142,15 +143,40 @@ int rawnet_publish(int32_t publisher_pid,
     rawnet_publish_entry_t *slot = NULL;
 
     if (existing) {
+        bool takeover_dead = false;
         if (existing->publisher_pid != publisher_pid) {
-            spinlock_release(&g_rawnet_lock);
-            return CAP_V2_EPERM;
+            // FU27.WASM Stage D2: a *different* PID owns the slot. If that
+            // PID is dead or zombie (no live entry in pid_hash), the slot
+            // is orphaned — rawnet_on_peer_death() should have fired at
+            // reap, but reap may not have run yet (the previous test killed
+            // a daemon and exited before the kernel reap path executed).
+            // Treat orphaned slots as free so the new publisher can take
+            // over. Live conflicts still return EPERM.
+            //
+            // Companion fix: scheduler now skips ZOMBIE tasks at dequeue
+            // (sched.c:944) so SIGKILL's state=ZOMBIE store isn't
+            // clobbered to RUNNING by the next dispatch. Without that
+            // fix, prev->state would read back as RUNNING for a
+            // SIGKILL'd-but-not-yet-reaped task and we'd reject here.
+            task_t *prev = pid_hash_lookup(existing->publisher_pid);
+            if (!prev || prev->state == TASK_STATE_ZOMBIE) {
+                takeover_dead = true;
+            } else {
+                spinlock_release(&g_rawnet_lock);
+                return CAP_V2_EPERM;
+            }
         }
-        // Same PID republishing (daemon respawn after crash). Drop old refcount
-        // on the previous accept channel, replace.
+        // Same PID republishing (daemon respawn after crash) OR new PID
+        // claiming an orphaned slot. Drop old refcount on the previous
+        // accept channel, replace.
         if (existing->accept_channel) {
             __atomic_fetch_sub(&existing->accept_channel->refcount, 1,
                                __ATOMIC_RELEASE);
+        }
+        if (takeover_dead) {
+            klog(KLOG_INFO, SUBSYS_NET,
+                 "[rawnet] orphan-takeover name=%s prev_pid=%d new_pid=%d",
+                 existing->name, (int)existing->publisher_pid, (int)publisher_pid);
         }
         slot = existing;
     } else {

@@ -1015,7 +1015,127 @@ static void grahai_phase27_observability(void) {
 }
 
 // --- Entry Point ---
-void _start(void) {
+// FU27.WASM Stage D3 — `grahai wasm-run <path>` subcommand. Connects to
+// /sys/wasm/control, sends RUN_MODULE for the requested file, prints
+// captured stdout, reports a per-call summary (status + stdout_len +
+// audit summary). Mirrors bin/wasm but adds grahai's audit-stream
+// observability so the reader sees correlated PLEDGE_NARROW_EXEC /
+// WASM_TRAP / WASM_OUT_OF_FUEL events alongside the call result.
+//
+// The wasmd protocol headers live under user/wasmd/proto.h; libnet's
+// connect-with-retry handles the "wasmd just published" race.
+#include "wasmd/proto.h"
+#include "libnet/libnet.h"
+#include <stdint.h>
+#include <stddef.h>
+
+static int grahai_wasm_run(const char *path) {
+    print("grahai: wasm-run path=");
+    print(path);
+    print("\n");
+
+    int fd = syscall_open(path);
+    if (fd < 0) {
+        print("grahai: cannot open '");
+        print(path);
+        print("' (rc=");
+        print_int(fd);
+        print(")\n");
+        return 2;
+    }
+    static uint8_t wasm_buf[WASMD_BYTES_MAX];
+    long n = syscall_read(fd, wasm_buf, WASMD_BYTES_MAX);
+    (void)syscall_close(fd);
+    if (n <= 0) {
+        print("grahai: read returned ");
+        print_int((int)n);
+        print("\n");
+        return 2;
+    }
+
+    libnet_client_ctx_t cli;
+    int rc = libnet_connect_service_with_retry(WASMD_SERVICE_NAME,
+                                               WASMD_SERVICE_NAME_LEN,
+                                               /*total_timeout_ms=*/4000,
+                                               &cli);
+    if (rc < 0) {
+        print("grahai: cannot connect to ");
+        print(WASMD_SERVICE_NAME);
+        print(" (rc=");
+        print_int(rc);
+        print("). Is wasmd running?\n");
+        return 1;
+    }
+
+    chan_msg_user_t req;
+    memset_local(&req, 0, sizeof(req));
+    req.header.type_hash = wasmd_type_hash();
+    *(uint32_t *)(req.inline_payload + 0) = WASMD_OP_RUN_MODULE;
+    *(uint32_t *)(req.inline_payload + 4) = (uint32_t)n;
+    memcpy_local(req.inline_payload + WASMD_BYTES_OFFSET, wasm_buf, (size_t)n);
+    req.header.inline_len = (uint16_t)(WASMD_BYTES_OFFSET + n);
+
+    long sr = syscall_chan_send(cli.wr_req, &req, /*timeout_ns=*/2000000000ULL);
+    if (sr < 0) {
+        print("grahai: chan_send -> ");
+        print_int((int)sr);
+        print("\n");
+        return 1;
+    }
+
+    chan_msg_user_t resp;
+    memset_local(&resp, 0, sizeof(resp));
+    long rr = syscall_chan_recv(cli.rd_resp, &resp, /*timeout_ns=*/30000000000ULL);
+    if (rr < 0) {
+        print("grahai: chan_recv -> ");
+        print_int((int)rr);
+        print(" (wasmd timeout?)\n");
+        return 1;
+    }
+
+    const wasmd_response_header_t *rh =
+        (const wasmd_response_header_t *)resp.inline_payload;
+    int32_t  status = rh->status;
+    uint32_t outlen = rh->stdout_len;
+    uint32_t outmax = (uint32_t)(sizeof(resp.inline_payload) - sizeof(*rh));
+    if (outlen > outmax) outlen = outmax;
+
+    /* Print captured stdout. */
+    const char *buf = (const char *)(resp.inline_payload + sizeof(*rh));
+    if (outlen > 0) {
+        for (uint32_t i = 0; i < outlen; i++) {
+            syscall_putc(buf[i]);
+        }
+        if (buf[outlen - 1] != '\n') syscall_putc('\n');
+    }
+
+    /* Per-call summary mirrors grahai's observability voice. */
+    print("grahai: wasm: status=");
+    print_int((int)status);
+    print(" stdout_len=");
+    print_int((int)outlen);
+    print(" audit_events=");
+    /* mask=0 means "all events" (kernel skips filtering); since
+     * audit codes 46-49 (WASM_*, PLEDGE_NARROW_EXEC) are above the
+     * 32-bit event_mask uint32_t, we can't filter on them inline.
+     * Counting any recent events still gives a useful summary. */
+    audit_entry_u_t aud[8];
+    long aq = syscall_audit_query(0, 0, 0, aud, 8);
+    print_int((int)(aq > 0 ? aq : 0));
+    print("\n");
+
+    return (status == WASMD_OK) ? 0 : 5;
+}
+
+void _start(int argc, char **argv) {
+    /* FU27.WASM Stage D3: dispatch wasm-run subcommand if invoked
+     * with arguments. Falls through to legacy + AI modes when no
+     * args are present. */
+    if (argc >= 3 && strcmp(argv[1], "wasm-run") == 0) {
+        int rc = grahai_wasm_run(argv[2]);
+        syscall_exit(rc);
+    }
+
     // Phase 27 Stage D3 — emit observability lines + register subscriber.
     grahai_phase27_observability();
 

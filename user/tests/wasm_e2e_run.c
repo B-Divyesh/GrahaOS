@@ -77,7 +77,7 @@ void _start(void) {
     }
 
     /* Give wasmd a moment to start its accept loop. */
-    spin_ms(50);
+    spin_ms(10);
 
     /* 1. Connect to wasmd. */
     libnet_client_ctx_t cli;
@@ -159,7 +159,10 @@ void _start(void) {
        and collide with later FS-heavy tests (fstest_v2, in particular,
        INCOMPLETE'd intermittently when wasmd was left alive). */
     if (wasmd_pid > 0) {
-        (void)syscall_kill(wasmd_pid, /*signal=*/9);
+        /* Kernel SIGKILL=2 (sched.h:21), NOT POSIX 9. Sending 9 is a
+         * no-op in this kernel and was leaking wasmd processes across
+         * tests under FU27.WASM Stage D2. */
+        (void)syscall_kill(wasmd_pid, /*signal=*/2);
     }
 
     syscall_exit(0);

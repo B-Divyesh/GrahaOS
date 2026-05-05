@@ -952,6 +952,21 @@ void schedule(struct interrupt_frame *frame) {
         spinlock_release(&rq->lock);
     }
 
+    /* FU27.WASM Stage D2: SIGKILL sets state=ZOMBIE under sched_lock
+     * but does NOT remove the target from its runq. If we dequeue a
+     * task that's already ZOMBIE, the unconditional state=RUNNING
+     * below would clobber SIGKILL's state and the task would appear
+     * "alive" to other subsystems (rawnet_publish saw prev_state=
+     * RUNNING for a SIGKILL'd wasmd, blocking orphan-takeover).
+     * Single-shot detection only: drop ZOMBIE here; the next
+     * schedule() iteration handles the next task. Looping past
+     * zombies inside this single dequeue starves later tasks under
+     * SMP burst and broke libtap_selftest / httptest / txn_nested
+     * with exit=142 (SIGALRM). */
+    if (next && next->state == TASK_STATE_ZOMBIE) {
+        next = NULL;
+    }
+
     if (!next) {
         next = rq->idle_task;
         if (!next) next = task_ptrs[0];  // pre-init bootstrap fallback only

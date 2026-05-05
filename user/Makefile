@@ -55,6 +55,9 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/pledge_narrow_exec \
              tests/wasmtest \
              tests/wasm_e2e_run \
+             tests/wasm_fault_trap \
+             tests/wasm_load_reject \
+             tests/wasm_concurrent_serial \
              tests/vsnprintftest \
              tests/console_init \
              tests/keyboard_alt \
@@ -251,6 +254,21 @@ tests/wasmtest: tests/wasmtest.o wasmd/src/loader.o $(LIBTAP) $(LIBC)
 tests/wasm_e2e_run: tests/wasm_e2e_run.o $(LIBTAP) $(LIBNET) $(LIBC)
 	@echo "Linking TAP test: $@ (with libnet + libtap + libc)"
 	@$(LD) $(LDFLAGS) -o $@ tests/wasm_e2e_run.o $(LIBNET) $(LIBTAP) $(LIBC)
+
+# FU27.WASM Stage D2 (this stage): trap-path / load-reject / serial-reuse
+# gates. Each test spawns its own wasmd, exercises one fault or stress
+# axis, then kills wasmd to keep later tests undisturbed.
+tests/wasm_fault_trap: tests/wasm_fault_trap.o $(LIBTAP) $(LIBNET) $(LIBC)
+	@echo "Linking TAP test: $@ (with libnet + libtap + libc)"
+	@$(LD) $(LDFLAGS) -o $@ tests/wasm_fault_trap.o $(LIBNET) $(LIBTAP) $(LIBC)
+
+tests/wasm_load_reject: tests/wasm_load_reject.o $(LIBTAP) $(LIBNET) $(LIBC)
+	@echo "Linking TAP test: $@ (with libnet + libtap + libc)"
+	@$(LD) $(LDFLAGS) -o $@ tests/wasm_load_reject.o $(LIBNET) $(LIBTAP) $(LIBC)
+
+tests/wasm_concurrent_serial: tests/wasm_concurrent_serial.o $(LIBTAP) $(LIBNET) $(LIBC)
+	@echo "Linking TAP test: $@ (with libnet + libtap + libc)"
+	@$(LD) $(LDFLAGS) -o $@ tests/wasm_concurrent_serial.o $(LIBNET) $(LIBTAP) $(LIBC)
 
 # Phase 12: generic rule for tests/NAME: tests/NAME.o libtap.a libc.a
 tests/%: tests/%.o $(LIBTAP) $(LIBC)

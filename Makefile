@@ -455,6 +455,14 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@# FU27.WASM Stage D1: end-to-end execution test. Connects to wasmd via
 	@# /sys/wasm/control, runs hello.wasm, checks output + audit code.
 	@cp user/tests/wasm_e2e_run            initrd_root/bin/tests/wasm_e2e_run.tap
+	@# FU27.WASM Stage D2: trap-path / load-reject / serial-reuse gates.
+	@# Each test spawns its own wasmd, exercises one axis (oopsie.wasm
+	@# trap; bad/truncated bytes; 4x sequential RUN_MODULE), then kills
+	@# wasmd. Worker subprocess (PLEDGE_FLAG_NARROW_EXEC fault isolation)
+	@# deferred to FU27.WASM.D2 follow-up; v1 wasmd runs wasm3 in-process.
+	@cp user/tests/wasm_fault_trap         initrd_root/bin/tests/wasm_fault_trap.tap
+	@cp user/tests/wasm_load_reject        initrd_root/bin/tests/wasm_load_reject.tap
+	@cp user/tests/wasm_concurrent_serial  initrd_root/bin/tests/wasm_concurrent_serial.tap
 	@# Phase 26 closeout (FU26.C): kernel vsnprintf width/flags parser gate.
 	@cp user/tests/vsnprintftest           initrd_root/bin/tests/vsnprintftest.tap
 	@# Phase 27 Block A (Stage A2): console subsystem syscall gate.
@@ -733,6 +741,16 @@ endif
 	@# accepts RUN_MODULE, narrow-execs a worker, hello.wasm prints,
 	@# AUDIT_PLEDGE_NARROW_EXEC visible.
 	@echo "wasm_e2e_run" >> initrd_root/bin/tests/manifest.txt
+	@# FU27.WASM Stage D2: trap-path gate. oopsie.wasm hits unreachable;
+	@# wasmd returns WASMD_E_TRAP. Then hello.wasm proves wasmd survived.
+	@echo "wasm_fault_trap" >> initrd_root/bin/tests/manifest.txt
+	@# FU27.WASM Stage D2: load-reject gate. Bad-magic + truncated bytes
+	@# both rejected with WASMD_E_LOAD_FAILED; daemon survives.
+	@echo "wasm_load_reject" >> initrd_root/bin/tests/manifest.txt
+	@# FU27.WASM Stage D2: serial reuse gate. 4x RUN_MODULE on the same
+	@# connection — checks wasm3's NewEnvironment/NewRuntime per-call
+	@# lifecycle leaves no leftover state.
+	@echo "wasm_concurrent_serial" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 26 closeout (FU26.C): kernel vsnprintf width/flags parser test.
 	@# Verifies %04x / %5d / %-10s / etc. produce correct output and that
 	@# the unknown-spec default branch no longer slips va_args (FU26.A trap).

@@ -113,10 +113,19 @@ static int32_t run_module(const uint8_t *mod_bytes, size_t mod_len) {
     WASMD_LOG("wasm3: LinkRawFunction(gcp.print)...");
     r = m3_LinkRawFunction(mod, "gcp", "print", "v(*i)", &host_gcp_print);
     if (r) {
-        WASMD_LOG("LinkRawFunction(gcp.print): %s", r);
-        m3_FreeRuntime(rt);
-        m3_FreeEnvironment(env);
-        return WASMD_E_INSTANTIATE_FAILED;
+        /* m3Err_functionLookupFailed is benign: the module simply
+         * doesn't import gcp.print (e.g. oopsie.wasm has 0 imports;
+         * a future fixture may import only fs.read). Modules that
+         * DO import "gcp.print" but somehow fail to link will still
+         * fail at the first call to print() with a runtime trap.
+         * Other errors (out of memory, bad signature) are fatal. */
+        if (r != m3Err_functionLookupFailed) {
+            WASMD_LOG("LinkRawFunction(gcp.print): %s [fatal]", r);
+            m3_FreeRuntime(rt);
+            m3_FreeEnvironment(env);
+            return WASMD_E_INSTANTIATE_FAILED;
+        }
+        WASMD_LOG("LinkRawFunction(gcp.print): not imported [ok]");
     }
 
     WASMD_LOG("wasm3: FindFunction(_start)...");
@@ -209,44 +218,67 @@ void _start(void) {
     for (;;) {
         libnet_server_ctx_t cli;
         memset(&cli, 0, sizeof(cli));
+        /* 5 ms nonblocking accept poll — same cadence as D1.
+         * A 1s blocking accept added per-connect latency under TCG
+         * (chan_recv on the accept channel didn't wake reliably when
+         * sender was on a different CPU). 25 ms cadence noticeably
+         * slowed test connect. The 5ms cadence is the empirical
+         * balance — fast connect, low CPU. */
         int ar = libnet_service_accept(&srv, &cli, /*timeout_ns=*/0);
         if (ar <= 0) {
-            spin_ms(5);
+            spin_ms_approx(5);
             continue;
         }
         WASMD_LOG("accept: client=%d", cli.connector_pid);
 
-        chan_msg_user_t req, resp;
-        memset(&req, 0, sizeof(req));
-        memset(&resp, 0, sizeof(resp));
+        /* FU27.WASM Stage D2: inner loop drains multiple RUN_MODULE
+         * requests on the same connection. The original D1 logic
+         * accept→recv→send→accept handled exactly one request per
+         * connection, which broke wasm_fault_trap (oopsie + hello),
+         * wasm_load_reject (bad + truncated + hello), and
+         * wasm_concurrent_serial (4× hello). Break on -EPIPE
+         * (client disconnected) or recv-timeout (client idle). */
+        for (;;) {
+            chan_msg_user_t req, resp;
+            memset(&req, 0, sizeof(req));
+            memset(&resp, 0, sizeof(resp));
 
-        long rr = syscall_chan_recv(cli.rd_req, &req, /*timeout_ns=*/2000000000ULL);
-        if (rr < 0) {
-            WASMD_LOG("chan_recv -> %ld; closing client", rr);
-            continue;
+            long rr = syscall_chan_recv(cli.rd_req, &req,
+                                        /*timeout_ns=*/30000000000ULL);
+            if (rr < 0) {
+                WASMD_LOG("chan_recv -> %ld; closing client=%d",
+                          rr, cli.connector_pid);
+                break;
+            }
+
+            uint32_t op = *(const uint32_t *)req.inline_payload;
+            if (op == WASMD_OP_RUN_MODULE) {
+                handle_run_module(&req, &resp);
+            } else {
+                WASMD_LOG("unknown op 0x%x", op);
+                wasmd_response_header_t *rh =
+                    (wasmd_response_header_t *)resp.inline_payload;
+                rh->op = WASMD_OP_RUN_RESPONSE;
+                rh->status = WASMD_E_INTERNAL;
+                rh->stdout_len = 0;
+            }
+
+            resp.header.type_hash = wasmd_type_hash();
+            resp.header.flags = 0;
+            wasmd_response_header_t *resp_rh =
+                (wasmd_response_header_t *)resp.inline_payload;
+            resp.header.inline_len =
+                (uint16_t)(sizeof(wasmd_response_header_t) +
+                           resp_rh->stdout_len);
+
+            long sr = syscall_chan_send(cli.wr_resp, &resp,
+                                        /*timeout_ns=*/1000000000ULL);
+            if (sr < 0) {
+                WASMD_LOG("chan_send response -> %ld; closing client=%d",
+                          sr, cli.connector_pid);
+                break;
+            }
         }
-
-        uint32_t op = *(const uint32_t *)req.inline_payload;
-        if (op == WASMD_OP_RUN_MODULE) {
-            handle_run_module(&req, &resp);
-        } else {
-            WASMD_LOG("unknown op 0x%x", op);
-            wasmd_response_header_t *rh = (wasmd_response_header_t *)resp.inline_payload;
-            rh->op = WASMD_OP_RUN_RESPONSE;
-            rh->status = WASMD_E_INTERNAL;
-            rh->stdout_len = 0;
-        }
-
-        resp.header.type_hash = wasmd_type_hash();
-        resp.header.flags = 0;
-        wasmd_response_header_t *resp_rh =
-            (wasmd_response_header_t *)resp.inline_payload;
-        resp.header.inline_len = (uint16_t)(sizeof(wasmd_response_header_t) +
-                                            resp_rh->stdout_len);
-
-        long sr = syscall_chan_send(cli.wr_resp, &resp, /*timeout_ns=*/1000000000ULL);
-        if (sr < 0) {
-            WASMD_LOG("chan_send response -> %ld", sr);
-        }
+        WASMD_LOG("connection closed: client=%d", cli.connector_pid);
     }
 }
