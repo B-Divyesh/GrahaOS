@@ -26,7 +26,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot txnctl assertpledge wasm fbd/fbd wasmd/wasmd wasmd/wasmd_worker
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot txnctl assertpledge wasm fbd/fbd wasmd/wasmd wasmd/wasmd_worker tui_demo tui_anim
 
 # Phase 12: TAP 1.4 test binaries. Each lives at user/tests/NAME.c
 # and is copied to initrd as /bin/tests/NAME.tap by the top-level
@@ -240,6 +240,16 @@ $(LIBWASM3): $(WASM3_OBJS)
 tests/tui_render: tests/tui_render.o $(LIBTUI) $(LIBTAP) $(LIBC)
 	@echo "Linking TAP test: $@ (with libtui + libtap + libc)"
 	@$(LD) $(LDFLAGS) -o $@ tests/tui_render.o $(LIBTUI) $(LIBTAP) $(LIBC)
+
+# FU27.X.tui_demo_apps: tui_demo + tui_anim are user binaries (NOT TAP
+# tests; manual demos run from gash). Link against libtui + libc.
+tui_demo: tui_demo.o $(LIBTUI) $(LIBC)
+	@echo "Linking user program: $@ (with libtui + libc)"
+	@$(LD) $(LDFLAGS) -o $@ tui_demo.o $(LIBTUI) $(LIBC)
+
+tui_anim: tui_anim.o $(LIBTUI) $(LIBC)
+	@echo "Linking user program: $@ (with libtui + libc)"
+	@$(LD) $(LDFLAGS) -o $@ tui_anim.o $(LIBTUI) $(LIBC)
 
 # Phase 27 Stage B1: console_sprite.tap links libtui (for TUI_SPRITE_BASE).
 tests/console_sprite: tests/console_sprite.o $(LIBTUI) $(LIBTAP) $(LIBC)

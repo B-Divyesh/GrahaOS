@@ -612,6 +612,13 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@# Phase 27 Block A (Stage A4): /bin/fbd userspace framebuffer compositor.
 	@# Spawned by init under autorun=init only (NOT in autorun=ktest gate).
 	@cp user/fbd/fbd                 initrd_root/bin/fbd
+	@# FU27.X.tui_demo_apps: tui_demo + tui_anim manual-only demos.
+	@# NOT in test manifest; run interactively from `gash> tui_demo` or
+	@# `gash> tui_anim`. tui_demo exercises libtui boxed-windows with
+	@# 256-color palette; tui_anim exercises the gfx_overlay + alpha
+	@# blending path landed in S1.B (FU27.X.alpha_blend).
+	@cp user/tui_demo                initrd_root/bin/tui_demo
+	@cp user/tui_anim                initrd_root/bin/tui_anim
 	@# Phase 22 Stage A: netd userspace TCP/IP daemon skeleton. Spawned by
 	@# init when /etc/init.conf names it (default init.conf below doesn't
 	@# for `make test`); sits in initrd unused otherwise. Stage A content:
