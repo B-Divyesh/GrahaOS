@@ -35,6 +35,11 @@
 #define MANIFEST_NAME_BLK_SERVICE_V1   "grahaos.blk.service.v1"  // ahcid per-client RPC
 #define MANIFEST_NAME_BLK_LIST_V1      "grahaos.blk.list.v1"     // blkctl diagnostic
 
+// FU27.WASM Stage D1: wasmd /sys/wasm/control per-client RPC channel.
+// Carries RUN_MODULE / KILL_INSTANCE / INSPECT_INSTANCE messages with
+// FNV-1a-hashed type discriminators in the header.
+#define MANIFEST_NAME_WASM_SERVICE_V1  "grahaos.wasm.service.v1"
+
 // Initialise the type-hash table. Called once from kmain after cap_object_init.
 void manifest_init(void);
 
@@ -55,6 +60,7 @@ uint64_t manifest_hash_net_frame_v1(void);
 uint64_t manifest_hash_net_socket_v1(void);
 uint64_t manifest_hash_blk_service_v1(void);
 uint64_t manifest_hash_blk_list_v1(void);
+uint64_t manifest_hash_wasm_service_v1(void);
 
 // Lazy-compute helper reusing kernel/fs/simhash.c's fnv1a_hash64. Callable
 // from any context.

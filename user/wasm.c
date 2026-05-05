@@ -20,52 +20,27 @@
 
 #include "syscalls.h"
 #include "wasmd/src/loader.h"
+#include "wasmd/proto.h"
+#include "libnet/libnet.h"
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 extern int  printf(const char *fmt, ...);
 
-#define WASM_MAX_FILE_BYTES  (1 * 1024 * 1024)   // 1 MiB cap; substrate scope
-static uint8_t g_module_buf[WASM_MAX_FILE_BYTES];
+/* Pre-Stage-D1: held a 1 MiB local buffer + load_file/split_csv helpers
+ * for in-process parsing. Stage D1 moves all parsing into wasmd, so this
+ * client is now a thin libnet caller. */
 
 static int s_strcmp(const char *a, const char *b) {
     while (*a && *b && *a == *b) { a++; b++; }
     return (int)(uint8_t)*a - (int)(uint8_t)*b;
 }
 
-static long load_file(const char *path, uint8_t *buf, size_t bufsz) {
-    int fd = syscall_open(path);
-    if (fd < 0) {
-        printf("wasm: cannot open '%s': %d\n", path, fd);
-        return -1;
-    }
-    long total = 0;
-    while ((size_t)total < bufsz) {
-        ssize_t n = syscall_read(fd, buf + total, bufsz - (size_t)total);
-        if (n <= 0) break;
-        total += (long)n;
-    }
-    return total;
-}
-
-// Tiny CSV splitter: returns count of tokens (>= 0) written into out[].
-// Mutates `csv` in place. Tokens are NUL-terminated within the input string.
-static int split_csv(char *csv, const char **out, int max) {
-    if (!csv || !*csv) return 0;
-    int n = 0;
-    char *p = csv;
-    out[n++] = p;
-    while (*p) {
-        if (*p == ',') {
-            *p = '\0';
-            if (n >= max) break;
-            out[n++] = p + 1;
-        }
-        p++;
-    }
-    return n;
-}
+/* load_file() and split_csv() removed in FU27.WASM Stage D1 — bin/wasmd now
+ * handles file loading and import-cap validation server-side. Pre-D1
+ * commits had local helpers here; see git history. */
 
 static int cmd_run(int argc, char **argv) {
     if (argc < 1) {
@@ -73,57 +48,105 @@ static int cmd_run(int argc, char **argv) {
         return 1;
     }
     const char *path = argv[0];
-    const char *allowed_csv = NULL;
-    for (int i = 1; i + 1 < argc; i++) {
-        if (s_strcmp(argv[i], "--cap") == 0) {
-            allowed_csv = argv[i + 1];
-            i++;
-        }
+
+    /* FU27.WASM Stage D1: connect to wasmd over /sys/wasm/control and
+       request RUN_MODULE. wasmd does the heavy lifting (parse, narrow-
+       exec a worker, capture stdout) and sends back a status + output
+       payload. Pre-Stage-D1 stub used to call wasm_load locally; that's
+       gone now (the loader still runs server-side inside wasmd). */
+    libnet_client_ctx_t cli;
+    int rc = libnet_connect_service_with_retry(WASMD_SERVICE_NAME,
+                                               WASMD_SERVICE_NAME_LEN,
+                                               /*total_timeout_ms=*/4000,
+                                               &cli);
+    if (rc < 0) {
+        printf("wasm: cannot connect to %s (rc=%d). Is wasmd running?\n",
+               WASMD_SERVICE_NAME, rc);
+        return 1;
     }
 
-    long n = load_file(path, g_module_buf, sizeof(g_module_buf));
-    if (n <= 0) return 2;
-
-    wasm_module_t m;
-    int rc = wasm_load(g_module_buf, (size_t)n, &m);
-    if (rc != WASM_OK) {
-        printf("wasm: load failed rc=%d\n", rc);
+    /* Build RUN_MODULE message:
+         header.type_hash = channel-payload type (matches publisher)
+         inline_payload[0..3] = WASMD_OP_RUN_MODULE
+         inline_payload[4..]  = path string (zero-terminated) */
+    /* Read module bytes locally; forward inline via channel. wasmd v1
+       doesn't open files (sidesteps vfs lock contention). */
+    int fd = syscall_open(path);
+    if (fd < 0) {
+        printf("wasm: cannot open '%s' (rc=%d)\n", path, fd);
         return 2;
     }
-
-    printf("wasm: loaded ok (%ld bytes, version=%u, imports=%u)\n",
-           n, (unsigned)m.version, (unsigned)m.n_imports);
-    for (uint32_t i = 0; i < m.n_imports; i++) {
-        printf("  import %u: %s.%s kind=%u\n",
-               (unsigned)i,
-               m.imports[i].module_name,
-               m.imports[i].field_name,
-               (unsigned)m.imports[i].kind);
+    static uint8_t wasm_buf[WASMD_BYTES_MAX];
+    long n = syscall_read(fd, wasm_buf, WASMD_BYTES_MAX);
+    (void)syscall_close(fd);
+    if (n <= 0) {
+        printf("wasm: read returned %ld\n", n);
+        return 2;
+    }
+    if (n == WASMD_BYTES_MAX) {
+        printf("wasm: module too large for inline transport (cap=%u). "
+               "VMO-based transfer arrives in FU27.WASM Stage D2.\n", WASMD_BYTES_MAX);
+        /* Continue — wasm3 may still parse the prefix as a fragment if
+           it is a complete module. */
     }
 
-    if (allowed_csv) {
-        // local copy so we can mutate
-        static char csv_buf[1024];
-        int j = 0;
-        while (allowed_csv[j] && j < (int)sizeof(csv_buf) - 1) {
-            csv_buf[j] = allowed_csv[j];
-            j++;
-        }
-        csv_buf[j] = '\0';
-        const char *toks[64] = {0};
-        int n_toks = split_csv(csv_buf, toks, 64);
+    chan_msg_user_t req;
+    memset(&req, 0, sizeof(req));
+    req.header.type_hash = wasmd_type_hash();
+    *(uint32_t *)(req.inline_payload + 0) = WASMD_OP_RUN_MODULE;
+    *(uint32_t *)(req.inline_payload + 4) = (uint32_t)n;
+    memcpy(req.inline_payload + WASMD_BYTES_OFFSET, wasm_buf, (size_t)n);
+    req.header.inline_len = (uint16_t)(WASMD_BYTES_OFFSET + n);
 
-        const char *missing = NULL;
-        rc = wasm_validate_imports(&m, toks, (size_t)n_toks, &missing);
-        if (rc != WASM_OK) {
-            printf("wasm: WASM_INSTANTIATE_MISSING_CAP missing=%s\n",
-                   missing ? missing : "?");
+    long sr = syscall_chan_send(cli.wr_req, &req, /*timeout_ns=*/2000000000ULL);
+    if (sr < 0) {
+        printf("wasm: chan_send -> %ld\n", sr);
+        return 1;
+    }
+
+    chan_msg_user_t resp;
+    memset(&resp, 0, sizeof(resp));
+    long rr = syscall_chan_recv(cli.rd_resp, &resp, /*timeout_ns=*/30000000000ULL);
+    if (rr < 0) {
+        printf("wasm: chan_recv -> %ld (wasmd timeout?)\n", rr);
+        return 1;
+    }
+
+    const wasmd_response_header_t *rh =
+        (const wasmd_response_header_t *)resp.inline_payload;
+    int32_t status = rh->status;
+    uint32_t outlen = rh->stdout_len;
+    uint32_t outmax = (uint32_t)(sizeof(resp.inline_payload) - sizeof(*rh));
+    if (outlen > outmax) outlen = outmax;
+
+    /* Print captured stdout (stored after the response header). */
+    const char *buf = (const char *)(resp.inline_payload + sizeof(*rh));
+    if (outlen > 0) {
+        for (uint32_t i = 0; i < outlen; i++) {
+            syscall_putc(buf[i]);
+        }
+        if (buf[outlen-1] != '\n') {
+            syscall_putc('\n');
+        }
+    }
+
+    if (status == WASMD_OK) {
+        return 0;
+    }
+    printf("wasm: wasmd reported status=%d\n", status);
+    /* Map wasmd status to a useful exit code for the test harness. */
+    switch (status) {
+        case WASMD_E_OPEN_FAILED:
+        case WASMD_E_READ_FAILED:
+        case WASMD_E_LOAD_FAILED:
+            return 2;
+        case WASMD_E_INSTANTIATE_FAILED:
             return 3;
-        }
+        case WASMD_E_TRAP:
+            return 4;
+        default:
+            return 5;
     }
-
-    printf("wasm: validate ok (substrate v1 does not execute; instantiate stubbed)\n");
-    return 0;
 }
 
 static int cmd_version(void) {

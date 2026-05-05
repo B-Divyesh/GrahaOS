@@ -26,7 +26,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot txnctl assertpledge wasm fbd/fbd
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot txnctl assertpledge wasm fbd/fbd wasmd/wasmd wasmd/wasmd_worker
 
 # Phase 12: TAP 1.4 test binaries. Each lives at user/tests/NAME.c
 # and is copied to initrd as /bin/tests/NAME.tap by the top-level
@@ -54,6 +54,7 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/cap_system \
              tests/pledge_narrow_exec \
              tests/wasmtest \
+             tests/wasm_e2e_run \
              tests/vsnprintftest \
              tests/console_init \
              tests/keyboard_alt \
@@ -243,6 +244,13 @@ tests/console_sprite: tests/console_sprite.o $(LIBTUI) $(LIBTAP) $(LIBC)
 tests/wasmtest: tests/wasmtest.o wasmd/src/loader.o $(LIBTAP) $(LIBC)
 	@echo "Linking TAP test (with wasmd loader): $@"
 	@$(LD) $(LDFLAGS) -o $@ tests/wasmtest.o wasmd/src/loader.o $(LIBTAP) $(LIBC)
+
+# FU27.WASM Stage D1: wasm_e2e_run.tap exercises the full wasmd pipeline:
+# connects to /sys/wasm/control via libnet, sends RUN_MODULE, waits for
+# response, asserts hello.wasm output + AUDIT_PLEDGE_NARROW_EXEC.
+tests/wasm_e2e_run: tests/wasm_e2e_run.o $(LIBTAP) $(LIBNET) $(LIBC)
+	@echo "Linking TAP test: $@ (with libnet + libtap + libc)"
+	@$(LD) $(LDFLAGS) -o $@ tests/wasm_e2e_run.o $(LIBNET) $(LIBTAP) $(LIBC)
 
 # Phase 12: generic rule for tests/NAME: tests/NAME.o libtap.a libc.a
 tests/%: tests/%.o $(LIBTAP) $(LIBC)
@@ -478,9 +486,31 @@ assertpledge: assertpledge.o $(LIBC)
 # Phase 26 Stage E/G: bin/wasm operator CLI + minimal loader/validator.
 # Real execution is Phase 27+ scope; substrate ships header + import-section
 # parser cross-referenced against allowed-cap CSV.
-wasm: wasm.o wasmd/src/loader.o $(LIBC)
-	@echo "Linking user program: $@ (with libc)"
-	@$(LD) $(LDFLAGS) -o $@ wasm.o wasmd/src/loader.o $(LIBC)
+wasm: wasm.o wasmd/src/loader.o $(LIBNET) $(LIBC)
+	@echo "Linking user program: $@ (with libnet + libc)"
+	@$(LD) $(LDFLAGS) -o $@ wasm.o wasmd/src/loader.o $(LIBNET) $(LIBC)
+
+# FU27.WASM Stage D1: wasmd daemon — accepts RUN_MODULE on
+# /sys/wasm/control, validates via Phase 26 loader, runs wasm3 IN-PROCESS,
+# returns captured stdout. v1 chooses simplicity over fault isolation;
+# Stage D2 fault tests will reintroduce wasmd_worker via narrow-exec.
+wasmd/wasmd.o: wasmd/wasmd.c
+	@echo "Compiling user C: $< (with wasm3 includes)"
+	@$(CC) $(CFLAGS) -I../vendor/wasm3/source -Dd_m3HasFloat=0 -Dd_m3LogOutput=0 \
+		-Wno-int-to-pointer-cast -Wno-sign-compare -c $< -o $@
+
+wasmd/wasmd: wasmd/wasmd.o wasmd/src/loader.o $(LIBNET) $(LIBWASM3) $(LIBC)
+	@echo "Linking user program: $@ (wasmd daemon — libnet + libwasm3 + libc)"
+	@$(LD) $(LDFLAGS) -o $@ wasmd/wasmd.o wasmd/src/loader.o $(LIBNET) $(LIBWASM3) $(LIBC)
+
+# FU27.WASM Stage D1: wasmd_worker — per-instance subprocess spawned by
+# wasmd. Reads /tmp/wasmd_pending.wasm, instantiates via wasm3, captures
+# stdout from `gcp.print` host import to /tmp/wasmd_output.txt, exits
+# with a code reflecting which step succeeded (0=ok, 1=load, 2=link,
+# 3=trap, 4+=internal). Links libwasm3 (vendored) + libc.
+wasmd/wasmd_worker: wasmd/wasmd_worker.o $(LIBWASM3) $(LIBC)
+	@echo "Linking user program: $@ (wasmd_worker — libwasm3 + libc)"
+	@$(LD) $(LDFLAGS) -o $@ wasmd/wasmd_worker.o $(LIBWASM3) $(LIBC)
 
 # Phase 27 Block A (Stage A4): /bin/fbd — userspace framebuffer compositor.
 # Spawned by init under autorun=init via etc/init.conf. NOT spawned under
@@ -570,6 +600,14 @@ schedbench: schedbench.o $(LIBC)
 schedbench_worker: schedbench_worker.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
 	@$(LD) $(LDFLAGS) -o $@ schedbench_worker.o $(LIBC)
+
+# FU27.WASM Stage D1: wasmd_worker.c includes <wasm3.h> from vendored tree.
+# Override the generic %.o rule for this file to add -Ivendor/wasm3/source
+# and the same -Dd_m3HasFloat=0 used to build libwasm3.a.
+wasmd/wasmd_worker.o: wasmd/wasmd_worker.c
+	@echo "Compiling user C: $< (with wasm3 includes)"
+	@$(CC) $(CFLAGS) -I../vendor/wasm3/source -Dd_m3HasFloat=0 -Dd_m3LogOutput=0 \
+		-Wno-int-to-pointer-cast -Wno-sign-compare -c $< -o $@
 
 %.o: %.c
 	@echo "Compiling user C: $<"
