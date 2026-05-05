@@ -3877,6 +3877,24 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             break;
         }
 
+        // -------------------------------------------------------------------
+        // Pre-Phase-28 sweep C.1 (FU25.A.3 substrate) — expose
+        // grahafs_pin_version. Holds a grahafs version alive across close
+        // so transactional code can revert to it on abort. Pure substrate;
+        // gash cmd_echo / cmd_touch txn-aware integration is follow-on
+        // Phase 28 entry-gate work.
+        // -------------------------------------------------------------------
+        case SYS_GRAHAFS_PIN_VERSION: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_FS_WRITE,
+                                        "pledge denied: fs_write")) break;
+            uint32_t inode_num = (uint32_t)frame->rdi;
+            uint64_t version_id = frame->rsi;
+            extern int grahafs_pin_version(uint32_t, uint64_t);
+            int rc = grahafs_pin_version(inode_num, version_id);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
         default:
             frame->rax = (uint64_t)-1;
             break;

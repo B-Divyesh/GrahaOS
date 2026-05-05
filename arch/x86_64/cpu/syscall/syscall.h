@@ -373,6 +373,15 @@
                                          // Pledge: SYS_QUERY.
                                          // Block C (Stage C2) — A2 stub returns -ENOSYS.
 
+// Pre-Phase-28 sweep C.1 (FU25.A.3 substrate) — SYS_GRAHAFS_PIN_VERSION
+// exposes kernel/fs/grahafs_v2.c::grahafs_pin_version to userspace. This
+// is the substrate piece for transactional FS-revert: gash's
+// `txn { echo > X } abort` semantics need the per-FD pin to retain a
+// pre-write version across close. Pledge: FS_WRITE (the pin holds a
+// version alive, equivalent to write-side bookkeeping).
+#define SYS_GRAHAFS_PIN_VERSION    1113  // RDI = uint32_t inode_num, RSI = uint64_t version_id
+                                         // returns 0 on success, negative -CAP_V2_* on failure.
+
 // Resource identifiers for SYS_SETRLIMIT / SYS_GETRLIMIT.
 #define RLIMIT_MEM            1     // pages (4 KiB each); 0 = unlimited
 #define RLIMIT_CPU            2     // ns per 1-second epoch (max 1_000_000_000); 0 = unlimited

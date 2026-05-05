@@ -140,6 +140,8 @@ typedef long ssize_t;
 #define SYS_AUDIT_SUBSCRIBE         1110
 #define SYS_AUDIT_STREAM_READ       1111
 #define SYS_MANIFEST_EXPORT         1112
+// Pre-Phase-28 sweep C.1 (FU25.A.3 substrate): expose grahafs_pin_version.
+#define SYS_GRAHAFS_PIN_VERSION     1113
 
 // Phase 24 W19: COW snapshot subsystem (slots reconciled to 1093-1096
 // because spec's original 1086-1089 collide with SPAWN_EX..MMIO_VMO_CREATE).
@@ -1734,6 +1736,23 @@ static inline long syscall_manifest_export(void *user_buf, uint64_t buflen,
                  : "=a"(ret)
                  : "a"(SYS_MANIFEST_EXPORT), "D"(user_buf),
                    "S"(buflen), "d"(out_generation)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Pre-Phase-28 sweep C.1 (FU25.A.3 substrate): pin a grahafs version so it
+// stays alive across close. Used by transactional FS-revert: if a file is
+// modified inside a `txn { }` body, the pre-write version must be pinned
+// so abort can revert. Returns 0 on success; negative on failure (e.g.
+// version not found, or inode doesn't exist).
+static inline long syscall_grahafs_pin_version(uint32_t inode_num,
+                                               uint64_t version_id) {
+    long ret;
+    register uint64_t r_inode asm("rdi") = (uint64_t)inode_num;
+    register uint64_t r_ver   asm("rsi") = version_id;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_GRAHAFS_PIN_VERSION), "r"(r_inode), "r"(r_ver)
                  : "rcx", "r11", "memory");
     return ret;
 }
