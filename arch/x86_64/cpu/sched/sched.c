@@ -649,6 +649,13 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     // entry whose backing cap_object has CAP_FLAG_INHERITABLE, derive a
     // sub-token (audience = parent's verbatim) and insert into the
     // child's table. Caps WITHOUT CAP_FLAG_INHERITABLE are ignored.
+    //
+    // FU27.X.cap_recursive_inheritance: when the cap also has
+    // CAP_FLAG_RECURSIVE_INHERIT set, append the child's pid (id) to
+    // the new cap's audience set so the child can re-derive the cap
+    // for its own grandchildren. The audience expansion is done via
+    // cap_object_derive_inherited (a trusted kernel-only variant that
+    // skips audience_is_subset).
     if (parent_for_limits && parent_for_limits != task_ptrs[id]) {
         cap_handle_table_t *ct = &(*task_ptrs[id]).cap_handles;
         for (uint32_t i = 0; i < inherit_n; i++) {
@@ -660,11 +667,31 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
             for (int j = 0; j < CAP_AUDIENCE_MAX && j < obj->audience_count; j++) {
                 aud[aud_n++] = obj->audience_set[j];
             }
+            // FU27.X.cap_recursive_inheritance: append child's pid so the
+            // child later passes the audience check when deriving for its
+            // grandchild. Skipped if RECURSIVE_INHERIT not set OR if the
+            // child's pid is already in the audience OR if the audience
+            // is full (CAP_AUDIENCE_MAX = 8).
+            bool recursive = (obj->flags & CAP_FLAG_RECURSIVE_INHERIT) != 0;
+            if (recursive && aud_n < CAP_AUDIENCE_MAX) {
+                bool already_present = false;
+                for (int j = 0; j < aud_n; j++) {
+                    if (aud[j] == id) { already_present = true; break; }
+                }
+                if (!already_present) {
+                    aud[aud_n++] = id;
+                }
+            }
             for (int j = aud_n; j < CAP_AUDIENCE_MAX; j++) aud[j] = PID_NONE;
-            int new_idx = cap_object_derive_quiet(inherit_snap[i],
-                                                   parent_for_limits->id,
-                                                   obj->rights_bitmap, aud,
-                                                   obj->flags);
+            int new_idx = recursive
+                ? cap_object_derive_inherited(inherit_snap[i],
+                                               parent_for_limits->id,
+                                               obj->rights_bitmap, aud,
+                                               obj->flags)
+                : cap_object_derive_quiet(inherit_snap[i],
+                                           parent_for_limits->id,
+                                           obj->rights_bitmap, aud,
+                                           obj->flags);
             if (new_idx > 0) {
                 uint32_t slot;
                 (void)cap_handle_insert(ct, (uint32_t)new_idx,

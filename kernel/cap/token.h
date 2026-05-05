@@ -104,6 +104,12 @@ typedef struct cap_token {
 #define CAP_FLAG_IMMORTAL           0x08  // revoke returns -EPERM
 #define CAP_FLAG_INHERITABLE        0x10  // copy to child handle table on spawn
 #define CAP_FLAG_CASCADE_TRUNCATED  0x20  // revoke overflowed work queue
+// FU27.X.cap_recursive_inheritance: when paired with CAP_FLAG_INHERITABLE,
+// the child's inherited copy gets the child's pid appended to the audience
+// set so the child can re-derive (re-inherit) to its own grandchildren.
+// Without this bit, the child holds the cap but cannot delegate further
+// because cap_object_derive_inner's audience_is_subset rejects new pids.
+#define CAP_FLAG_RECURSIVE_INHERIT  0x40
 
 // ------------------------------------------------------------------------
 // Well-known pid sentinels.

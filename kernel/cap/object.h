@@ -149,6 +149,17 @@ int cap_object_derive_quiet(uint32_t parent_idx, int32_t caller_pid,
                             const int32_t *audience_subset,
                             uint8_t flags_subset);
 
+// FU27.X.cap_recursive_inheritance: kernel-internal derive used by the
+// sched_create_user_process inheritance walk when the parent cap has
+// CAP_FLAG_RECURSIVE_INHERIT. Behaves like cap_object_derive_quiet
+// (no audit emit) AND skips the audience_is_subset check so the kernel
+// can append the child's pid to the new cap's audience. The sched walker
+// is fully trusted; never call this from the syscall surface.
+int cap_object_derive_inherited(uint32_t parent_idx, int32_t caller_pid,
+                                uint64_t rights_subset,
+                                const int32_t *audience_subset,
+                                uint8_t flags_subset);
+
 // Revoke by bumping generation atomically. Returns >= 1 (count invalidated)
 // on success, or a negative CAP_V2_* error. If CAP_FLAG_EAGER_REVOKE is set
 // on the target, cascades through children via revoke_cascade.

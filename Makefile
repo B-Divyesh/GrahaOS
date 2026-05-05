@@ -78,6 +78,18 @@ compdb:
 test:
 	@scripts/run_tests.sh
 
+# FU25.G: nightly soak. Runs make test with GRAHAOS_LONG_STRESS=1 (10K-iter
+# txn_stress_*) plus a 3-iter outer loop. NOT promoted to per-commit gate
+# because per-commit budget would balloon ~5×; lands as a nightly cron job
+# the team runs out-of-band against main. See specs/phase-25-followups.yml::
+# FU25.G for context.
+test-soak-3:
+	@for i in 1 2 3; do \
+	   echo "=== test-soak-3 iter $$i ==="; \
+	   GRAHAOS_LONG_STRESS=1 scripts/run_tests.sh || exit 1; \
+	done
+	@echo "test-soak-3: 3 iterations clean under GRAHAOS_LONG_STRESS=1"
+
 # Prove the harness catches failures. Runs the suite with sentinel_fail
 # (a deliberately-failing test) linked in. Expected to exit non-zero.
 # The whole pipeline (user build → initrd manifest → ktest → parse_tap.py)

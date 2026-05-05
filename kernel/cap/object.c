@@ -262,10 +262,16 @@ int cap_object_create(uint16_t kind, uint64_t rights, const int32_t *audience,
 // AUDIT_CAP_DERIVE emission. Used by the inheritance-on-spawn walk in
 // sched_create_user_process (which would otherwise spam the audit ring
 // with one derive per spawn × every inheritable cap).
+//
+// FU27.X.cap_recursive_inheritance: allow_audience_expand=true skips the
+// audience_is_subset check so the kernel-internal inheritance walk can
+// append the child's pid to the audience. ONLY callable from trusted
+// kernel paths (cap_object_derive_inherited).
 static int cap_object_derive_inner(uint32_t parent_idx, int32_t caller_pid,
                                    uint64_t rights_subset,
                                    const int32_t *audience_subset,
-                                   uint8_t flags_subset, bool quiet) {
+                                   uint8_t flags_subset, bool quiet,
+                                   bool allow_audience_expand) {
     if (parent_idx == 0 || parent_idx >= CAP_OBJECT_CAPACITY) return CAP_V2_EINVAL;
 
     cap_object_t *parent = __atomic_load_n(&g_cap_object_ptrs[parent_idx], __ATOMIC_ACQUIRE);
@@ -285,7 +291,9 @@ static int cap_object_derive_inner(uint32_t parent_idx, int32_t caller_pid,
     uint8_t priv_sub = flags_subset & PRIVILEGED_FLAGS;
     if ((parent->flags & priv_sub) != priv_sub) return CAP_V2_EPERM;
     if (flags_subset & KERNEL_MANAGED_FLAGS) return CAP_V2_EPERM;
-    if (!audience_is_subset(parent, audience_subset)) return CAP_V2_EPERM;
+    if (!allow_audience_expand && !audience_is_subset(parent, audience_subset)) {
+        return CAP_V2_EPERM;
+    }
 
     int32_t default_audience[CAP_AUDIENCE_MAX];
     const int32_t *aud = audience_subset;
@@ -309,7 +317,9 @@ int cap_object_derive(uint32_t parent_idx, int32_t caller_pid,
                       uint64_t rights_subset, const int32_t *audience_subset,
                       uint8_t flags_subset) {
     return cap_object_derive_inner(parent_idx, caller_pid, rights_subset,
-                                   audience_subset, flags_subset, false);
+                                   audience_subset, flags_subset,
+                                   /*quiet=*/false,
+                                   /*allow_audience_expand=*/false);
 }
 
 // Quiet variant: same logic + same return contract, but no audit emission.
@@ -319,7 +329,24 @@ int cap_object_derive_quiet(uint32_t parent_idx, int32_t caller_pid,
                             const int32_t *audience_subset,
                             uint8_t flags_subset) {
     return cap_object_derive_inner(parent_idx, caller_pid, rights_subset,
-                                   audience_subset, flags_subset, true);
+                                   audience_subset, flags_subset,
+                                   /*quiet=*/true,
+                                   /*allow_audience_expand=*/false);
+}
+
+// FU27.X.cap_recursive_inheritance: trusted kernel-only variant. Used by
+// sched_create_user_process when inheriting a cap whose object has
+// CAP_FLAG_RECURSIVE_INHERIT. Skips audience_is_subset so the kernel can
+// add the child's pid to the new cap's audience set, enabling the child
+// to re-derive (re-inherit) the cap to its own grandchildren.
+int cap_object_derive_inherited(uint32_t parent_idx, int32_t caller_pid,
+                                uint64_t rights_subset,
+                                const int32_t *audience_subset,
+                                uint8_t flags_subset) {
+    return cap_object_derive_inner(parent_idx, caller_pid, rights_subset,
+                                   audience_subset, flags_subset,
+                                   /*quiet=*/true,
+                                   /*allow_audience_expand=*/true);
 }
 
 int cap_object_revoke(uint32_t idx) {
