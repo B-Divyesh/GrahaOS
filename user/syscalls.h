@@ -1283,6 +1283,13 @@ typedef struct wasm_pledge_narrow_args_u {
     uint64_t cap_delegation_list[WASM_PLEDGE_NARROW_DELEGATIONS_MAX_U];
     uint8_t  ndelegations;
     uint8_t  reserved8[7];
+    // Pre-Phase-28 sweep B.1: kernel populates child_slots_out[i] with
+    // the child-side handle-table slot index for cap_delegation_list[i].
+    // Parent reads this after a successful syscall_pledge_narrow_exec
+    // call. Used by wasmd to build a boot manifest message the worker
+    // then receives via its inherited channel handle (so worker knows
+    // which slot its module-VMO + response-channel are in).
+    uint32_t child_slots_out[WASM_PLEDGE_NARROW_DELEGATIONS_MAX_U];
 } wasm_pledge_narrow_args_u_t;
 
 // SYS_PLEDGE | PLEDGE_FLAG_NARROW_EXEC: returns child PID on success,

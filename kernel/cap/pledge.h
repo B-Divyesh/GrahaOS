@@ -92,9 +92,22 @@ typedef struct wasm_pledge_narrow_args {
     uint64_t cap_delegation_list[WASM_PLEDGE_NARROW_DELEGATIONS_MAX];  // raw cap_token_t handles
     uint8_t  ndelegations;
     uint8_t  reserved8[7];
+    // Pre-Phase-28 sweep B.1 (FU27.WASM.D2_worker via Alt 1):
+    // kernel-write / parent-read field. After successful spawn + handle
+    // install, child_slots_out[i] holds the child-side cap_handle slot
+    // index that received cap_delegation_list[i]. Parent uses this to
+    // construct a "boot manifest" message it sends to the worker on a
+    // delegated channel — so the worker knows e.g. "module VMO is at
+    // slot N, response channel is at slot M". Solves the cap-discovery
+    // gap where cap_handle_insert returned a slot but the (void)-cast
+    // discarded it. Pre-sweep this field was absent and the gap blocked
+    // a clean wasmd_worker subprocess design (file-based fallback at
+    // user/wasmd/wasmd_worker.c was unreachable). Field zeroed by kernel
+    // on validation failure / spawn failure.
+    uint32_t child_slots_out[WASM_PLEDGE_NARROW_DELEGATIONS_MAX];
 } wasm_pledge_narrow_args_t;
-_Static_assert(sizeof(wasm_pledge_narrow_args_t) == 208,
-               "wasm_pledge_narrow_args_t ABI must be 208 bytes");
+_Static_assert(sizeof(wasm_pledge_narrow_args_t) == 272,
+               "wasm_pledge_narrow_args_t ABI must be 272 bytes");
 
 // Default minimum a process must retain: COMPUTE | TIME. Spec prohibits
 // PLEDGE_NONE as a target mask, so pledge_narrow(..., 0) returns -EINVAL.

@@ -2406,14 +2406,39 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                     // Install delegated handles into the child's handle
                     // table. Each handle is "shared" — the parent retains
                     // its slot; the child gets a fresh slot pointing at
-                    // the same cap_object_t.
+                    // the same cap_object_t. Pre-Phase-28 sweep B.1:
+                    // populate a.child_slots_out[i] with the slot index
+                    // returned by cap_handle_insert so the parent can
+                    // build a boot-manifest message telling the worker
+                    // where its handles live (FU27.WASM.D2_worker Alt 1
+                    // cap-discovery convention). Pre-sweep this loop
+                    // (void)-cast new_slot, blocking a clean worker
+                    // subprocess design.
+                    for (int i = 0; i < WASM_PLEDGE_NARROW_DELEGATIONS_MAX; i++) {
+                        a.child_slots_out[i] = 0;  // zero-fill unused entries
+                    }
                     for (int i = 0; i < a.ndelegations; i++) {
                         if (resolved_obj_idx[i] == 0) continue;
                         uint32_t new_slot = 0;
-                        (void)cap_handle_insert(&child->cap_handles,
-                                                resolved_obj_idx[i],
-                                                resolved_token_flags[i],
-                                                &new_slot);
+                        int rc = cap_handle_insert(&child->cap_handles,
+                                                   resolved_obj_idx[i],
+                                                   resolved_token_flags[i],
+                                                   &new_slot);
+                        if (rc >= 0) {
+                            a.child_slots_out[i] = new_slot;
+                        }
+                        // On insert failure, slot stays 0 (signalling parent
+                        // that this delegation didn't land). Parent must
+                        // check before constructing boot manifest.
+                    }
+                    // Copy the populated args back to user. Handle the case
+                    // where user_args was a const pointer cast — the actual
+                    // user buffer is writable (caller passes a stack
+                    // wasm_pledge_narrow_args_u_t).
+                    {
+                        uint8_t *udst = (uint8_t *)user_args;
+                        const uint8_t *ksrc = (const uint8_t *)&a;
+                        for (size_t i = 0; i < sizeof(a); i++) udst[i] = ksrc[i];
                     }
                 }
 
