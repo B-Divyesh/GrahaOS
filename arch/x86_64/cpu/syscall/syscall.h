@@ -450,6 +450,18 @@
 //   RDX = uint64_t plan_id
 // Returns 0.
 #define DEBUG_AUDIT_EMIT_PLAN 74
+// FU27.X.cap_recursive_inheritance: TEST-ONLY helpers paired with the
+// user-side wrappers in user/syscalls.h. CAP_CREATE_WITH_FLAGS allocates
+// a cap_object with caller-specified flags + audience=[caller_pid] +
+// RIGHTS_ALL, inserts into caller's cap_handle_table, returns packed
+// cap_token (0 on failure).
+//   RSI = uint8_t flags  Returns: cap_token_raw_t (0 on failure)
+// CAP_CHECK_INHERITED_AUDIENCE walks caller's handle table looking for a
+// cap with CAP_FLAG_RECURSIVE_INHERIT set; returns 0 if found AND
+// caller_pid is in its audience set, 1 otherwise. Used by the child half
+// of the cap_recursive_inheritance gate test.
+#define DEBUG_CAP_CREATE_WITH_FLAGS         75
+#define DEBUG_CAP_CHECK_INHERITED_AUDIENCE  76
 
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);

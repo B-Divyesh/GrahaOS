@@ -1973,6 +1973,72 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = (uint64_t)(long)rc;
                 break;
             }
+            // FU27.X.cap_recursive_inheritance: TEST-ONLY helper. Allocates a
+            // fresh CAP_KIND_PROC cap_object with caller-specified flags +
+            // audience=[caller_pid] + RIGHTS_ALL, inserts into caller's
+            // cap_handle_table, returns packed cap_token (0 on failure).
+            // RDI=op, RSI=uint8_t flags. The cap is owned by caller_pid and
+            // has no parent, so revoke / reap cleans it up at task exit.
+            case DEBUG_CAP_CREATE_WITH_FLAGS: {
+                task_t *cur_dbg = sched_get_current_task();
+                if (!cur_dbg) { frame->rax = 0; break; }
+                uint8_t flags_in = (uint8_t)frame->rsi;
+                int32_t audience[2] = { cur_dbg->id, PID_NONE };
+                int obj_idx = cap_object_create(CAP_KIND_PROC, RIGHTS_ALL,
+                                                 audience, flags_in,
+                                                 0, cur_dbg->id,
+                                                 CAP_OBJECT_IDX_NONE);
+                if (obj_idx <= 0) { frame->rax = 0; break; }
+                uint32_t slot = 0;
+                int gen = cap_handle_insert(&cur_dbg->cap_handles,
+                                             (uint32_t)obj_idx,
+                                             flags_in, &slot);
+                if (gen < 0) {
+                    (void)cap_object_revoke((uint32_t)obj_idx);
+                    frame->rax = 0;
+                    break;
+                }
+                cap_token_t t = cap_token_pack((uint32_t)gen,
+                                                (uint32_t)obj_idx,
+                                                flags_in);
+                frame->rax = t.raw;
+                break;
+            }
+            // FU27.X.cap_recursive_inheritance: TEST-ONLY helper. Walks
+            // caller's cap_handle_table looking for a cap whose backing
+            // cap_object_t has CAP_FLAG_RECURSIVE_INHERIT set; if found,
+            // verifies caller_pid is in the object's audience_set. Returns
+            // 0 on found-and-verified, 1 on not-found-or-pid-missing. Used
+            // by the child half of cap_recursive_inheritance.tap to confirm
+            // S5a's kernel substrate appended the child's pid at spawn.
+            case DEBUG_CAP_CHECK_INHERITED_AUDIENCE: {
+                task_t *cur_dbg = sched_get_current_task();
+                if (!cur_dbg) { frame->rax = 1; break; }
+                int32_t my_pid = cur_dbg->id;
+                int found = 0;
+                cap_handle_table_t *t = &cur_dbg->cap_handles;
+                spinlock_acquire(&t->lock);
+                for (uint32_t s = 0; s < t->capacity; s++) {
+                    cap_handle_entry_t *e = &t->entries[s];
+                    if (e->object_idx == CAP_OBJECT_IDX_NONE) continue;
+                    cap_object_t *obj = cap_object_get(e->object_idx);
+                    if (!obj) continue;
+                    if (!(obj->flags & CAP_FLAG_RECURSIVE_INHERIT)) continue;
+                    if (obj->flags & CAP_FLAG_PUBLIC) { found = 1; break; }
+                    for (int j = 0;
+                         j < obj->audience_count && j < CAP_AUDIENCE_MAX;
+                         j++) {
+                        if (obj->audience_set[j] == my_pid) {
+                            found = 1;
+                            break;
+                        }
+                    }
+                    if (found) break;
+                }
+                spinlock_release(&t->lock);
+                frame->rax = (uint64_t)(long)(found ? 0 : 1);
+                break;
+            }
             default:
                 frame->rax = (uint64_t)-1;
                 break;

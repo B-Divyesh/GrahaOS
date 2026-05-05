@@ -285,6 +285,16 @@ typedef struct {
 #define DEBUG_CONSOLE_SYNTHETIC_RENDER 72
 #define DEBUG_CONSOLE_GFX_FILL     73
 #define DEBUG_AUDIT_EMIT_PLAN      74
+// FU27.X.cap_recursive_inheritance: test-only helpers used by
+// user/tests/cap_recursive_inheritance.c.  CAP_CREATE_WITH_FLAGS allocates
+// a CAP_KIND_PROC cap_object with caller-specified flags and audience=
+// [caller_pid], then inserts into caller's cap_handle_table; returns the
+// packed cap_token_raw_t (0 on failure).  CAP_CHECK_INHERITED_AUDIENCE
+// walks caller's handle table; returns 0 if any cap with
+// CAP_FLAG_RECURSIVE_INHERIT set has caller_pid in its audience set, 1
+// otherwise.  Both gated on PLEDGE_CLASS_SYS_CONTROL like other DEBUG ops.
+#define DEBUG_CAP_CREATE_WITH_FLAGS         75
+#define DEBUG_CAP_CHECK_INHERITED_AUDIENCE  76
 #define DEBUG_FB_READ_PIXEL    61
 #define DEBUG_SET_WALL       51
 
@@ -323,6 +333,10 @@ typedef struct {
 #define CAP_FLAG_IMMORTAL         0x08
 #define CAP_FLAG_INHERITABLE      0x10
 #define CAP_FLAG_CASCADE_TRUNCATED 0x20
+// FU27.X.cap_recursive_inheritance: when paired with CAP_FLAG_INHERITABLE,
+// the child's inherited copy gets the child's pid appended to the audience
+// set so the child can re-derive (re-inherit) to its own grandchildren.
+#define CAP_FLAG_RECURSIVE_INHERIT 0x40
 // Errors (-CAP_V2_*)
 #define CAP_V2_OK         0
 #define CAP_V2_EPERM     -1
@@ -1657,6 +1671,37 @@ static inline long syscall_debug_audit_emit_plan(uint16_t event_type,
 #define U_AUDIT_PLAN_COMMIT         52
 #define U_AUDIT_PLAN_ABORT          53
 #define U_AUDIT_RLIMIT_SYSCALL_RATE 54
+
+// FU27.X.cap_recursive_inheritance: test-only helper. Creates a fresh
+// CAP_KIND_PROC cap_object with caller-specified flags + audience=
+// [caller_pid] + RIGHTS_ALL, inserts into caller's cap_handle_table.
+// Returns the packed cap_token_raw_t (0 on failure). Used by
+// user/tests/cap_recursive_inheritance.tap.
+static inline cap_token_raw_t syscall_debug_cap_create_with_flags(uint8_t flags) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_CAP_CREATE_WITH_FLAGS),
+                   "S"((uint64_t)flags)
+                 : "rcx", "r11", "memory");
+    return (cap_token_raw_t)ret;
+}
+
+// FU27.X.cap_recursive_inheritance: test-only helper. Walks caller's
+// cap_handle_table for any cap with CAP_FLAG_RECURSIVE_INHERIT set and
+// checks whether caller's pid is in the audience set. Returns 0 on
+// found-and-verified, 1 on not-found-or-pid-missing. Used by the child
+// half of the cap_recursive_inheritance gate test.
+static inline long syscall_debug_cap_check_inherited_audience(void) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_CAP_CHECK_INHERITED_AUDIENCE)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
 
 // Drain up to `max` audit_entry_t records from subscriber `slot` into
 // `buf`. Returns count copied (0 if empty, max 64), or -EINVAL.

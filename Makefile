@@ -496,6 +496,11 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@cp user/tests/manifest_export         initrd_root/bin/tests/manifest_export.tap
 	@cp user/tests/rlimit_syscall_rate     initrd_root/bin/tests/rlimit_syscall_rate.tap
 	@cp user/tests/cap_inherit             initrd_root/bin/tests/cap_inherit.tap
+	@# FU27.X.cap_recursive_inheritance: parent test spawns the child binary
+	@# below; child walks its own cap_handle_table to verify the kernel S5a
+	@# walk appended the child's pid to the inherited cap's audience set.
+	@cp user/tests/cap_recursive_inheritance  initrd_root/bin/tests/cap_recursive_inheritance.tap
+	@cp user/tests/cap_recursive_inherit_child initrd_root/bin/tests/cap_recursive_inherit_child.tap
 	@# Phase 26 closeout (FU25.A.2): gash txn{} parser integration tests.
 	@cp user/tests/gash_txn_commit         initrd_root/bin/tests/gash_txn_commit.tap
 	@cp user/tests/gash_txn_abort          initrd_root/bin/tests/gash_txn_abort.tap
@@ -795,6 +800,10 @@ endif
 	@echo "manifest_export" >> initrd_root/bin/tests/manifest.txt
 	@echo "rlimit_syscall_rate" >> initrd_root/bin/tests/manifest.txt
 	@echo "cap_inherit" >> initrd_root/bin/tests/manifest.txt
+	@# FU27.X.cap_recursive_inheritance gate test. Parent spawns the child
+	@# binary (NOT in manifest.txt — harness only auto-runs items listed
+	@# here; the parent invokes the child directly via syscall_spawn).
+	@echo "cap_recursive_inheritance" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 26 closeout (FU25.A.2): gash `txn { } commit|abort` parser
 	@# integration tests. Substrate (gash auto-runs sentinel /.gash-script
 	@# via try_run_script_sentinel + cmd_txn_block parser) lands in this

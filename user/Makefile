@@ -70,6 +70,8 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/manifest_export \
              tests/rlimit_syscall_rate \
              tests/cap_inherit \
+             tests/cap_recursive_inheritance \
+             tests/cap_recursive_inherit_child \
              tests/gash_txn_commit \
              tests/gash_txn_abort \
              tests/txn_stress_basic tests/txn_stress_nested \
