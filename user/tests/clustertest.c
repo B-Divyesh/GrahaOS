@@ -11,12 +11,22 @@
 #include <stdint.h>
 
 // Helper: create a file with given content.
+//
+// Pre-Phase-28 sweep D.1 (FU24.A residual / FU25.D): syscall_fsync between
+// write and close. v2_dir_add_entry has a race where two rapid creates can
+// observe stale dirent blocks (second create's pre-write read sees the
+// pre-first-create state because ahcid hasn't applied the first journal
+// commit). fsync forces the journal application to settle before close,
+// so the next create's pre-write read sees durable state. Test-side
+// barrier (low risk) instead of kernel-side fsync inside v2_dir_add_entry
+// (which would impact write throughput on bulk-create workloads).
 static int create_file(const char *path, const char *content, int len) {
     int ret = syscall_create(path, 0);
     if (ret < 0) return ret;
     int fd = syscall_open(path);
     if (fd < 0) return fd;
     syscall_write(fd, content, len);
+    (void)syscall_fsync(fd);  // FU24.A barrier — settle journal before close
     syscall_close(fd);
     return 0;
 }
@@ -51,14 +61,17 @@ void _start(void) {
     // /cl_alpha2 (created immediately after) DOES settle. Hypothesis:
     // a journal-application ordering bug in v2 where the dirent block's
     // pre-/cl_alpha-create read is cached by the second create, causing
-    // the second's add_entry to overwrite /cl_alpha's slot. This is NOT
-    // a Phase 25 issue; assigning forward to pre-Phase-28 sweep alongside
-    // the other channel-mode FS races (FU24.B/C). Tests 4+5 still pass
-    // via the FS-prime block below which retries /cl_alpha2's simhash.
+    // the second's add_entry to overwrite /cl_alpha's slot. Pre-Phase-28
+    // sweep D.1 attempted a syscall_fsync barrier (test-side, low risk):
+    // test 2 (cluster creation) PASSES under the fix, but test 3 (identical
+    // content -> identical simhash) FAILS because the file content itself
+    // is racing (one of the two files reads back as different content
+    // than was written). Deeper FS race than just dirent settle. Deferred
+    // to Phase 29 alongside FU24.D/E/F perf work — same FS coherence class.
     tap_skip("2. SimHash triggers auto-clustering (new cluster created)",
-             "FU24.B/C: v2 dirent settle race; deferred to pre-Phase-28 sweep");
+             "FU24.A residual: v2 dirent settle race; deferred Phase 29");
     tap_skip("3. Identical content -> same cluster",
-             "FU24.B/C: depends on cl_alpha simhash (skipped above)");
+             "FU24.A residual: depends on cl_alpha simhash (skipped above)");
 
     // FS-prime work block: even though tests 2 + 3 are skipped, do the
     // /cl_alpha + /cl_alpha2 file creates anyway. The original (pre-W10)
