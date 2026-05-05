@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 360" width="880" height="360" font-family="Calibri, Helvetica, Arial, sans-serif" role="img" aria-label="GrahaOS AI control loop: snapshot, dispatch, audit">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#244a91"/>
+    </marker>
+    <marker id="arr2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#8a1f1f"/>
+    </marker>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fbfcff"/>
+      <stop offset="100%" stop-color="#eef2fa"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="880" height="360" fill="url(#bgGrad)"/>
+
+  <!-- Boxes -->
+  <g>
+    <rect x="40"  y="130" width="170" height="100" rx="10" fill="#dbe9ff" stroke="#244a91" stroke-width="1.5"/>
+    <text x="125" y="172" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f1f3f">User Process</text>
+    <text x="125" y="194" text-anchor="middle" font-size="12" fill="#222">grahai / gash / wasmd</text>
+    <text x="125" y="212" text-anchor="middle" font-size="11" fill="#444">capability-narrowed</text>
+  </g>
+
+  <g>
+    <rect x="240" y="40"  width="180" height="80" rx="10" fill="#dcefd6" stroke="#2c5d2c" stroke-width="1.5"/>
+    <text x="330" y="72"  text-anchor="middle" font-size="15" font-weight="bold" fill="#1d3a1d">Snapshot</text>
+    <text x="330" y="92"  text-anchor="middle" font-size="12" fill="#222">COW captures · FS pin</text>
+    <text x="330" y="108" text-anchor="middle" font-size="11" fill="#444">SYS_SNAP_CREATE 1093</text>
+  </g>
+
+  <g>
+    <rect x="240" y="240" width="180" height="80" rx="10" fill="#fde8c5" stroke="#8a5a18" stroke-width="1.5"/>
+    <text x="330" y="272" text-anchor="middle" font-size="15" font-weight="bold" fill="#3a2a08">GCP Dispatch</text>
+    <text x="330" y="292" text-anchor="middle" font-size="12" fill="#222">manifest-validated syscall</text>
+    <text x="330" y="308" text-anchor="middle" font-size="11" fill="#444">/etc/gcp.json</text>
+  </g>
+
+  <g>
+    <rect x="450" y="130" width="170" height="100" rx="10" fill="#fbd9d9" stroke="#8a1f1f" stroke-width="1.5"/>
+    <text x="535" y="172" text-anchor="middle" font-size="15" font-weight="bold" fill="#3a0f0f">Capability Core</text>
+    <text x="535" y="194" text-anchor="middle" font-size="12" fill="#222">14 kinds · 17 rights</text>
+    <text x="535" y="212" text-anchor="middle" font-size="11" fill="#444">pledge narrows</text>
+  </g>
+
+  <g>
+    <rect x="660" y="40"  width="180" height="80" rx="10" fill="#e7d9ff" stroke="#5a2c8a" stroke-width="1.5"/>
+    <text x="750" y="72"  text-anchor="middle" font-size="15" font-weight="bold" fill="#2a0f4f">Audit Log</text>
+    <text x="750" y="92"  text-anchor="middle" font-size="12" fill="#222">256-byte records</text>
+    <text x="750" y="108" text-anchor="middle" font-size="11" fill="#444">55 event codes</text>
+  </g>
+
+  <g>
+    <rect x="660" y="240" width="180" height="80" rx="10" fill="#dbe9ff" stroke="#244a91" stroke-width="1.5"/>
+    <text x="750" y="272" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f1f3f">Transaction</text>
+    <text x="750" y="292" text-anchor="middle" font-size="12" fill="#222">commit / abort / replay</text>
+    <text x="750" y="308" text-anchor="middle" font-size="11" fill="#444">SYS_TXN_* 1098-1100</text>
+  </g>
+
+  <!-- Static arrow paths -->
+  <g fill="none" stroke="#244a91" stroke-width="1.6" marker-end="url(#arr)" opacity="0.55">
+    <path d="M170,150 Q200,100 240,80"/>
+    <path d="M420,80 Q460,100 480,140"/>
+    <path d="M535,130 Q580,100 660,80"/>
+    <path d="M535,230 Q580,260 660,280"/>
+    <path d="M420,280 Q460,260 480,230"/>
+    <path d="M170,210 Q200,260 240,280"/>
+  </g>
+
+  <!-- Animated pulses traveling each arrow -->
+  <g fill="#244a91">
+    <circle r="5">
+      <animateMotion dur="6s" repeatCount="indefinite" rotate="auto" path="M170,150 Q200,100 240,80"/>
+      <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.05;0.95;1" dur="6s" repeatCount="indefinite"/>
+    </circle>
+    <circle r="5">
+      <animateMotion dur="6s" begin="1s" repeatCount="indefinite" rotate="auto" path="M420,80 Q460,100 480,140"/>
+      <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.05;0.95;1" dur="6s" begin="1s" repeatCount="indefinite"/>
+    </circle>
+    <circle r="5" fill="#5a2c8a">
+      <animateMotion dur="6s" begin="2s" repeatCount="indefinite" rotate="auto" path="M535,130 Q580,100 660,80"/>
+      <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.05;0.95;1" dur="6s" begin="2s" repeatCount="indefinite"/>
+    </circle>
+    <circle r="5" fill="#244a91">
+      <animateMotion dur="6s" begin="3s" repeatCount="indefinite" rotate="auto" path="M535,230 Q580,260 660,280"/>
+      <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.05;0.95;1" dur="6s" begin="3s" repeatCount="indefinite"/>
+    </circle>
+    <circle r="5" fill="#8a5a18">
+      <animateMotion dur="6s" begin="4s" repeatCount="indefinite" rotate="auto" path="M420,280 Q460,260 480,230"/>
+      <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.05;0.95;1" dur="6s" begin="4s" repeatCount="indefinite"/>
+    </circle>
+    <circle r="5" fill="#2c5d2c">
+      <animateMotion dur="6s" begin="5s" repeatCount="indefinite" rotate="auto" path="M170,210 Q200,260 240,280"/>
+      <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.05;0.95;1" dur="6s" begin="5s" repeatCount="indefinite"/>
+    </circle>
+  </g>
+
+  <!-- Caption -->
+  <text x="440" y="22" text-anchor="middle" font-size="14" font-weight="bold" fill="#0f1f3f">
+    GrahaOS request loop: snapshot → dispatch → cap-check → audit, with transactional rollback
+  </text>
+</svg>

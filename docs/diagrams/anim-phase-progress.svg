@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 180" width="880" height="180" font-family="Calibri, Helvetica, Arial, sans-serif" role="img" aria-label="GrahaOS phase progress: Phase 27 complete, Phase 28 next">
+  <defs>
+    <linearGradient id="fillGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#2c5d2c"/>
+      <stop offset="100%" stop-color="#5fa55f"/>
+    </linearGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fbfcff"/>
+      <stop offset="100%" stop-color="#eef2fa"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="880" height="180" fill="url(#bg)"/>
+
+  <text x="440" y="28" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f1f3f">
+    Phase progression — 28 phases, 987-assertion gate, 0 known regressions
+  </text>
+
+  <!-- Track -->
+  <rect x="40" y="60" width="800" height="34" rx="6" fill="#e7e7ee" stroke="#bbb" stroke-width="1"/>
+
+  <!-- Animated fill: 0 → ~96% (27 of 28) -->
+  <rect x="40" y="60" height="34" rx="6" fill="url(#fillGrad)">
+    <animate attributeName="width" from="0" to="771" dur="3s" begin="0s" fill="freeze"/>
+  </rect>
+
+  <!-- Tick marks every phase -->
+  <g stroke="#666" stroke-width="0.6">
+    <line x1="40"  y1="58" x2="40"  y2="98"/>
+    <line x1="155" y1="58" x2="155" y2="98"/>
+    <line x1="270" y1="58" x2="270" y2="98"/>
+    <line x1="385" y1="58" x2="385" y2="98"/>
+    <line x1="500" y1="58" x2="500" y2="98"/>
+    <line x1="615" y1="58" x2="615" y2="98"/>
+    <line x1="730" y1="58" x2="730" y2="98"/>
+    <line x1="811" y1="58" x2="811" y2="98"/>
+    <line x1="840" y1="58" x2="840" y2="98"/>
+  </g>
+
+  <!-- Phase labels -->
+  <g font-size="11" fill="#222" text-anchor="middle">
+    <text x="40"  y="120">P0</text>
+    <text x="155" y="120">P12</text>
+    <text x="270" y="120">P15a</text>
+    <text x="385" y="120">P19</text>
+    <text x="500" y="120">P21</text>
+    <text x="615" y="120">P24</text>
+    <text x="730" y="120">P26</text>
+    <text x="811" y="120">P27</text>
+    <text x="840" y="120">P28</text>
+  </g>
+
+  <!-- Current marker -->
+  <g>
+    <circle cx="811" cy="77" r="10" fill="#2c5d2c" stroke="#fff" stroke-width="2">
+      <animate attributeName="r" values="10;13;10" dur="2.4s" repeatCount="indefinite"/>
+    </circle>
+    <text x="811" y="155" text-anchor="middle" font-size="12" font-weight="bold" fill="#1d3a1d">
+      Phase 27 complete (you are here)
+    </text>
+  </g>
+
+  <!-- Future marker -->
+  <g opacity="0.55">
+    <circle cx="840" cy="77" r="7" fill="#bbb" stroke="#666" stroke-width="1"/>
+    <text x="840" y="155" text-anchor="middle" font-size="10" fill="#444">P28 soak →</text>
+  </g>
+</svg>
