@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="480" viewBox="0 0 820 480" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+
+<rect x="40" y="60" width="740" height="50" class="accent" rx="4" ry="4"/>
+<text x="410" y="85" text-anchor="middle" class="lbl">Block device (AHCI / image)</text>
+
+
+<rect x="40" y="130" width="130" height="50" class="box" rx="4" ry="4"/>
+<text x="105" y="148" text-anchor="middle" class="lbl">superblock</text>
+<text x="105" y="164" text-anchor="middle" class="lbl-xs">magic · gen</text>
+
+<rect x="180" y="130" width="130" height="50" class="box" rx="4" ry="4"/>
+<text x="245" y="148" text-anchor="middle" class="lbl">inode table</text>
+<text x="245" y="164" text-anchor="middle" class="lbl-xs">512 B / inode</text>
+
+<rect x="320" y="130" width="130" height="50" class="box" rx="4" ry="4"/>
+<text x="385" y="148" text-anchor="middle" class="lbl">journal</text>
+<text x="385" y="164" text-anchor="middle" class="lbl-xs">64 MB · 2-barrier</text>
+
+<rect x="460" y="130" width="130" height="50" class="box" rx="4" ry="4"/>
+<text x="525" y="148" text-anchor="middle" class="lbl">data segments</text>
+<text x="525" y="164" text-anchor="middle" class="lbl-xs">immutable</text>
+
+<rect x="600" y="130" width="180" height="50" class="box" rx="4" ry="4"/>
+<text x="690" y="148" text-anchor="middle" class="lbl">GC / recluster ranges</text>
+<text x="690" y="164" text-anchor="middle" class="lbl-xs">SimHash + leader</text>
+
+<text x="40" y="220" class="ttl">Inode (512 B)</text>
+
+<rect x="40" y="235" width="740" height="110" class="box" rx="4" ry="4"/>
+<text x="410" y="290" text-anchor="middle" class="lbl"></text>
+
+<text x="60"  y="265" class="lbl-sm" font-weight="bold">core (128 B)</text>
+<text x="60"  y="288" class="lbl-xs">size · mode · ctime · mtime · gen · ai_flags</text>
+<text x="240" y="265" class="lbl-sm" font-weight="bold">block ptrs (256 B)</text>
+<text x="240" y="288" class="lbl-xs">12 direct + indirect + double-indirect</text>
+<text x="240" y="306" class="lbl-xs">→ 4 GB max file</text>
+<text x="500" y="265" class="lbl-sm" font-weight="bold">AI metadata (128 B)</text>
+<text x="500" y="288" class="lbl-xs">simhash u64</text>
+<text x="500" y="306" class="lbl-xs">cluster_id · embedding[0..3]</text>
+<text x="500" y="324" class="lbl-xs">tag · provenance</text>
+
+<text x="40" y="380" class="ttl">Version chain (capped at 16)</text>
+
+<rect x="40" y="400" width="100" height="50" class="ok" rx="4" ry="4"/>
+<text x="90" y="425" text-anchor="middle" class="lbl">v1</text>
+
+
+<rect x="160" y="400" width="100" height="50" class="ok" rx="4" ry="4"/>
+<text x="210" y="425" text-anchor="middle" class="lbl">v2</text>
+
+
+<rect x="280" y="400" width="100" height="50" class="ok" rx="4" ry="4"/>
+<text x="330" y="425" text-anchor="middle" class="lbl">v3</text>
+
+<text x="430" y="425" class="lbl-sm">…</text>
+
+<rect x="470" y="400" width="100" height="50" class="ok" rx="4" ry="4"/>
+<text x="520" y="425" text-anchor="middle" class="lbl">v15</text>
+
+
+<rect x="590" y="400" width="100" height="50" class="warn" rx="4" ry="4"/>
+<text x="640" y="425" text-anchor="middle" class="lbl">v16 (head)</text>
+
+<line x1="140" y1="425" x2="160" y2="425" class="arrow"/>
+
+<line x1="260" y1="425" x2="280" y2="425" class="arrow"/>
+
+<line x1="380" y1="425" x2="410" y2="425" class="arrow"/>
+
+<line x1="450" y1="425" x2="470" y2="425" class="arrow"/>
+
+<line x1="570" y1="425" x2="590" y2="425" class="arrow"/>
+
+<text x="710" y="425" class="lbl-sm">→ snapshot pin</text>
+
+</svg>

@@ -17,6 +17,7 @@
 //     after a wrap by observing seq gaps.
 
 #include "log.h"
+#include "cmdline.h"          // Phase 27 closeout: respect quiet=1
 #include "vsnprintf.h"
 #include "sync/spinlock.h"
 
@@ -231,6 +232,15 @@ static void klog_write_formatted(uint8_t level, uint8_t subsys, int16_t pid,
     // ring later wraps over the slot.
     klog_entry_t snapshot;
     bool do_mirror = g_ring.mirror_to_serial;
+    // Phase 27 closeout: KLOG_DEBUG and KLOG_TRACE never mirror to serial.
+    // INFO and above always do. The `quiet=1` cmdline is parsed but no
+    // longer wired to filter levels — it accidentally exposed a timing-
+    // dependent kernel race in the spawn path (init's bin/ahcid crash-
+    // loop respawns oopsed with "page fault rip=0" when serial was fast).
+    // Tracked as FU27.X.spawn_rip0_race in specs/phase-27-followups.yml.
+    if (do_mirror && (level & KLOG_LEVEL_MASK) <= KLOG_DEBUG) {
+        do_mirror = false;
+    }
     if (do_mirror) snapshot = *e;
 
     spinlock_release(&g_ring.lock);

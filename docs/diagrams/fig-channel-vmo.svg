@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="460" viewBox="0 0 820 460" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+
+<rect x="40" y="70" width="200" height="250" class="accent" rx="4" ry="4"/>
+<text x="140" y="195" text-anchor="middle" class="lbl">Process A (sender)</text>
+
+
+<rect x="580" y="70" width="200" height="250" class="accent" rx="4" ry="4"/>
+<text x="680" y="195" text-anchor="middle" class="lbl">Process B (receiver)</text>
+
+
+
+<rect x="60" y="110" width="160" height="50" class="box" rx="4" ry="4"/>
+<text x="140" y="128" text-anchor="middle" class="lbl">chan_send()</text>
+<text x="140" y="144" text-anchor="middle" class="lbl-xs">typed msg + handles</text>
+
+<rect x="60" y="180" width="160" height="50" class="box" rx="4" ry="4"/>
+<text x="140" y="198" text-anchor="middle" class="lbl">inline payload</text>
+<text x="140" y="214" text-anchor="middle" class="lbl-xs">≤ 256 B</text>
+
+<rect x="60" y="250" width="160" height="50" class="box" rx="4" ry="4"/>
+<text x="140" y="268" text-anchor="middle" class="lbl">handle list</text>
+<text x="140" y="284" text-anchor="middle" class="lbl-xs">VMO · cap · stream</text>
+
+
+<rect x="600" y="110" width="160" height="50" class="box" rx="4" ry="4"/>
+<text x="680" y="128" text-anchor="middle" class="lbl">chan_recv()</text>
+<text x="680" y="144" text-anchor="middle" class="lbl-xs">blocks until ready</text>
+
+<rect x="600" y="180" width="160" height="50" class="box" rx="4" ry="4"/>
+<text x="680" y="198" text-anchor="middle" class="lbl">msg + new handles</text>
+<text x="680" y="214" text-anchor="middle" class="lbl-xs">installed in handle table</text>
+
+<rect x="600" y="250" width="160" height="50" class="box" rx="4" ry="4"/>
+<text x="680" y="268" text-anchor="middle" class="lbl">VMO mapped</text>
+<text x="680" y="284" text-anchor="middle" class="lbl-xs">via vmm_map_user</text>
+
+
+<rect x="290" y="130" width="240" height="130" class="warn" rx="4" ry="4"/>
+<text x="410" y="188" text-anchor="middle" class="lbl">Channel ring</text>
+<text x="410" y="204" text-anchor="middle" class="lbl-xs">typed · FNV-1a hash · bounded</text>
+<text x="410" y="170" text-anchor="middle" class="lbl-sm">type_hash: u64</text>
+<text x="410" y="190" text-anchor="middle" class="lbl-sm">capacity: 256</text>
+<text x="410" y="210" text-anchor="middle" class="lbl-sm">freezable (snap)</text>
+<text x="410" y="230" text-anchor="middle" class="lbl-sm">handle xfer with audience check</text>
+
+<line x1="220" y1="135" x2="290" y2="165" class="arrow"/>
+
+<line x1="530" y1="165" x2="600" y2="135" class="arrow"/>
+
+
+
+<rect x="140" y="360" width="540" height="60" class="ok" rx="4" ry="4"/>
+<text x="410" y="390" text-anchor="middle" class="lbl">Shared VMO (zeroed · ondemand · COW · pinned · MMIO · contiguous) — handle passed through channel</text>
+
+<line x1="220" y1="280" x2="250" y2="360" class="arrowd"/>
+<text x="235" y="314" text-anchor="middle" class="lbl-sm">map</text>
+<line x1="600" y1="280" x2="570" y2="360" class="arrowd"/>
+<text x="585" y="314" text-anchor="middle" class="lbl-sm">map</text>
+
+</svg>

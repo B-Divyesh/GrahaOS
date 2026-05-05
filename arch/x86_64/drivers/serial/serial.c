@@ -30,6 +30,17 @@ static void ensure_tx_lock(void) {
     }
 }
 
+// Phase 27 closeout: serial RX ring. Wraps a 256-byte SPSC ring;
+// producer is the COM1 IRQ handler (one writer), consumer is SYS_GETC
+// running in syscall context (one reader at a time across CPUs, gated
+// by spinlock). Drop-on-overflow if the consumer falls behind — bytes
+// from the host terminal aren't worth blocking the ISR over.
+#define SERIAL_RX_RING_SIZE 256
+static volatile char     s_rx_ring[SERIAL_RX_RING_SIZE];
+static volatile uint32_t s_rx_head = 0;   // ISR writes here
+static volatile uint32_t s_rx_tail = 0;   // SYS_GETC reads here
+static volatile uint64_t s_rx_dropped = 0;
+
 // Driver framework stats callback
 static int serial_get_driver_stats(state_driver_stat_t *stats, int max) {
     if (!stats || max < 2) return 0;
@@ -62,8 +73,15 @@ void serial_init(void) {
     // Enable FIFO, clear, with 14-byte threshold
     outb(PORT_COM1 + 2, 0xC7);
 
-    // Enable IRQs, RTS/DSR set
+    // Enable IRQs, RTS/DSR set, OUT2 high so PIC/IOAPIC sees the line.
     outb(PORT_COM1 + 4, 0x0B);
+
+    // Phase 27 closeout: enable Received-Data-Available interrupt (IER
+    // bit 0). Without this the host terminal under `-serial stdio` could
+    // never deliver keystrokes — the byte sat in RBR forever and nothing
+    // polled it. Now the COM1 IRQ4 line fires on each byte and our ISR
+    // (interrupts.c case 36) drains it into s_rx_ring.
+    outb(PORT_COM1 + 1, 0x01);
 
     serial_initialized = 1;
 
@@ -159,4 +177,39 @@ void serial_write_dec(uint64_t value) {
     }
 
     serial_write(&buf[i]);
+}
+
+// Phase 27 closeout: serial RX ISR. Called from interrupts.c case 36
+// (IRQ4 = legacy COM1). Drains all available bytes from the UART RBR
+// while the LSR Data-Ready bit is set, pushing each into the ring.
+// Most QEMU implementations deliver bytes one at a time but Real
+// Hardware (and FIFOs deeper than 1) can present multiple — drain the
+// whole batch per IRQ.
+void serial_irq_handler(void) {
+    // Read IIR (port +2) low 4 bits to identify cause:
+    //   0x04 = Received Data Available
+    //   0x0C = Character Timeout (FIFO partial drain)
+    // Anything else (TX-empty, modem-status, line-status) is benign here.
+    while (inb(PORT_COM1 + 5) & 0x01u) {  // LSR.Data-Ready
+        char c = (char)inb(PORT_COM1);    // RBR — clears the flag
+        // Map CR (0x0D) → LF (0x0A): most terminals send CR on Enter
+        // but gash/libtap line-readers split on LF. Without this the
+        // user types a command and Enter does nothing.
+        if (c == '\r') c = '\n';
+        uint32_t next = (s_rx_head + 1) % SERIAL_RX_RING_SIZE;
+        if (next == s_rx_tail) {
+            // Ring full — drop oldest to keep the ISR forward-progressing.
+            s_rx_tail = (s_rx_tail + 1) % SERIAL_RX_RING_SIZE;
+            s_rx_dropped++;
+        }
+        s_rx_ring[s_rx_head] = c;
+        s_rx_head = next;
+    }
+}
+
+char serial_pop_char(void) {
+    if (s_rx_head == s_rx_tail) return 0;
+    char c = s_rx_ring[s_rx_tail];
+    s_rx_tail = (s_rx_tail + 1) % SERIAL_RX_RING_SIZE;
+    return c;
 }

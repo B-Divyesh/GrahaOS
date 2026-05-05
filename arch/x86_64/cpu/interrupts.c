@@ -363,7 +363,7 @@ void interrupt_handler(struct interrupt_frame *frame) {
                     if (cpu < 16) {
                         if (g_timer_ticks - last_heartbeat[cpu] >= 100u) {
                             last_heartbeat[cpu] = g_timer_ticks;
-                            klog(KLOG_INFO, SUBSYS_CORE,
+                            klog(KLOG_DEBUG, SUBSYS_CORE,
                                  "[HB] cpu=%lu ticks=%lu runq.current=%ld",
                                  (unsigned long)cpu,
                                  (unsigned long)g_timer_ticks,
@@ -378,6 +378,12 @@ void interrupt_handler(struct interrupt_frame *frame) {
             case 33: // IRQ1: Keyboard (if still using legacy keyboard)
                 keyboard_irq_handler();
                 // For keyboard, we might still need PIC EOI if using legacy mode
+                if (!using_lapic) {
+                    outb(PIC1_COMMAND, PIC_EOI);
+                }
+                break;
+            case 36: // IRQ4: COM1 serial RX (Phase 27 closeout)
+                serial_irq_handler();
                 if (!using_lapic) {
                     outb(PIC1_COMMAND, PIC_EOI);
                 }

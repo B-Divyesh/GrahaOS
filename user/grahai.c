@@ -966,8 +966,59 @@ static void run_legacy_mode(void) {
     print("grahai: Plan execution complete.\n");
 }
 
+// Phase 27 Stage D3 — read-only AI primitives integration.
+//
+// On startup, grahai subscribes to PLAN_* audit events and exports the GCP
+// manifest blob via the kernel-side rodata + FNV-1a hash. This is purely
+// observational substrate for AI agents (real --txn integration is FU25.B
+// in Phase 28). The two side effects are:
+//   (1) one-line manifest summary on stdout: "grahai: gcp.json gen=0x... bytes=NNN"
+//   (2) startup ack of audit subscription so cap_inherit / future PLAN_*
+//       emissions are visible during interactive sessions.
+static void grahai_phase27_observability(void) {
+    // Manifest export — one-shot read.
+    static uint8_t manifest_buf[16384];
+    uint64_t generation = 0;
+    long copied = syscall_manifest_export(manifest_buf, sizeof(manifest_buf),
+                                          &generation);
+    if (copied > 0) {
+        print("grahai: gcp.json gen=0x");
+        // Hex-print the 64-bit generation (16 nibbles).
+        char hex[17];
+        const char *hexc = "0123456789abcdef";
+        for (int i = 15; i >= 0; i--) {
+            hex[15 - i] = hexc[(generation >> (i * 4)) & 0xF];
+        }
+        hex[16] = '\0';
+        print(hex);
+        print(" bytes=");
+        print_int((int)copied);
+        print("\n");
+    } else {
+        print("grahai: manifest_export unavailable (rc=");
+        print_int((int)copied);
+        print(")\n");
+    }
+
+    // Subscribe to PLAN_* events for observability. We don't fork a sidecar
+    // reader — the subscription stays open for the lifetime of grahai;
+    // cleanup happens automatically via audit_unsubscribe_all_for_pid in
+    // sched_reap_zombie when grahai exits.
+    uint64_t plan_mask = (1ULL << 50) | (1ULL << 51) |
+                        (1ULL << 52) | (1ULL << 53);  // PLAN_BEGIN..ABORT
+    long slot = syscall_audit_subscribe(plan_mask);
+    if (slot >= 0) {
+        print("grahai: subscribed to AUDIT_PLAN_* (slot=");
+        print_int((int)slot);
+        print(")\n");
+    }
+}
+
 // --- Entry Point ---
 void _start(void) {
+    // Phase 27 Stage D3 — emit observability lines + register subscriber.
+    grahai_phase27_observability();
+
     // Check for AI agent mode: if ai_prompt.txt exists, use AI mode
     int fd = syscall_open("ai_prompt.txt");
     if (fd >= 0) {

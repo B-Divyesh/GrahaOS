@@ -66,38 +66,65 @@ static void fill_base(audit_entry_t *e, uint16_t event_type,
 // AUDIT_* event values.
 static const char *event_name(uint16_t ev) {
     static const char *names[AUDIT_EVENT_MAX + 1] = {
-        "NONE",
-        "CAP_REGISTER",
-        "CAP_UNREGISTER",
-        "CAP_DERIVE",
-        "CAP_REVOKE",
-        "CAP_GRANT",
-        "CAP_VIOLATION",
-        "PLEDGE_NARROW",
-        "SPAWN",
-        "KILL",
-        "FS_WRITE_CRITICAL",
-        "MMIO_DIRECT",
-        "REBOOT",
-        "NET_BIND",
-        "AI_INVOKE",
-        "CAP_ACTIVATE",
-        "CAP_DEACTIVATE",
-        "DEPRECATED_SYSCALL",
-        "CHAN_SEND",
-        "CHAN_RECV",
-        "CHAN_TYPE_MISMATCH",
-        "VMO_FAULT",
-        "HANDLE_TRANSFER",
-        "STREAM_OP_REJECTED",
-        "STREAM_DESTROY_CANCELED",
-        "FS_JOURNAL_REPLAY",
-        "FS_REVERT",
-        "FS_GC_NOW",
-        "FS_SNAPSHOT",
+        [0]                            = "NONE",
+        [AUDIT_CAP_REGISTER]          = "CAP_REGISTER",
+        [AUDIT_CAP_UNREGISTER]        = "CAP_UNREGISTER",
+        [AUDIT_CAP_DERIVE]            = "CAP_DERIVE",
+        [AUDIT_CAP_REVOKE]            = "CAP_REVOKE",
+        [AUDIT_CAP_GRANT]             = "CAP_GRANT",
+        [AUDIT_CAP_VIOLATION]         = "CAP_VIOLATION",
+        [AUDIT_PLEDGE_NARROW]         = "PLEDGE_NARROW",
+        [AUDIT_SPAWN]                 = "SPAWN",
+        [AUDIT_KILL]                  = "KILL",
+        [AUDIT_FS_WRITE_CRITICAL]     = "FS_WRITE_CRITICAL",
+        [AUDIT_MMIO_DIRECT]           = "MMIO_DIRECT",
+        [AUDIT_REBOOT]                = "REBOOT",
+        [AUDIT_NET_BIND]              = "NET_BIND",
+        [AUDIT_AI_INVOKE]             = "AI_INVOKE",
+        [AUDIT_CAP_ACTIVATE]          = "CAP_ACTIVATE",
+        [AUDIT_CAP_DEACTIVATE]        = "CAP_DEACTIVATE",
+        [AUDIT_DEPRECATED_SYSCALL]    = "DEPRECATED_SYSCALL",
+        [AUDIT_CHAN_SEND]             = "CHAN_SEND",
+        [AUDIT_CHAN_RECV]             = "CHAN_RECV",
+        [AUDIT_CHAN_TYPE_MISMATCH]    = "CHAN_TYPE_MISMATCH",
+        [AUDIT_VMO_FAULT]             = "VMO_FAULT",
+        [AUDIT_HANDLE_TRANSFER]       = "HANDLE_TRANSFER",
+        [AUDIT_STREAM_OP_REJECTED]    = "STREAM_OP_REJECTED",
+        [AUDIT_STREAM_DESTROY_CANCELED] = "STREAM_DESTROY_CANCELED",
+        [AUDIT_FS_JOURNAL_REPLAY]     = "FS_JOURNAL_REPLAY",
+        [AUDIT_FS_REVERT]             = "FS_REVERT",
+        [AUDIT_FS_GC_NOW]             = "FS_GC_NOW",
+        [AUDIT_FS_SNAPSHOT]           = "FS_SNAPSHOT",
+        [AUDIT_RLIMIT_MEM]            = "RLIMIT_MEM",
+        [AUDIT_RLIMIT_CPU]            = "RLIMIT_CPU",
+        [AUDIT_RLIMIT_IO]             = "RLIMIT_IO",
+        [AUDIT_SCHED_EPOCH]           = "SCHED_EPOCH",
+        [AUDIT_SCHED_STARVATION]      = "SCHED_STARVATION",
+        [AUDIT_SCHED_SPINLOCK_PANIC]  = "SCHED_SPINLOCK_PANIC",
+        [AUDIT_DRV_REGISTERED]        = "DRV_REGISTERED",
+        [AUDIT_DRV_DIED]              = "DRV_DIED",
+        [AUDIT_MMIO_DENIED]           = "MMIO_DENIED",
+        [AUDIT_IRQ_DROPPED]           = "IRQ_DROPPED",
+        [AUDIT_CHAN_NAME_PUBLISH]     = "CHAN_NAME_PUBLISH",
+        [AUDIT_CHAN_NAME_CONNECT]     = "CHAN_NAME_CONNECT",
+        [AUDIT_TXN_BEGIN]             = "TXN_BEGIN",
+        [AUDIT_TXN_COMMIT]            = "TXN_COMMIT",
+        [AUDIT_TXN_ABORT]             = "TXN_ABORT",
+        [AUDIT_TXN_PARTIAL_EXTERNAL]  = "TXN_PARTIAL_EXTERNAL",
+        [AUDIT_WASM_CAP_DENIED]       = "WASM_CAP_DENIED",
+        [AUDIT_WASM_TRAP]             = "WASM_TRAP",
+        [AUDIT_WASM_CRASHED]          = "WASM_CRASHED",
+        [AUDIT_WASM_OUT_OF_FUEL]      = "WASM_OUT_OF_FUEL",
+        [AUDIT_PLEDGE_NARROW_EXEC]    = "PLEDGE_NARROW_EXEC",
+        [AUDIT_PLAN_BEGIN]            = "PLAN_BEGIN",
+        [AUDIT_PLAN_STEP]             = "PLAN_STEP",
+        [AUDIT_PLAN_COMMIT]           = "PLAN_COMMIT",
+        [AUDIT_PLAN_ABORT]            = "PLAN_ABORT",
+        [AUDIT_RLIMIT_SYSCALL_RATE]   = "RLIMIT_SYSCALL_RATE",
     };
     if (ev > AUDIT_EVENT_MAX) return "UNKNOWN";
-    return names[ev];
+    const char *n = names[ev];
+    return n ? n : "UNKNOWN";
 }
 
 // Enqueue into the ring. Never blocks — the ring is overwrite-oldest, so
@@ -122,10 +149,25 @@ static void audit_enqueue(const audit_entry_t *e) {
     g_audit_state.next_seq++;
     spinlock_release(&q->lock);
 
+    // Phase 27 Stage C1: subscriber broadcast. POST-spinlock-release so a
+    // slow subscriber doesn't backpressure other audit emissions (Phase 25
+    // T1/T2 regression class). Each subscriber try_locks its own ring;
+    // contention drops the entry and bumps dropped_count.
+    audit_broadcast(e);
+
     // Mirror every entry to klog while the flusher is stubbed. U9 will
     // condition this on g_audit_state.fs_attached being false.
     if (!g_audit_state.fs_attached) {
-        klog(KLOG_INFO, SUBSYS_AUDIT,
+        // Phase 27 closeout: high-frequency low-value events (1Hz scheduler
+        // epoch tick, e1000 IRQ drops) get demoted to KLOG_DEBUG so they
+        // don't bury the user's gash output. They still land in the audit
+        // ring + are queryable via SYS_AUDIT_QUERY for diagnostics.
+        uint8_t lvl = KLOG_INFO;
+        if (e->event_type == AUDIT_SCHED_EPOCH ||
+            e->event_type == AUDIT_IRQ_DROPPED) {
+            lvl = KLOG_DEBUG;
+        }
+        klog(lvl, SUBSYS_AUDIT,
              "audit[%lu] ev=%s pid=%d obj=0x%x rc=%d src=%s %.80s",
              (unsigned long)g_audit_state.next_seq,
              event_name(e->event_type),
@@ -135,6 +177,184 @@ static void audit_enqueue(const audit_entry_t *e) {
              e->audit_source == AUDIT_SRC_SHIM ? "SHIM" : "NATIVE",
              e->detail);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 27 Stage C1 — per-process audit subscribers.
+// ---------------------------------------------------------------------------
+audit_subscriber_t g_audit_subscribers[AUDIT_SUB_MAX] = {0};
+spinlock_t          g_audit_subscribers_lock = SPINLOCK_INITIALIZER("audit_subs");
+
+int audit_subscribe(int32_t pid, uint64_t filter_mask) {
+    spinlock_acquire(&g_audit_subscribers_lock);
+    int slot = -1;
+    for (uint32_t i = 0; i < AUDIT_SUB_MAX; i++) {
+        if (!g_audit_subscribers[i].in_use) {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        spinlock_release(&g_audit_subscribers_lock);
+        return -1;  // -EAGAIN at syscall layer
+    }
+    audit_subscriber_t *s = &g_audit_subscribers[slot];
+    s->in_use = true;
+    s->pid = pid;
+    s->filter_mask = filter_mask;
+    s->dropped_count = 0;
+    s->head = 0;
+    s->tail = 0;
+    spinlock_init(&s->lock, "audit_sub");
+    spinlock_release(&g_audit_subscribers_lock);
+    klog(KLOG_INFO, SUBSYS_AUDIT,
+         "audit: subscriber %d attached (pid=%d filter=0x%lx)",
+         slot, (int)pid, (unsigned long)filter_mask);
+    return slot;
+}
+
+void audit_unsubscribe(int slot_idx) {
+    if (slot_idx < 0 || (uint32_t)slot_idx >= AUDIT_SUB_MAX) return;
+    spinlock_acquire(&g_audit_subscribers_lock);
+    audit_subscriber_t *s = &g_audit_subscribers[slot_idx];
+    if (s->in_use) {
+        s->in_use = false;
+        s->pid = -1;
+        s->filter_mask = 0;
+        s->head = s->tail = 0;
+    }
+    spinlock_release(&g_audit_subscribers_lock);
+}
+
+void audit_unsubscribe_all_for_pid(int32_t pid) {
+    if (pid <= 0) return;
+    spinlock_acquire(&g_audit_subscribers_lock);
+    for (uint32_t i = 0; i < AUDIT_SUB_MAX; i++) {
+        if (g_audit_subscribers[i].in_use && g_audit_subscribers[i].pid == pid) {
+            g_audit_subscribers[i].in_use = false;
+            g_audit_subscribers[i].pid = -1;
+            g_audit_subscribers[i].head = 0;
+            g_audit_subscribers[i].tail = 0;
+        }
+    }
+    spinlock_release(&g_audit_subscribers_lock);
+}
+
+int audit_stream_read(int slot_idx, int32_t caller_pid,
+                      audit_entry_t *out_buf, uint32_t max) {
+    if (slot_idx < 0 || (uint32_t)slot_idx >= AUDIT_SUB_MAX) return -1;
+    if (!out_buf || max == 0) return -1;
+    audit_subscriber_t *s = &g_audit_subscribers[slot_idx];
+    spinlock_acquire(&s->lock);
+    if (!s->in_use || s->pid != caller_pid) {
+        spinlock_release(&s->lock);
+        return -1;
+    }
+    uint32_t avail = s->head - s->tail;
+    uint32_t take = (avail < max) ? avail : max;
+    for (uint32_t i = 0; i < take; i++) {
+        out_buf[i] = s->ring[(s->tail + i) % AUDIT_SUB_RING_DEPTH];
+    }
+    s->tail += take;
+    spinlock_release(&s->lock);
+    return (int)take;
+}
+
+void audit_broadcast(const audit_entry_t *entry) {
+    if (!entry) return;
+    uint16_t ev = entry->event_type;
+    uint64_t bit = (ev < 64) ? (1ull << ev) : 0ull;
+    for (uint32_t i = 0; i < AUDIT_SUB_MAX; i++) {
+        audit_subscriber_t *s = &g_audit_subscribers[i];
+        // Lock-free hint: if not in_use, skip without taking the lock.
+        if (!s->in_use) continue;
+        if (bit && !(s->filter_mask & bit)) continue;
+        // Phase 25 T1/T2 lesson: this lock is OUTSIDE the audit_queue
+        // primary lock so contention here can't backpressure the audit
+        // emitter. Per-subscriber lock is short-held (~200 ns) — only a
+        // bounded ring write — so spinlock_acquire is safe. (try_acquire
+        // would shave the contention drop, but spinlock_t doesn't expose
+        // it; FU27.X.lockless_audit_ring revisits if measurement justifies.)
+        spinlock_acquire(&s->lock);
+        if (!s->in_use) {
+            spinlock_release(&s->lock);
+            continue;
+        }
+        if (s->head - s->tail >= AUDIT_SUB_RING_DEPTH) {
+            // Full ring → drop oldest.
+            s->dropped_count++;
+            s->tail++;
+        }
+        s->ring[s->head % AUDIT_SUB_RING_DEPTH] = *entry;
+        s->head++;
+        spinlock_release(&s->lock);
+    }
+}
+
+// PLAN_* writers (Stage C1; consumed by Stage D3 grahai integration).
+static void fill_plan_detail(audit_entry_t *e, uint64_t plan_id,
+                             const char *fmt_extra, uint32_t step) {
+    // Format "plan=<hex> step=<N> <extra>" into e->detail. ksnprintf-equivalent.
+    // Simple manual formatter to avoid pulling vsnprintf into this critical path.
+    char *d = e->detail;
+    int dmax = (int)sizeof(e->detail);
+    int p = 0;
+    p += ksnprintf(d + p, (size_t)(dmax - p), "plan=0x%lx",
+                   (unsigned long)plan_id);
+    if (step != 0xFFFFFFFFu && p < dmax) {
+        p += ksnprintf(d + p, (size_t)(dmax - p), " step=%u", step);
+    }
+    if (fmt_extra && p < dmax - 2) {
+        p += ksnprintf(d + p, (size_t)(dmax - p), " %s", fmt_extra);
+    }
+    if (p >= dmax) p = dmax - 1;
+    e->detail[p] = '\0';
+}
+
+void audit_write_plan_begin(int32_t pid, uint64_t plan_id, const char *detail) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_PLAN_BEGIN, pid, AUDIT_SRC_NATIVE);
+    fill_plan_detail(&e, plan_id, detail, 0xFFFFFFFFu);
+    audit_enqueue(&e);
+}
+
+void audit_write_plan_step(int32_t pid, uint64_t plan_id, uint32_t step_idx,
+                           const char *detail) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_PLAN_STEP, pid, AUDIT_SRC_NATIVE);
+    e.subject_pid = pid;
+    fill_plan_detail(&e, plan_id, detail, step_idx);
+    audit_enqueue(&e);
+}
+
+void audit_write_plan_commit(int32_t pid, uint64_t plan_id) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_PLAN_COMMIT, pid, AUDIT_SRC_NATIVE);
+    e.subject_pid = pid;
+    fill_plan_detail(&e, plan_id, "committed", 0xFFFFFFFFu);
+    audit_enqueue(&e);
+}
+
+void audit_write_plan_abort(int32_t pid, uint64_t plan_id, const char *reason) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_PLAN_ABORT, pid, AUDIT_SRC_NATIVE);
+    e.subject_pid = pid;
+    fill_plan_detail(&e, plan_id, reason ? reason : "aborted", 0xFFFFFFFFu);
+    audit_enqueue(&e);
+}
+
+// Stage C2: rate-quota audit code 54. Emitted when a task's per-second
+// syscall token bucket is exhausted (when fully wired); for now the
+// substrate is in place (writer + audit code) and the runtime check is
+// deferred to FU27.X.rate_check_syscall_path.
+void audit_write_rlimit_syscall_rate(int32_t pid, uint64_t limit_per_sec,
+                                     uint64_t observed_per_sec) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_RLIMIT_SYSCALL_RATE, pid, AUDIT_SRC_NATIVE);
+    ksnprintf(e.detail, sizeof(e.detail),
+              "limit=%lu observed=%lu",
+              (unsigned long)limit_per_sec, (unsigned long)observed_per_sec);
+    audit_enqueue(&e);
 }
 
 // ---------------------------------------------------------------------------

@@ -71,6 +71,9 @@ static const char scancode_set1_shift_map[128] = {
 static bool left_shift_pressed = false;
 static bool right_shift_pressed = false;
 static bool caps_lock = false;
+// Phase 27 Block A (Stage A3): Left-Alt state for Alt+N console-switch
+// detection. Right-Alt (E0 38) is deferred to FU27.X per phase-27-mega.yml.
+static bool left_alt_pressed = false;
 
 // Phase 16: CAN-controlled activation flag. Drives the scancode guard and the
 // PIC mask. True at boot because keyboard_init() calls cap_register with type
@@ -136,6 +139,7 @@ void keyboard_init(void) {
     left_shift_pressed = false;
     right_shift_pressed = false;
     caps_lock = false;
+    left_alt_pressed = false;
     
     framebuffer_draw_string("KB: Initializing...", 10, 280, COLOR_YELLOW, 0x00101828);
     
@@ -272,8 +276,10 @@ void keyboard_handle_scancode(uint8_t scancode) {
             left_shift_pressed = false;
         } else if (key == 0x36) {  // Right shift release
             right_shift_pressed = false;
+        } else if (key == 0x38 && !e0_prefix) {  // Left Alt release (E0 38 = right-Alt; ignored)
+            left_alt_pressed = false;
         }
-        
+
         e0_prefix = false; // Clear E0 prefix on any key release
         return;
     }
@@ -293,6 +299,25 @@ void keyboard_handle_scancode(uint8_t scancode) {
         caps_lock = !caps_lock;
         e0_prefix = false;
         return;
+    }
+
+    // Phase 27 Block A (Stage A3): Left-Alt press detection.
+    if (scancode == 0x38 && !e0_prefix) {  // Left Alt press
+        left_alt_pressed = true;
+        return;
+    }
+
+    // Phase 27 Block A (Stage A3): Alt+1..Alt+4 console-switch intercept.
+    // Scancodes 0x02..0x05 are keys '1'..'4'. When left-Alt is held, route
+    // to console_switch and suppress the digit (don't enqueue '1'..'4'
+    // into key_buffer, otherwise the active console gets a stray digit).
+    // Right-Alt (E0 38) NOT supported in v1; tracked as FU27.X.
+    if (left_alt_pressed && !e0_prefix &&
+        scancode >= 0x02 && scancode <= 0x05) {
+        extern int console_switch(uint32_t console_id);
+        uint32_t target = (uint32_t)(scancode - 0x02);  // 0x02→0, 0x05→3
+        console_switch(target);
+        return;  // suppress the digit
     }
     
     // Handle extended scancodes (arrow keys, etc.)

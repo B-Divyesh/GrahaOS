@@ -18,6 +18,25 @@ spinlock_t fb_lock = SPINLOCK_INITIALIZER("framebuffer");
 // last written state (we memset it to black inside fb_deactivate). Defaults
 // true so the early boot banner is visible before cap_activate("display") runs.
 static bool g_fb_active = true;
+
+// Phase 27 Stage A4: composite-mode handshake.
+//
+// Once the userspace fbd compositor publishes its first SYS_CONSOLE_ACK_RENDER
+// (via console_set_fbd_alive(true), which calls framebuffer_set_fbd_alive(true)
+// here), every direct kernel draw through framebuffer_draw_* becomes a no-op so
+// fbd's framebuffer composite isn't trampled by interleaved klog writes.
+// EXCEPTION: the panic path bumps g_panic_in_progress, which OVERRIDES the
+// bypass — kernel oops/panic always wins over fbd. Defaults false so early
+// boot (pre-fbd) draws normally.
+static volatile bool g_fbd_alive = false;
+static volatile bool g_panic_in_progress = false;
+
+static inline bool fb_should_bypass(void) {
+    // Bypass = "fbd is in charge AND we are not in a panic". Reads are
+    // intentionally relaxed (no acquire) — racing with set_fbd_alive is
+    // fine; worst case we draw one extra/missed frame at the handshake.
+    return g_fbd_alive && !g_panic_in_progress;
+}
 // --- Simple 8x16 Bitmap Font ---
 // Basic ASCII characters (32-126)
 static const uint8_t font_8x16[95][16] = {
@@ -142,6 +161,90 @@ static const uint8_t font_8x16[95][16] = {
     // K (75) - 75-32 = 43
     [43] = {0x00,0x00,0x66,0x6C,0x78,0x70,0x78,0x6C,0x66,0x66,0x66,0x00,0x00,0x00,0x00,0x00},
 };
+
+// Phase 27 Stage A5 — Unicode box-drawing glyphs (U+2500..U+2518 minimal
+// subset for libtui windows). Full CP437 sweep is FU27.X.font_full. Each
+// glyph is 16 bytes (8x16 1bpp); bit 7 (0x80) is leftmost pixel.
+//
+// Single-line glyphs use a 1px-thick horizontal at row 7 and a 1px-thick
+// vertical at col 4 so corners intersect cleanly. The visual middle of an
+// 8x16 cell is (col=4, row=8); we use row 7 for the horizontal and col 4
+// for the vertical so the intersection is at (4, 7).
+typedef struct {
+    uint32_t codepoint;
+    uint8_t  bitmap[16];
+} box_glyph_t;
+
+static const box_glyph_t box_glyphs[] = {
+    // U+2500 ─ light horizontal
+    { 0x2500, {0,0,0,0,0,0,0, 0xFF, 0xFF, 0,0,0,0,0,0,0} },
+    // U+2502 │ light vertical
+    { 0x2502, {0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,
+               0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18} },
+    // U+250C ┌ light down + right
+    { 0x250C, {0,0,0,0,0,0,0, 0x1F, 0x1F, 0x18,0x18,0x18,0x18,0x18,0x18,0x18} },
+    // U+2510 ┐ light down + left
+    { 0x2510, {0,0,0,0,0,0,0, 0xF8, 0xF8, 0x18,0x18,0x18,0x18,0x18,0x18,0x18} },
+    // U+2514 └ light up + right
+    { 0x2514, {0x18,0x18,0x18,0x18,0x18,0x18,0x18, 0x1F, 0x1F, 0,0,0,0,0,0,0} },
+    // U+2518 ┘ light up + left
+    { 0x2518, {0x18,0x18,0x18,0x18,0x18,0x18,0x18, 0xF8, 0xF8, 0,0,0,0,0,0,0} },
+    // U+251C ├ light vertical + right
+    { 0x251C, {0x18,0x18,0x18,0x18,0x18,0x18,0x18, 0x1F, 0x1F, 0x18,0x18,0x18,0x18,0x18,0x18,0x18} },
+    // U+2524 ┤ light vertical + left
+    { 0x2524, {0x18,0x18,0x18,0x18,0x18,0x18,0x18, 0xF8, 0xF8, 0x18,0x18,0x18,0x18,0x18,0x18,0x18} },
+    // U+252C ┬ light down + horizontal
+    { 0x252C, {0,0,0,0,0,0,0, 0xFF, 0xFF, 0x18,0x18,0x18,0x18,0x18,0x18,0x18} },
+    // U+2534 ┴ light up + horizontal
+    { 0x2534, {0x18,0x18,0x18,0x18,0x18,0x18,0x18, 0xFF, 0xFF, 0,0,0,0,0,0,0} },
+    // U+253C ┼ light vertical + horizontal
+    { 0x253C, {0x18,0x18,0x18,0x18,0x18,0x18,0x18, 0xFF, 0xFF, 0x18,0x18,0x18,0x18,0x18,0x18,0x18} },
+    // ===== Double-line glyphs (Phase 27 Stage CLOSE banner polish) =====
+    // U+2550 ═ heavy horizontal (double rule)
+    { 0x2550, {0,0,0,0,0,0, 0xFF, 0,0, 0xFF, 0,0,0,0,0,0} },
+    // U+2551 ║ heavy vertical
+    { 0x2551, {0x36,0x36,0x36,0x36,0x36,0x36,0x36,0x36,
+               0x36,0x36,0x36,0x36,0x36,0x36,0x36,0x36} },
+    // U+2554 ╔ heavy down + right (top-left double corner)
+    { 0x2554, {0,0,0,0,0,0, 0x3F, 0x30, 0x30, 0x37, 0x36,0x36,0x36,0x36,0x36,0x36} },
+    // U+2557 ╗ heavy down + left (top-right double corner)
+    { 0x2557, {0,0,0,0,0,0, 0xFC, 0x0C, 0x0C, 0xEC, 0x6C,0x6C,0x6C,0x6C,0x6C,0x6C} },
+    // U+255A ╚ heavy up + right (bottom-left double corner)
+    { 0x255A, {0x36,0x36,0x36,0x36,0x36,0x36, 0x37, 0x30, 0x30, 0x3F, 0,0,0,0,0,0} },
+    // U+255D ╝ heavy up + left (bottom-right double corner)
+    { 0x255D, {0x6C,0x6C,0x6C,0x6C,0x6C,0x6C, 0xEC, 0x0C, 0x0C, 0xFC, 0,0,0,0,0,0} },
+    // U+2560 ╠ heavy vertical + right
+    { 0x2560, {0x36,0x36,0x36,0x36,0x36,0x36, 0x37, 0x30, 0x30, 0x37, 0x36,0x36,0x36,0x36,0x36,0x36} },
+    // U+2563 ╣ heavy vertical + left
+    { 0x2563, {0x6C,0x6C,0x6C,0x6C,0x6C,0x6C, 0xEC, 0x0C, 0x0C, 0xEC, 0x6C,0x6C,0x6C,0x6C,0x6C,0x6C} },
+    // ===== Block elements (light/medium/dark/full shading + half-blocks) =====
+    // U+2580 ▀ upper half block
+    { 0x2580, {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, 0,0,0,0,0,0,0,0} },
+    // U+2584 ▄ lower half block
+    { 0x2584, {0,0,0,0,0,0,0,0, 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF} },
+    // U+2588 █ full block
+    { 0x2588, {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+               0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF} },
+    // U+2591 ░ light shade (25%)
+    { 0x2591, {0x44,0x11,0x44,0x11,0x44,0x11,0x44,0x11,
+               0x44,0x11,0x44,0x11,0x44,0x11,0x44,0x11} },
+    // U+2592 ▒ medium shade (50%)
+    { 0x2592, {0x55,0xAA,0x55,0xAA,0x55,0xAA,0x55,0xAA,
+               0x55,0xAA,0x55,0xAA,0x55,0xAA,0x55,0xAA} },
+    // U+2593 ▓ dark shade (75%)
+    { 0x2593, {0xBB,0xEE,0xBB,0xEE,0xBB,0xEE,0xBB,0xEE,
+               0xBB,0xEE,0xBB,0xEE,0xBB,0xEE,0xBB,0xEE} },
+};
+static const uint32_t box_glyphs_count = sizeof(box_glyphs) / sizeof(box_glyphs[0]);
+
+// Linear-scan codepoint→glyph lookup. 11 entries; constant-time enough for
+// a render path that processes each cell once per frame.
+static const uint8_t *find_box_glyph(uint32_t cp) {
+    for (uint32_t i = 0; i < box_glyphs_count; i++) {
+        if (box_glyphs[i].codepoint == cp) return box_glyphs[i].bitmap;
+    }
+    return NULL;
+}
 
 // --- Helper Functions ---
 static size_t strlen(const char *str) {
@@ -315,6 +418,102 @@ uint32_t framebuffer_read_pixel(uint32_t x, uint32_t y) {
     return fb_addr[y * (fb_pitch / 4) + x];
 }
 
+// Phase 27 Stage A4: composite-mode setters.
+void framebuffer_set_fbd_alive(bool alive) {
+    g_fbd_alive = alive;
+}
+
+bool framebuffer_get_fbd_alive(void) {
+    return g_fbd_alive;
+}
+
+void framebuffer_set_panic_in_progress(bool in_progress) {
+    g_panic_in_progress = in_progress;
+}
+
+uint32_t framebuffer_get_pitch(void) {
+    return fb_pitch;
+}
+
+// Phase 27 Stage A4: force-draw a single 8x16 cell into FB regardless of
+// g_fbd_alive / g_fb_active. Used by:
+//   (1) console_render_synthetic_frame() for the gate test fbd_render
+//   (2) panic.c/oops emit path before/after kpanic claims the screen
+// Codepoints outside the basic ASCII range are rendered as a space (blank
+// 8x16 block at bg_color) — extended glyphs land in Stage A5 with libtui's
+// font extension.
+void framebuffer_force_draw_cell(uint32_t pixel_x, uint32_t pixel_y,
+                                 uint32_t codepoint,
+                                 uint32_t fg_color, uint32_t bg_color) {
+    if (!fb_addr) return;
+    if (pixel_x + 8 > fb_width || pixel_y + 16 > fb_height) return;
+
+    bool in_intr = in_interrupt_context();
+    if (!in_intr) spinlock_acquire(&fb_lock);
+
+    // Background fill (always paint so cells that toggle from glyph-set to
+    // glyph-clear don't leak the previous frame's pixels).
+    for (uint32_t row = 0; row < 16; row++) {
+        for (uint32_t col = 0; col < 8; col++) {
+            fb_addr[(pixel_y + row) * (fb_pitch / 4) + (pixel_x + col)] = bg_color;
+        }
+    }
+
+    // Foreground glyph. Stage A5 supports:
+    //   ASCII 0x20..0x7E    — font_8x16 array
+    //   Unicode 0x2500..2518 subset — find_box_glyph() table
+    //   Sprite cells 0xE100..0xE7FF — Stage B1 (rendered as blanks here)
+    const uint8_t *glyph = NULL;
+    if (codepoint >= 32 && codepoint <= 126) {
+        glyph = font_8x16[codepoint - 32];
+    } else if (codepoint >= 0x2500 && codepoint <= 0x257F) {
+        glyph = find_box_glyph(codepoint);
+    }
+    if (glyph) {
+        for (int row = 0; row < 16; row++) {
+            uint8_t bits = glyph[row];
+            if (!bits) continue;
+            for (int col = 0; col < 8; col++) {
+                if (bits & (0x80 >> col)) {
+                    fb_addr[(pixel_y + row) * (fb_pitch / 4) + (pixel_x + col)] = fg_color;
+                }
+            }
+        }
+    }
+
+    asm volatile("mfence" ::: "memory");
+    if (!in_intr) spinlock_release(&fb_lock);
+}
+
+// Phase 27 Stage B1: render a sprite (8x16 1bpp) at the given pixel position.
+void framebuffer_force_draw_sprite(uint32_t pixel_x, uint32_t pixel_y,
+                                   const uint8_t glyph[16],
+                                   uint32_t fg_color, uint32_t bg_color) {
+    if (!fb_addr || !glyph) return;
+    if (pixel_x + 8 > fb_width || pixel_y + 16 > fb_height) return;
+
+    bool in_intr = in_interrupt_context();
+    if (!in_intr) spinlock_acquire(&fb_lock);
+
+    for (uint32_t row = 0; row < 16; row++) {
+        uint8_t bits = glyph[row];
+        for (uint32_t col = 0; col < 8; col++) {
+            uint32_t color = (bits & (0x80u >> col)) ? fg_color : bg_color;
+            fb_addr[(pixel_y + row) * (fb_pitch / 4) + (pixel_x + col)] = color;
+        }
+    }
+    asm volatile("mfence" ::: "memory");
+    if (!in_intr) spinlock_release(&fb_lock);
+}
+
+// Phase 27 Stage B1: write one pixel from the overlay buffer to the FB.
+void framebuffer_force_blit_pixel(uint32_t pixel_x, uint32_t pixel_y, uint32_t argb) {
+    if (!fb_addr) return;
+    if (pixel_x >= fb_width || pixel_y >= fb_height) return;
+    // Drop alpha; FU27.X.alpha_blend will respect it.
+    fb_addr[pixel_y * (fb_pitch / 4) + pixel_x] = argb & 0x00FFFFFFu;
+}
+
 uint32_t framebuffer_get_width(void) {
     return fb_width;
 }
@@ -325,6 +524,7 @@ uint32_t framebuffer_get_height(void) {
 
 void framebuffer_draw_pixel(uint32_t x, uint32_t y, uint32_t color) {
     if (!g_fb_active) return;
+    if (fb_should_bypass()) return;
     spinlock_acquire(&fb_lock);
     _draw_pixel_unsafe(x, y, color);
     spinlock_release(&fb_lock);
@@ -332,6 +532,7 @@ void framebuffer_draw_pixel(uint32_t x, uint32_t y, uint32_t color) {
 
 void framebuffer_draw_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t color) {
     if (!g_fb_active) return;
+    if (fb_should_bypass()) return;
     if (x >= fb_width || y >= fb_height || width == 0 || height == 0) {
         return;
     }
@@ -351,6 +552,7 @@ void framebuffer_draw_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t heig
 
 void framebuffer_draw_rect_outline(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t color) {
     if (!g_fb_active) return;
+    if (fb_should_bypass()) return;
     if (x >= fb_width || y >= fb_height || width == 0 || height == 0) {
         return;
     }
@@ -378,6 +580,7 @@ void framebuffer_draw_rect_outline(uint32_t x, uint32_t y, uint32_t width, uint3
 
 void framebuffer_draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color) {
     if (!g_fb_active) return;
+    if (fb_should_bypass()) return;
     spinlock_acquire(&fb_lock);
     _draw_char_unsafe(c, x, y, fg_color);
     spinlock_release(&fb_lock);
@@ -388,6 +591,7 @@ void framebuffer_draw_string(const char *str, uint32_t x, uint32_t y,
                              uint32_t fg_color, uint32_t bg_color) {
     if (!str || !fb_addr) return;
     if (!g_fb_active) return;
+    if (fb_should_bypass()) return;
     
     // Check if we're in interrupt context
     if (in_interrupt_context()) {
@@ -436,6 +640,7 @@ void framebuffer_draw_hex(uint64_t value, int x, int y, uint32_t fg_color, uint3
 // Clear function with interrupt safety
 void framebuffer_clear(uint32_t color) {
     if (!g_fb_active) return;
+    if (fb_should_bypass()) return;
     if (in_interrupt_context()) {
         // Clear without lock
         for (uint32_t i = 0; i < fb_width * fb_height; i++) {
@@ -462,6 +667,7 @@ void framebuffer_draw_string_safe(const char *str, uint32_t x, uint32_t y,
                                   uint32_t fg_color, uint32_t bg_color) {
     if (!str || !fb_addr) return;
     if (!g_fb_active) return;
+    if (fb_should_bypass()) return;
     
     // Try to acquire lock with timeout
     int attempts = 1000000;

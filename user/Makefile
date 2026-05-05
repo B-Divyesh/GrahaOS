@@ -26,7 +26,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot txnctl assertpledge wasm
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot txnctl assertpledge wasm fbd/fbd
 
 # Phase 12: TAP 1.4 test binaries. Each lives at user/tests/NAME.c
 # and is copied to initrd as /bin/tests/NAME.tap by the top-level
@@ -55,6 +55,17 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/pledge_narrow_exec \
              tests/wasmtest \
              tests/vsnprintftest \
+             tests/console_init \
+             tests/keyboard_alt \
+             tests/fbd_render \
+             tests/tui_render \
+             tests/console_sprite \
+             tests/console_gfx \
+             tests/audit_stream \
+             tests/audit_plan_codes \
+             tests/manifest_export \
+             tests/rlimit_syscall_rate \
+             tests/cap_inherit \
              tests/gash_txn_commit \
              tests/gash_txn_abort \
              tests/txn_stress_basic tests/txn_stress_nested \
@@ -122,10 +133,13 @@ LIBNET := libnet/libnet.a
 LIBNETD := libnetd.a
 # Phase 22 Stage D U17b: HTTP/1.1 client (plaintext; HTTPS via libtls-mg in U19).
 LIBHTTP := libhttp/libhttp.a
+# Phase 27 Block A (Stage A5): libtui userspace TUI primitives library.
+# Linked into apps that drive the virtual consoles (tui_demo, gsh in P28).
+LIBTUI := libtui/libtui.a
 
 .PHONY: all clean libc
 
-all: libc $(LIBTAP) $(LIBNET) $(LIBNETD) $(LIBHTTP) $(LIBTLS) $(PROGRAMS) $(TAP_TESTS)
+all: libc $(LIBTAP) $(LIBNET) $(LIBNETD) $(LIBHTTP) $(LIBTLS) $(LIBTUI) $(PROGRAMS) $(TAP_TESTS)
 
 # Build libc first
 libc:
@@ -159,6 +173,12 @@ $(LIBHTTP): libhttp/libhttp.o
 	@echo "Creating $@"
 	@$(AR) rcs $@ $^
 
+# Phase 27 Block A (Stage A5): libtui.a — ncurses-like TUI primitives over
+# the Phase 27 console subsystem. Apps link against it; gsh in Phase 28.
+$(LIBTUI): libtui/libtui.o
+	@echo "Creating $@"
+	@$(AR) rcs $@ $^
+
 # Phase 22 Stage D U18: libtls-mg.a — Mongoose-backed TLS 1.3 client. The
 # Stage D landing ships the public API + shim architecture + the
 # deterministic extraction tooling in user/libtls-mg/extract.py; the
@@ -177,6 +197,16 @@ $(LIBTLS): libtls-mg/libtls.o libtls-mg/libtls_shim.o libtls-mg/mongoose_tls_cor
 
 # Phase 26 Stage H.1: wasmtest links additionally against the loader.o
 # from user/wasmd/src/loader.c. Override of the generic TAP rule.
+# Phase 27 Stage A5: tui_render.tap also needs libtui.
+tests/tui_render: tests/tui_render.o $(LIBTUI) $(LIBTAP) $(LIBC)
+	@echo "Linking TAP test: $@ (with libtui + libtap + libc)"
+	@$(LD) $(LDFLAGS) -o $@ tests/tui_render.o $(LIBTUI) $(LIBTAP) $(LIBC)
+
+# Phase 27 Stage B1: console_sprite.tap links libtui (for TUI_SPRITE_BASE).
+tests/console_sprite: tests/console_sprite.o $(LIBTUI) $(LIBTAP) $(LIBC)
+	@echo "Linking TAP test: $@ (with libtui + libtap + libc)"
+	@$(LD) $(LDFLAGS) -o $@ tests/console_sprite.o $(LIBTUI) $(LIBTAP) $(LIBC)
+
 tests/wasmtest: tests/wasmtest.o wasmd/src/loader.o $(LIBTAP) $(LIBC)
 	@echo "Linking TAP test (with wasmd loader): $@"
 	@$(LD) $(LDFLAGS) -o $@ tests/wasmtest.o wasmd/src/loader.o $(LIBTAP) $(LIBC)
@@ -418,6 +448,16 @@ assertpledge: assertpledge.o $(LIBC)
 wasm: wasm.o wasmd/src/loader.o $(LIBC)
 	@echo "Linking user program: $@ (with libc)"
 	@$(LD) $(LDFLAGS) -o $@ wasm.o wasmd/src/loader.o $(LIBC)
+
+# Phase 27 Block A (Stage A4): /bin/fbd — userspace framebuffer compositor.
+# Spawned by init under autorun=init via etc/init.conf. NOT spawned under
+# autorun=ktest; the gate test fbd_render.tap exercises the substrate via
+# DEBUG syscalls instead. Links libtui for the startup banner (Stage A4
+# closeout fix — without a banner the framebuffer goes black after fbd's
+# first ACK_RENDER because the cell VMO is zero-filled).
+fbd/fbd: fbd/fbd.o $(LIBTUI) $(LIBC)
+	@echo "Linking user program: $@ (with libtui + libc)"
+	@$(LD) $(LDFLAGS) -o $@ fbd/fbd.o $(LIBTUI) $(LIBC)
 
 # Phase 21: /bin/drvctl — driver control CLI (list/info/kill).
 drvctl: drvctl.o $(LIBC)

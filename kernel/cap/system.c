@@ -50,16 +50,22 @@ void cap_system_init(void) {
         return;  // already initialised; idempotent
     }
 
-    // Audience = [PID_KERNEL] only. Userspace cannot resolve this directly;
-    // sub-tokens minted by cap_system_install_to_pid carry the per-task
-    // audience.
+    // Phase 27 Stage C2 fix: bootcap is CAP_FLAG_PUBLIC so derives via
+    // cap_system_install_to_pid (which target any pid in the system) bypass
+    // the audience-subset check. The bootcap is a kernel-only object — no
+    // token is ever published outside cap_system.c — so the PUBLIC flag is
+    // moot for direct token resolution. Without this flag the bootcap had
+    // audience_count=0 (PID_KERNEL gets dropped as PID_NONE-equivalent),
+    // and cap_system_install_to_pid silently failed during boot, leaving
+    // init/ktest without any system-privileged cap. Pre-Stage-C2 the
+    // cap_system test masked this with a negative-path assertion.
     int32_t audience[2] = { PID_KERNEL, PID_NONE };
 
     int idx = cap_object_create(
         CAP_KIND_SYSTEM,
         CAP_SYSTEM_INIT_RIGHTS,
         audience,
-        CAP_FLAG_EAGER_REVOKE,   // revoke cascades to children
+        CAP_FLAG_EAGER_REVOKE | CAP_FLAG_PUBLIC,  // see comment above
         (uintptr_t)0,             // no kind_data
         PID_KERNEL,
         CAP_OBJECT_IDX_NONE       // no parent — bootcap is its own root

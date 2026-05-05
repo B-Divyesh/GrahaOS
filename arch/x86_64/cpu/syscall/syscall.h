@@ -314,6 +314,65 @@
                                 // Returns: 0 on successful abort; -EINVAL,
                                 //   -EPERM, -ESTALE.
 
+// =============================================================================
+// Phase 27 syscalls — TUI Framework + Graphics + AI Primitives (slots 1101-1112).
+//
+// Block A (TUI Framework): 1101 SWITCH, 1102 CREATE, 1103 ATTACH, 1104 INSPECT,
+//                          1105 OBSERVE, 1106 ACK_RENDER.
+// Block B (Graphics):     1107 SPRITE_REGISTER, 1108 GFX_ENABLE, 1109 GFX_DAMAGE.
+// Block C (AI Primitives):1110 AUDIT_SUBSCRIBE, (1111 reserved), 1112 MANIFEST_EXPORT.
+//
+// Original Phase 27 spec proposed 1093/1094 — those collide with Phase 24
+// SYS_SNAP_CREATE/RESTORE. Reassigned 1101-1112 per phase-27-mega.yml.
+// =============================================================================
+#define SYS_CONSOLE_SWITCH         1101  // RDI = uint32_t console_id (0..NUM_CONSOLES-1)
+                                         // Pledge: IPC_SEND. Cap: CAP_KIND_SYSTEM RIGHT_INVOKE.
+                                         // Returns: 0 on success, -EINVAL/-EPERM.
+#define SYS_CONSOLE_CREATE         1102  // RDI = uint32_t width_cells (0=default)
+                                         // RSI = uint32_t height_cells (0=default)
+                                         // RDX = console_info_t *out (user ptr)
+                                         // Pledge: SYS_CONTROL. Cap: CAP_KIND_SYSTEM.
+                                         // Returns: cap_handle ≥ 0, or -EINVAL/-EPERM/-ENOMEM/-E2BIG.
+#define SYS_CONSOLE_ATTACH         1103  // RDI = uint32_t console_id
+                                         // RSI = uint64_t cap_token (CAP_KIND_CONSOLE w/ RIGHT_ATTACH)
+                                         // Pledge: IPC_RECV.
+                                         // Returns: 0 on success, -EBUSY/-EPERM/-EINVAL.
+#define SYS_CONSOLE_INSPECT        1104  // RDI = uint32_t console_id
+                                         // RSI = void *out_buf (user ptr to W*H*16 bytes)
+                                         // RDX = size_t buflen
+                                         // RCX(R10) = uint64_t cap_token (CAP_KIND_CONSOLE w/ RIGHT_INSPECT)
+                                         // Pledge: SYS_QUERY.
+                                         // Returns: bytes copied, or -EFAULT/-EPERM/-EINVAL.
+#define SYS_CONSOLE_OBSERVE        1105  // RDI = uint32_t console_id
+                                         // RSI = uint64_t cap_token (CAP_KIND_CONSOLE w/ RIGHT_OBSERVE)
+                                         // RDX = uint64_t *out_chan_token (user ptr)
+                                         // Pledge: IPC_RECV.
+                                         // Returns: 0 on success, -EPERM/-EINVAL/-ENOMEM.
+#define SYS_CONSOLE_ACK_RENDER     1106  // RDI = uint32_t console_id
+                                         // RSI = uint64_t rendered_seq
+                                         // Pledge: IPC_SEND. Cap: CAP_KIND_SYSTEM RIGHT_INVOKE.
+                                         // Returns: 0 on success, -EINVAL/-EPERM. Sets fbd_alive=true on
+                                         // first call. Used by fbd userspace daemon.
+#define SYS_CONSOLE_SPRITE_REGISTER 1107 // RDI = uint64_t cap_token (CAP_KIND_CONSOLE w/ RIGHT_WRITE)
+                                         // RSI = uint32_t sprite_id (0..NUM_SPRITES-1)
+                                         // RDX = const uint8_t *bitmap16 (user ptr; 16 bytes)
+                                         // Pledge: SYS_CONTROL.
+                                         // Block B (Stage B1) — A2 stub returns -ENOSYS.
+#define SYS_CONSOLE_GFX_ENABLE     1108  // RDI = uint64_t cap_token, RSI = w_px, RDX = h_px,
+                                         // R10 = uint64_t *out_vmo_handle. Block B (Stage B1) — A2 stub.
+#define SYS_CONSOLE_GFX_DAMAGE     1109  // RDI = uint64_t cap_token, RSI = damage_rect_t *.
+                                         // Block B (Stage B1) — A2 stub.
+#define SYS_AUDIT_SUBSCRIBE        1110  // RDI = uint64_t filter_mask, returns slot id (>=0) or -EAGAIN
+#define SYS_AUDIT_STREAM_READ      1111  // RDI = int slot, RSI = audit_entry_t *buf, RDX = uint32_t max
+                                         // RDX = uint64_t *out_chan_token
+                                         // Pledge: SYS_QUERY, IPC_RECV.
+                                         // Block C (Stage C1) — A2 stub returns -ENOSYS.
+// 1111 reserved for SYS_AUDIT_UNSUBSCRIBE or SYS_AUDIT_FILTER_UPDATE (FU27.X).
+#define SYS_MANIFEST_EXPORT        1112  // RDI = char *user_buf, RSI = size_t buflen,
+                                         // RDX = uint32_t *out_generation.
+                                         // Pledge: SYS_QUERY.
+                                         // Block C (Stage C2) — A2 stub returns -ENOSYS.
+
 // Resource identifiers for SYS_SETRLIMIT / SYS_GETRLIMIT.
 #define RLIMIT_MEM            1     // pages (4 KiB each); 0 = unlimited
 #define RLIMIT_CPU            2     // ns per 1-second epoch (max 1_000_000_000); 0 = unlimited
@@ -353,6 +412,44 @@
 //   R8  = char *out (user, must be 256 bytes)
 // Returns vsnprintf-convention byte count or -EFAULT on copy failure.
 #define DEBUG_VSNPRINTF       68
+// Phase 27 Block A (Stage A3): inject a single PS/2 scancode into the
+// keyboard ISR path so user/tests/keyboard_alt.c can exercise Alt+N detection
+// without poking real hardware. Returns 0; no error path.
+#define DEBUG_INJECT_SCANCODE 69  // RSI = uint8_t scancode
+// Phase 27 Block A (Stage A3): query console_table.selected so user-tests
+// can verify Alt+N detection actually switched the displayed console.
+#define DEBUG_CONSOLE_GET_SELECTED 70  // no args; returns selected console ID
+// Phase 27 Block A (Stage A4): test-only direct cell-VMO write so the
+// fbd_render.tap gate test can populate a console without owning it
+// (SYS_CONSOLE_ATTACH is -ENOSYS until Stage C2 lands cap inheritance).
+//   RSI = uint32_t console_id
+//   RDX = uint32_t row
+//   R10 = uint32_t col
+//   R8  = uint64_t packed (codepoint:32 | fg:8 | bg:8 | attrs:16)
+// Returns 0 / -1.
+#define DEBUG_CONSOLE_WRITE_CELL   71
+// Phase 27 Block A (Stage A4): trigger a kernel-side composite of the named
+// console's cell-VMO into the hardware framebuffer. Bypasses g_fbd_alive
+// (force_draw_cell). Used by fbd_render.tap to validate the cell→pixel path
+// without spawning fbd in autorun=ktest.
+//   RSI = uint32_t console_id
+// Returns 0 / -1.
+#define DEBUG_CONSOLE_SYNTHETIC_RENDER 72
+// Phase 27 Block B (Stage B1): test-only fill of a rectangle in a console's
+// gfx_overlay buffer with a known ARGB color. Used by console_gfx.tap so the
+// test doesn't need the full vmo_map plumbing to write overlay pixels.
+//   RSI = uint32_t console_id
+//   RDX = uint64_t (packed: x:16 | y:16 | w:16 | h:16)
+//   R10 = uint32_t color (ARGB)
+// Returns 0 / -1.
+#define DEBUG_CONSOLE_GFX_FILL 73
+// Phase 27 Block C (Stage C1): test-only emission of a synthetic audit event
+// (PLAN_BEGIN / PLAN_STEP / PLAN_COMMIT / PLAN_ABORT) so audit_stream + audit_plan_codes
+// gates can verify the broadcast path without wiring grahai end-to-end.
+//   RSI = uint16_t event_type
+//   RDX = uint64_t plan_id
+// Returns 0.
+#define DEBUG_AUDIT_EMIT_PLAN 74
 
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);

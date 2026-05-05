@@ -116,3 +116,39 @@ int fb_activate(void);
 int fb_deactivate(void);
 bool framebuffer_is_active(void);
 uint32_t framebuffer_read_pixel(uint32_t x, uint32_t y);
+
+/* Phase 27 Stage A4 — composite-mode handshake.
+ *
+ * framebuffer_set_fbd_alive(true) is called from console_set_fbd_alive() once
+ * the userspace fbd compositor has performed its first SYS_CONSOLE_ACK_RENDER.
+ * From that point onward every klog-driven framebuffer_draw_* call becomes a
+ * no-op (the FB is owned by fbd; serial still mirrors klog). The
+ * g_panic_in_progress flag overrides this — kernel oops/panic always wins.
+ *
+ * framebuffer_force_draw_cell() bypasses both flags and is used by:
+ *   (1) console_render_synthetic_frame() — kernel-side composite for the
+ *       gate test fbd_render under autorun=ktest, where fbd is not spawned.
+ *   (2) Future panic.c paths that want to overlay diagnostics on top of
+ *       fbd's last frame without losing it. */
+void     framebuffer_set_fbd_alive(bool alive);
+bool     framebuffer_get_fbd_alive(void);
+void     framebuffer_set_panic_in_progress(bool in_progress);
+uint32_t framebuffer_get_pitch(void);
+void     framebuffer_force_draw_cell(uint32_t pixel_x, uint32_t pixel_y,
+                                     uint32_t codepoint,
+                                     uint32_t fg_color, uint32_t bg_color);
+
+// Phase 27 Stage B1 — render an arbitrary 8x16 1bpp glyph at (pixel_x,
+// pixel_y) using fg_color/bg_color. Used by console_render_synthetic_frame
+// for sprite-cell codepoints (0xE100..0xE7FF) where the glyph isn't in the
+// kernel font tables. Bypasses g_fbd_alive (always draws).
+void framebuffer_force_draw_sprite(uint32_t pixel_x, uint32_t pixel_y,
+                                   const uint8_t glyph[16],
+                                   uint32_t fg_color, uint32_t bg_color);
+
+// Phase 27 Stage B1 — composite an RGBA pixel onto the framebuffer at
+// (pixel_x, pixel_y). Bypasses g_fbd_alive. Used by overlay damage-rect
+// composite path. Alpha blending is FU27.X.alpha_blend; for now the
+// high byte (alpha) is dropped so the call writes opaque RGB.
+void framebuffer_force_blit_pixel(uint32_t pixel_x, uint32_t pixel_y,
+                                  uint32_t argb);

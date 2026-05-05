@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="460" viewBox="0 0 820 460" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+
+<rect x="60" y="50" width="140" height="36" class="box" rx="4" ry="4"/>
+<text x="130" y="68" text-anchor="middle" class="lbl">caller</text>
+
+
+<rect x="220" y="50" width="140" height="36" class="box" rx="4" ry="4"/>
+<text x="290" y="68" text-anchor="middle" class="lbl">syscall layer</text>
+
+
+<rect x="380" y="50" width="140" height="36" class="box" rx="4" ry="4"/>
+<text x="450" y="68" text-anchor="middle" class="lbl">pledge gate</text>
+
+
+<rect x="540" y="50" width="140" height="36" class="box" rx="4" ry="4"/>
+<text x="610" y="68" text-anchor="middle" class="lbl">cap_handle_resolve</text>
+
+
+<rect x="700" y="50" width="80" height="36" class="box" rx="4" ry="4"/>
+<text x="740" y="68" text-anchor="middle" class="lbl">op</text>
+
+<line x1="130" y1="86" x2="130" y2="430" stroke="#222" stroke-dasharray="4,3"/>
+<line x1="290" y1="86" x2="290" y2="430" stroke="#222" stroke-dasharray="4,3"/>
+<line x1="450" y1="86" x2="450" y2="430" stroke="#222" stroke-dasharray="4,3"/>
+<line x1="610" y1="86" x2="610" y2="430" stroke="#222" stroke-dasharray="4,3"/>
+<line x1="740" y1="86" x2="740" y2="430" stroke="#222" stroke-dasharray="4,3"/>
+
+<line x1="130" y1="120" x2="290" y2="120" class="arrow"/>
+<text x="210" y="114" text-anchor="middle" class="lbl-sm">sysenter (token, args)</text>
+<line x1="290" y1="160" x2="450" y2="160" class="arrow"/>
+<text x="370" y="154" text-anchor="middle" class="lbl-sm">pledge_check(class)</text>
+<line x1="450" y1="200" x2="290" y2="200" class="arrow"/>
+<text x="370" y="194" text-anchor="middle" class="lbl-sm">OK / -EPERM</text>
+<line x1="290" y1="240" x2="610" y2="240" class="arrow"/>
+<text x="450" y="234" text-anchor="middle" class="lbl-sm">lock-free resolve(token)</text>
+<line x1="610" y1="280" x2="290" y2="280" class="arrow"/>
+<text x="450" y="274" text-anchor="middle" class="lbl-sm">cap_object* | NULL</text>
+<line x1="290" y1="320" x2="740" y2="320" class="arrow"/>
+<text x="515" y="314" text-anchor="middle" class="lbl-sm">invoke + audit</text>
+<line x1="740" y1="360" x2="290" y2="360" class="arrow"/>
+<text x="515" y="354" text-anchor="middle" class="lbl-sm">result</text>
+<line x1="290" y1="400" x2="130" y2="400" class="arrow"/>
+<text x="210" y="394" text-anchor="middle" class="lbl-sm">sysret</text>
+
+<text x="780" y="445" text-anchor="end" class="lbl-xs">Hot-path: 4 mem refs, no spinlocks; AUDIT_CAP_INVOKE emitted async.</text>
+
+</svg>

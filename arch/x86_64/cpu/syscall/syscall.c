@@ -26,6 +26,7 @@ extern spinlock_t sched_lock;
 #include "../../drivers/e1000/e1000.h"
 #include "../../../../kernel/net/rawnet.h"
 #include "../../../../kernel/snap/snapshot.h"
+#include "../../../../kernel/console/console.h"
 #include "../../../../kernel/fs/pipe.h"
 #include "../../../../kernel/fs/cluster.h"
 #include "../../../../kernel/autorun.h"
@@ -728,10 +729,18 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             }
 
             if (fd0_type == FD_TYPE_CONSOLE || fd0_type == FD_TYPE_UNUSED) {
-                // Original keyboard path
+                // Phase 27 closeout: multiplex the PS/2 keyboard buffer
+                // AND the COM1 serial RX ring. Either source returns a
+                // char first and wins. Lets users type in the QEMU window
+                // (PS/2) OR the controlling terminal (`-serial stdio`).
+                extern char serial_pop_char(void);
                 char c;
                 asm volatile("sti");
-                while ((c = keyboard_getchar()) == 0) {
+                while (1) {
+                    c = keyboard_getchar();
+                    if (c != 0) break;
+                    c = serial_pop_char();
+                    if (c != 0) break;
                     asm ("hlt");
                 }
                 asm volatile("cli");
@@ -1875,6 +1884,95 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = (uint64_t)(long)n;
                 break;
             }
+            // Phase 27 Block A (Stage A3): inject a PS/2 scancode into the
+            // keyboard handler so user-tests can verify Alt+N → console_switch.
+            case DEBUG_INJECT_SCANCODE: {
+                extern void keyboard_handle_scancode(uint8_t scancode);
+                keyboard_handle_scancode((uint8_t)frame->rsi);
+                frame->rax = 0;
+                break;
+            }
+            // Phase 27 Block A (Stage A3): query currently-displayed console.
+            case DEBUG_CONSOLE_GET_SELECTED: {
+                extern uint32_t console_get_selected(void);
+                frame->rax = (uint64_t)console_get_selected();
+                break;
+            }
+            // Phase 27 Block A (Stage A4): test-only direct cell write.
+            case DEBUG_CONSOLE_WRITE_CELL: {
+                extern int console_write_cell_debug(uint32_t console_id,
+                                                    uint32_t row, uint32_t col,
+                                                    uint32_t codepoint,
+                                                    uint8_t fg, uint8_t bg,
+                                                    uint16_t attrs);
+                uint32_t cid = (uint32_t)frame->rsi;
+                uint32_t row = (uint32_t)frame->rdx;
+                uint32_t col = (uint32_t)frame->r10;
+                uint64_t packed = frame->r8;
+                uint32_t cp    = (uint32_t)(packed & 0xFFFFFFFFu);
+                uint8_t  fg    = (uint8_t)((packed >> 32) & 0xFFu);
+                uint8_t  bg    = (uint8_t)((packed >> 40) & 0xFFu);
+                uint16_t attrs = (uint16_t)((packed >> 48) & 0xFFFFu);
+                int rc = console_write_cell_debug(cid, row, col, cp, fg, bg, attrs);
+                frame->rax = (uint64_t)(long)rc;
+                break;
+            }
+            // Phase 27 Block A (Stage A4): kernel-side composite for the
+            // gate test fbd_render. Bypasses g_fbd_alive on every blit.
+            case DEBUG_CONSOLE_SYNTHETIC_RENDER: {
+                extern int console_render_synthetic_frame(uint32_t console_id);
+                uint32_t cid = (uint32_t)frame->rsi;
+                int rc = console_render_synthetic_frame(cid);
+                frame->rax = (uint64_t)(long)rc;
+                break;
+            }
+            // Phase 27 Block C (Stage C1): test-only PLAN_* audit emission.
+            case DEBUG_AUDIT_EMIT_PLAN: {
+                uint16_t ev = (uint16_t)frame->rsi;
+                uint64_t plan_id = frame->rdx;
+                task_t *cur = sched_get_current_task();
+                int32_t pid = cur ? cur->id : -1;
+                switch (ev) {
+                case AUDIT_PLAN_BEGIN:
+                    audit_write_plan_begin(pid, plan_id, "debug-emit");
+                    break;
+                case AUDIT_PLAN_STEP:
+                    audit_write_plan_step(pid, plan_id, 1, "debug-emit");
+                    break;
+                case AUDIT_PLAN_COMMIT:
+                    audit_write_plan_commit(pid, plan_id);
+                    break;
+                case AUDIT_PLAN_ABORT:
+                    audit_write_plan_abort(pid, plan_id, "debug-emit");
+                    break;
+                case AUDIT_RLIMIT_SYSCALL_RATE:
+                    audit_write_rlimit_syscall_rate(pid, plan_id, plan_id + 1);
+                    break;
+                default:
+                    frame->rax = (uint64_t)(long)-22;
+                    goto debug_audit_emit_done;
+                }
+                frame->rax = 0;
+            debug_audit_emit_done:
+                break;
+            }
+            // Phase 27 Block B (Stage B1): test-only overlay fill.
+            case DEBUG_CONSOLE_GFX_FILL: {
+                extern int console_gfx_fill_debug(uint32_t console_id,
+                                                  uint32_t x, uint32_t y,
+                                                  uint32_t w, uint32_t h,
+                                                  uint32_t color);
+                uint32_t cid = (uint32_t)frame->rsi;
+                uint64_t packed = frame->rdx;
+                uint32_t x = (uint32_t)(packed & 0xFFFFu);
+                uint32_t y = (uint32_t)((packed >> 16) & 0xFFFFu);
+                uint32_t w = (uint32_t)((packed >> 32) & 0xFFFFu);
+                uint32_t h = (uint32_t)((packed >> 48) & 0xFFFFu);
+                uint32_t color = (uint32_t)frame->r10;
+                int rc = console_gfx_fill_debug(cid, x, y, w, h, color);
+                frame->rax = (uint64_t)(long)rc;
+                break;
+            }
             default:
                 frame->rax = (uint64_t)-1;
                 break;
@@ -2622,16 +2720,34 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             // handoff between driver daemons and protocol stacks. Default
             // (flags == 0 or VMO_CLONE_COW (0x10)) is still COW.
             vmo_t *child;
-            if (clone_flags & 0x20u /* VMO_CLONE_SHARED */) {
+            bool is_shared = (clone_flags & 0x20u /* VMO_CLONE_SHARED */) != 0;
+            if (is_shared) {
                 child = vmo_clone_shared(src, cur->id);
             } else {
                 child = vmo_clone_cow(src, cur->id);
             }
             if (!child) { frame->rax = (uint64_t)(long)CAP_V2_ENOMEM; break; }
 
+            // Phase 22 closeout (post-Phase-27 follow-up FIX): the entire
+            // point of VMO_CLONE_SHARED is to hand the clone to a different
+            // process via chan_send. The receiver must be able to
+            // cap_token_resolve() the handle, but cap_token_resolve checks
+            // audience — and our caller's pid won't match the receiver's.
+            // Mirror the kernel blk_client pattern (kernel/fs/blk_client.c
+            // line 1065 "PID_PUBLIC audience so ahcid can resolve it
+            // post-handle-transfer") and default SHARED clones to public
+            // audience. COW clones stay caller-private (the COW child is
+            // mapped only by the original caller's process tree). This
+            // unbreaks the netd ↔ e1000d ANNOUNCE handshake under
+            // autorun=init.
             int32_t audience[CAP_AUDIENCE_MAX + 1];
-            audience[0] = cur->id;
-            audience[1] = PID_NONE;
+            if (is_shared) {
+                audience[0] = PID_PUBLIC;
+                audience[1] = PID_NONE;
+            } else {
+                audience[0] = cur->id;
+                audience[1] = PID_NONE;
+            }
             int idx = cap_object_create(CAP_KIND_VMO,
                                         RIGHT_READ | RIGHT_WRITE | RIGHT_INSPECT |
                                             RIGHT_DERIVE | RIGHT_REVOKE,
@@ -3438,6 +3554,184 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             int rc = txn_abort(handle, cur);
             if (cur) cur->syscall_frame_ptr = NULL;
             frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        // ----------------------------------------------------------
+        // Phase 27 Block A — Virtual console syscalls (1101-1106).
+        // Stage A2 wires SYS_CONSOLE_SWITCH + SYS_CONSOLE_ACK_RENDER
+        // (the syscalls fbd needs at Stage A4). SYS_CONSOLE_CREATE,
+        // ATTACH, INSPECT, OBSERVE land at Stage A4 alongside cap
+        // inheritance (FU26.D, Stage C2). Block B + Block C slots
+        // (1107-1112) reserved here, return -ENOSYS until their stages.
+        // ----------------------------------------------------------
+        case SYS_CONSOLE_SWITCH: {
+            // Pledge: IPC_SEND. Cap-gating via CAP_KIND_SYSTEM RIGHT_INVOKE
+            // is enforced after FU26.D cap inheritance lands (Stage C2);
+            // for Stage A2 we accept any caller and rely on the consumer
+            // (fbd) being trusted via init.conf.
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_SEND,
+                                        "pledge denied: ipc_send")) break;
+            extern int console_switch(uint32_t console_id);
+            uint32_t cid = (uint32_t)frame->rdi;
+            int rc = console_switch(cid);
+            // Map -1 (internal "invalid id") to userspace -EINVAL = -22.
+            frame->rax = (uint64_t)(long)(rc == 0 ? 0 : -22);
+            break;
+        }
+
+        case SYS_CONSOLE_CREATE: {
+            // Stage A2 stub — full creation lands at Stage A4 (when fbd
+            // and userspace consumers exist).
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                        "pledge denied: sys_control")) break;
+            frame->rax = (uint64_t)(long)-38;  // -ENOSYS
+            break;
+        }
+
+        case SYS_CONSOLE_ATTACH:
+        case SYS_CONSOLE_INSPECT:
+        case SYS_CONSOLE_OBSERVE: {
+            // Stage A4 will wire these once owner-pid + cap_token paths
+            // are needed by gsh / grahai. For now -ENOSYS.
+            frame->rax = (uint64_t)(long)-38;
+            break;
+        }
+
+        case SYS_CONSOLE_ACK_RENDER: {
+            // Pledge: IPC_SEND. Cap: CAP_KIND_SYSTEM RIGHT_INVOKE (deferred
+            // to C2 alongside cap inheritance — see SYS_CONSOLE_SWITCH note).
+            // First successful call sets fbd_alive=true so direct-FB klog
+            // draws bail (drivers/video/framebuffer.c checks the flag).
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_SEND,
+                                        "pledge denied: ipc_send")) break;
+            extern int console_ack_render(uint32_t console_id, uint64_t rendered_seq);
+            uint32_t cid = (uint32_t)frame->rdi;
+            uint64_t seq = frame->rsi;
+            int rc = console_ack_render(cid, seq);
+            frame->rax = (uint64_t)(long)(rc == 0 ? 0 : -22);
+            break;
+        }
+
+        // Block B (Stage B1) — sprite registry + RGBA overlay.
+        case SYS_CONSOLE_SPRITE_REGISTER: {
+            // Pledge IPC_SEND (write to console). Cap-gating CAP_KIND_CONSOLE
+            // RIGHT_WRITE deferred to Stage C2.
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_SEND,
+                                        "pledge denied: ipc_send")) break;
+            extern int console_sprite_register(uint32_t console_id,
+                                               uint32_t sprite_id,
+                                               const uint8_t bitmap16[16]);
+            uint32_t cid = (uint32_t)frame->rdi;
+            uint32_t sid = (uint32_t)frame->rsi;
+            const void *user_bitmap = (const void *)frame->rdx;
+            // Bounce buffer: copy 16 bytes from user. Reusing kernel's
+            // copy_from_user pattern would be cleaner but we don't have a
+            // public symbol for it yet — read directly with VM safety
+            // assumed (caller is trusted; cap-gating arrives in C2).
+            uint8_t buf[16];
+            if (!user_bitmap) { frame->rax = (uint64_t)(long)-22; break; }
+            const uint8_t *src = (const uint8_t *)user_bitmap;
+            for (int i = 0; i < 16; i++) buf[i] = src[i];
+            int rc = console_sprite_register(cid, sid, buf);
+            // Map -2 (-ENOMEM) to -12, -1 (-EINVAL) to -22.
+            int urc = (rc == 0) ? 0 : (rc == -2 ? -12 : -22);
+            frame->rax = (uint64_t)(long)urc;
+            break;
+        }
+
+        case SYS_CONSOLE_GFX_ENABLE: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                        "pledge denied: sys_control")) break;
+            extern struct vmo *console_gfx_enable(uint32_t console_id,
+                                                  uint32_t w_px, uint32_t h_px);
+            uint32_t cid = (uint32_t)frame->rdi;
+            uint32_t w = (uint32_t)frame->rsi;
+            uint32_t h = (uint32_t)frame->rdx;
+            struct vmo *v = console_gfx_enable(cid, w, h);
+            // Stage B1 returns the cap_object_idx (so userspace can
+            // syscall_vmo_map). Stage C2 will tighten via
+            // cap_handle_insert into caller's table.
+            if (!v) { frame->rax = (uint64_t)(long)-22; break; }
+            // The vmo cap_object_idx was set inside console_gfx_enable.
+            extern uint32_t console_get_gfx_cap_idx(uint32_t console_id);
+            uint32_t cap_idx = console_get_gfx_cap_idx(cid);
+            frame->rax = (uint64_t)cap_idx;
+            break;
+        }
+
+        case SYS_CONSOLE_GFX_DAMAGE: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_SEND,
+                                        "pledge denied: ipc_send")) break;
+            extern int console_gfx_damage(uint32_t console_id,
+                                          const damage_rect_t *rect);
+            uint32_t cid = (uint32_t)frame->rdi;
+            uint32_t x = (uint32_t)frame->rsi;
+            uint32_t y = (uint32_t)frame->rdx;
+            uint32_t w = (uint32_t)frame->r10;
+            uint32_t h = (uint32_t)frame->r8;
+            damage_rect_t r = {
+                .x = (uint16_t)x,
+                .y = (uint16_t)y,
+                .w = (uint16_t)w,
+                .h = (uint16_t)h,
+            };
+            int rc = console_gfx_damage(cid, &r);
+            frame->rax = (uint64_t)(long)(rc == 0 ? 0 : -22);
+            break;
+        }
+
+        case SYS_AUDIT_SUBSCRIBE: {
+            // Pledge SYS_QUERY (read-only observation).
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY,
+                                        "pledge denied: sys_query")) break;
+            uint64_t filter_mask = frame->rdi;
+            task_t *cur = sched_get_current_task();
+            int32_t pid = cur ? cur->id : -1;
+            int slot = audit_subscribe(pid, filter_mask);
+            // Map -1 (no slot) to -EAGAIN = -11.
+            frame->rax = (uint64_t)(long)(slot >= 0 ? slot : -11);
+            break;
+        }
+        case SYS_AUDIT_STREAM_READ: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY,
+                                        "pledge denied: sys_query")) break;
+            int slot = (int)(int32_t)frame->rdi;
+            audit_entry_t *user_buf = (audit_entry_t *)frame->rsi;
+            uint32_t max = (uint32_t)frame->rdx;
+            if (!user_buf || max == 0 || max > 64) {
+                frame->rax = (uint64_t)(long)-22;
+                break;
+            }
+            // Bounce buffer in kernel, then copy out. 64*256 = 16 KiB max.
+            static audit_entry_t bounce[64];
+            task_t *cur = sched_get_current_task();
+            int32_t pid = cur ? cur->id : -1;
+            int n = audit_stream_read(slot, pid, bounce, max);
+            if (n < 0) { frame->rax = (uint64_t)(long)-22; break; }
+            for (int i = 0; i < n; i++) user_buf[i] = bounce[i];
+            frame->rax = (uint64_t)(long)n;
+            break;
+        }
+        case SYS_MANIFEST_EXPORT: {
+            // Pledge SYS_QUERY (read-only manifest blob).
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY,
+                                        "pledge denied: sys_query")) break;
+            extern const uint8_t  g_manifest_blob[];
+            extern const uint64_t g_manifest_blob_size;
+            extern const uint64_t g_manifest_generation;
+            uint8_t *user_buf = (uint8_t *)frame->rdi;
+            uint64_t buflen = frame->rsi;
+            uint64_t *out_gen = (uint64_t *)frame->rdx;
+            if (!user_buf || buflen == 0) {
+                frame->rax = (uint64_t)(long)-22;
+                break;
+            }
+            uint64_t copy = (buflen < g_manifest_blob_size)
+                                ? buflen : g_manifest_blob_size;
+            for (uint64_t i = 0; i < copy; i++) user_buf[i] = g_manifest_blob[i];
+            if (out_gen) *out_gen = g_manifest_generation;
+            frame->rax = (uint64_t)copy;
             break;
         }
 

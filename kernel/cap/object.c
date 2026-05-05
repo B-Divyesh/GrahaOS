@@ -258,9 +258,14 @@ int cap_object_create(uint16_t kind, uint64_t rights, const int32_t *audience,
     return err;
 }
 
-int cap_object_derive(uint32_t parent_idx, int32_t caller_pid,
-                      uint64_t rights_subset, const int32_t *audience_subset,
-                      uint8_t flags_subset) {
+// Phase 27 Stage C2: shared derive core. quiet=true suppresses the
+// AUDIT_CAP_DERIVE emission. Used by the inheritance-on-spawn walk in
+// sched_create_user_process (which would otherwise spam the audit ring
+// with one derive per spawn × every inheritable cap).
+static int cap_object_derive_inner(uint32_t parent_idx, int32_t caller_pid,
+                                   uint64_t rights_subset,
+                                   const int32_t *audience_subset,
+                                   uint8_t flags_subset, bool quiet) {
     if (parent_idx == 0 || parent_idx >= CAP_OBJECT_CAPACITY) return CAP_V2_EINVAL;
 
     cap_object_t *parent = __atomic_load_n(&g_cap_object_ptrs[parent_idx], __ATOMIC_ACQUIRE);
@@ -275,16 +280,11 @@ int cap_object_derive(uint32_t parent_idx, int32_t caller_pid,
     // Rights subset check.
     if ((parent->rights_bitmap & rights_subset) != rights_subset) return CAP_V2_EPERM;
     // Flags subset check — strict only for privileged flags (PUBLIC + IMMORTAL).
-    // Non-privileged flags (EAGER_REVOKE, INHERITABLE) may be freely set by
-    // the derive caller: they only affect the new subtree and don't elevate
-    // the child's effective authority over the parent.
     const uint8_t PRIVILEGED_FLAGS = CAP_FLAG_PUBLIC | CAP_FLAG_IMMORTAL;
     const uint8_t KERNEL_MANAGED_FLAGS = CAP_FLAG_SHIM_EPHEMERAL | CAP_FLAG_CASCADE_TRUNCATED;
     uint8_t priv_sub = flags_subset & PRIVILEGED_FLAGS;
     if ((parent->flags & priv_sub) != priv_sub) return CAP_V2_EPERM;
-    // Callers may not set kernel-managed flags.
     if (flags_subset & KERNEL_MANAGED_FLAGS) return CAP_V2_EPERM;
-    // Audience subset check.
     if (!audience_is_subset(parent, audience_subset)) return CAP_V2_EPERM;
 
     int32_t default_audience[CAP_AUDIENCE_MAX];
@@ -297,15 +297,29 @@ int cap_object_derive(uint32_t parent_idx, int32_t caller_pid,
 
     int new_idx = cap_object_create(parent->kind, rights_subset, aud, flags_subset,
                                     parent->kind_data, caller_pid, parent_idx);
-    // Phase 15b: audit successful derives. Failed ones already get a
-    // CAP_VIOLATION entry from the syscall dispatcher when pledge or
-    // ownership blocks them.
-    if (new_idx >= 0) {
+    if (new_idx >= 0 && !quiet) {
         audit_write_cap_derive(caller_pid, parent_idx,
                                (uint32_t)new_idx, rights_subset,
                                AUDIT_SRC_NATIVE);
     }
     return new_idx;
+}
+
+int cap_object_derive(uint32_t parent_idx, int32_t caller_pid,
+                      uint64_t rights_subset, const int32_t *audience_subset,
+                      uint8_t flags_subset) {
+    return cap_object_derive_inner(parent_idx, caller_pid, rights_subset,
+                                   audience_subset, flags_subset, false);
+}
+
+// Quiet variant: same logic + same return contract, but no audit emission.
+// Used by the FU26.D inheritance-on-spawn walk.
+int cap_object_derive_quiet(uint32_t parent_idx, int32_t caller_pid,
+                            uint64_t rights_subset,
+                            const int32_t *audience_subset,
+                            uint8_t flags_subset) {
+    return cap_object_derive_inner(parent_idx, caller_pid, rights_subset,
+                                   audience_subset, flags_subset, true);
 }
 
 int cap_object_revoke(uint32_t idx) {

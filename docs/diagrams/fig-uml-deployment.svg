@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="480" viewBox="0 0 820 480" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+
+<rect x="40" y="60" width="740" height="90" class="accent" rx="4" ry="4"/>
+<text x="410" y="105" text-anchor="middle" class="lbl">«device» Host (Linux x86_64) — make test / make qemu-interactive</text>
+
+
+<rect x="60" y="90" width="200" height="50" class="box" rx="4" ry="4"/>
+<text x="160" y="115" text-anchor="middle" class="lbl">gcc 15 / Limine 9.3.3</text>
+
+
+<rect x="280" y="90" width="200" height="50" class="box" rx="4" ry="4"/>
+<text x="380" y="115" text-anchor="middle" class="lbl">mkfs.gfs / build/limine.iso</text>
+
+
+<rect x="500" y="90" width="270" height="50" class="box" rx="4" ry="4"/>
+<text x="635" y="115" text-anchor="middle" class="lbl">QEMU 8.x (-enable-kvm -cpu host)</text>
+
+
+
+<rect x="40" y="180" width="740" height="240" class="warn" rx="4" ry="4"/>
+<text x="410" y="300" text-anchor="middle" class="lbl">«executionEnvironment» QEMU virtual machine</text>
+
+
+<rect x="60" y="220" width="320" height="50" class="box" rx="4" ry="4"/>
+<text x="220" y="245" text-anchor="middle" class="lbl">CPU 0..3 + 512 MB RAM + AHCI ctrl</text>
+
+
+<rect x="400" y="220" width="370" height="50" class="box" rx="4" ry="4"/>
+<text x="585" y="245" text-anchor="middle" class="lbl">Limine boots /boot/grahaos.elf</text>
+
+
+<rect x="60" y="290" width="320" height="50" class="accent" rx="4" ry="4"/>
+<text x="220" y="315" text-anchor="middle" class="lbl">GrahaOS kernel half (Ring 0)</text>
+
+
+<rect x="400" y="290" width="370" height="50" class="accent" rx="4" ry="4"/>
+<text x="585" y="315" text-anchor="middle" class="lbl">GrahaFS v2 disk image (mkfs.gfs)</text>
+
+
+<rect x="60" y="360" width="320" height="50" class="accent" rx="4" ry="4"/>
+<text x="220" y="385" text-anchor="middle" class="lbl">Userspace ELFs from initrd (CPIO)</text>
+
+
+<rect x="400" y="360" width="370" height="50" class="accent" rx="4" ry="4"/>
+<text x="585" y="385" text-anchor="middle" class="lbl">/etc/gcp.json + /etc/gcp.wit shipped</text>
+
+
+
+<rect x="40" y="430" width="740" height="38" class="ok" rx="4" ry="4"/>
+<text x="410" y="449" text-anchor="middle" class="lbl">«artifact» phase-28-complete tag — gate clean × 3-iter KVM + 3-iter TCG</text>
+
+
+</svg>

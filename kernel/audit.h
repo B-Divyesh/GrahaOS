@@ -99,7 +99,14 @@
 #define AUDIT_WASM_CRASHED            47  // wasmd_worker process died unexpectedly mid-execution
 #define AUDIT_WASM_OUT_OF_FUEL        48  // fuel exhaustion (Wasmtime) / wall-clock deadline (wasm3)
 #define AUDIT_PLEDGE_NARROW_EXEC      49  // SYS_PLEDGE | PLEDGE_FLAG_NARROW_EXEC: child spawned with narrowed bundle
-#define AUDIT_EVENT_MAX               49
+// Phase 27 Block C (Stage C1): planning + rate-limit codes for AI agent
+// observability. Reserved range is 50..54.
+#define AUDIT_PLAN_BEGIN              50  // grahai (or other agent) starts a plan
+#define AUDIT_PLAN_STEP               51  // step within a plan
+#define AUDIT_PLAN_COMMIT             52  // plan committed (txn closed)
+#define AUDIT_PLAN_ABORT              53  // plan aborted
+#define AUDIT_RLIMIT_SYSCALL_RATE     54  // syscall-rate quota exceeded (Stage C2 emits)
+#define AUDIT_EVENT_MAX               54
 
 // Source of the event.
 #define AUDIT_SRC_NATIVE  0   // Native v2 API.
@@ -442,3 +449,67 @@ void audit_write_wasm_out_of_fuel(int32_t parent_pid, uint32_t obj_idx,
 // a negative CAP_V2_* errno on failure. event_mask = 0 means all events.
 int audit_query(uint64_t since_ns, uint64_t until_ns, uint32_t event_mask,
                 audit_entry_t *out_buf, uint32_t max);
+
+// ---------------------------------------------------------------------------
+// Phase 27 Block C (Stage C1): per-process audit subscribers.
+//
+// Each subscriber owns a 64-entry SPSC ring of audit_entry_t (16 KiB).
+// Producer side: audit_enqueue() calls audit_broadcast() POST-spinlock-release;
+// broadcast walks subscribers and try_locks each subscriber's ring lock to
+// push the entry. On contention or full ring, drop and bump dropped_count.
+// Consumer side: SYS_AUDIT_STREAM_READ copies up to N entries out of the ring
+// into a userspace buffer.
+//
+// The producer broadcast is intentionally OUTSIDE the audit_queue lock so a
+// slow subscriber doesn't backpressure other audit emissions (Phase 25 T1/T2
+// regression class). filter_mask is a bitmap of audit event_type bits
+// (1<<event_type); filter_mask=~0 receives every event.
+// ---------------------------------------------------------------------------
+#define AUDIT_SUB_RING_DEPTH       64u
+#define AUDIT_SUB_MAX              16u
+
+typedef struct {
+    bool       in_use;
+    int32_t    pid;
+    uint64_t   filter_mask;
+    uint64_t   dropped_count;
+    spinlock_t lock;
+    uint32_t   head;
+    uint32_t   tail;
+    audit_entry_t ring[AUDIT_SUB_RING_DEPTH];
+} audit_subscriber_t;
+
+extern audit_subscriber_t g_audit_subscribers[AUDIT_SUB_MAX];
+extern spinlock_t          g_audit_subscribers_lock;
+
+// Allocate a subscriber slot for `pid` with the given `filter_mask`. Returns
+// the slot index (0..AUDIT_SUB_MAX-1) on success, -1 on no-free-slot.
+int  audit_subscribe(int32_t pid, uint64_t filter_mask);
+
+// Free a subscriber slot. Idempotent if `slot_idx` is invalid or already free.
+void audit_unsubscribe(int slot_idx);
+
+// Free every subscriber owned by `pid`. Called from sched_reap_zombie /
+// task_exit cleanup so AI agents that crash don't leave stale subscriptions.
+void audit_unsubscribe_all_for_pid(int32_t pid);
+
+// Drain up to `max` entries from subscriber `slot_idx` into `out_buf`.
+// Returns count copied (0 if ring empty), or -1 on invalid slot/pid mismatch.
+int  audit_stream_read(int slot_idx, int32_t caller_pid,
+                       audit_entry_t *out_buf, uint32_t max);
+
+// Internal: invoked from audit_enqueue post-lock-release. Walks subscribers
+// and pushes the entry into each matching ring.
+void audit_broadcast(const audit_entry_t *entry);
+
+// Stage C1 PLAN_* writers. Driven by grahai (Stage D3) for AI agent
+// observability. Detail field carries plan id + step description.
+void audit_write_plan_begin(int32_t pid, uint64_t plan_id, const char *detail);
+void audit_write_plan_step(int32_t pid, uint64_t plan_id, uint32_t step_idx,
+                           const char *detail);
+void audit_write_plan_commit(int32_t pid, uint64_t plan_id);
+void audit_write_plan_abort(int32_t pid, uint64_t plan_id, const char *reason);
+
+// Stage C2 — rate-quota audit code 54.
+void audit_write_rlimit_syscall_rate(int32_t pid, uint64_t limit_per_sec,
+                                     uint64_t observed_per_sec);

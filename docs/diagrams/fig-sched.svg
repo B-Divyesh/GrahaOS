@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="440" viewBox="0 0 820 440" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+
+<rect x="40" y="60" width="180" height="280" class="accent" rx="4" ry="4"/>
+<text x="130" y="200" text-anchor="middle" class="lbl">CPU 0 (BSP)</text>
+
+
+<rect x="50" y="100" width="160" height="60" class="box" rx="4" ry="4"/>
+<text x="130" y="123" text-anchor="middle" class="lbl">runq[0]</text>
+<text x="130" y="139" text-anchor="middle" class="lbl-xs">head → tail</text>
+
+<rect x="50" y="170" width="160" height="60" class="box" rx="4" ry="4"/>
+<text x="130" y="193" text-anchor="middle" class="lbl">idle_task</text>
+<text x="130" y="209" text-anchor="middle" class="lbl-xs">hlt</text>
+
+<rect x="50" y="240" width="160" height="60" class="box" rx="4" ry="4"/>
+<text x="130" y="263" text-anchor="middle" class="lbl">IPI receiver</text>
+<text x="130" y="279" text-anchor="middle" class="lbl-xs">vector 48</text>
+
+
+<rect x="240" y="60" width="180" height="280" class="accent" rx="4" ry="4"/>
+<text x="330" y="200" text-anchor="middle" class="lbl">CPU 1</text>
+
+
+<rect x="250" y="100" width="160" height="60" class="box" rx="4" ry="4"/>
+<text x="330" y="123" text-anchor="middle" class="lbl">runq[1]</text>
+<text x="330" y="139" text-anchor="middle" class="lbl-xs">runnable=2</text>
+
+<rect x="250" y="170" width="160" height="60" class="box" rx="4" ry="4"/>
+<text x="330" y="193" text-anchor="middle" class="lbl">current</text>
+<text x="330" y="209" text-anchor="middle" class="lbl-xs">task_t *</text>
+
+<rect x="250" y="240" width="160" height="60" class="box" rx="4" ry="4"/>
+<text x="330" y="263" text-anchor="middle" class="lbl">IPI receiver</text>
+<text x="330" y="279" text-anchor="middle" class="lbl-xs">vector 48</text>
+
+
+<rect x="440" y="60" width="180" height="280" class="accent" rx="4" ry="4"/>
+<text x="530" y="200" text-anchor="middle" class="lbl">CPU 2</text>
+
+
+<rect x="450" y="100" width="160" height="60" class="box" rx="4" ry="4"/>
+<text x="530" y="123" text-anchor="middle" class="lbl">runq[2]</text>
+<text x="530" y="139" text-anchor="middle" class="lbl-xs">runnable=0</text>
+
+<rect x="450" y="170" width="160" height="60" class="box" rx="4" ry="4"/>
+<text x="530" y="193" text-anchor="middle" class="lbl">idle_task</text>
+<text x="530" y="209" text-anchor="middle" class="lbl-xs">hlt</text>
+
+<rect x="450" y="240" width="160" height="60" class="box" rx="4" ry="4"/>
+<text x="530" y="263" text-anchor="middle" class="lbl">IPI receiver</text>
+<text x="530" y="279" text-anchor="middle" class="lbl-xs">vector 48</text>
+
+
+<rect x="640" y="60" width="160" height="280" class="accent" rx="4" ry="4"/>
+<text x="720" y="200" text-anchor="middle" class="lbl">CPU 3</text>
+
+
+<rect x="650" y="100" width="140" height="60" class="box" rx="4" ry="4"/>
+<text x="720" y="123" text-anchor="middle" class="lbl">runq[3]</text>
+<text x="720" y="139" text-anchor="middle" class="lbl-xs">runnable=5</text>
+
+<rect x="650" y="170" width="140" height="60" class="box" rx="4" ry="4"/>
+<text x="720" y="193" text-anchor="middle" class="lbl">current</text>
+<text x="720" y="209" text-anchor="middle" class="lbl-xs">task_t *</text>
+
+<rect x="650" y="240" width="140" height="60" class="box" rx="4" ry="4"/>
+<text x="720" y="263" text-anchor="middle" class="lbl">IPI receiver</text>
+<text x="720" y="279" text-anchor="middle" class="lbl-xs">vector 48</text>
+
+<text x="410" y="370" text-anchor="middle" class="lbl-sm" font-weight="bold">Cross-CPU wake</text>
+<text x="410" y="390" text-anchor="middle" class="lbl-sm">sender on CPU 1 → chan_send wakes blocked task on CPU 2 → IPI vector 48 → schedule()</text>
+<text x="410" y="408" text-anchor="middle" class="lbl-xs">Wake-to-run drops from ~10 ms (tick) to &lt; 1 µs (IPI delivery + dispatch). Pattern from seL4 (Lyons et al. ATC '18).</text>
+
+<line x1="330" y1="270" x2="530" y2="270" class="arrow"/>
+<text x="430" y="264" text-anchor="middle" class="lbl-sm">IPI</text>
+<line x1="330" y1="290" x2="530" y2="290" class="arrowd"/>
+<text x="430" y="284" text-anchor="middle" class="lbl-sm">work-steal</text>
+
+</svg>

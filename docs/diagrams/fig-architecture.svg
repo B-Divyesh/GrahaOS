@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="540" viewBox="0 0 820 540" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+
+<rect x="40" y="50" width="740" height="60" class="box" rx="4" ry="4"/>
+<text x="410" y="80" text-anchor="middle" class="lbl">Hardware (x86_64): CPU · MMU · APIC · IOAPIC · AHCI · NIC · Framebuffer</text>
+
+
+<rect x="40" y="130" width="740" height="130" class="accent" rx="4" ry="4"/>
+<text x="410" y="195" text-anchor="middle" class="lbl">Kernel half (Ring 0)</text>
+
+
+<rect x="60" y="162" width="160" height="38" class="box" rx="4" ry="4"/>
+<text x="140" y="174" text-anchor="middle" class="lbl">PMM / VMM</text>
+<text x="140" y="190" text-anchor="middle" class="lbl-xs">HHDM, COW</text>
+
+<rect x="230" y="162" width="160" height="38" class="box" rx="4" ry="4"/>
+<text x="310" y="174" text-anchor="middle" class="lbl">Scheduler / SMP</text>
+<text x="310" y="190" text-anchor="middle" class="lbl-xs">per-CPU runq</text>
+
+<rect x="400" y="162" width="170" height="38" class="box" rx="4" ry="4"/>
+<text x="485" y="174" text-anchor="middle" class="lbl">Capability core</text>
+<text x="485" y="190" text-anchor="middle" class="lbl-xs">tokens · objects</text>
+
+<rect x="580" y="162" width="180" height="38" class="box" rx="4" ry="4"/>
+<text x="670" y="174" text-anchor="middle" class="lbl">Channels · VMOs</text>
+<text x="670" y="190" text-anchor="middle" class="lbl-xs">typed IPC</text>
+
+<rect x="60" y="210" width="160" height="38" class="box" rx="4" ry="4"/>
+<text x="140" y="222" text-anchor="middle" class="lbl">Submission Streams</text>
+<text x="140" y="238" text-anchor="middle" class="lbl-xs">SQE / CQE rings</text>
+
+<rect x="230" y="210" width="160" height="38" class="box" rx="4" ry="4"/>
+<text x="310" y="222" text-anchor="middle" class="lbl">GrahaFS v2 core</text>
+<text x="310" y="238" text-anchor="middle" class="lbl-xs">journal · GC</text>
+
+<rect x="400" y="210" width="170" height="38" class="box" rx="4" ry="4"/>
+<text x="485" y="222" text-anchor="middle" class="lbl">Snapshot · Txn</text>
+<text x="485" y="238" text-anchor="middle" class="lbl-xs">barrier · replay</text>
+
+<rect x="580" y="210" width="180" height="38" class="box" rx="4" ry="4"/>
+<text x="670" y="222" text-anchor="middle" class="lbl">Audit · Pledge</text>
+<text x="670" y="238" text-anchor="middle" class="lbl-xs">256 B records</text>
+
+
+<rect x="40" y="280" width="740" height="220" class="warn" rx="4" ry="4"/>
+<text x="410" y="390" text-anchor="middle" class="lbl">User half (Ring 3)</text>
+
+
+<rect x="60" y="320" width="160" height="50" class="box" rx="4" ry="4"/>
+<text x="140" y="338" text-anchor="middle" class="lbl">init / gash / grahai</text>
+<text x="140" y="354" text-anchor="middle" class="lbl-xs">PID 1 · shell · agent</text>
+
+<rect x="230" y="320" width="160" height="50" class="box" rx="4" ry="4"/>
+<text x="310" y="338" text-anchor="middle" class="lbl">libtui · libc</text>
+<text x="310" y="354" text-anchor="middle" class="lbl-xs">frame compositing</text>
+
+<rect x="400" y="320" width="170" height="50" class="box" rx="4" ry="4"/>
+<text x="485" y="338" text-anchor="middle" class="lbl">libnet · libhttp · libtls</text>
+<text x="485" y="354" text-anchor="middle" class="lbl-xs">client surface</text>
+
+<rect x="580" y="320" width="180" height="50" class="box" rx="4" ry="4"/>
+<text x="670" y="338" text-anchor="middle" class="lbl">tests (40+)</text>
+<text x="670" y="354" text-anchor="middle" class="lbl-xs">TAP gate harness</text>
+
+<rect x="60" y="380" width="160" height="50" class="box" rx="4" ry="4"/>
+<text x="140" y="398" text-anchor="middle" class="lbl">ahcid</text>
+<text x="140" y="414" text-anchor="middle" class="lbl-xs">AHCI driver</text>
+
+<rect x="230" y="380" width="160" height="50" class="box" rx="4" ry="4"/>
+<text x="310" y="398" text-anchor="middle" class="lbl">e1000d</text>
+<text x="310" y="414" text-anchor="middle" class="lbl-xs">NIC driver</text>
+
+<rect x="400" y="380" width="170" height="50" class="box" rx="4" ry="4"/>
+<text x="485" y="398" text-anchor="middle" class="lbl">netd</text>
+<text x="485" y="414" text-anchor="middle" class="lbl-xs">TCP/IP stack</text>
+
+<rect x="580" y="380" width="180" height="50" class="box" rx="4" ry="4"/>
+<text x="670" y="398" text-anchor="middle" class="lbl">wasmd</text>
+<text x="670" y="414" text-anchor="middle" class="lbl-xs">Wasmtime substrate</text>
+
+<rect x="60" y="450" width="700" height="38" class="accent" rx="4" ry="4"/>
+<text x="410" y="469" text-anchor="middle" class="lbl">/etc/gcp.json — single public manifest (kernel + user share verbatim)</text>
+
+
+<text x="20" y="80" text-anchor="start" class="lbl-sm">HW</text>
+<text x="20" y="195" text-anchor="start" class="lbl-sm">K</text>
+<text x="20" y="400" text-anchor="start" class="lbl-sm">U</text>
+<line x1="410" y1="280" x2="410" y2="260" class="arrow"/>
+
+<line x1="410" y1="130" x2="410" y2="110" class="arrow"/>
+
+
+</svg>

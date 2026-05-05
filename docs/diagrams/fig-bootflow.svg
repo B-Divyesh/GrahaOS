@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="380" viewBox="0 0 820 380" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+
+<rect x="20" y="60" width="130" height="60" class="accent" rx="4" ry="4"/>
+<text x="85" y="83" text-anchor="middle" class="lbl">Limine</text>
+<text x="85" y="99" text-anchor="middle" class="lbl-xs">UEFI loader</text>
+
+<rect x="170" y="60" width="130" height="60" class="box" rx="4" ry="4"/>
+<text x="235" y="83" text-anchor="middle" class="lbl">kmain (BSP)</text>
+<text x="235" y="99" text-anchor="middle" class="lbl-xs">PMM · VMM init</text>
+
+<rect x="320" y="60" width="130" height="60" class="box" rx="4" ry="4"/>
+<text x="385" y="83" text-anchor="middle" class="lbl">GDT · IDT</text>
+<text x="385" y="99" text-anchor="middle" class="lbl-xs">ISRs · TSS</text>
+
+<rect x="470" y="60" width="130" height="60" class="box" rx="4" ry="4"/>
+<text x="535" y="83" text-anchor="middle" class="lbl">SMP bring-up</text>
+<text x="535" y="99" text-anchor="middle" class="lbl-xs">APs released</text>
+
+<rect x="620" y="60" width="180" height="60" class="box" rx="4" ry="4"/>
+<text x="710" y="83" text-anchor="middle" class="lbl">subsystems</text>
+<text x="710" y="99" text-anchor="middle" class="lbl-xs">channels · audit · GCP</text>
+
+<line x1="150" y1="90" x2="170" y2="90" class="arrow"/>
+
+<line x1="300" y1="90" x2="320" y2="90" class="arrow"/>
+
+<line x1="450" y1="90" x2="470" y2="90" class="arrow"/>
+
+<line x1="600" y1="90" x2="620" y2="90" class="arrow"/>
+
+
+
+<rect x="20" y="180" width="130" height="60" class="box" rx="4" ry="4"/>
+<text x="85" y="203" text-anchor="middle" class="lbl">snap_init</text>
+<text x="85" y="219" text-anchor="middle" class="lbl-xs">barrier · cow_tracker</text>
+
+<rect x="170" y="180" width="130" height="60" class="box" rx="4" ry="4"/>
+<text x="235" y="203" text-anchor="middle" class="lbl">fs_init</text>
+<text x="235" y="219" text-anchor="middle" class="lbl-xs">GrahaFS v2 mount</text>
+
+<rect x="320" y="180" width="130" height="60" class="box" rx="4" ry="4"/>
+<text x="385" y="203" text-anchor="middle" class="lbl">kt task</text>
+<text x="385" y="219" text-anchor="middle" class="lbl-xs">spawns ahcid</text>
+
+<rect x="470" y="180" width="130" height="60" class="box" rx="4" ry="4"/>
+<text x="535" y="203" text-anchor="middle" class="lbl">autorun</text>
+<text x="535" y="219" text-anchor="middle" class="lbl-xs">init or ktest</text>
+
+<rect x="620" y="180" width="180" height="60" class="ok" rx="4" ry="4"/>
+<text x="710" y="203" text-anchor="middle" class="lbl">PID 1 (init)</text>
+<text x="710" y="219" text-anchor="middle" class="lbl-xs">daemons · gsh / ktest</text>
+
+<line x1="150" y1="210" x2="170" y2="210" class="arrow"/>
+
+<line x1="300" y1="210" x2="320" y2="210" class="arrow"/>
+
+<line x1="450" y1="210" x2="470" y2="210" class="arrow"/>
+
+<line x1="600" y1="210" x2="620" y2="210" class="arrow"/>
+
+<line x1="85" y1="120" x2="85" y2="180" class="arrow"/>
+
+
+
+<rect x="20" y="300" width="780" height="50" class="accent" rx="4" ry="4"/>
+<text x="410" y="325" text-anchor="middle" class="lbl">Steady state — kernel idle on each CPU; daemons drive I/O via channels; tests drive gate via TAP</text>
+
+
+</svg>

@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="460" viewBox="0 0 820 460" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+<text x="50" y="55" class="ttl">cap_token_t (64 bits)</text>
+
+<rect x="50" y="70" width="760" height="60" class="box" rx="4" ry="4"/>
+<text x="430" y="100" text-anchor="middle" class="lbl"></text>
+
+<line x1="50"  y1="70" x2="50"  y2="130" stroke="#222"/>
+<line x1="430" y1="70" x2="430" y2="130" stroke="#222"/>
+<line x1="715" y1="70" x2="715" y2="130" stroke="#222"/>
+<line x1="810" y1="70" x2="810" y2="130" stroke="#222"/>
+<text x="240" y="92" text-anchor="middle" class="lbl">generation : 32</text>
+<text x="572" y="92" text-anchor="middle" class="lbl">index : 24</text>
+<text x="762" y="92" text-anchor="middle" class="lbl">flags : 8</text>
+<text x="240" y="118" text-anchor="middle" class="lbl-xs">ABA-prevention counter</text>
+<text x="572" y="118" text-anchor="middle" class="lbl-xs">slab slot index</text>
+<text x="762" y="118" text-anchor="middle" class="lbl-xs">fast-path bits</text>
+
+<text x="50" y="170" class="ttl">cap_object_t (96 bytes)</text>
+
+<rect x="50" y="185" width="250" height="230" class="accent" rx="4" ry="4"/>
+<text x="175" y="300" text-anchor="middle" class="lbl">header</text>
+
+<text x="175" y="210" text-anchor="middle" class="lbl-sm">kind : 8 (14 kinds)</text>
+<text x="175" y="232" text-anchor="middle" class="lbl-sm">rights : 17 (bitmask)</text>
+<text x="175" y="254" text-anchor="middle" class="lbl-sm">flags : 16</text>
+<text x="175" y="276" text-anchor="middle" class="lbl-sm">refcount, gen, watchers</text>
+<text x="175" y="298" text-anchor="middle" class="lbl-sm">parent_idx, root_idx</text>
+<text x="175" y="320" text-anchor="middle" class="lbl-sm">audience_set[8]</text>
+<text x="175" y="342" text-anchor="middle" class="lbl-sm">audit_mask</text>
+<text x="175" y="364" text-anchor="middle" class="lbl-sm">created_tsc</text>
+<text x="175" y="394" text-anchor="middle" class="lbl-xs">audited derivation chain</text>
+
+
+<rect x="330" y="185" width="470" height="230" class="box" rx="4" ry="4"/>
+<text x="565" y="300" text-anchor="middle" class="lbl">14 capability kinds</text>
+
+<text x="345" y="210" class="lbl-sm">CAN = 1     CHANNEL = 2     VMO = 3     STREAM = 4</text>
+<text x="345" y="234" class="lbl-sm">SCHED = 5   AUDIT = 6       WASM_INSTANCE = 7   FS_NODE = 8</text>
+<text x="345" y="258" class="lbl-sm">STATE = 9   AI_METADATA = 10   PROCESS = 11</text>
+<text x="345" y="282" class="lbl-sm">SNAPSHOT = 12   TRANSACTION = 13</text>
+<text x="345" y="306" class="lbl-sm">SYSTEM = 14     CONSOLE = 15</text>
+<text x="345" y="340" class="lbl-sm" font-weight="bold">17 rights bits</text>
+<text x="345" y="360" class="lbl-xs">READ · WRITE · INVOKE · DERIVE · REVOKE · INSPECT</text>
+<text x="345" y="376" class="lbl-xs">RESTORE · DELETE · COMMIT · ABORT · ATTACH · OBSERVE</text>
+<text x="345" y="392" class="lbl-xs">subset-narrowing only — no expansion ever</text>
+
+</svg>

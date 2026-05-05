@@ -612,11 +612,66 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     // which yields default unlimited limits.
     task_t *parent_for_limits = sched_get_current_task();
     rlimit_init_defaults(task_ptrs[id], parent_for_limits);
+
+    // Snapshot parent's handle-table contents under the table's own lock
+    // BEFORE we leave the sched_lock critical section. Walking the table
+    // mid-spawn is safe (other code only mutates handle tables of running
+    // processes; the spawning child isn't accessible yet). We collect just
+    // the object_idx values so the heavy work — cap_object_derive_quiet
+    // (allocates a cap_object) and cap_handle_insert (may grow the
+    // child's table via kmalloc) — runs OUTSIDE the sched_lock + with
+    // interrupts re-enabled. Doing those allocations inside the
+    // interrupts-disabled critical section was a fatal hazard: the slab
+    // / kheap locks aren't expected to be acquired with IF=0 + sched_lock
+    // held, so under spawn pressure (init crash-loops bin/ahcid every
+    // few hundred ms) the kernel eventually panics with a lock-order
+    // / nested-allocator violation. Phase 27 Stage CLOSE follow-up.
+    uint32_t inherit_snap[32];
+    uint32_t inherit_n = 0;
+    if (parent_for_limits && parent_for_limits != task_ptrs[id]) {
+        cap_handle_table_t *pt = &parent_for_limits->cap_handles;
+        spinlock_acquire(&pt->lock);
+        for (uint32_t s = 0; s < pt->capacity && inherit_n < 32; s++) {
+            uint32_t oidx = pt->entries[s].object_idx;
+            if (oidx == CAP_OBJECT_IDX_NONE) continue;
+            inherit_snap[inherit_n++] = oidx;
+        }
+        spinlock_release(&pt->lock);
+    }
+
     pid_hash_insert(task_ptrs[id]);
     g_task_count++;
 
     asm volatile("push %0; popfq" : : "r"(flags));
     spinlock_release(&sched_lock);
+
+    // Phase 27 Stage C2 (FU26.D): cap inheritance on spawn. For each
+    // entry whose backing cap_object has CAP_FLAG_INHERITABLE, derive a
+    // sub-token (audience = parent's verbatim) and insert into the
+    // child's table. Caps WITHOUT CAP_FLAG_INHERITABLE are ignored.
+    if (parent_for_limits && parent_for_limits != task_ptrs[id]) {
+        cap_handle_table_t *ct = &(*task_ptrs[id]).cap_handles;
+        for (uint32_t i = 0; i < inherit_n; i++) {
+            cap_object_t *obj = cap_object_get(inherit_snap[i]);
+            if (!obj || obj->deleted) continue;
+            if (!(obj->flags & CAP_FLAG_INHERITABLE)) continue;
+            int32_t aud[CAP_AUDIENCE_MAX];
+            int aud_n = 0;
+            for (int j = 0; j < CAP_AUDIENCE_MAX && j < obj->audience_count; j++) {
+                aud[aud_n++] = obj->audience_set[j];
+            }
+            for (int j = aud_n; j < CAP_AUDIENCE_MAX; j++) aud[j] = PID_NONE;
+            int new_idx = cap_object_derive_quiet(inherit_snap[i],
+                                                   parent_for_limits->id,
+                                                   obj->rights_bitmap, aud,
+                                                   obj->flags);
+            if (new_idx > 0) {
+                uint32_t slot;
+                (void)cap_handle_insert(ct, (uint32_t)new_idx,
+                                        obj->flags, &slot);
+            }
+        }
+    }
 
     size_t num_pages = KERNEL_STACK_SIZE / PAGE_SIZE;
     void* kstack_phys = pmm_alloc_pages(num_pages);
@@ -1067,6 +1122,12 @@ void sched_reap_zombie(int task_id) {
     // Mirrors the txn cleanup pattern (R5).
     extern void cap_wasm_task_exit_cleanup(int32_t dying_pid);
     cap_wasm_task_exit_cleanup((int32_t)(*task_ptrs[task_id]).id);
+
+    // Phase 27 Stage C1: free any audit subscriber slots held by the dying
+    // task so a crashed grahai (or other AI agent) doesn't leave its
+    // 16 KiB ring sitting in g_audit_subscribers[] forever.
+    extern void audit_unsubscribe_all_for_pid(int32_t dying_pid);
+    audit_unsubscribe_all_for_pid((int32_t)(*task_ptrs[task_id]).id);
 
     // Phase 22: if the dying task had published any /sys/net/* names in
     // the rawnet registry (e.g. e1000d published /sys/net/rawframe, netd

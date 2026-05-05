@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="540" viewBox="0 0 820 540" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+<text x="50" y="55" class="ttl">«kernel»</text>
+
+<rect x="60" y="70" width="720" height="220" class="box" rx="4" ry="4"/>
+<text x="420" y="180" text-anchor="middle" class="lbl"></text>
+
+
+<rect x="80" y="100" width="150" height="50" class="accent" rx="4" ry="4"/>
+<text x="155" y="125" text-anchor="middle" class="lbl">core::vmm</text>
+
+
+<rect x="245" y="100" width="150" height="50" class="accent" rx="4" ry="4"/>
+<text x="320" y="125" text-anchor="middle" class="lbl">core::sched</text>
+
+
+<rect x="410" y="100" width="150" height="50" class="accent" rx="4" ry="4"/>
+<text x="485" y="125" text-anchor="middle" class="lbl">core::cap</text>
+
+
+<rect x="575" y="100" width="190" height="50" class="accent" rx="4" ry="4"/>
+<text x="670" y="125" text-anchor="middle" class="lbl">core::ipc::channel</text>
+
+
+<rect x="80" y="170" width="150" height="50" class="accent" rx="4" ry="4"/>
+<text x="155" y="195" text-anchor="middle" class="lbl">core::ipc::vmo</text>
+
+
+<rect x="245" y="170" width="150" height="50" class="accent" rx="4" ry="4"/>
+<text x="320" y="195" text-anchor="middle" class="lbl">core::audit</text>
+
+
+<rect x="410" y="170" width="150" height="50" class="accent" rx="4" ry="4"/>
+<text x="485" y="195" text-anchor="middle" class="lbl">core::pledge</text>
+
+
+<rect x="575" y="170" width="190" height="50" class="accent" rx="4" ry="4"/>
+<text x="670" y="195" text-anchor="middle" class="lbl">core::stream</text>
+
+
+<rect x="80" y="240" width="150" height="40" class="box" rx="4" ry="4"/>
+<text x="155" y="260" text-anchor="middle" class="lbl">fs::grahafs_v2</text>
+
+
+<rect x="245" y="240" width="150" height="40" class="box" rx="4" ry="4"/>
+<text x="320" y="260" text-anchor="middle" class="lbl">snap</text>
+
+
+<rect x="410" y="240" width="150" height="40" class="box" rx="4" ry="4"/>
+<text x="485" y="260" text-anchor="middle" class="lbl">txn</text>
+
+
+<rect x="575" y="240" width="190" height="40" class="box" rx="4" ry="4"/>
+<text x="670" y="260" text-anchor="middle" class="lbl">cap::wasm</text>
+
+
+<text x="50" y="320" class="ttl">«userspace»</text>
+
+<rect x="60" y="340" width="720" height="180" class="warn" rx="4" ry="4"/>
+<text x="420" y="430" text-anchor="middle" class="lbl"></text>
+
+
+<rect x="80" y="360" width="150" height="50" class="accent" rx="4" ry="4"/>
+<text x="155" y="385" text-anchor="middle" class="lbl">init / gash</text>
+
+
+<rect x="245" y="360" width="150" height="50" class="accent" rx="4" ry="4"/>
+<text x="320" y="385" text-anchor="middle" class="lbl">grahai</text>
+
+
+<rect x="410" y="360" width="150" height="50" class="accent" rx="4" ry="4"/>
+<text x="485" y="385" text-anchor="middle" class="lbl">wasmd</text>
+
+
+<rect x="575" y="360" width="190" height="50" class="accent" rx="4" ry="4"/>
+<text x="670" y="385" text-anchor="middle" class="lbl">libtui · libnet</text>
+
+
+<rect x="80" y="430" width="150" height="50" class="accent" rx="4" ry="4"/>
+<text x="155" y="455" text-anchor="middle" class="lbl">ahcid</text>
+
+
+<rect x="245" y="430" width="150" height="50" class="accent" rx="4" ry="4"/>
+<text x="320" y="455" text-anchor="middle" class="lbl">e1000d</text>
+
+
+<rect x="410" y="430" width="150" height="50" class="accent" rx="4" ry="4"/>
+<text x="485" y="455" text-anchor="middle" class="lbl">netd</text>
+
+
+<rect x="575" y="430" width="190" height="50" class="accent" rx="4" ry="4"/>
+<text x="670" y="455" text-anchor="middle" class="lbl">tests (TAP)</text>
+
+
+<text x="780" y="535" text-anchor="end" class="lbl-xs">All boundaries between components are channels + manifest entries.</text>
+
+</svg>

@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="380" viewBox="0 0 820 380" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+
+<rect x="40" y="60" width="200" height="240" class="accent" rx="4" ry="4"/>
+<text x="140" y="180" text-anchor="middle" class="lbl">User process</text>
+
+
+<rect x="50" y="100" width="180" height="50" class="box" rx="4" ry="4"/>
+<text x="140" y="118" text-anchor="middle" class="lbl">libsubmit</text>
+<text x="140" y="134" text-anchor="middle" class="lbl-xs">build SQE</text>
+
+<rect x="50" y="170" width="180" height="50" class="box" rx="4" ry="4"/>
+<text x="140" y="188" text-anchor="middle" class="lbl">wait CQE</text>
+<text x="140" y="204" text-anchor="middle" class="lbl-xs">poll · block</text>
+
+
+<rect x="280" y="60" width="240" height="240" class="warn" rx="4" ry="4"/>
+<text x="400" y="180" text-anchor="middle" class="lbl">Kernel</text>
+
+
+<rect x="290" y="100" width="220" height="50" class="box" rx="4" ry="4"/>
+<text x="400" y="118" text-anchor="middle" class="lbl">SQE ring (submission)</text>
+<text x="400" y="134" text-anchor="middle" class="lbl-xs">manifest-gated dispatch</text>
+
+<rect x="290" y="170" width="220" height="50" class="box" rx="4" ry="4"/>
+<text x="400" y="188" text-anchor="middle" class="lbl">worker pool</text>
+<text x="400" y="204" text-anchor="middle" class="lbl-xs">SUBMISSION_OP table</text>
+
+<rect x="290" y="240" width="220" height="50" class="box" rx="4" ry="4"/>
+<text x="400" y="258" text-anchor="middle" class="lbl">CQE ring (completion)</text>
+<text x="400" y="274" text-anchor="middle" class="lbl-xs">result + opaque user_data</text>
+
+
+<rect x="560" y="60" width="220" height="240" class="ok" rx="4" ry="4"/>
+<text x="670" y="180" text-anchor="middle" class="lbl">Backing</text>
+
+
+<rect x="570" y="100" width="200" height="50" class="box" rx="4" ry="4"/>
+<text x="670" y="118" text-anchor="middle" class="lbl">fs ops</text>
+<text x="670" y="134" text-anchor="middle" class="lbl-xs">GrahaFS v2 batched</text>
+
+<rect x="570" y="170" width="200" height="50" class="box" rx="4" ry="4"/>
+<text x="670" y="188" text-anchor="middle" class="lbl">ahcid / e1000d</text>
+<text x="670" y="204" text-anchor="middle" class="lbl-xs">user driver via chan</text>
+
+<rect x="570" y="240" width="200" height="50" class="box" rx="4" ry="4"/>
+<text x="670" y="258" text-anchor="middle" class="lbl">audit / cap</text>
+<text x="670" y="274" text-anchor="middle" class="lbl-xs">manifest-bound only</text>
+
+<line x1="230" y1="125" x2="290" y2="125" class="arrow"/>
+<text x="260" y="119" text-anchor="middle" class="lbl-sm">submit</text>
+<line x1="510" y1="195" x2="570" y2="195" class="arrow"/>
+<text x="540" y="189" text-anchor="middle" class="lbl-sm">dispatch</text>
+<line x1="290" y1="265" x2="230" y2="195" class="arrow"/>
+<text x="260" y="224" text-anchor="middle" class="lbl-sm">complete</text>
+
+<text x="410" y="345" text-anchor="middle" class="lbl-sm">io_uring-style; manifest-bound — every SQE op_id must exist in /etc/gcp.json::ops[]</text>
+
+</svg>

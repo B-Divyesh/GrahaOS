@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="460" viewBox="0 0 820 460" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+
+<rect x="340" y="60" width="140" height="50" class="box" rx="4" ry="4"/>
+<text x="410" y="85" text-anchor="middle" class="lbl">IDLE</text>
+
+
+<rect x="60" y="180" width="140" height="50" class="accent" rx="4" ry="4"/>
+<text x="130" y="198" text-anchor="middle" class="lbl">ACTIVE</text>
+<text x="130" y="214" text-anchor="middle" class="lbl-xs">snap captured</text>
+
+<rect x="280" y="180" width="160" height="50" class="warn" rx="4" ry="4"/>
+<text x="360" y="198" text-anchor="middle" class="lbl">COMMITTING</text>
+<text x="360" y="214" text-anchor="middle" class="lbl-xs">replay buffer</text>
+
+<rect x="500" y="180" width="160" height="50" class="danger" rx="4" ry="4"/>
+<text x="580" y="198" text-anchor="middle" class="lbl">COMMITTING_FAILED</text>
+<text x="580" y="214" text-anchor="middle" class="lbl-xs">partial-external</text>
+
+<rect x="60" y="320" width="140" height="50" class="box" rx="4" ry="4"/>
+<text x="130" y="338" text-anchor="middle" class="lbl">ABORTING</text>
+<text x="130" y="354" text-anchor="middle" class="lbl-xs">restore snap</text>
+
+<rect x="280" y="320" width="160" height="50" class="ok" rx="4" ry="4"/>
+<text x="360" y="338" text-anchor="middle" class="lbl">COMMITTED</text>
+<text x="360" y="354" text-anchor="middle" class="lbl-xs">external visible</text>
+
+<rect x="500" y="320" width="160" height="50" class="ok" rx="4" ry="4"/>
+<text x="580" y="338" text-anchor="middle" class="lbl">ABORTED</text>
+<text x="580" y="354" text-anchor="middle" class="lbl-xs">clean rollback</text>
+
+<line x1="390" y1="110" x2="130" y2="180" class="arrow"/>
+<text x="260" y="139" text-anchor="middle" class="lbl-sm">txn_begin</text>
+<line x1="200" y1="205" x2="280" y2="205" class="arrow"/>
+<text x="240" y="199" text-anchor="middle" class="lbl-sm">txn_commit</text>
+<line x1="440" y1="205" x2="500" y2="205" class="arrow"/>
+<text x="470" y="199" text-anchor="middle" class="lbl-sm">send fault</text>
+<line x1="130" y1="230" x2="130" y2="320" class="arrow"/>
+<text x="130" y="269" text-anchor="middle" class="lbl-sm">txn_abort</text>
+<line x1="360" y1="230" x2="360" y2="320" class="arrow"/>
+<text x="360" y="269" text-anchor="middle" class="lbl-sm">replay drained</text>
+<line x1="580" y1="230" x2="580" y2="320" class="arrowd"/>
+<text x="580" y="269" text-anchor="middle" class="lbl-sm">fall back to abort</text>
+
+<text x="40" y="430" class="lbl-sm" font-weight="bold">CAS-serialised transitions:</text>
+<text x="240" y="430" class="lbl-sm">ACTIVE → COMMITTING (single-writer wins). Concurrent abort sleeps 100 ms watchdog.</text>
+
+</svg>

@@ -57,6 +57,12 @@ cp "$LIMINE_CONF" "$LIMINE_BACKUP"
 cleanup() {
     cp "$LIMINE_BACKUP" "$LIMINE_CONF"
     rm -f "$LIMINE_BACKUP"
+    # Phase 27 closeout fix: bump limine.conf mtime so the next `make run`
+    # re-builds the ISO with the restored interactive cmdline. Without
+    # this, Make sees the ISO is newer than the restored limine.conf and
+    # skips the rebuild — leaving the ISO stuck in test mode (autorun=ktest)
+    # forever.
+    touch "$LIMINE_CONF"
 }
 trap cleanup EXIT
 

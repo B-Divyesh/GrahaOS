@@ -50,6 +50,7 @@ typedef struct cap_token {
 #define CAP_KIND_MMIO_REGION       12
 #define CAP_KIND_TRANSACTION       13   // Phase 25 — wraps a snapshot + buffered external sends
 #define CAP_KIND_SYSTEM            14   // Phase 26 FU25.F — system-privileged ops (TXN_FLAG_GLOBAL_SCOPE etc.)
+#define CAP_KIND_CONSOLE           15   // Phase 27 Block A — virtual console (cell VMO + input chan)
 
 // ------------------------------------------------------------------------
 // Rights bitmap (cap_object_t.rights_bitmap — 64 bits).
@@ -84,7 +85,14 @@ typedef struct cap_token {
 // privileged module instantiation, etc.). Diminishing-derive sub-tokens
 // may carry only RIGHT_INSPECT (for monitoring) without RIGHT_INVOKE.
 #define RIGHT_INVOKE      0x0000000000010000ULL  // CAP_KIND_SYSTEM
-// 0x0000000000020000ULL .. reserved for higher kind-specific rights.
+// Phase 27 Block A: CAP_KIND_CONSOLE-specific rights. RIGHT_ATTACH gates
+// SYS_CONSOLE_ATTACH (becoming console owner). RIGHT_OBSERVE gates
+// SYS_CONSOLE_OBSERVE (subscribing to keystrokes from non-owner position).
+// RIGHT_READ + RIGHT_WRITE (existing) gate cell-VMO mapping access.
+// RIGHT_INSPECT (existing) gates SYS_CONSOLE_INSPECT (read cells without owning).
+#define RIGHT_ATTACH      0x0000000000020000ULL  // CAP_KIND_CONSOLE
+#define RIGHT_OBSERVE     0x0000000000040000ULL  // CAP_KIND_CONSOLE
+// 0x0000000000080000ULL .. reserved for higher kind-specific rights.
 #define RIGHTS_ALL        0xFFFFFFFFFFFFFFFFULL
 
 // ------------------------------------------------------------------------

@@ -124,6 +124,23 @@ typedef long ssize_t;
 #define SYS_TXN_COMMIT        1099
 #define SYS_TXN_ABORT         1100
 
+// Phase 27 syscalls (slots 1101-1112). Block A TUI Framework, Block B
+// Graphics, Block C AI Primitives. See arch/x86_64/cpu/syscall/syscall.h
+// for full per-slot documentation. Stage A2 wires SWITCH + ACK_RENDER;
+// remaining slots stub to -ENOSYS until their owning stages.
+#define SYS_CONSOLE_SWITCH          1101
+#define SYS_CONSOLE_CREATE          1102
+#define SYS_CONSOLE_ATTACH          1103
+#define SYS_CONSOLE_INSPECT         1104
+#define SYS_CONSOLE_OBSERVE         1105
+#define SYS_CONSOLE_ACK_RENDER      1106
+#define SYS_CONSOLE_SPRITE_REGISTER 1107
+#define SYS_CONSOLE_GFX_ENABLE      1108
+#define SYS_CONSOLE_GFX_DAMAGE      1109
+#define SYS_AUDIT_SUBSCRIBE         1110
+#define SYS_AUDIT_STREAM_READ       1111
+#define SYS_MANIFEST_EXPORT         1112
+
 // Phase 24 W19: COW snapshot subsystem (slots reconciled to 1093-1096
 // because spec's original 1086-1089 collide with SPAWN_EX..MMIO_VMO_CREATE).
 #define SYS_SNAP_CREATE       1093
@@ -262,6 +279,13 @@ typedef struct {
 #define DEBUG_AHCI_IS_ACTIVE   67
 // FU26.C: kernel-side ksnprintf reachable from user/tests/vsnprintftest.c.
 #define DEBUG_VSNPRINTF        68
+#define DEBUG_INJECT_SCANCODE  69
+#define DEBUG_CONSOLE_GET_SELECTED 70
+#define DEBUG_CONSOLE_WRITE_CELL   71
+#define DEBUG_CONSOLE_SYNTHETIC_RENDER 72
+#define DEBUG_CONSOLE_GFX_FILL     73
+#define DEBUG_AUDIT_EMIT_PLAN      74
+#define DEBUG_FB_READ_PIXEL    61
 #define DEBUG_SET_WALL       51
 
 // Phase 15a: Capability Objects v2 constants (mirror kernel/cap/token.h).
@@ -1020,6 +1044,87 @@ static inline long syscall_debug_vsnprintf(const char *fmt,
     return ret;
 }
 
+// Phase 27 Block A (Stage A3): inject a PS/2 scancode into the keyboard ISR
+// handler. Used by user/tests/keyboard_alt.c to verify Alt+N detection
+// without poking real hardware. Returns 0.
+static inline long syscall_debug_inject_scancode(uint8_t scancode) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_DEBUG),
+          "D"((uint64_t)DEBUG_INJECT_SCANCODE),
+          "S"((uint64_t)scancode)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Phase 27 Block A (Stage A3): query selected console (0..NUM_CONSOLES-1).
+static inline uint32_t syscall_debug_console_get_selected(void) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_DEBUG),
+          "D"((uint64_t)DEBUG_CONSOLE_GET_SELECTED)
+        : "rcx", "r11", "memory");
+    return (uint32_t)ret;
+}
+
+// Phase 27 Block A (Stage A4): test-only direct cell-VMO write. Bypasses
+// SYS_CONSOLE_ATTACH (which is -ENOSYS until Stage C2 cap inheritance).
+// Pack: codepoint:32 | fg:8 | bg:8 | attrs:16.
+static inline long syscall_debug_console_write_cell(uint32_t console_id,
+                                                    uint32_t row, uint32_t col,
+                                                    uint32_t codepoint,
+                                                    uint8_t fg, uint8_t bg,
+                                                    uint16_t attrs) {
+    uint64_t packed = (uint64_t)codepoint |
+                      ((uint64_t)fg << 32) |
+                      ((uint64_t)bg << 40) |
+                      ((uint64_t)attrs << 48);
+    long ret;
+    register uint64_t r10 asm("r10") = (uint64_t)col;
+    register uint64_t r8  asm("r8")  = packed;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_DEBUG),
+          "D"((uint64_t)DEBUG_CONSOLE_WRITE_CELL),
+          "S"((uint64_t)console_id),
+          "d"((uint64_t)row),
+          "r"(r10),
+          "r"(r8)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Phase 27 Block A (Stage A4): trigger kernel-side synthetic composite of
+// the named console's cell-VMO into the framebuffer. Used by fbd_render.tap.
+static inline long syscall_debug_console_synthetic_render(uint32_t console_id) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_DEBUG),
+          "D"((uint64_t)DEBUG_CONSOLE_SYNTHETIC_RENDER),
+          "S"((uint64_t)console_id)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Read raw 32-bit pixel value at (x,y) from the hardware framebuffer.
+// Returns the ARGB word as written by framebuffer_force_draw_cell or zero
+// if (x,y) is out of bounds. Used by fbd_render.tap to verify rendered
+// pixels match expected glyph.
+static inline uint32_t syscall_debug_fb_read_pixel(uint32_t x, uint32_t y) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_DEBUG),
+          "D"((uint64_t)DEBUG_FB_READ_PIXEL),
+          "S"((uint64_t)x),
+          "d"((uint64_t)y)
+        : "rcx", "r11", "memory");
+    return (uint32_t)ret;
+}
+
 // Phase 14: kheap_stats_entry_t — must mirror kernel/mm/kheap.h exactly.
 typedef struct kheap_stats_entry_u {
     char     name[32];
@@ -1377,6 +1482,206 @@ static inline long syscall_txn_abort(uint32_t handle) {
     asm volatile("syscall"
                  : "=a"(ret)
                  : "a"(SYS_TXN_ABORT), "D"((uint64_t)handle)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// =====================================================================
+// Phase 27 syscall wrappers (slots 1101-1112).
+// Stage A2 wires SWITCH + ACK_RENDER; rest are stubs returning -ENOSYS.
+// =====================================================================
+static inline long syscall_console_switch(uint32_t console_id) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_SWITCH), "D"((uint64_t)console_id)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_console_ack_render(uint32_t console_id, uint64_t rendered_seq) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_ACK_RENDER), "D"((uint64_t)console_id), "S"(rendered_seq)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Stage A4 implementations — currently -ENOSYS.
+static inline long syscall_console_create(uint32_t width_cells, uint32_t height_cells, void *out_info) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_CREATE), "D"((uint64_t)width_cells),
+                   "S"((uint64_t)height_cells), "d"(out_info)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_console_attach(uint32_t console_id, uint64_t cap_token_raw) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_ATTACH), "D"((uint64_t)console_id), "S"(cap_token_raw)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_console_inspect(uint32_t console_id, void *out_buf, uint64_t buflen, uint64_t cap_token_raw) {
+    long ret;
+    register uint64_t r10 asm("r10") = cap_token_raw;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_INSPECT), "D"((uint64_t)console_id),
+                   "S"(out_buf), "d"(buflen), "r"(r10)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_console_observe(uint32_t console_id, uint64_t cap_token_raw, uint64_t *out_chan_token) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_OBSERVE), "D"((uint64_t)console_id),
+                   "S"(cap_token_raw), "d"(out_chan_token)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Phase 27 Block B (Stage B1) — sprite + RGBA overlay wrappers. ABI:
+//   SPRITE_REGISTER: RDI=console_id, RSI=sprite_id, RDX=*bitmap16 → 0/-EINVAL
+//   GFX_ENABLE:      RDI=console_id, RSI=w_px, RDX=h_px → cap_idx (>0) / negative
+//   GFX_DAMAGE:      RDI=console_id, RSI=x, RDX=y, R10=w, R8=h → 0/-EINVAL
+static inline long syscall_console_sprite_register(uint32_t console_id,
+                                                   uint32_t sprite_id,
+                                                   const void *bitmap16) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_SPRITE_REGISTER),
+                   "D"((uint64_t)console_id),
+                   "S"((uint64_t)sprite_id),
+                   "d"(bitmap16)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_console_gfx_enable(uint32_t console_id,
+                                              uint32_t w_px, uint32_t h_px) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_GFX_ENABLE),
+                   "D"((uint64_t)console_id),
+                   "S"((uint64_t)w_px),
+                   "d"((uint64_t)h_px)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_console_gfx_damage(uint32_t console_id,
+                                              uint32_t x, uint32_t y,
+                                              uint32_t w, uint32_t h) {
+    long ret;
+    register uint64_t r10 asm("r10") = (uint64_t)w;
+    register uint64_t r8  asm("r8")  = (uint64_t)h;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_GFX_DAMAGE),
+                   "D"((uint64_t)console_id),
+                   "S"((uint64_t)x),
+                   "d"((uint64_t)y),
+                   "r"(r10), "r"(r8)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// DEBUG-only fill of overlay rect with ARGB color (Stage B1 test substrate).
+// Production path is to syscall_vmo_map the cap returned by gfx_enable and
+// write directly; this helper exists to keep console_gfx.tap from needing
+// the full vmo_map plumbing.
+static inline long syscall_debug_console_gfx_fill(uint32_t console_id,
+                                                  uint32_t x, uint32_t y,
+                                                  uint32_t w, uint32_t h,
+                                                  uint32_t color) {
+    uint64_t packed = ((uint64_t)x & 0xFFFFu) |
+                      (((uint64_t)y & 0xFFFFu) << 16) |
+                      (((uint64_t)w & 0xFFFFu) << 32) |
+                      (((uint64_t)h & 0xFFFFu) << 48);
+    long ret;
+    register uint64_t r10 asm("r10") = (uint64_t)color;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_CONSOLE_GFX_FILL),
+                   "S"((uint64_t)console_id),
+                   "d"(packed),
+                   "r"(r10)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Phase 27 Block C (Stage C1) — audit log streaming. Returns subscriber
+// slot id (0..15) on success or -EAGAIN if no free slot. filter_mask is a
+// 64-bit bitmap of audit event types (bit N = (1ULL << N)); ~0 receives
+// every event.
+static inline long syscall_audit_subscribe(uint64_t filter_mask) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_AUDIT_SUBSCRIBE), "D"(filter_mask)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Test-only: emit a synthetic PLAN_* audit event. Used by audit_stream.tap
+// + audit_plan_codes.tap so they can verify subscriber broadcast without
+// wiring grahai end-to-end.
+static inline long syscall_debug_audit_emit_plan(uint16_t event_type,
+                                                 uint64_t plan_id) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_AUDIT_EMIT_PLAN),
+                   "S"((uint64_t)event_type),
+                   "d"(plan_id)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// AUDIT_PLAN_* event codes — mirror kernel/audit.h.
+#define U_AUDIT_PLAN_BEGIN          50
+#define U_AUDIT_PLAN_STEP           51
+#define U_AUDIT_PLAN_COMMIT         52
+#define U_AUDIT_PLAN_ABORT          53
+#define U_AUDIT_RLIMIT_SYSCALL_RATE 54
+
+// Drain up to `max` audit_entry_t records from subscriber `slot` into
+// `buf`. Returns count copied (0 if empty, max 64), or -EINVAL.
+static inline long syscall_audit_stream_read(int slot, void *buf, uint32_t max) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_AUDIT_STREAM_READ),
+                   "D"((long)slot),
+                   "S"(buf),
+                   "d"((uint64_t)max)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Phase 27 Stage C2 — manifest blob export. Returns bytes copied (>0) or
+// -EINVAL. out_generation receives the FNV-1a 64-bit hash of the source
+// gcp.json so AI agents can detect surface drift between kernel builds.
+static inline long syscall_manifest_export(void *user_buf, uint64_t buflen,
+                                           uint64_t *out_generation) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_MANIFEST_EXPORT), "D"(user_buf),
+                   "S"(buflen), "d"(out_generation)
                  : "rcx", "r11", "memory");
     return ret;
 }

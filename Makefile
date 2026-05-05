@@ -215,6 +215,14 @@ etc/gcp.wit: etc/gcp.json scripts/gcp2wit.py
 	@python3 scripts/gcp2wit.py etc/gcp.json --out etc/gcp.wit
 	@echo "  /etc/gcp.wit: $$(wc -l < etc/gcp.wit) lines, $$(wc -c < etc/gcp.wit) bytes"
 
+# Phase 27 Stage C2: regenerate kernel/manifest_blob.c whenever gcp.json is
+# newer. The blob is shipped to userspace via SYS_MANIFEST_EXPORT so AI
+# agents can read the syscall surface + detect surface drift via the FNV-1a
+# generation hash.
+kernel/manifest_blob.c: etc/gcp.json scripts/gen_manifest_blob.py
+	@echo "Regenerating kernel/manifest_blob.c from etc/gcp.json..."
+	@python3 scripts/gen_manifest_blob.py etc/gcp.json --out kernel/manifest_blob.c
+
 # MODIFIED: Package gash, grahai, and libctest into the initrd (Phase 7c)
 # Phase 26 Stage C: gcp.wit added as initrd dep.
 initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
@@ -446,6 +454,25 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@cp user/tests/wasmtest                initrd_root/bin/tests/wasmtest.tap
 	@# Phase 26 closeout (FU26.C): kernel vsnprintf width/flags parser gate.
 	@cp user/tests/vsnprintftest           initrd_root/bin/tests/vsnprintftest.tap
+	@# Phase 27 Block A (Stage A2): console subsystem syscall gate.
+	@cp user/tests/console_init            initrd_root/bin/tests/console_init.tap
+	@# Phase 27 Block A (Stage A3): keyboard Alt+N detection + routing gate.
+	@cp user/tests/keyboard_alt            initrd_root/bin/tests/keyboard_alt.tap
+	@# Phase 27 Block A (Stage A4): cell→pixel synthetic render gate.
+	@cp user/tests/fbd_render              initrd_root/bin/tests/fbd_render.tap
+	@# Phase 27 Block A (Stage A5): libtui + box-drawing + 256-color palette.
+	@cp user/tests/tui_render              initrd_root/bin/tests/tui_render.tap
+	@# Phase 27 Block B (Stage B1): sprite registry + RGBA bitmap overlay.
+	@cp user/tests/console_sprite          initrd_root/bin/tests/console_sprite.tap
+	@cp user/tests/console_gfx             initrd_root/bin/tests/console_gfx.tap
+	@# Phase 27 Block C (Stage C1): audit subscriber broadcast + PLAN_* codes.
+	@cp user/tests/audit_stream            initrd_root/bin/tests/audit_stream.tap
+	@cp user/tests/audit_plan_codes        initrd_root/bin/tests/audit_plan_codes.tap
+	@# Phase 27 Block C (Stage C2): manifest export + rate-quota audit code
+	@# + FU26.D cap inheritance gate.
+	@cp user/tests/manifest_export         initrd_root/bin/tests/manifest_export.tap
+	@cp user/tests/rlimit_syscall_rate     initrd_root/bin/tests/rlimit_syscall_rate.tap
+	@cp user/tests/cap_inherit             initrd_root/bin/tests/cap_inherit.tap
 	@# Phase 26 closeout (FU25.A.2): gash txn{} parser integration tests.
 	@cp user/tests/gash_txn_commit         initrd_root/bin/tests/gash_txn_commit.tap
 	@cp user/tests/gash_txn_abort          initrd_root/bin/tests/gash_txn_abort.tap
@@ -540,6 +567,9 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@cp user/txnctl                  initrd_root/bin/txn-status
 	@# Phase 26 Stage E/G: bin/wasm operator CLI (load + validate WebAssembly).
 	@cp user/wasm                    initrd_root/bin/wasm
+	@# Phase 27 Block A (Stage A4): /bin/fbd userspace framebuffer compositor.
+	@# Spawned by init under autorun=init only (NOT in autorun=ktest gate).
+	@cp user/fbd/fbd                 initrd_root/bin/fbd
 	@# Phase 22 Stage A: netd userspace TCP/IP daemon skeleton. Spawned by
 	@# init when /etc/init.conf names it (default init.conf below doesn't
 	@# for `make test`); sits in initrd unused otherwise. Stage A content:
@@ -567,6 +597,12 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@echo "daemon=bin/ahcid:storage_server,sys_control,sys_query,ipc_send,ipc_recv,compute" >> initrd_root/etc/init.conf
 	@echo "daemon=bin/e1000d:net_server,sys_control,sys_query,ipc_send,ipc_recv" >> initrd_root/etc/init.conf
 	@echo "daemon=bin/netd:net_server,net_client,ipc_send,ipc_recv,sys_query,fs_read,compute,time" >> initrd_root/etc/init.conf
+	@# Phase 27 Block A (Stage A4): fbd userspace framebuffer compositor.
+	@# Owns the framebuffer once SYS_CONSOLE_ACK_RENDER fires; klog stops
+	@# painting the FB and starts mirroring serial only.
+	@# Note: sys_control needed for SYS_DEBUG synthetic-render trigger
+	@# until FU27.X.tui_demo_apps replaces it with a real userspace blit.
+	@echo "daemon=bin/fbd:ipc_send,ipc_recv,sys_query,sys_control,time" >> initrd_root/etc/init.conf
 ifdef TEST_HARNESS
 	@# G6.4 — echod loopback echo daemon for tcp_stress_1000 harness.
 	@# Production boot does NOT carry this; only `make TEST_HARNESS=1 ...`.
@@ -672,6 +708,34 @@ endif
 	@# Verifies %04x / %5d / %-10s / etc. produce correct output and that
 	@# the unknown-spec default branch no longer slips va_args (FU26.A trap).
 	@echo "vsnprintftest" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 27 Block A (Stage A2): SYS_CONSOLE_SWITCH + SYS_CONSOLE_ACK_RENDER
+	@# dispatch + bounds checking. fbd compositor (Stage A4) consumes these.
+	@echo "console_init" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 27 Block A (Stage A3): keyboard Alt+N detection. Injects PS/2
+	@# scancodes via DEBUG_INJECT_SCANCODE; verifies console_switch fires.
+	@echo "keyboard_alt" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 27 Block A (Stage A4): cell→pixel render via synthetic
+	@# composite (kernel-side). Writes 'A' via DEBUG_CONSOLE_WRITE_CELL,
+	@# triggers DEBUG_CONSOLE_SYNTHETIC_RENDER, reads pixels via
+	@# DEBUG_FB_READ_PIXEL and verifies foreground/background match.
+	@echo "fbd_render" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 27 Block A (Stage A5): libtui box-drawing + 256-color palette
+	@# + cursor attribute. Exercises tui_draw_box, tui_palette_lookup,
+	@# TUI_ATTR_CURSOR via libtui → DEBUG syscall substrate.
+	@echo "tui_render" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 27 Block B (Stage B1): per-console sprite registry (codepoints
+	@# 0xE100..0xE7FF) + RGBA bitmap overlay with damage-ring tracking.
+	@echo "console_sprite" >> initrd_root/bin/tests/manifest.txt
+	@echo "console_gfx" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 27 Block C (Stage C1): per-process audit subscriber broadcast
+	@# (16 slots × 64-entry SPSC ring) + PLAN_BEGIN/STEP/COMMIT/ABORT codes.
+	@echo "audit_stream" >> initrd_root/bin/tests/manifest.txt
+	@echo "audit_plan_codes" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 27 Block C (Stage C2): SYS_MANIFEST_EXPORT + AUDIT_RLIMIT_SYSCALL_RATE
+	@# substrate + FU26.D cap inheritance walk in sched_create_user_process.
+	@echo "manifest_export" >> initrd_root/bin/tests/manifest.txt
+	@echo "rlimit_syscall_rate" >> initrd_root/bin/tests/manifest.txt
+	@echo "cap_inherit" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 26 closeout (FU25.A.2): gash `txn { } commit|abort` parser
 	@# integration tests. Substrate (gash auto-runs sentinel /.gash-script
 	@# via try_run_script_sentinel + cmd_txn_block parser) lands in this
@@ -836,8 +900,32 @@ kernel/kernel.elf: $(OBJECTS) linker.ld
 -include $(DEPS)
 
 run: grahaos.iso format-disk-if-needed
-	@echo "Starting QEMU with persistent disk..."
+	@echo "Starting QEMU (interactive, autorun=init → daemons → gash on serial)..."
+	@echo "Tip: Ctrl+A then X to exit. ELF-loader chatter + heartbeats are at"
+	@echo "     KLOG_DEBUG so they don't bury gash output."
+	@echo "Note: TCG (no -enable-kvm) — KVM exposes a known spawn race"
+	@echo "     (FU27.X.spawn_rip0_race) that fires ~30% under fast respawn."
 	@qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 \
+	     -drive file=disk.img,format=raw,if=none,id=mydisk \
+	     -device ich9-ahci,id=ahci \
+	     -device ide-hd,drive=mydisk,bus=ahci.0 \
+	     -netdev user,id=net0,hostfwd=tcp::8080-:80 -device e1000,netdev=net0 \
+	     -d int,cpu_reset -D qemu.log
+
+# Phase 27 closeout: explicit "boot the gate live, no TAP parsing" target.
+# Patches limine.conf with autorun=ktest + watchdog 500s, rebuilds the ISO,
+# boots it. limine.conf is restored from backup AFTER qemu exits so the next
+# `make run` stays interactive.
+run-test: format-disk-if-needed
+	@echo "Building TEST-mode ISO with autorun=ktest test_timeout_seconds=500..."
+	@cp limine.conf limine.conf.run-test-bak
+	@trap 'mv limine.conf.run-test-bak limine.conf' EXIT INT TERM; \
+	  awk '!/^cmdline:/' limine.conf.run-test-bak > limine.conf.tmp && \
+	  mv limine.conf.tmp limine.conf && \
+	  printf '\ncmdline: autorun=ktest quiet=1 test_timeout_seconds=500\n' >> limine.conf && \
+	  $(MAKE) grahaos.iso && \
+	  echo "Booting TEST-mode ISO (gate runs live; Ctrl+A then X to abort)..." && \
+	  qemu-system-x86_64 -cdrom grahaos.iso -serial stdio -m 512M -smp 4 \
 	     -drive file=disk.img,format=raw,if=none,id=mydisk \
 	     -device ich9-ahci,id=ahci \
 	     -device ide-hd,drive=mydisk,bus=ahci.0 \
@@ -893,10 +981,14 @@ info:
 
 help:
 	@echo "Available targets:"
-	@echo "  all      - Build the OS ISO with initrd (default)"
-	@echo "  userland - Build user-space programs"
-	@echo "  run      - Build and run in QEMU"
-	@echo "  debug    - Build and run in QEMU with GDB support"
-	@echo "  clean    - Clean build artifacts"
-	@echo "  info     - Show build information"
-	@echo "  help     - Show this help message"
+	@echo "  all          - Build the OS ISO with initrd (default)"
+	@echo "  userland     - Build user-space programs"
+	@echo "  run          - Build and run in QEMU (INTERACTIVE: init -> daemons -> gash on serial)"
+	@echo "  run-test     - Build and run in QEMU with the test harness live (autorun=ktest, watchdog 500s)"
+	@echo "  test         - Build, run gate headless, parse TAP, exit non-zero on any failure"
+	@echo "  qemu-interactive - Same as run (legacy alias)"
+	@echo "  debug        - Build and run in QEMU with GDB stub on tcp:1234"
+	@echo "  clean        - Clean build artifacts"
+	@echo "  reformat     - Wipe disk.img and re-run mkfs.gfs"
+	@echo "  info         - Show build information"
+	@echo "  help         - Show this help message"

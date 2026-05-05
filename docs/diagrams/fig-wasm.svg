@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="480" viewBox="0 0 820 480" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+
+<rect x="40" y="60" width="180" height="60" class="accent" rx="4" ry="4"/>
+<text x="130" y="83" text-anchor="middle" class="lbl">etc/gcp.json</text>
+<text x="130" y="99" text-anchor="middle" class="lbl-xs">single manifest</text>
+
+<rect x="260" y="60" width="180" height="60" class="box" rx="4" ry="4"/>
+<text x="350" y="83" text-anchor="middle" class="lbl">gcp2wit.py</text>
+<text x="350" y="99" text-anchor="middle" class="lbl-xs">build-time generator</text>
+
+<rect x="480" y="60" width="300" height="60" class="accent" rx="4" ry="4"/>
+<text x="630" y="83" text-anchor="middle" class="lbl">etc/gcp.wit (kebab-case interfaces)</text>
+<text x="630" y="99" text-anchor="middle" class="lbl-xs">partitioned by pledge class</text>
+
+<line x1="220" y1="90" x2="260" y2="90" class="arrow"/>
+
+<line x1="440" y1="90" x2="480" y2="90" class="arrow"/>
+
+
+
+<rect x="40" y="180" width="180" height="60" class="box" rx="4" ry="4"/>
+<text x="130" y="203" text-anchor="middle" class="lbl">.wat / .wasm module</text>
+<text x="130" y="219" text-anchor="middle" class="lbl-xs">authored against WIT</text>
+
+<rect x="260" y="180" width="180" height="60" class="box" rx="4" ry="4"/>
+<text x="350" y="203" text-anchor="middle" class="lbl">wasmd loader</text>
+<text x="350" y="219" text-anchor="middle" class="lbl-xs">header + section walk</text>
+
+<rect x="480" y="180" width="300" height="60" class="warn" rx="4" ry="4"/>
+<text x="630" y="203" text-anchor="middle" class="lbl">cap_object_create(KIND_WASM_INSTANCE)</text>
+<text x="630" y="219" text-anchor="middle" class="lbl-xs">60 B slab entry</text>
+
+<line x1="220" y1="210" x2="260" y2="210" class="arrow"/>
+
+<line x1="440" y1="210" x2="480" y2="210" class="arrow"/>
+
+
+
+<rect x="40" y="300" width="380" height="60" class="danger" rx="4" ry="4"/>
+<text x="230" y="323" text-anchor="middle" class="lbl">pledge_narrow_exec</text>
+<text x="230" y="339" text-anchor="middle" class="lbl-xs">PLEDGE_FLAG_NARROW_EXEC + cap delegation</text>
+
+<rect x="460" y="300" width="320" height="60" class="ok" rx="4" ry="4"/>
+<text x="620" y="323" text-anchor="middle" class="lbl">wasm sandbox running</text>
+<text x="620" y="339" text-anchor="middle" class="lbl-xs">only manifest-permitted ops callable</text>
+<line x1="420" y1="330" x2="460" y2="330" class="arrow"/>
+
+
+
+<rect x="40" y="400" width="740" height="50" class="accent" rx="4" ry="4"/>
+<text x="410" y="425" text-anchor="middle" class="lbl">Result — module imports = a strict subset of GCP that the parent process explicitly delegated.</text>
+
+
+</svg>

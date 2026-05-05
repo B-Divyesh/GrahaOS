@@ -33,7 +33,9 @@
 #define MANIFEST_PATH      "bin/tests/manifest.txt"
 #define TEST_DIR_PREFIX    "bin/tests/"
 #define TEST_EXT           ".tap"
-#define MAX_TESTS          64
+// Phase 27 bumped 64 → 96 to fit the new console / fbd / tui / sprite /
+// gfx / audit / wasm gate tests (B1 + C1 + C2 + D2 add ~28 entries).
+#define MAX_TESTS          96
 #define MAX_NAME           48
 #define READ_BUF_BYTES     4096
 

@@ -140,6 +140,15 @@ int cap_object_derive(uint32_t parent_idx, int32_t caller_pid,
                       uint64_t rights_subset, const int32_t *audience_subset,
                       uint8_t flags_subset);
 
+// Phase 27 Stage C2: same as cap_object_derive but suppresses the
+// AUDIT_CAP_DERIVE emission. Used internally by the FU26.D
+// inheritance-on-spawn walk so the audit queue doesn't fill with one
+// entry per cap × per spawn (saturating audit_query's max-64 result cap).
+int cap_object_derive_quiet(uint32_t parent_idx, int32_t caller_pid,
+                            uint64_t rights_subset,
+                            const int32_t *audience_subset,
+                            uint8_t flags_subset);
+
 // Revoke by bumping generation atomically. Returns >= 1 (count invalidated)
 // on success, or a negative CAP_V2_* error. If CAP_FLAG_EAGER_REVOKE is set
 // on the target, cascades through children via revoke_cascade.

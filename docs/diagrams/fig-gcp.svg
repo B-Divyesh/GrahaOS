@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="440" viewBox="0 0 820 440" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+
+<rect x="280" y="50" width="260" height="60" class="accent" rx="4" ry="4"/>
+<text x="410" y="73" text-anchor="middle" class="lbl">/etc/gcp.json — single manifest</text>
+<text x="410" y="89" text-anchor="middle" class="lbl-xs">types · syscalls · ops · audit</text>
+
+
+<rect x="40" y="170" width="220" height="60" class="box" rx="4" ry="4"/>
+<text x="150" y="193" text-anchor="middle" class="lbl">kernel parser</text>
+<text x="150" y="209" text-anchor="middle" class="lbl-xs">syscall slot validation</text>
+
+<rect x="290" y="170" width="240" height="60" class="box" rx="4" ry="4"/>
+<text x="410" y="193" text-anchor="middle" class="lbl">gcp2wit.py (build-time)</text>
+<text x="410" y="209" text-anchor="middle" class="lbl-xs">generates etc/gcp.wit</text>
+
+<rect x="560" y="170" width="220" height="60" class="box" rx="4" ry="4"/>
+<text x="670" y="193" text-anchor="middle" class="lbl">user libgcp</text>
+<text x="670" y="209" text-anchor="middle" class="lbl-xs">wrappers + type defs</text>
+
+<line x1="360" y1="110" x2="150" y2="170" class="arrow"/>
+
+<line x1="410" y1="110" x2="410" y2="170" class="arrow"/>
+
+<line x1="460" y1="110" x2="670" y2="170" class="arrow"/>
+
+
+
+<rect x="40" y="290" width="220" height="60" class="box" rx="4" ry="4"/>
+<text x="150" y="313" text-anchor="middle" class="lbl">syscall dispatch</text>
+<text x="150" y="329" text-anchor="middle" class="lbl-xs">manifest-gated</text>
+
+<rect x="290" y="290" width="240" height="60" class="box" rx="4" ry="4"/>
+<text x="410" y="313" text-anchor="middle" class="lbl">WIT bindings (Wasmtime)</text>
+<text x="410" y="329" text-anchor="middle" class="lbl-xs">imports = GCP ops</text>
+
+<rect x="560" y="290" width="220" height="60" class="box" rx="4" ry="4"/>
+<text x="670" y="313" text-anchor="middle" class="lbl">user code</text>
+<text x="670" y="329" text-anchor="middle" class="lbl-xs">same protocol as kernel</text>
+
+<line x1="150" y1="230" x2="150" y2="290" class="arrow"/>
+
+<line x1="410" y1="230" x2="410" y2="290" class="arrow"/>
+
+<line x1="670" y1="230" x2="670" y2="290" class="arrow"/>
+
+
+
+<rect x="40" y="380" width="740" height="40" class="ok" rx="4" ry="4"/>
+<text x="410" y="400" text-anchor="middle" class="lbl">AI agent + human dev + WASM module + kernel ALL read the same machine-readable contract</text>
+
+
+</svg>

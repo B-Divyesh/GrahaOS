@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="380" viewBox="0 0 820 380" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+<circle cx="80" cy="80" r="14" fill="#111"/>
+
+<rect x="160" y="60" width="140" height="50" class="ok" rx="4" ry="4"/>
+<text x="230" y="78" text-anchor="middle" class="lbl">CONNECTED</text>
+<text x="230" y="94" text-anchor="middle" class="lbl-xs">live ring</text>
+
+<rect x="360" y="60" width="140" height="50" class="warn" rx="4" ry="4"/>
+<text x="430" y="78" text-anchor="middle" class="lbl">FROZEN</text>
+<text x="430" y="94" text-anchor="middle" class="lbl-xs">snap captured</text>
+
+<rect x="560" y="60" width="140" height="50" class="warn" rx="4" ry="4"/>
+<text x="630" y="78" text-anchor="middle" class="lbl">DRAINED</text>
+<text x="630" y="94" text-anchor="middle" class="lbl-xs">queued msgs cached</text>
+
+<rect x="160" y="200" width="140" height="50" class="danger" rx="4" ry="4"/>
+<text x="230" y="218" text-anchor="middle" class="lbl">ABORTED</text>
+<text x="230" y="234" text-anchor="middle" class="lbl-xs">snapshot abort</text>
+
+<rect x="360" y="200" width="140" height="50" class="ok" rx="4" ry="4"/>
+<text x="430" y="218" text-anchor="middle" class="lbl">COMMITTED</text>
+<text x="430" y="234" text-anchor="middle" class="lbl-xs">txn replay drained</text>
+
+<rect x="560" y="200" width="140" height="50" class="box" rx="4" ry="4"/>
+<text x="630" y="218" text-anchor="middle" class="lbl">CLOSED</text>
+<text x="630" y="234" text-anchor="middle" class="lbl-xs">endpoint reaped</text>
+
+<line x1="94" y1="80" x2="160" y2="80" class="arrow"/>
+<text x="127" y="74" text-anchor="middle" class="lbl-sm">create</text>
+<line x1="300" y1="80" x2="360" y2="80" class="arrow"/>
+<text x="330" y="74" text-anchor="middle" class="lbl-sm">snap</text>
+<line x1="500" y1="80" x2="560" y2="80" class="arrow"/>
+<text x="530" y="74" text-anchor="middle" class="lbl-sm">capture body</text>
+<line x1="230" y1="110" x2="230" y2="200" class="arrow"/>
+<text x="230" y="149" text-anchor="middle" class="lbl-sm">thaw + abort</text>
+<line x1="430" y1="110" x2="430" y2="200" class="arrow"/>
+<text x="430" y="149" text-anchor="middle" class="lbl-sm">thaw + commit</text>
+<line x1="630" y1="110" x2="630" y2="200" class="arrow"/>
+<text x="630" y="149" text-anchor="middle" class="lbl-sm">all readers gone</text>
+
+<circle cx="630" cy="320" r="14" fill="none" stroke="#111" stroke-width="2"/>
+<circle cx="630" cy="320" r="8"  fill="#111"/>
+<line x1="630" y1="250" x2="630" y2="305" class="arrow"/>
+
+
+</svg>

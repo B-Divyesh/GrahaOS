@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="380" viewBox="0 0 820 380" font-family="Calibri, Helvetica, Arial, sans-serif">
+<style>
+  .box   { fill:#fafafa; stroke:#222; stroke-width:1.5; }
+  .accent{ fill:#dbe9ff; stroke:#244a91; stroke-width:1.5; }
+  .warn  { fill:#fde8c5; stroke:#8a5a18; stroke-width:1.5; }
+  .ok    { fill:#dcefd6; stroke:#2c5d2c; stroke-width:1.5; }
+  .danger{ fill:#fbd9d9; stroke:#8a1f1f; stroke-width:1.5; }
+  .lbl   { font-size:13px; fill:#111; }
+  .lbl-sm{ font-size:11px; fill:#222; }
+  .lbl-xs{ font-size:10px; fill:#333; }
+  .ttl   { font-size:14px; font-weight:bold; fill:#111; }
+  .mono  { font-family:"Courier New", monospace; font-size:11px; fill:#111; }
+  .arrow { fill:none; stroke:#222; stroke-width:1.5; marker-end:url(#arrow); }
+  .arrowd{ fill:none; stroke:#222; stroke-width:1.5; stroke-dasharray:5,3; marker-end:url(#arrow); }
+  .gridln{ stroke:#bbb; stroke-width:0.5; stroke-dasharray:2,2; }
+  text   { dominant-baseline:middle; }
+</style>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+    <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+  </marker>
+</defs>
+
+
+<line x1="40" y1="200" x2="780" y2="200" stroke="#222" stroke-width="2"/>
+<text x="20" y="200" class="lbl-sm">t →</text>
+
+<line x1="80"  y1="190" x2="80"  y2="210" stroke="#222" stroke-width="2"/>
+<line x1="200" y1="190" x2="200" y2="210" stroke="#222" stroke-width="2"/>
+<line x1="330" y1="190" x2="330" y2="210" stroke="#222" stroke-width="2"/>
+<line x1="470" y1="190" x2="470" y2="210" stroke="#222" stroke-width="2"/>
+<line x1="610" y1="190" x2="610" y2="210" stroke="#222" stroke-width="2"/>
+
+
+<rect x="40" y="60" width="100" height="90" class="accent" rx="4" ry="4"/>
+<text x="90" y="98" text-anchor="middle" class="lbl">snap_create</text>
+<text x="90" y="114" text-anchor="middle" class="lbl-xs">syscall</text>
+
+<rect x="160" y="60" width="100" height="90" class="box" rx="4" ry="4"/>
+<text x="210" y="98" text-anchor="middle" class="lbl">IPI all CPUs</text>
+<text x="210" y="114" text-anchor="middle" class="lbl-xs">schedule hook</text>
+
+<rect x="290" y="60" width="100" height="90" class="box" rx="4" ry="4"/>
+<text x="340" y="98" text-anchor="middle" class="lbl">park non-idle</text>
+<text x="340" y="114" text-anchor="middle" class="lbl-xs">barrier_flag</text>
+
+<rect x="430" y="60" width="100" height="90" class="box" rx="4" ry="4"/>
+<text x="480" y="98" text-anchor="middle" class="lbl">capture</text>
+<text x="480" y="114" text-anchor="middle" class="lbl-xs">PML4 walk · regs · FDs · pin FS</text>
+
+<rect x="570" y="60" width="100" height="90" class="box" rx="4" ry="4"/>
+<text x="620" y="98" text-anchor="middle" class="lbl">mark RO</text>
+<text x="620" y="114" text-anchor="middle" class="lbl-xs">clear PTE_W</text>
+
+<rect x="710" y="60" width="80" height="90" class="ok" rx="4" ry="4"/>
+<text x="750" y="98" text-anchor="middle" class="lbl">thaw</text>
+<text x="750" y="114" text-anchor="middle" class="lbl-xs">resume</text>
+
+<text x="80"  y="240" text-anchor="middle" class="lbl-xs">CAS barrier_flag</text>
+<text x="200" y="240" text-anchor="middle" class="lbl-xs">IPI fan-out</text>
+<text x="330" y="240" text-anchor="middle" class="lbl-xs">poll runq.current=idle</text>
+<text x="470" y="240" text-anchor="middle" class="lbl-xs">cow_tracker++</text>
+<text x="610" y="240" text-anchor="middle" class="lbl-xs">install snap_pf handler</text>
+
+
+<rect x="40" y="280" width="740" height="50" class="warn" rx="4" ry="4"/>
+<text x="410" y="305" text-anchor="middle" class="lbl">After thaw — first write to a captured page → cow_fault → fresh frame, parent unaffected. 100 ms watchdog if barrier stalls.</text>
+
+
+</svg>

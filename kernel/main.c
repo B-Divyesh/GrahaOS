@@ -364,6 +364,17 @@ void kmain(void) {
     framebuffer_draw_string("IOAPIC Initialized.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
 
+    // Phase 27 closeout: route legacy COM1 IRQ4 → vector 36 so the host
+    // terminal under QEMU `-serial stdio` can deliver keystrokes. ioapic
+    // entries default-masked at init; ioapic_unmask_irq drops the mask
+    // bit so the IRQ actually fires.
+    extern void ioapic_route_irq(uint8_t gsi, uint8_t vector, uint8_t lapic_id,
+                                 uint8_t edge_or_level, uint8_t active_high_or_low);
+    extern void ioapic_unmask_irq(uint8_t gsi);
+    ioapic_route_irq(/*gsi=*/4, /*vector=*/36, /*lapic_id=*/0,
+                     /*edge=*/0, /*active_high=*/0);
+    ioapic_unmask_irq(4);
+
     // 3b. Phase 14: per-CPU data + slab + kheap.
     // percpu_init(0) populates the BSP's Phase 14 extension fields
     // (magazines, preempt counters, self-pointer). APs run their own
@@ -443,6 +454,22 @@ void kmain(void) {
     channel_subsystem_init();
     framebuffer_draw_string("Phase 17 Channels Ready.", 50, y_pos, COLOR_GREEN, 0x00101828);
     y_pos += 20;
+
+    // Phase 27 Block A (Stage A1): virtual console subsystem.
+    // Allocates 4 default consoles + per-console cell-VMO + input channel +
+    // CAP_KIND_CONSOLE objects. Hardware framebuffer untouched until fbd
+    // (userspace, Stage A4) takes over via SYS_CONSOLE_ACK_RENDER handshake.
+    // Must run AFTER vmo_init + channel_subsystem_init (we allocate one VMO
+    // and one channel per console).
+    {
+        extern void console_init(uint32_t fb_width_px, uint32_t fb_height_px);
+        extern uint32_t framebuffer_get_width(void);
+        extern uint32_t framebuffer_get_height(void);
+        klog(KLOG_INFO, SUBSYS_CORE, "Phase 27 Block A: console_init...");
+        console_init(framebuffer_get_width(), framebuffer_get_height());
+        framebuffer_draw_string("Phase 27 A Consoles Ready.", 50, y_pos, COLOR_GREEN, 0x00101828);
+        y_pos += 20;
+    }
 
     // Phase 24 W13: snapshot subsystem skeleton. Registers snapshot_t and
     // cow_page_tracker_t slab caches and zeroes the global barrier state.
