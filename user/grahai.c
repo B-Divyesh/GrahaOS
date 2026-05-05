@@ -1136,10 +1136,73 @@ void _start(int argc, char **argv) {
         syscall_exit(rc);
     }
 
+    /* FU25.B grahai --txn flag (default-off in Phase 26; default-on in
+     * Phase 28 per registry's assigned_phase). When present, the entire
+     * plan-execution body is wrapped in SYS_TXN_BEGIN / SYS_TXN_COMMIT
+     * (or SYS_TXN_ABORT on plan failure / --abort).
+     *
+     * Activation: argv[]-based when args are passed AND a sentinel-file
+     * fallback for spawned-without-argv contexts (gash spawn_program +
+     * test ktest spawn don't propagate argv through syscall_spawn).
+     *   /.grahai-txn   → use_txn = 1 (truncated after read)
+     *   /.grahai-abort → force_abort = 1 (truncated after read)
+     *
+     * --abort is a user-facing companion: forces abort even on plan
+     * success. Useful for "preview-but-rollback" semantics in AI
+     * speculation workflows; requires --txn. */
+    int use_txn = 0;
+    int force_abort = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--txn") == 0) {
+            use_txn = 1;
+        } else if (strcmp(argv[i], "--abort") == 0) {
+            force_abort = 1;
+        }
+    }
+    /* Sentinel-file fallback (FU25.B v1 — same pattern as gash's
+     * try_run_script_sentinel). Read-then-truncate so the next spawn
+     * starts clean. */
+    {
+        int sf = syscall_open("/.grahai-txn");
+        if (sf >= 0) {
+            (void)syscall_truncate(sf);
+            syscall_close(sf);
+            use_txn = 1;
+        }
+        sf = syscall_open("/.grahai-abort");
+        if (sf >= 0) {
+            (void)syscall_truncate(sf);
+            syscall_close(sf);
+            force_abort = 1;
+            use_txn = 1;  /* --abort implies --txn */
+        }
+    }
+    if (force_abort && !use_txn) {
+        print("grahai: --abort requires --txn (no transaction to abort)\n");
+        syscall_exit(2);
+    }
+
     // Phase 27 Stage D3 — emit observability lines + register subscriber.
     grahai_phase27_observability();
 
+    long txn_handle = -1;
+    if (use_txn) {
+        txn_handle = syscall_txn_begin(TXN_FLAG_SELF_SCOPE | TXN_FLAG_BUFFER_4MB,
+                                       "grahai-plan");
+        if (txn_handle < 0) {
+            print("grahai: --txn requested but txn_begin failed rc=");
+            print_int((int)txn_handle);
+            print(" (continuing without txn wrap)\n");
+            txn_handle = -1;  /* fall back to non-txn execution */
+        } else {
+            print("grahai: --txn active; handle=");
+            print_int((int)txn_handle);
+            print("\n");
+        }
+    }
+
     // Check for AI agent mode: if ai_prompt.txt exists, use AI mode
+    int plan_failed = 0;
     int fd = syscall_open("ai_prompt.txt");
     if (fd >= 0) {
         char prompt[512];
@@ -1159,9 +1222,37 @@ void _start(int argc, char **argv) {
             run_legacy_mode();
         }
     } else {
-        run_legacy_mode();
+        /* No ai_prompt.txt → legacy mode. Treat missing /etc/plan.json
+         * as a plan failure (drives txn_abort under --txn). */
+        int probe = syscall_open("etc/plan.json");
+        if (probe < 0) {
+            plan_failed = 1;
+        } else {
+            syscall_close(probe);
+            run_legacy_mode();
+        }
+    }
+
+    if (txn_handle >= 0) {
+        long rc;
+        int do_abort = plan_failed || force_abort;
+        if (do_abort) {
+            rc = syscall_txn_abort((uint32_t)txn_handle);
+            print("grahai: txn_abort rc=");
+        } else {
+            rc = syscall_txn_commit((uint32_t)txn_handle);
+            print("grahai: txn_commit rc=");
+        }
+        print_int((int)rc);
+        print("\n");
+        /* Exit 0 on user-requested abort (--abort), 1 on plan failure,
+         * 2 on syscall_txn_* failure, 0 on commit success. */
+        int exit_code = 0;
+        if (rc < 0) exit_code = 2;
+        else if (plan_failed) exit_code = 1;
+        syscall_exit(exit_code);
     }
 
     asm volatile("" ::: "memory");
-    syscall_exit(0);
+    syscall_exit(plan_failed ? 1 : 0);
 }

@@ -504,6 +504,9 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@# Phase 26 closeout (FU25.A.2): gash txn{} parser integration tests.
 	@cp user/tests/gash_txn_commit         initrd_root/bin/tests/gash_txn_commit.tap
 	@cp user/tests/gash_txn_abort          initrd_root/bin/tests/gash_txn_abort.tap
+	@# Pre-Phase-28 sweep B (FU25.B): grahai --txn integration tests.
+	@cp user/tests/grahai_txn_commit       initrd_root/bin/tests/grahai_txn_commit.tap
+	@cp user/tests/grahai_txn_abort        initrd_root/bin/tests/grahai_txn_abort.tap
 	@# Phase 25 Stage G: stress (1K cycles in gate; nightly env-gates 10K).
 	@cp user/tests/txn_stress_basic        initrd_root/bin/tests/txn_stress_basic.tap
 	@cp user/tests/txn_stress_nested       initrd_root/bin/tests/txn_stress_nested.tap
@@ -820,6 +823,12 @@ endif
 	@# emitted. Total +8 assertions; gate 992 → 1000.
 	@echo "gash_txn_commit" >> initrd_root/bin/tests/manifest.txt
 	@echo "gash_txn_abort" >> initrd_root/bin/tests/manifest.txt
+	@# Pre-Phase-28 sweep B (FU25.B): grahai --txn / --abort integration.
+	@# grahai_txn_commit asserts AUDIT_TXN_COMMIT (42) emitted on plan
+	@# success; grahai_txn_abort asserts AUDIT_TXN_ABORT (43) emitted on
+	@# --abort sentinel. 4 asserts each → +8 gate.
+	@echo "grahai_txn_commit" >> initrd_root/bin/tests/manifest.txt
+	@echo "grahai_txn_abort" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 15a: capability objects v2.
 	@echo "captest_v2" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 15b: pledge classes + audit log.
