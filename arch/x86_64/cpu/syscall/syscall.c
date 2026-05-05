@@ -862,10 +862,25 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             // us. (Setting state earlier — as the original code did — opened
             // a use-after-free window where wake_waiting_parent dereferenced
             // an already-freed task_ptrs slot — observed crash, sched.c:606.)
+            // FU24.B/A.4 S1.E diagnostic: also log parent's pid + state at
+            // the moment of wake_waiting_parent so the next intermittent hang
+            // serial log shows whether the wake observed a BLOCKED parent
+            // (legacy path) or a RUNNING one (polling path; current default).
+            // task_ptrs[] is static-internal to sched.c so we resolve parent
+            // via pid_hash_lookup which IS exported.
             klog(KLOG_INFO, SUBSYS_SYSCALL, "[SYS_EXIT] pid=%lu status=%d entering",
                  (unsigned long)current->id, status);
             current->exit_status = status;
             sched_orphan_children(current->id);
+            int dbg_parent_id = current->parent_id;
+            int dbg_parent_state = -1;
+            if (dbg_parent_id >= 0) {
+                task_t *dbg_p = pid_hash_lookup(dbg_parent_id);
+                if (dbg_p) dbg_parent_state = (int)dbg_p->state;
+            }
+            klog(KLOG_INFO, SUBSYS_SYSCALL,
+                 "[SYS_EXIT] pid=%lu pre-wake parent_id=%d parent_state=%d",
+                 (unsigned long)current->id, dbg_parent_id, dbg_parent_state);
             wake_waiting_parent(current->id);
             __atomic_store_n((volatile int *)&current->state, (int)TASK_STATE_ZOMBIE,
                              __ATOMIC_RELEASE);
@@ -949,8 +964,19 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 spinlock_release(&sched_lock);
                 if (child_pid >= 0) break;
                 if (!has_children) break;
-                // Diagnostic: log periodically if wait is taking unusually long.
+                // FU24.B/A.4 S1.E diagnostic instrumentation: emit early
+                // klog at iter 1/32/128 so the serial log shows ramp-up
+                // timing of any intermittent hang. The existing
+                // 1024-iter-periodic klog stays for late-stage diagnosis.
                 wait_iter++;
+                if (wait_iter == 1 || wait_iter == 32 || wait_iter == 128) {
+                    uint64_t elapsed = g_timer_ticks - wait_start_ticks;
+                    klog(KLOG_DEBUG, SUBSYS_SYSCALL,
+                         "[SYS_WAIT] pid=%lu polling iter=%lu (elapsed=%lu ticks)",
+                         (unsigned long)current->id,
+                         (unsigned long)wait_iter,
+                         (unsigned long)elapsed);
+                }
                 if (wait_iter > 0 && (wait_iter & 0x3FF) == 0) {
                     uint64_t elapsed = g_timer_ticks - wait_start_ticks;
                     klog(KLOG_WARN, SUBSYS_SYSCALL,

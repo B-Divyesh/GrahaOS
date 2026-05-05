@@ -28,6 +28,10 @@ void _start(void) {
     }
     uint64_t cur = (uint64_t)base;
     uint64_t n = 0;
+    // FU24.B diagnostic instrumentation (S1.E): emit a heartbeat every
+    // 1024 successful brk pages so the serial log distinguishes
+    // "stuck-in-brk" from "stuck-after-loop-exit" on the next intermittent
+    // hang. Pure logging; no behavior change.
     while (1) {
         uint64_t next = cur + 4096;
         long r = syscall_brk((void *)next);
@@ -38,6 +42,11 @@ void _start(void) {
         }
         cur = next;
         n++;
+        if ((n & 1023) == 0) {
+            print("mallocbomb: heartbeat n=");
+            print_u64(n);
+            print("\n");
+        }
     }
     print("mallocbomb: allocated ");
     print_u64(n);

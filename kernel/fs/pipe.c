@@ -99,6 +99,20 @@ int pipe_read(int idx, void *buf, int count) {
         spinlock_release(&c->lock);
         if (read_total > 0) return read_total;
         if (g_pipes[idx].writers == 0) return 0;
+        // FU24.C S1.E diagnostic instrumentation: count busy-wait
+        // iterations so the serial log shows long-stall behaviour on the
+        // next intermittent pipetest flake. Pure logging; no semantic
+        // change to the busy-wait pattern (FU24.C still pending; a real
+        // sched_block_on_channel rewrite is the proper fix). Counter is
+        // file-local + volatile so concurrent CPUs each contribute.
+        static volatile uint32_t debug_pipe_read_iter = 0;
+        uint32_t this_iter = __atomic_add_fetch(&debug_pipe_read_iter, 1u,
+                                                 __ATOMIC_RELAXED);
+        if ((this_iter & 0xFFu) == 0u) {
+            klog(KLOG_DEBUG, SUBSYS_SYSCALL,
+                 "[pipe_read] busy-wait iter=%lu pipe_idx=%d",
+                 (unsigned long)this_iter, idx);
+        }
         asm volatile("sti; hlt; cli");
     }
     return read_total;
