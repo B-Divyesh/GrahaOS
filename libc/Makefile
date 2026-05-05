@@ -18,7 +18,9 @@ SRC_DIR = src
 OBJ_DIR = obj
 
 SOURCES = $(wildcard $(SRC_DIR)/*.c)
-OBJECTS = $(SOURCES:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
+ASM_SOURCES = $(wildcard $(SRC_DIR)/*.S)
+OBJECTS = $(SOURCES:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o) \
+          $(ASM_SOURCES:$(SRC_DIR)/%.S=$(OBJ_DIR)/%.o)
 
 # Output library
 LIBNAME = libc.a
@@ -37,6 +39,13 @@ $(LIBNAME): $(OBJECTS)
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 	@echo "Compiling $<"
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# FU27.WASM Stage D0: support .S files (setjmp/longjmp shim).
+# Match user/Makefile's CFLAGS minus the -W warnings (gas accepts neither
+# -Wall nor -Wextra; passing them as preprocessor flags is harmless but noisy).
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.S
+	@echo "Assembling $<"
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:

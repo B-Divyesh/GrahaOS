@@ -54,6 +54,17 @@ unsigned long strtoul(const char *nptr, char **endptr, int base) {
     return (unsigned long)strtol(nptr, endptr, base);
 }
 
+/* FU27.WASM Stage D0: vendored wasm3's m3_env.c::m3_CallArgv reads i64 args
+   via strtoull. On x86-64 SYSV, unsigned long long == unsigned long (both
+   64 bits), so the wrapper is exact. */
+unsigned long long strtoull(const char *nptr, char **endptr, int base) {
+    return (unsigned long long)strtol(nptr, endptr, base);
+}
+
+long long strtoll(const char *nptr, char **endptr, int base) {
+    return (long long)strtol(nptr, endptr, base);
+}
+
 int atoi(const char *nptr) {
     return (int)strtol(nptr, NULL, 10);
 }

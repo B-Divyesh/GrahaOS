@@ -139,7 +139,7 @@ LIBTUI := libtui/libtui.a
 
 .PHONY: all clean libc
 
-all: libc $(LIBTAP) $(LIBNET) $(LIBNETD) $(LIBHTTP) $(LIBTLS) $(LIBTUI) $(PROGRAMS) $(TAP_TESTS)
+all: libc $(LIBTAP) $(LIBNET) $(LIBNETD) $(LIBHTTP) $(LIBTLS) $(LIBTUI) $(LIBWASM3) $(PROGRAMS) $(TAP_TESTS)
 
 # Build libc first
 libc:
@@ -193,6 +193,39 @@ LIBTLS := libtls-mg/libtls-mg.a
 # libtls-mg.a actually links into clients.
 $(LIBTLS): libtls-mg/libtls.o libtls-mg/libtls_shim.o libtls-mg/mongoose_tls_core.o libtls-mg/mg_stubs.o
 	@echo "Creating $@"
+	@$(AR) rcs $@ $^
+
+# FU27.WASM Stage D0: vendored wasm3 v0.5.0 (MIT). Built into libwasm3.a
+# from vendor/wasm3/source/ — 11 core files (m3_bind, m3_code, m3_compile,
+# m3_core, m3_emit, m3_env, m3_exec, m3_function, m3_info, m3_module,
+# m3_parse). The host-import shims (m3_api_*.c) are excluded; FU27.WASM
+# Stage D1 provides our own host imports at user/wasmd/host_imports.c.
+#
+# Compile flags worth noting:
+#   -Dd_m3HasFloat=0    — disable f32/f64 ops; saves libgcc 64-bit float
+#                         helpers we'd otherwise have to shim. Our 5
+#                         FU27.WASM fixtures are i32-only.
+#   -Dd_m3LogOutput=0   — disable wasm3's verbose printf logging.
+#   -Wno-int-to-pointer-cast / -Wno-sign-compare — match upstream
+#                         CMakeLists.txt's per-source warning suppressions
+#                         (m3_emit.c + m3_env.c).
+LIBWASM3 := ../vendor/wasm3/libwasm3.a
+WASM3_SRCS := m3_bind m3_code m3_compile m3_core m3_emit m3_env \
+              m3_exec m3_function m3_info m3_module m3_parse
+WASM3_OBJS := $(addprefix ../vendor/wasm3/obj/,$(addsuffix .o,$(WASM3_SRCS)))
+WASM3_CFLAGS := $(CFLAGS) -Dd_m3HasFloat=0 -Dd_m3LogOutput=0 \
+                -Wno-int-to-pointer-cast -Wno-sign-compare \
+                -I../vendor/wasm3/source
+
+../vendor/wasm3/obj:
+	@mkdir -p $@
+
+../vendor/wasm3/obj/%.o: ../vendor/wasm3/source/%.c | ../vendor/wasm3/obj
+	@echo "Compiling vendor/wasm3: $<"
+	@$(CC) $(WASM3_CFLAGS) -c $< -o $@
+
+$(LIBWASM3): $(WASM3_OBJS)
+	@echo "Creating $@ (FU27.WASM Stage D0; 11 core files)"
 	@$(AR) rcs $@ $^
 
 # Phase 26 Stage H.1: wasmtest links additionally against the loader.o

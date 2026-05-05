@@ -23,6 +23,8 @@ long atol(const char *nptr);
 long long atoll(const char *nptr);
 long strtol(const char *nptr, char **endptr, int base);
 unsigned long strtoul(const char *nptr, char **endptr, int base);
+long long strtoll(const char *nptr, char **endptr, int base);
+unsigned long long strtoull(const char *nptr, char **endptr, int base);
 
 // Pseudo-random number generation
 int rand(void);
