@@ -88,7 +88,14 @@ void _start(void) {
     // Footer.
     (void)tui_print(CID, ROWS - 2, 4, COL_TEXT, COL_BG, 0,
                     "Press Alt+1..Alt+4 to switch consoles.");
+    (void)tui_print(CID, ROWS - 2, 46, COL_TEXT, COL_BG, 0,
+                    "Press 'q' to exit.");
 
     (void)tui_present(CID);
+
+    // FU27.X.tui_demo_apps polish: block on input so user can examine the
+    // demo before control returns to gash.
+    while (syscall_getc() != 'q') { /* swallow non-q keys */ }
+
     syscall_exit(0);
 }

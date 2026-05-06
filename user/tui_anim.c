@@ -97,7 +97,13 @@ void _start(void) {
     // Final clear so the prompt isn't obscured.
     (void)syscall_debug_console_gfx_fill(CID, 0, 0, OV_W, OV_H, 0x00000000u);
     (void)syscall_console_gfx_damage(CID, 0, 0, OV_W, OV_H);
-    (void)syscall_debug_console_synthetic_render(CID);
+
+    // FU27.X.tui_demo_apps polish: q-to-quit so user can read the final
+    // frame instead of returning instantly to gash. Blocking getc loops
+    // until the user types 'q' (any other keypress is consumed silently).
+    (void)tui_print(CID, 5, 2, 11, 0, 0, "Animation done.  Press 'q' to exit.");
+    (void)tui_present(CID);
+    while (syscall_getc() != 'q') { /* swallow non-q keys */ }
 
     syscall_exit(0);
 }

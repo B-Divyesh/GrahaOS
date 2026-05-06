@@ -53,7 +53,7 @@ OBJECTS     := $(C_OBJECTS) $(ASM_OBJECTS)
 DEPS := $(C_OBJECTS:.o=.d)
 
 # --- Build Targets ---
-.PHONY: all clean run help debug info userland test test-sentinel-meta qemu-interactive test-panic test-kernel-pf test-fault-injection compdb test-host
+.PHONY: all clean run terminal help debug info userland test test-sentinel-meta qemu-interactive test-panic test-kernel-pf test-fault-injection compdb test-host
 
 all: grahaos.iso format-disk-if-needed
 
@@ -1007,8 +1007,25 @@ kernel/kernel.elf: $(OBJECTS) linker.ld
 
 -include $(DEPS)
 
+# 'run' = headed graphical (TUI in QEMU window). Pre-Phase-28 sweep this
+# was serial-only; use 'make terminal' for that mode now.
 run: grahaos.iso format-disk-if-needed
-	@echo "Starting QEMU (interactive, autorun=init → daemons → gash on serial)..."
+	@echo "Starting QEMU (headed, TUI in graphical window)..."
+	@echo "Tip: Alt+1..Alt+4 to switch consoles. Close the QEMU window to exit."
+	@echo "Note: TCG (no -enable-kvm) — KVM exposes a known spawn race"
+	@echo "     (FU27.X.spawn_rip0_race) that fires ~30% under fast respawn."
+	@qemu-system-x86_64 -cdrom grahaos.iso -m 512M -smp 4 \
+	     -display gtk -serial /dev/null \
+	     -drive file=disk.img,format=raw,if=none,id=mydisk \
+	     -device ich9-ahci,id=ahci \
+	     -device ide-hd,drive=mydisk,bus=ahci.0 \
+	     -netdev user,id=net0,hostfwd=tcp::8080-:80 -device e1000,netdev=net0 \
+	     -d int,cpu_reset -D qemu.log
+
+# 'terminal' = serial-only (gash on host terminal). Was 'run' pre-Phase-28
+# sweep; preserved here for users who prefer text-only iteration.
+terminal: grahaos.iso format-disk-if-needed
+	@echo "Starting QEMU (serial-only, gash on host terminal)..."
 	@echo "Tip: Ctrl+A then X to exit. ELF-loader chatter + heartbeats are at"
 	@echo "     KLOG_DEBUG so they don't bury gash output."
 	@echo "Note: TCG (no -enable-kvm) — KVM exposes a known spawn race"
