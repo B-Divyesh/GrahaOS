@@ -1,0 +1,16 @@
+# GrahaOS API Keys — copy to api_keys.md and fill in your key
+#
+# WARNING: api_keys.md is gitignored (covered by *.md rule in .gitignore);
+# never commit your real key. If you accidentally git-add it, run
+# `git rm --cached api_keys.md` and rotate the key.
+#
+# NOTE: The TLS stack is currently a stub (user/libtls-mg/mongoose_tls_core.c
+# is 634 bytes returning -ENOSYS pending Phase 22.D.2 extraction). Until that
+# lands, http_post over https:// returns -EPROTO and AI mode cannot reach
+# generativelanguage.googleapis.com. Adding the key now is harmless but
+# won't enable live AI calls.
+#
+# Once TLS lands, the Makefile rule (lines 977-984) will copy the key into
+# initrd_root/etc/ai.conf and grahai will read it at runtime.
+
+GEMINI_API_KEY=<paste-your-gemini-api-key-here>

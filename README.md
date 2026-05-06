@@ -26,6 +26,24 @@ The full technical report is at [`docs/GRAHAOS-COMPREHENSIVE-REPORT.md`](docs/GR
 
 ---
 
+## Quick Start
+
+```bash
+git clone https://github.com/B-Divyesh/GrahaOS.git
+cd GrahaOS
+source ./scripts/env_setup.sh
+./scripts/build-toolchain.sh   # ~30 min, one-time
+make
+make run        # graphical TUI in QEMU window
+make terminal   # serial-only in host terminal
+```
+
+See [`docs/ONBOARDING.md`](docs/ONBOARDING.md) for AI agent setup,
+troubleshooting (KVM access, blank QEMU window, toolchain failures), and
+the current TLS limitation note.
+
+---
+
 ## Why Not Just Bolt AI Onto Unix?
 
 The pre-existing AI-OS attempts (Rutgers AIOS, MemGPT, agentic shells layered over Linux) start from POSIX and add a coordinator. GrahaOS argues that POSIX is precisely the wrong substrate for agentic execution:
