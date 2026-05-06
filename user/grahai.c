@@ -1131,11 +1131,12 @@ static void grahai_print_help(void) {
     print("grahai — GrahaOS AI agent + GCP plan executor\n");
     print("\n");
     print("Usage:\n");
-    print("  grahai                    Run AI mode (reads ai_prompt.txt)\n");
-    print("                            or legacy mode (reads etc/plan.json)\n");
-    print("  grahai --txn              Wrap plan execution in a transaction;\n");
-    print("                            commit on success, abort on failure\n");
-    print("  grahai --txn --abort      Force-abort even on plan success\n");
+    print("  grahai                    Run plan in a txn (default-on since\n");
+    print("                            Phase 28). Commit on success, abort\n");
+    print("                            on failure. Reads ai_prompt.txt or\n");
+    print("                            etc/plan.json.\n");
+    print("  grahai --no-txn           Disable txn wrap (legacy behavior)\n");
+    print("  grahai --abort            Force-abort even on plan success\n");
     print("                            (preview-but-rollback for AI speculation)\n");
     print("  grahai wasm-run <path>    Run a WebAssembly module via wasmd\n");
     print("                            (e.g. grahai wasm-run /etc/wasm/hello.wasm)\n");
@@ -1148,8 +1149,9 @@ static void grahai_print_help(void) {
     print("               window via syscall_gcp_execute draw commands.\n");
     print("\n");
     print("Sentinel-file activation (for use under syscall_spawn which doesn't\n");
-    print("propagate argv): create /.grahai-txn or /.grahai-abort then spawn.\n");
-    print("Both files are truncated after read (one-shot).\n");
+    print("propagate argv): create /.grahai-no-txn (opt-out of txn) or\n");
+    print("/.grahai-abort (force-abort within txn) then spawn. Both files are\n");
+    print("truncated after read (one-shot).\n");
 }
 
 void _start(int argc, char **argv) {
@@ -1169,25 +1171,24 @@ void _start(int argc, char **argv) {
         }
     }
 
-    /* FU25.B grahai --txn flag (default-off in Phase 26; default-on in
-     * Phase 28 per registry's assigned_phase). When present, the entire
-     * plan-execution body is wrapped in SYS_TXN_BEGIN / SYS_TXN_COMMIT
-     * (or SYS_TXN_ABORT on plan failure / --abort).
+    /* FU25.B grahai txn wrap. Phase 28 flip: default-ON (was default-off
+     * pre-sweep). Wraps the entire plan-execution body in
+     * SYS_TXN_BEGIN / SYS_TXN_COMMIT (or SYS_TXN_ABORT on plan failure /
+     * --abort).
      *
-     * Activation: argv[]-based when args are passed AND a sentinel-file
-     * fallback for spawned-without-argv contexts (gash spawn_program +
-     * test ktest spawn don't propagate argv through syscall_spawn).
-     *   /.grahai-txn   → use_txn = 1 (truncated after read)
-     *   /.grahai-abort → force_abort = 1 (truncated after read)
+     * Opt-out: --no-txn argv flag OR /.grahai-no-txn sentinel file
+     * (truncated after read). The inverse sentinel mirrors gash's
+     * try_run_script_sentinel pattern for spawned-without-argv contexts.
      *
-     * --abort is a user-facing companion: forces abort even on plan
-     * success. Useful for "preview-but-rollback" semantics in AI
-     * speculation workflows; requires --txn. */
-    int use_txn = 0;
+     * Force-abort: --abort argv OR /.grahai-abort sentinel — forces
+     * SYS_TXN_ABORT even on plan success. "preview-but-rollback" for AI
+     * speculation. Requires txn active (always true under default-on
+     * unless --no-txn was also passed). */
+    int use_txn = 1;     /* DEFAULT-ON since Phase 28 Session F.2 (FU25.B). */
     int force_abort = 0;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--txn") == 0) {
-            use_txn = 1;
+        if (strcmp(argv[i], "--no-txn") == 0) {
+            use_txn = 0;
         } else if (strcmp(argv[i], "--abort") == 0) {
             force_abort = 1;
         }
@@ -1196,22 +1197,26 @@ void _start(int argc, char **argv) {
      * try_run_script_sentinel). Read-then-truncate so the next spawn
      * starts clean. */
     {
-        int sf = syscall_open("/.grahai-txn");
+        int sf = syscall_open("/.grahai-no-txn");
         if (sf >= 0) {
             (void)syscall_truncate(sf);
             syscall_close(sf);
-            use_txn = 1;
+            use_txn = 0;
         }
         sf = syscall_open("/.grahai-abort");
         if (sf >= 0) {
             (void)syscall_truncate(sf);
             syscall_close(sf);
             force_abort = 1;
-            use_txn = 1;  /* --abort implies --txn */
+            /* --abort still requires txn; if --no-txn was also passed,
+             * --abort wins (re-enable txn so abort can fire). */
+            use_txn = 1;
         }
     }
     if (force_abort && !use_txn) {
-        print("grahai: --abort requires --txn (no transaction to abort)\n");
+        /* Defensive — unreachable today (the /.grahai-abort branch above
+         * forces use_txn back to 1). Kept for clarity. */
+        print("grahai: --abort requires txn (no transaction to abort)\n");
         syscall_exit(2);
     }
 

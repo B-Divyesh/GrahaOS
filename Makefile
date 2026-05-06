@@ -96,6 +96,26 @@ test-soak-3:
 	done
 	@echo "test-soak-3: 3 iterations clean under GRAHAOS_LONG_STRESS=1"
 
+# Phase 28 Session F.3 stub: 30-min default soak with fault injection.
+# Full implementation (scripts/run_soak.sh) lands in Session G.2 alongside
+# the kernel-side fault-injection hooks. For now this prints the planned
+# scope so callers see Phase 28 progress.
+test-soak: grahaos.iso disk.img
+	@echo "Phase 28 soak (Session F.3 stub):"
+	@echo "  TARGET_DURATION_SEC=$${TARGET_DURATION_SEC:-1800}  (default 30 min)"
+	@echo "  Fault injection: $${GRAHAOS_SOAK_FAULT_INJECT:-0}"
+	@if [ -x scripts/run_soak.sh ]; then \
+	   ./scripts/run_soak.sh; \
+	else \
+	   echo "scripts/run_soak.sh not yet implemented (Phase 28 Session G.2)"; \
+	   exit 1; \
+	fi
+
+# Phase 28 closeout: full 1-hour soak. Spec-required exit criterion.
+test-soak-1h: grahaos.iso disk.img
+	@TARGET_DURATION_SEC=3600 GRAHAOS_SOAK_FAULT_INJECT=1 \
+	   $(MAKE) test-soak
+
 # Prove the harness catches failures. Runs the suite with sentinel_fail
 # (a deliberately-failing test) linked in. Expected to exit non-zero.
 # The whole pipeline (user build → initrd manifest → ktest → parse_tap.py)
@@ -162,9 +182,21 @@ scripts/mkfs.gfs.v2: scripts/mkfs.gfs.v2.c kernel/fs/grahafs_v2.h kernel/lib/crc
 # default to v2 currently regresses 29 assertions across clustertest /
 # simtest / metatest (v1-specific SimHash/cluster + AI-metadata syscalls
 # expect v1 layout) and fstest_v2 (3 G5.x version-chain asserts that need
-# v2 segments to be wired before the assertions trigger).  Default stays
-# at v1 until Phase 24 ports those tests; v2 formatter is invocable via
-# `make format-disk-v2` for interactive smoke testing.
+# v2 segments to be wired before the assertions trigger).
+#
+# Phase 28 Session F.1 attempt (2026-05-06): flipping the default to v2
+# triggered a HARD kernel panic during fs_init mount — sched_block_on_channel
+# chain-walk dereferenced 0xffffffea (sign-extended -EINVAL), preceded by a
+# burst of "stale spsc resp req_id=..." warnings indicating the SPSC ring is
+# delivering responses with corrupted req_ids under the v2 mount workload
+# (likely a race between SPSC producer and waiter-list reaper exposed by
+# v2's denser I/O pattern). This is much deeper than the "29 test
+# regressions" anticipated; reverted to v1 default. v2-in-gate is now a
+# Phase 28 blocker, deferred to a focused v2 session post-F (track in plan
+# rev 4 + memory).
+#
+# v2 formatter is invocable via `make format-disk-v2` for interactive
+# smoke testing.
 format-disk: scripts/mkfs.gfs disk.img
 	@echo "Formatting disk.img with GrahaFS v1..."
 	@./scripts/mkfs.gfs disk.img
@@ -173,8 +205,9 @@ format-disk: scripts/mkfs.gfs disk.img
 # Format with v2 (256 MB disk required — journal is 64 MB, plus metadata
 # and at least one segment).  Wires through scripts/mkfs.gfs.v2 which
 # already supports the full v2 layout (superblock, bitmap, inode table,
-# segment table, journal area, root directory).  Phase 24 is expected to
-# port the v1-specific test programs and then this becomes the default.
+# segment table, journal area, root directory).  WARNING: under the gate
+# this currently triggers a fs_init kernel panic (SPSC race) — interactive
+# smoke testing only until the race is fixed.
 format-disk-v2: scripts/mkfs.gfs.v2
 	@rm -f disk.img .disk_formatted
 	@echo "Creating 256 MB virtual hard disk for v2..."
