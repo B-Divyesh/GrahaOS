@@ -1127,6 +1127,31 @@ static int grahai_wasm_run(const char *path) {
     return (status == WASMD_OK) ? 0 : 5;
 }
 
+static void grahai_print_help(void) {
+    print("grahai — GrahaOS AI agent + GCP plan executor\n");
+    print("\n");
+    print("Usage:\n");
+    print("  grahai                    Run AI mode (reads ai_prompt.txt)\n");
+    print("                            or legacy mode (reads etc/plan.json)\n");
+    print("  grahai --txn              Wrap plan execution in a transaction;\n");
+    print("                            commit on success, abort on failure\n");
+    print("  grahai --txn --abort      Force-abort even on plan success\n");
+    print("                            (preview-but-rollback for AI speculation)\n");
+    print("  grahai wasm-run <path>    Run a WebAssembly module via wasmd\n");
+    print("                            (e.g. grahai wasm-run /etc/wasm/hello.wasm)\n");
+    print("  grahai --help             Print this message\n");
+    print("\n");
+    print("Modes:\n");
+    print("  AI mode      Active when /ai_prompt.txt exists and is non-empty.\n");
+    print("               Sends prompt to Gemini API via libhttp + libtls.\n");
+    print("  Legacy mode  Active when /etc/plan.json exists. Renders the test\n");
+    print("               window via syscall_gcp_execute draw commands.\n");
+    print("\n");
+    print("Sentinel-file activation (for use under syscall_spawn which doesn't\n");
+    print("propagate argv): create /.grahai-txn or /.grahai-abort then spawn.\n");
+    print("Both files are truncated after read (one-shot).\n");
+}
+
 void _start(int argc, char **argv) {
     /* FU27.WASM Stage D3: dispatch wasm-run subcommand if invoked
      * with arguments. Falls through to legacy + AI modes when no
@@ -1134,6 +1159,14 @@ void _start(int argc, char **argv) {
     if (argc >= 3 && strcmp(argv[1], "wasm-run") == 0) {
         int rc = grahai_wasm_run(argv[2]);
         syscall_exit(rc);
+    }
+
+    /* --help / -h short-circuit. Print before any side effects. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            grahai_print_help();
+            syscall_exit(0);
+        }
     }
 
     /* FU25.B grahai --txn flag (default-off in Phase 26; default-on in
@@ -1226,6 +1259,13 @@ void _start(int argc, char **argv) {
          * as a plan failure (drives txn_abort under --txn). */
         int probe = syscall_open("etc/plan.json");
         if (probe < 0) {
+            /* Neither AI mode nor legacy mode is invocable — print help
+             * so the user knows what's available instead of silently
+             * exiting with no rendering (the framebuffer-bypass-once-
+             * fbd-alive footgun). */
+            print("grahai: no ai_prompt.txt or etc/plan.json found; nothing to do.\n");
+            print("\n");
+            grahai_print_help();
             plan_failed = 1;
         } else {
             syscall_close(probe);

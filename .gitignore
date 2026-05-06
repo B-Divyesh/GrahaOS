@@ -44,6 +44,12 @@ initrd_root/
 iso_root/
 build/
 
+# Meson cross-files are generated from .ini.in templates by
+# scripts/env_setup.sh — they hold the absolute toolchain path which
+# differs per developer machine.
+scripts/cross-x86_64-elf.ini
+scripts/cross-x86_64-elf-user.ini
+
 # Compiled user programs (not .c source)
 user/gash
 user/grahai

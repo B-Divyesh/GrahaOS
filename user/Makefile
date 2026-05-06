@@ -1,7 +1,9 @@
 # Makefile for GrahaOS Userland Programs (Phase 6c)
 
-# Inherit from parent Makefile
-PREFIX ?= /home/atman/GrahaOS/toolchain
+# Inherit from parent Makefile (which exports PREFIX + TARGET).
+# When invoked standalone (`cd user && make`), fall back to a local
+# toolchain at <repo>/toolchain so cloned repos work without env setup.
+PREFIX ?= $(abspath $(CURDIR)/../toolchain)
 TARGET ?= x86_64-elf
 
 # Tools

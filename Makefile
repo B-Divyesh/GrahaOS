@@ -1,8 +1,14 @@
 # Makefile for GrahaOS (Phase 6c - Interactive Shell)
 
 # --- Configuration ---
-PREFIX   := /home/atman/GrahaOS/toolchain
+# Toolchain location — resolved relative to this Makefile so cloned repos
+# work anywhere. Override with `make TOOLCHAIN_PREFIX=/some/path` if you
+# keep the cross-compiler outside the source tree.
+TOOLCHAIN_PREFIX ?= $(abspath $(CURDIR)/toolchain)
+PREFIX   := $(TOOLCHAIN_PREFIX)
+export PREFIX
 TARGET   := x86_64-elf
+export TARGET
 
 # Tools
 HOST_CC  := gcc
@@ -654,9 +660,19 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@# Phase 27 Block A (Stage A4): fbd userspace framebuffer compositor.
 	@# Owns the framebuffer once SYS_CONSOLE_ACK_RENDER fires; klog stops
 	@# painting the FB and starts mirroring serial only.
-	@# Note: sys_control needed for SYS_DEBUG synthetic-render trigger
-	@# until FU27.X.tui_demo_apps replaces it with a real userspace blit.
-	@echo "daemon=bin/fbd:ipc_send,ipc_recv,sys_query,sys_control,time" >> initrd_root/etc/init.conf
+	@#
+	@# DISABLED 2026-05-06 (post-Phase-28 sweep) — fbd's substrate was
+	@# scoped substrate-only at Stage A4; it owns the framebuffer (sets
+	@# g_fbd_alive=1, gating every framebuffer_draw_* call via
+	@# fb_should_bypass) but never actually paints. Result: gash text +
+	@# grahai legacy-mode draws + boot messages all silently bail in the
+	@# QEMU graphical window. tui_demo / tui_anim work because they use
+	@# framebuffer_force_* (force-prefix bypasses the bypass), but normal
+	@# user-facing output doesn't. Re-enable when fbd gains a paint loop
+	@# that translates cell VMOs into pixels (post-Phase-28 polish).
+	@# fbd_render.tap is unaffected (uses DEBUG_CONSOLE_SYNTHETIC_RENDER
+	@# which runs through the force-path).
+	@# echo "daemon=bin/fbd:ipc_send,ipc_recv,sys_query,sys_control,time" >> initrd_root/etc/init.conf
 	@# FU27.WASM Stage D1: bin/wasmd daemon. Pledge:
 	@#   ipc_send/ipc_recv  — chan_publish + accept loop
 	@#   sys_control        — SYS_PLEDGE narrow-exec for spawning workers
