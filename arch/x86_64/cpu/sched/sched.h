@@ -14,7 +14,16 @@
 // RLIMIT_MAX_TASKS in spawn/create paths; exceed → -EAGAIN. task_ptrs[]
 // remains as the iteration index until U7's schedule() rewrite drops it.
 #define MAX_TASKS 10240
-#define KERNEL_STACK_SIZE 16384
+// Kernel stack — 32 KiB (8 pages). Bumped from 16 KiB during pre-Phase-28
+// v2-in-gate work: grahafs v2 mount calls journal_replay (3× 4 KiB on-stack
+// block buffers) and inode_cache_get in a tight cluster-rebuild loop (4 KiB
+// block buffer per call). Combined frame depth was overflowing the prior
+// 16 KiB allocation by ~800 bytes, corrupting whatever physical page sat
+// just below the stack's HHDM mapping (in the failing case: the SPSC ring
+// VMO). 32 KiB gives ~16 KiB of headroom over observed peak usage. The
+// inode_cache_get + journal_replay buffers are also moved off-stack to
+// kmalloc so this remains comfortable when v2 picks up larger batches.
+#define KERNEL_STACK_SIZE 32768
 
 // Signal definitions (Phase 7d)
 #define SIGTERM   1   // Terminate process (catchable)

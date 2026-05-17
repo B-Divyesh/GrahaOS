@@ -102,22 +102,38 @@ grahafs_v2_inode_cache_t *inode_cache_get(uint32_t inode_num) {
         return NULL;
     }
 
-    // Read the block containing the inode.
+    // Read the block containing the inode. Buffer is heap-allocated rather
+    // than on-stack because this function is called in a tight loop during
+    // mount (cluster rebuild walks every inode, up to 16K iterations) and
+    // its callers have other 4 KiB stack buffers — keeping this on-stack
+    // overflowed the kernel stack on v2 mount.
     uint64_t lba; uint32_t off;
     inode_locate(inode_num, &lba, &off);
-    uint8_t block[GRAHAFS_V2_BLOCK_SIZE];
+    uint8_t *block = kmalloc(GRAHAFS_V2_BLOCK_SIZE, SUBSYS_FS);
+    if (!block) {
+        spinlock_release(&g_inode_cache_lock);
+        klog(KLOG_ERROR, SUBSYS_FS, "inode_cache_get: kmalloc failed inode=%u", inode_num);
+        return NULL;
+    }
     if (grahafs_block_read((uint8_t)g_v2_device_id, lba, 1, block) != 1) {
+        kfree(block);
         spinlock_release(&g_inode_cache_lock);
         klog(KLOG_ERROR, SUBSYS_FS, "inode_cache_get: read failed inode=%u", inode_num);
         return NULL;
     }
     memcpy(&slot->disk, block + off, GRAHAFS_V2_INODE_SIZE);
+    kfree(block);
 
     if (slot->disk.magic != GRAHAFS_V2_INODE_MAGIC) {
         spinlock_release(&g_inode_cache_lock);
-        klog(KLOG_WARN, SUBSYS_FS,
-             "inode_cache_get: inode=%u bad magic=0x%08x",
-             inode_num, slot->disk.magic);
+        /* magic==0 means the slot is unallocated — expected during table
+         * scans on a fresh-formatted disk. Suppress the noise; only log
+         * actual corruption (non-zero magic that doesn't match). */
+        if (slot->disk.magic != 0u) {
+            klog(KLOG_WARN, SUBSYS_FS,
+                 "inode_cache_get: inode=%u bad magic=0x%08x",
+                 inode_num, slot->disk.magic);
+        }
         return NULL;
     }
 
@@ -266,22 +282,52 @@ int grahafs_v2_mount(int device_id) {
     // Cluster rebuild: walk inode table, feed every inode with a SimHash
     // into the in-memory cluster table so `clusters` CLI reports correct
     // state immediately after mount.
+    //
+    // Optimisation: read INODES_PER_BLOCK (8) inodes per block, rather than
+    // calling inode_cache_get per-inode. The fresh-disk case is dominated
+    // by empty inodes (16K * ~10 ms/op = several minutes wall-clock under
+    // TCG); reading by block collapses that to ~2 K reads. We bypass the
+    // inode_cache_t cache here because cluster rebuild only needs the
+    // raw on-disk fields and runs once at mount.
     cluster_init();
-    for (uint32_t ino = 2; ino < g_v2_sb.inode_count_max; ++ino) {
-        grahafs_v2_inode_cache_t *ce = inode_cache_get(ino);
-        if (!ce) continue;
-        uint64_t sh = ce->disk.ai_embedding[0];
-        uint32_t cid = ((uint32_t)ce->disk.ai_reserved[0])       |
-                       ((uint32_t)ce->disk.ai_reserved[1] << 8)  |
-                       ((uint32_t)ce->disk.ai_reserved[2] << 16) |
-                       ((uint32_t)ce->disk.ai_reserved[3] << 24);
-        char hint[28];
-        memcpy(hint, ce->disk.ai_tags, 27);
-        hint[27] = 0;
-        if (sh != 0 && cid != 0) {
-            cluster_rebuild_add(ino, cid, sh, hint);
+    uint8_t *ino_block = kmalloc(GRAHAFS_V2_BLOCK_SIZE, SUBSYS_FS);
+    if (!ino_block) {
+        klog(KLOG_ERROR, SUBSYS_FS,
+             "grahafs_v2_mount: kmalloc(ino_block) failed; skipping cluster rebuild");
+    } else {
+        uint32_t blocks_to_scan =
+            (g_v2_sb.inode_count_max + GRAHAFS_V2_INODES_PER_BLOCK - 1) /
+            GRAHAFS_V2_INODES_PER_BLOCK;
+        for (uint32_t blk = 0; blk < blocks_to_scan; ++blk) {
+            uint64_t lba = (uint64_t)g_v2_sb.inode_table_start_block + blk;
+            if (grahafs_block_read((uint8_t)g_v2_device_id, lba, 1,
+                                   ino_block) != 1) {
+                klog(KLOG_WARN, SUBSYS_FS,
+                     "grahafs_v2_mount: cluster rebuild read failed lba=%lu",
+                     (unsigned long)lba);
+                break;
+            }
+            for (uint32_t i = 0; i < GRAHAFS_V2_INODES_PER_BLOCK; ++i) {
+                uint32_t ino = blk * GRAHAFS_V2_INODES_PER_BLOCK + i;
+                if (ino < 2u) continue;
+                if (ino >= g_v2_sb.inode_count_max) break;
+                grahafs_v2_inode_t *disk =
+                    (grahafs_v2_inode_t *)
+                        (ino_block + i * GRAHAFS_V2_INODE_SIZE);
+                if (disk->magic != GRAHAFS_V2_INODE_MAGIC) continue;
+                uint64_t sh = disk->ai_embedding[0];
+                uint32_t cid = ((uint32_t)disk->ai_reserved[0])       |
+                               ((uint32_t)disk->ai_reserved[1] << 8)  |
+                               ((uint32_t)disk->ai_reserved[2] << 16) |
+                               ((uint32_t)disk->ai_reserved[3] << 24);
+                if (sh == 0u || cid == 0u) continue;
+                char hint[28];
+                memcpy(hint, disk->ai_tags, 27);
+                hint[27] = 0;
+                cluster_rebuild_add(ino, cid, sh, hint);
+            }
         }
-        inode_cache_put(ce);
+        kfree(ino_block);
     }
     cluster_rebuild_finalize();
 
@@ -648,7 +694,7 @@ ssize_t grahafs_v2_write(struct vfs_node *node, uint64_t offset, size_t size, vo
     while (bytes_written < size) {
         uint32_t lba = v2_block_index_to_lba_alloc(&work, block_index, txn);
         if (!lba) { journal_txn_abort(txn); inode_cache_put(ce);
-                    return (ssize_t)(bytes_written > 0 ? bytes_written : -28); }
+                    return bytes_written > 0 ? (ssize_t)bytes_written : (ssize_t)-28; }
         size_t chunk = GRAHAFS_V2_BLOCK_SIZE - block_offset;
         if (chunk > size - bytes_written) chunk = size - bytes_written;
 
@@ -1216,6 +1262,7 @@ static int v2_emit_version_record(uint32_t inode_num,
                                   journal_txn_t *txn,
                                   uint32_t *out_segment_id,
                                   uint64_t *out_version_id) {
+    (void)inode_num;  /* version-record body doesn't store the inode #. */
     // Allocate one 128-byte slot — we request a full block's worth so the
     // segment allocator doesn't partially fill a block across txns.
     uint32_t bytes_needed = GRAHAFS_V2_BLOCK_SIZE;

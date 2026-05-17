@@ -1653,7 +1653,28 @@ int sched_block_on_channel(void *channel, uint8_t dir, uint64_t timeout_ns,
     // may have already removed us).
     spinlock_acquire(&sched_lock);
     task_t **p = list_head;
+    int _walk_iters = 0;
     while (*p && *p != cur) {
+        /* Defensive guard: pointers in this list MUST be kernel-virtual
+         * (high-half canonical, bit 47 set → 0xffff800000000000+). If we
+         * see a small int / low-half garbage value, the chain is corrupt.
+         * Bail out with a klog instead of dereferencing into a fault. */
+        if (((uintptr_t)*p) < 0xffff800000000000ULL) {
+            klog(KLOG_FATAL, SUBSYS_SCHED,
+                 "sched_block_on_channel: corrupt waiter chain at iter=%d "
+                 "*p=%p list_head=%p cur=%p — aborting walk",
+                 _walk_iters, *p, list_head, cur);
+            *p = NULL;  /* truncate list to avoid further traversal */
+            break;
+        }
+        if (++_walk_iters > 256) {
+            klog(KLOG_FATAL, SUBSYS_SCHED,
+                 "sched_block_on_channel: waiter chain >256 iters list_head=%p "
+                 "cur=%p first=%p — aborting walk",
+                 list_head, cur, *list_head);
+            *p = NULL;
+            break;
+        }
         p = (task_t **)&((*p)->wait_next);
     }
     if (*p == cur) *p = (task_t *)cur->wait_next;

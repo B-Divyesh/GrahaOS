@@ -121,8 +121,26 @@ int journal_replay(int device_id, grahafs_v2_superblock_t *sb) {
     // Read one block at a time looking for a begin magic. MVP: only the
     // very next slot after the committed head can hold a partial txn — so
     // we scan at most JOURNAL_TXN_MAX_BLOCKS slots before giving up.
+    //
+    // Buffers are heap-allocated rather than on-stack: this function lives
+    // deep in the boot/mount call chain (blk_client_fs_init →
+    // grahafs_v2_mount → journal_replay), and the on-stack variants
+    // (3× 4 KiB) plus other 4 KiB buffers in the same chain were
+    // overflowing the kernel stack. The kmalloc cost is negligible
+    // because journal_replay only fires when there is actual work
+    // (uncommitted txns at last shutdown) — usually a no-op.
     uint32_t scan_budget = JOURNAL_TXN_MAX_BLOCKS;
-    uint8_t buf[GRAHAFS_V2_BLOCK_SIZE];
+    uint8_t *buf        = kmalloc(GRAHAFS_V2_BLOCK_SIZE, SUBSYS_FS);
+    uint8_t *commit_buf = kmalloc(GRAHAFS_V2_BLOCK_SIZE, SUBSYS_FS);
+    uint8_t *payload    = kmalloc(GRAHAFS_V2_BLOCK_SIZE, SUBSYS_FS);
+    if (!buf || !commit_buf || !payload) {
+        if (buf) kfree(buf);
+        if (commit_buf) kfree(commit_buf);
+        if (payload) kfree(payload);
+        klog(KLOG_ERROR, SUBSYS_FS,
+             "journal_replay: kmalloc(3x %u) failed", GRAHAFS_V2_BLOCK_SIZE);
+        return -3;  // -ENOMEM
+    }
 
     while (scan_budget-- > 0 && scan_lba < end) {
         if (ahci_read_block(device_id, scan_lba, buf) != 0) {
@@ -155,7 +173,6 @@ int journal_replay(int device_id, grahafs_v2_superblock_t *sb) {
             discarded++;
             break;
         }
-        uint8_t commit_buf[GRAHAFS_V2_BLOCK_SIZE];
         if (ahci_read_block(device_id, commit_lba, commit_buf) != 0) {
             discarded++;
             break;
@@ -176,7 +193,6 @@ int journal_replay(int device_id, grahafs_v2_superblock_t *sb) {
         // Re-read the begin copy since `buf` may change below.
         uint32_t refs_n = begin->ref_count;
         for (uint32_t i = 0; i < refs_n; ++i) {
-            uint8_t payload[GRAHAFS_V2_BLOCK_SIZE];
             if (ahci_read_block(device_id, begin->refs[i].journal_lba, payload) != 0) {
                 crc = 0;
                 break;
@@ -193,7 +209,6 @@ int journal_replay(int device_id, grahafs_v2_superblock_t *sb) {
         }
         // Apply each ref to main area.
         for (uint32_t i = 0; i < refs_n; ++i) {
-            uint8_t payload[GRAHAFS_V2_BLOCK_SIZE];
             if (ahci_read_block(device_id, begin->refs[i].journal_lba, payload) != 0 ||
                 ahci_write_block(device_id, begin->refs[i].lba_target, payload) != 0) {
                 klog(KLOG_ERROR, SUBSYS_FS,
@@ -205,6 +220,10 @@ int journal_replay(int device_id, grahafs_v2_superblock_t *sb) {
         replayed++;
         scan_lba += block_count;
     }
+
+    kfree(buf);
+    kfree(commit_buf);
+    kfree(payload);
 
     if (replayed > 0 || discarded > 0) {
         klog(KLOG_INFO, SUBSYS_FS,
