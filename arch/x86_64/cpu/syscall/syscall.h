@@ -482,6 +482,18 @@
 // of the cap_recursive_inheritance gate test.
 #define DEBUG_CAP_CREATE_WITH_FLAGS         75
 #define DEBUG_CAP_CHECK_INHERITED_AUDIENCE  76
+// Phase 28 Session G.1 fault injection subops.  RSI carries the new
+// counter value; RAX returns 0 (or the prior hits count for RESET_ALL).
+//   PMM_FAIL_NTH (80)     : RSI = int64_t  countdown (0 = disabled)
+//   KMALLOC_FAIL_NTH (81) : RSI = int64_t  countdown (0 = disabled)
+//   CHAN_SEND_FAIL_RATE (82)    : RSI = uint32_t (0 = disabled, >0 = sample on)
+//   SPINLOCK_TIMEOUT_RATE (83)  : RSI = uint32_t (0 = disabled, >0 = sample on)
+//   RESET_ALL (84)        : zero all counters; RAX = prior spinlock_injection_hits
+#define DEBUG_INJECT_PMM_FAIL_NTH           80
+#define DEBUG_INJECT_KMALLOC_FAIL_NTH       81
+#define DEBUG_INJECT_CHAN_SEND_FAIL_RATE    82
+#define DEBUG_INJECT_SPINLOCK_TIMEOUT_RATE  83
+#define DEBUG_INJECT_RESET_ALL              84
 
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);

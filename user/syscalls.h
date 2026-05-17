@@ -298,6 +298,12 @@ typedef struct {
 // otherwise.  Both gated on PLEDGE_CLASS_SYS_CONTROL like other DEBUG ops.
 #define DEBUG_CAP_CREATE_WITH_FLAGS         75
 #define DEBUG_CAP_CHECK_INHERITED_AUDIENCE  76
+// Phase 28 Session G.1 fault injection.
+#define DEBUG_INJECT_PMM_FAIL_NTH           80
+#define DEBUG_INJECT_KMALLOC_FAIL_NTH       81
+#define DEBUG_INJECT_CHAN_SEND_FAIL_RATE    82
+#define DEBUG_INJECT_SPINLOCK_TIMEOUT_RATE  83
+#define DEBUG_INJECT_RESET_ALL              84
 #define DEBUG_FB_READ_PIXEL    61
 #define DEBUG_SET_WALL       51
 
@@ -1709,6 +1715,64 @@ static inline long syscall_debug_cap_check_inherited_audience(void) {
                  : "=a"(ret)
                  : "a"(SYS_DEBUG),
                    "D"((uint64_t)DEBUG_CAP_CHECK_INHERITED_AUDIENCE)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Phase 28 Session G.1 — fault injection control plane.  Each call
+// installs a new value for one of four kernel-side counters; the
+// counter then drives synthetic failures from the soak harness and
+// the inject_*.tap gate tests.  Spinlock injection is observe-only —
+// the kernel never alters control flow on a sample, only increments
+// g_debug_spinlock_injection_hits, which RESET_ALL returns.
+static inline long syscall_debug_inject_pmm_fail_nth(int64_t n) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_INJECT_PMM_FAIL_NTH),
+                   "S"((uint64_t)n)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+static inline long syscall_debug_inject_kmalloc_fail_nth(int64_t n) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_INJECT_KMALLOC_FAIL_NTH),
+                   "S"((uint64_t)n)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+static inline long syscall_debug_inject_chan_send_fail_rate(uint32_t r) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_INJECT_CHAN_SEND_FAIL_RATE),
+                   "S"((uint64_t)r)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+static inline long syscall_debug_inject_spinlock_timeout_rate(uint32_t r) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_INJECT_SPINLOCK_TIMEOUT_RATE),
+                   "S"((uint64_t)r)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+// Returns the prior g_debug_spinlock_injection_hits value so callers can
+// confirm the sample-gated hook actually fired.
+static inline long syscall_debug_inject_reset_all(void) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_INJECT_RESET_ALL)
                  : "rcx", "r11", "memory");
     return ret;
 }

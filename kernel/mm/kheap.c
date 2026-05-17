@@ -104,6 +104,11 @@ void *kmalloc(size_t size, uint8_t subsys) {
         klog(KLOG_FATAL, SUBSYS_MM, "kmalloc called before kheap_init");
         return NULL;
     }
+    // Phase 28 G.1 fault injection: deterministic Nth-call failure.
+    extern int64_t g_debug_kmalloc_fail_nth;
+    if (g_debug_kmalloc_fail_nth > 0) {
+        if (--g_debug_kmalloc_fail_nth == 0) return NULL;
+    }
     // 0-byte request: return a valid 16 B allocation. Safer than NULL
     // for callers that pass size from user-controlled values; it also
     // makes kmalloc(0)+kfree idempotent.

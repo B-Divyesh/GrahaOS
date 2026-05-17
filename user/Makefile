@@ -28,7 +28,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot txnctl assertpledge wasm fbd/fbd wasmd/wasmd wasmd/wasmd_worker tui_demo tui_anim
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot txnctl assertpledge wasm fbd/fbd wasmd/wasmd wasmd/wasmd_worker tui_demo tui_anim gsh
 
 # Phase 12: TAP 1.4 test binaries. Each lives at user/tests/NAME.c
 # and is copied to initrd as /bin/tests/NAME.tap by the top-level
@@ -74,6 +74,14 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/cap_inherit \
              tests/cap_recursive_inheritance \
              tests/cap_recursive_inherit_child \
+             tests/inject_kmalloc_fail \
+             tests/inject_pmm_fail \
+             tests/inject_chan_fail \
+             tests/inject_spinlock_timeout \
+             tests/soak_inject_apply \
+             tests/gcp_manifest_export_full \
+             tests/gsh_completion \
+             tests/ai_txn_rollback \
              tests/gash_txn_commit \
              tests/gash_txn_abort \
              tests/gash_txn_abort_fs_revert \
@@ -390,6 +398,12 @@ grahai: grahai.o json.o $(LIBHTTP) $(LIBTLS) $(LIBNET) $(LIBC)
 gash: gash.o json.o $(LIBHTTP) $(LIBTLS) $(LIBNET) $(LIBC)
 	@echo "Linking user program: $@ (with libhttp + libtls + libnet + libc)"
 	@$(LD) $(LDFLAGS) -o $@ gash.o json.o $(LIBHTTP) --whole-archive $(LIBTLS) --no-whole-archive $(LIBNET) $(LIBC)
+
+# Phase 28 Session G.3 — gsh shell (full rewrite, TUI-first, parallel
+# to gash).  Links only libc; no libtls / libhttp dependency.
+gsh: gsh.o $(LIBC)
+	@echo "Linking user program: $@ (with libc)"
+	@$(LD) $(LDFLAGS) -o $@ gsh.o $(LIBC)
 
 # Build libc test program
 libctest: libctest.o $(LIBC)

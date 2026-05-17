@@ -179,21 +179,32 @@ scripts/mkfs.gfs.v2: scripts/mkfs.gfs.v2.c kernel/fs/grahafs_v2.h kernel/lib/crc
 
 # Format the disk image with GrahaFS v1 (default).  Phase 23 Step 5 added
 # a working v2 formatter at scripts/mkfs.gfs.v2.c, but switching the gate
-# default to v2 currently regresses 29 assertions across clustertest /
-# simtest / metatest (v1-specific SimHash/cluster + AI-metadata syscalls
-# expect v1 layout) and fstest_v2 (3 G5.x version-chain asserts that need
-# v2 segments to be wired before the assertions trigger).
+# default to v2 currently regresses ~26 assertions across clustertest /
+# simtest / metatest / fdtest (v1-specific SimHash/cluster + AI-metadata
+# syscalls expect v1 layout) plus the pre-existing gash_txn flake.
 #
-# Phase 28 Session F.1 attempt (2026-05-06): flipping the default to v2
-# triggered a HARD kernel panic during fs_init mount — sched_block_on_channel
-# chain-walk dereferenced 0xffffffea (sign-extended -EINVAL), preceded by a
-# burst of "stale spsc resp req_id=..." warnings indicating the SPSC ring is
-# delivering responses with corrupted req_ids under the v2 mount workload
-# (likely a race between SPSC producer and waiter-list reaper exposed by
-# v2's denser I/O pattern). This is much deeper than the "29 test
-# regressions" anticipated; reverted to v1 default. v2-in-gate is now a
-# Phase 28 blocker, deferred to a focused v2 session post-F (track in plan
-# rev 4 + memory).
+# Phase 28 v2-substrate session (2026-05-06): the v2-in-gate kernel
+# panic that blocked F.1 was diagnosed and FIXED — root cause was a
+# kernel stack overflow (16 KiB stack), not the suspected SPSC race.
+# `journal_replay` had three 4 KiB on-stack block buffers and
+# `inode_cache_get` had a 4 KiB block buffer in the cluster-rebuild
+# tight loop; combined frame depth in `grahafs_v2_mount`'s call chain
+# overflowed the stack into whatever physical page sat just below
+# (in the failing case: the SPSC ring VMO, hence the misleading
+# "stale spsc resp" warnings as kernel stack contents leaked through
+# the SPSC ring fields). Fix has three parts: (a) heap-allocate the
+# four 4 KiB buffers, (b) bump KERNEL_STACK_SIZE 16 → 32 KiB as
+# defense-in-depth, (c) read inode blocks in 8-inode batches during
+# cluster rebuild (16 K block reads → 2 K). v2 mount now boots cleanly.
+#
+# What still needs porting before v2 becomes the gate default:
+# clustertest 7→10 (3 v1-specific simhash asserts), simtest 3→10
+# (7 v1-specific simhash asserts), fdtest 11→12 (1 v1-specific FD
+# assert), metatest 2→14 (12 v1-specific AI-metadata syscalls).
+# Plus the pre-existing gash_txn flake (FU24.A class). These are
+# the originally-predicted ~29 v1-specific tests; the SPSC blocker
+# was a separate (now-fixed) issue. Flip is safe whenever the v1
+# tests are ported.
 #
 # v2 formatter is invocable via `make format-disk-v2` for interactive
 # smoke testing.
@@ -422,6 +433,8 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	fi
 	@cp user/grahai initrd_root/bin/
 	@cp user/gash initrd_root/bin/
+	@# Phase 28 Session G.3 — gsh shell (TUI-first, parallel to gash).
+	@cp user/gsh initrd_root/bin/gsh
 	@cp user/libctest initrd_root/bin/
 	@cp user/sbrk_test initrd_root/bin/
 	@cp user/printf_test initrd_root/bin/
@@ -540,6 +553,19 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@# walk appended the child's pid to the inherited cap's audience set.
 	@cp user/tests/cap_recursive_inheritance  initrd_root/bin/tests/cap_recursive_inheritance.tap
 	@cp user/tests/cap_recursive_inherit_child initrd_root/bin/tests/cap_recursive_inherit_child.tap
+	@# Phase 28 Session G.1: fault injection harness — kmalloc / pmm /
+	@# chan_send / spinlock observer hooks driven via SYS_DEBUG subops 80-84.
+	@cp user/tests/inject_kmalloc_fail      initrd_root/bin/tests/inject_kmalloc_fail.tap
+	@cp user/tests/inject_pmm_fail          initrd_root/bin/tests/inject_pmm_fail.tap
+	@cp user/tests/inject_chan_fail         initrd_root/bin/tests/inject_chan_fail.tap
+	@cp user/tests/inject_spinlock_timeout  initrd_root/bin/tests/inject_spinlock_timeout.tap
+	@# Phase 28 Session G.2: soak inject front-end.  Reads etc/soak_inject.conf
+	@# (written by scripts/run_soak.sh per iter) and applies counters via SYS_DEBUG.
+	@cp user/tests/soak_inject_apply        initrd_root/bin/tests/soak_inject_apply.tap
+	@# Phase 28 Session G.4: spec-mandated gate tests.
+	@cp user/tests/gcp_manifest_export_full initrd_root/bin/tests/gcp_manifest_export_full.tap
+	@cp user/tests/gsh_completion           initrd_root/bin/tests/gsh_completion.tap
+	@cp user/tests/ai_txn_rollback          initrd_root/bin/tests/ai_txn_rollback.tap
 	@# Phase 26 closeout (FU25.A.2): gash txn{} parser integration tests.
 	@cp user/tests/gash_txn_commit         initrd_root/bin/tests/gash_txn_commit.tap
 	@cp user/tests/gash_txn_abort          initrd_root/bin/tests/gash_txn_abort.tap
@@ -865,6 +891,18 @@ endif
 	@# binary (NOT in manifest.txt — harness only auto-runs items listed
 	@# here; the parent invokes the child directly via syscall_spawn).
 	@echo "cap_recursive_inheritance" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 28 Session G.1: fault injection gate (4 tests / 12 asserts).
+	@echo "inject_kmalloc_fail"      >> initrd_root/bin/tests/manifest.txt
+	@echo "inject_pmm_fail"          >> initrd_root/bin/tests/manifest.txt
+	@echo "inject_chan_fail"         >> initrd_root/bin/tests/manifest.txt
+	@echo "inject_spinlock_timeout"  >> initrd_root/bin/tests/manifest.txt
+	@# Phase 28 Session G.2: soak inject front-end (2 asserts).  Listed
+	@# first so it runs before the test suite in soak iterations.
+	@echo "soak_inject_apply"        >> initrd_root/bin/tests/manifest.txt
+	@# Phase 28 Session G.4: spec-mandated gate tests (5+5+8 = 18 asserts).
+	@echo "gcp_manifest_export_full" >> initrd_root/bin/tests/manifest.txt
+	@echo "gsh_completion"           >> initrd_root/bin/tests/manifest.txt
+	@echo "ai_txn_rollback"          >> initrd_root/bin/tests/manifest.txt
 	@# Pre-Phase-28 sweep A.5 (resolves FU25.A.4): gash_txn_commit + gash_txn_abort
 	@# promoted to gate. Previously held back due to FU24.B/C wait/exit race
 	@# (intermittent INCOMPLETE on ~33-50% of TCG iters when ktest's syscall_wait
@@ -1007,6 +1045,13 @@ endif
 	@cp etc/plan.json initrd_root/etc/
 	@cp etc/gcp.json initrd_root/etc/
 	@cp etc/gcp.wit initrd_root/etc/
+	@# Phase 28 G.2 soak harness: scripts/run_soak.sh writes
+	@# etc/soak_inject.conf before each fault-injection iter; the
+	@# soak_inject_driver test reads it at gate-start.  Absent file
+	@# means no injection (normal `make test` path).
+	@if [ -f etc/soak_inject.conf ]; then \
+		cp etc/soak_inject.conf initrd_root/etc/soak_inject.conf; \
+	fi
 	@if [ -f api_keys.md ]; then \
 		grep '^GEMINI_API_KEY=' api_keys.md | sed 's/^GEMINI_API_KEY=//' > initrd_root/etc/ai.conf; \
 	else echo "" > initrd_root/etc/ai.conf; fi

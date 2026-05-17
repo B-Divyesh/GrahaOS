@@ -339,6 +339,18 @@ int chan_send(channel_t *c, task_t *sender, channel_msg_t *msg_kern,
               uint64_t timeout_ns) {
     if (!chan_check(c) || !sender || !msg_kern) return CAP_V2_EINVAL;
 
+    // Phase 28 G.1 fault injection: sample-gated -EAGAIN return.  Sample
+    // entropy from rdtsc (changes every nanosecond) so the hook fires
+    // ~1/256 chan_send calls.  Phase 25 T2 perf-regression class — the
+    // rdtsc opcode is ~10 cycles which is fine when guarded by the
+    // rate>0 outer test.
+    extern uint32_t g_debug_chan_send_fail_rate;
+    if (g_debug_chan_send_fail_rate > 0) {
+        uint64_t tsc;
+        asm volatile("rdtsc" : "=A"(tsc));
+        if ((tsc & 0xFFu) == 0) return CAP_V2_EAGAIN;
+    }
+
     // Type-hash gate.
     if (msg_kern->header.type_hash != c->type_hash) {
         c->rejected_messages++;

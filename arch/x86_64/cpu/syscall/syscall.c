@@ -2091,6 +2091,36 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = (uint64_t)(long)(found ? 0 : 1);
                 break;
             }
+            // Phase 28 Session G.1 — fault injection control plane.
+            case DEBUG_INJECT_PMM_FAIL_NTH: {
+                extern int64_t g_debug_pmm_fail_nth;
+                g_debug_pmm_fail_nth = (int64_t)frame->rsi;
+                frame->rax = 0;
+                break;
+            }
+            case DEBUG_INJECT_KMALLOC_FAIL_NTH: {
+                extern int64_t g_debug_kmalloc_fail_nth;
+                g_debug_kmalloc_fail_nth = (int64_t)frame->rsi;
+                frame->rax = 0;
+                break;
+            }
+            case DEBUG_INJECT_CHAN_SEND_FAIL_RATE: {
+                extern uint32_t g_debug_chan_send_fail_rate;
+                g_debug_chan_send_fail_rate = (uint32_t)frame->rsi;
+                frame->rax = 0;
+                break;
+            }
+            case DEBUG_INJECT_SPINLOCK_TIMEOUT_RATE: {
+                extern uint32_t g_debug_spinlock_timeout_rate;
+                g_debug_spinlock_timeout_rate = (uint32_t)frame->rsi;
+                frame->rax = 0;
+                break;
+            }
+            case DEBUG_INJECT_RESET_ALL: {
+                extern uint64_t debug_inject_reset_all(void);
+                frame->rax = (uint64_t)debug_inject_reset_all();
+                break;
+            }
             default:
                 frame->rax = (uint64_t)-1;
                 break;

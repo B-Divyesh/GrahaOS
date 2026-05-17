@@ -143,6 +143,25 @@ void _spinlock_acquire_with_budget(spinlock_t *lock, uint64_t budget_ns,
 
     uint64_t cpu_id = get_cpu_id();
 
+    // Phase 28 G.1 fault injection: OBSERVE-ONLY hook.  A panic-on-sample
+    // design would brick the kernel on its own syscall return paths
+    // (every interrupt acquires sched_lock).  Instead we just count the
+    // samples so the soak harness + inject_spinlock_timeout.tap can
+    // confirm the hook is reachable, and surface contention metrics
+    // without altering control flow.  Note: not gated by `lock !=
+    // NULL`-check above, so a NULL caller still panics — we never want
+    // injection to mask a real bug.
+    extern uint32_t g_debug_spinlock_timeout_rate;
+    extern uint64_t g_debug_spinlock_injection_hits;
+    if (g_debug_spinlock_timeout_rate > 0) {
+        uint64_t tsc;
+        asm volatile("rdtsc" : "=A"(tsc));
+        if ((tsc & 0xFFu) == 0) {
+            __atomic_fetch_add(&g_debug_spinlock_injection_hits, 1,
+                               __ATOMIC_RELAXED);
+        }
+    }
+
     // Recursive acquisition: same CPU already holds it.
     if (lock->locked && lock->owner == cpu_id) {
         lock->count++;

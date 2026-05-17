@@ -125,6 +125,12 @@ void pmm_init(volatile struct limine_memmap_response *memmap_response) {
 }
 
 void *pmm_alloc_page(void) {
+    // Phase 28 G.1 fault injection: shares the counter with pmm_alloc_pages
+    // because most callers go through this single-page path.
+    extern int64_t g_debug_pmm_fail_nth;
+    if (g_debug_pmm_fail_nth > 0) {
+        if (--g_debug_pmm_fail_nth == 0) return NULL;
+    }
     spinlock_acquire(&pmm_lock);
 
     // Start searching from last used index
@@ -158,6 +164,11 @@ void *pmm_alloc_page(void) {
 void *pmm_alloc_pages(size_t num_pages) {
     if (num_pages == 0) return NULL;
     if (num_pages == 1) return pmm_alloc_page();
+    // Phase 28 G.1 fault injection: deterministic Nth-call failure.
+    extern int64_t g_debug_pmm_fail_nth;
+    if (g_debug_pmm_fail_nth > 0) {
+        if (--g_debug_pmm_fail_nth == 0) return NULL;
+    }
 
     spinlock_acquire(&pmm_lock);
     
