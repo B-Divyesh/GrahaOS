@@ -353,6 +353,15 @@ void interrupt_handler(struct interrupt_frame *frame) {
                 // Phase 12: TEST_TIMEOUT watchdog piggybacks on the
                 // timer tick. No-op unless armed via watchdog_arm().
                 watchdog_tick(g_timer_ticks);
+                // Phase 29 Session E: drive sprite-animation scheduler at
+                // every timer tick (LAPIC fires ~100 Hz; we cap stepping
+                // per-tick to one frame per animation via TSC deadline so
+                // this is bounded constant-time when no animation is
+                // running).
+                {
+                    extern void console_animation_tick_all(void);
+                    console_animation_tick_all();
+                }
                 {
                     // SMP diagnostic: per-CPU heartbeat. Each CPU logs once
                     // per second so a hang on a specific CPU is visible.
@@ -385,6 +394,17 @@ void interrupt_handler(struct interrupt_frame *frame) {
             case 36: // IRQ4: COM1 serial RX (Phase 27 closeout)
                 serial_irq_handler();
                 if (!using_lapic) {
+                    outb(PIC1_COMMAND, PIC_EOI);
+                }
+                break;
+            case 44: // IRQ12: PS/2 mouse (Phase 29 Session E)
+                {
+                    extern void mouse_irq_handler(void);
+                    mouse_irq_handler();
+                }
+                if (!using_lapic) {
+                    // IRQ12 lives on the slave PIC — EOI both.
+                    outb(PIC2_COMMAND, PIC_EOI);
                     outb(PIC1_COMMAND, PIC_EOI);
                 }
                 break;

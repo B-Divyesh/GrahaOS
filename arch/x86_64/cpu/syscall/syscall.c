@@ -28,6 +28,8 @@ extern spinlock_t sched_lock;
 #include "../../../../kernel/snap/snapshot.h"
 #include "../../../../kernel/txn/transaction.h"
 #include "../../../../kernel/console/console.h"
+#include "../../../../kernel/console/animation.h"
+#include "../../../../kernel/console/cell_tx.h"
 #include "../../../../kernel/fs/pipe.h"
 #include "../../../../kernel/fs/cluster.h"
 #include "../../../../kernel/autorun.h"
@@ -2169,6 +2171,59 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = (uint64_t)console_debug_read_cell(cid, row, col);
                 break;
             }
+            // Phase 29 Session E test substrate.
+            case DEBUG_ANIM_TICK: {
+                extern int console_animation_tick_one(uint32_t console_id);
+                uint32_t cid = (uint32_t)frame->rsi;
+                frame->rax = (uint64_t)(long)console_animation_tick_one(cid);
+                break;
+            }
+            case DEBUG_ANIM_GET_FRAME: {
+                extern int console_animation_debug_get_frame(uint32_t console_id,
+                                                             uint32_t slot);
+                uint32_t cid = (uint32_t)frame->rsi;
+                uint32_t slot = (uint32_t)frame->rdx;
+                frame->rax = (uint64_t)(long)
+                    console_animation_debug_get_frame(cid, slot);
+                break;
+            }
+            case DEBUG_ANIM_GET_STATE: {
+                extern int console_animation_debug_get_state(uint32_t console_id,
+                                                             uint32_t slot);
+                uint32_t cid = (uint32_t)frame->rsi;
+                uint32_t slot = (uint32_t)frame->rdx;
+                frame->rax = (uint64_t)(long)
+                    console_animation_debug_get_state(cid, slot);
+                break;
+            }
+            case DEBUG_INJECT_MOUSE: {
+                extern void mouse_debug_inject(uint8_t kind, uint8_t action,
+                                               int16_t dx, int16_t dy,
+                                               uint8_t button);
+                uint64_t packed = frame->rsi;
+                uint8_t  kind   = (uint8_t)(packed & 0xFF);
+                uint8_t  action = (uint8_t)((packed >> 8) & 0xFF);
+                int16_t  dx     = (int16_t)((packed >> 16) & 0xFFFF);
+                int16_t  dy     = (int16_t)((packed >> 32) & 0xFFFF);
+                uint8_t  btn    = (uint8_t)((packed >> 48) & 0xFF);
+                mouse_debug_inject(kind, action, dx, dy, btn);
+                frame->rax = 0;
+                break;
+            }
+            case DEBUG_FB_READ_PIXEL_AT: {
+                uint64_t packed = frame->rsi;
+                uint32_t x = (uint32_t)(packed & 0xFFFFFFFFu);
+                uint32_t y = (uint32_t)((packed >> 32) & 0xFFFFFFFFu);
+                extern uint32_t framebuffer_read_pixel(uint32_t x, uint32_t y);
+                frame->rax = (uint64_t)framebuffer_read_pixel(x, y);
+                break;
+            }
+            case DEBUG_MOUSE_CURSOR_VISIBLE: {
+                extern bool mouse_cursor_visible(uint32_t console_id);
+                uint32_t cid = (uint32_t)frame->rsi;
+                frame->rax = mouse_cursor_visible(cid) ? 1u : 0u;
+                break;
+            }
             default:
                 frame->rax = (uint64_t)-1;
                 break;
@@ -4109,6 +4164,69 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             };
             int rc = console_gfx_damage(cid, &r);
             frame->rax = (uint64_t)(long)(rc == 0 ? 0 : -22);
+            break;
+        }
+
+        // Phase 29 Session E — sprite animation + cell-grid atomic TX.
+        case SYS_CONSOLE_SPRITE_ANIMATE: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                        "pledge denied: sys_control")) break;
+            uint32_t cid     = (uint32_t)frame->rdi;
+            uint32_t sid     = (uint32_t)frame->rsi;
+            const void *user_kf = (const void *)frame->rdx;
+            uint16_t nframes = (uint16_t)(frame->r10 & 0xFFFF);
+            uint32_t dur_ms  = (uint32_t)frame->r8;
+            if (!user_kf || nframes == 0 || nframes > 64) {
+                frame->rax = (uint64_t)(long)-22;
+                break;
+            }
+            // Bounce keyframes through a kernel-local buffer (max 64 cells
+            // * 16 bytes = 1024 B — fits comfortably on the kstack).
+            tui_cell_t bounce[64];
+            uint64_t need = (uint64_t)nframes * sizeof(tui_cell_t);
+            if (!is_user_pointer(user_kf, need)) {
+                frame->rax = (uint64_t)(long)-14;
+                break;
+            }
+            const uint8_t *src = (const uint8_t *)user_kf;
+            uint8_t *dst = (uint8_t *)bounce;
+            for (uint64_t i = 0; i < need; i++) dst[i] = src[i];
+            int rc = console_animation_create(cid, sid, bounce, nframes,
+                                              dur_ms, /*interp=*/0);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        case SYS_CONSOLE_BEGIN_TX: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                        "pledge denied: sys_control")) break;
+            uint32_t cid = (uint32_t)frame->rdi;
+            task_t *cur_btx = sched_get_current_task();
+            int32_t pid = cur_btx ? cur_btx->id : -1;
+            int rc = console_tx_begin(pid, cid);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        case SYS_CONSOLE_COMMIT_TX: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                        "pledge denied: sys_control")) break;
+            uint32_t handle = (uint32_t)frame->rdi;
+            task_t *cur_ctx = sched_get_current_task();
+            int32_t pid = cur_ctx ? cur_ctx->id : -1;
+            int rc = console_tx_commit(pid, handle);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
+        case SYS_CONSOLE_ABORT_TX: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                        "pledge denied: sys_control")) break;
+            uint32_t handle = (uint32_t)frame->rdi;
+            task_t *cur_atx = sched_get_current_task();
+            int32_t pid = cur_atx ? cur_atx->id : -1;
+            int rc = console_tx_abort(pid, handle);
+            frame->rax = (uint64_t)(long)rc;
             break;
         }
 

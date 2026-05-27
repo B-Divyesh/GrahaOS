@@ -382,6 +382,29 @@ void audit_write_tui_input_overflow(int32_t pid, uint32_t console_id,
     audit_enqueue(&e);
 }
 
+// Phase 29 Session E writers.
+void audit_write_tui_tx_abort(int32_t pid, uint32_t console_id,
+                              uint32_t cells_dropped) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_TUI_TX_ABORT, pid, AUDIT_SRC_NATIVE);
+    e.subject_pid = pid;
+    ksnprintf(e.detail, sizeof(e.detail),
+              "console=%u cells_dropped=%u",
+              (unsigned int)console_id, (unsigned int)cells_dropped);
+    audit_enqueue(&e);
+}
+
+void audit_write_input_mouse_dropped(int32_t pid, uint32_t console_id,
+                                     uint64_t total_dropped) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_INPUT_MOUSE_DROPPED, pid, AUDIT_SRC_NATIVE);
+    e.subject_pid = pid;
+    ksnprintf(e.detail, sizeof(e.detail),
+              "console=%u total_dropped=%lu",
+              (unsigned int)console_id, (unsigned long)total_dropped);
+    audit_enqueue(&e);
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle.
 // ---------------------------------------------------------------------------

@@ -112,7 +112,10 @@
 // Session D (TUI primitives) consumes 57 + 58:
 #define AUDIT_GFX_FB_MAPPED           57  // SYS_CONSOLE_GFX_MAP_FB: caller got FB MMIO handle
 #define AUDIT_TUI_INPUT_OVERFLOW      58  // SYS_CONSOLE_READ_INPUT: events dropped (user buffer too small)
-#define AUDIT_EVENT_MAX               58
+// Session E (sprite animation + mouse + cell-grid TX) consumes 59 + 60:
+#define AUDIT_TUI_TX_ABORT            59  // SYS_CONSOLE_ABORT_TX: shadow cell-VMO dropped
+#define AUDIT_INPUT_MOUSE_DROPPED     60  // PS/2 mouse event dropped (input ring full)
+#define AUDIT_EVENT_MAX               60
 
 // Source of the event.
 #define AUDIT_SRC_NATIVE  0   // Native v2 API.
@@ -527,3 +530,13 @@ void audit_write_gfx_fb_mapped(int32_t pid, uint64_t phys_addr,
                                uint64_t size_bytes);
 void audit_write_tui_input_overflow(int32_t pid, uint32_t console_id,
                                     uint32_t dropped);
+
+// Phase 29 Session E writers.
+//   TUI_TX_ABORT fires on SYS_CONSOLE_ABORT_TX.  Records the console_id,
+//   the calling pid, and the count of cells the shadow held.
+//   INPUT_MOUSE_DROPPED fires when the PS/2 mouse ISR can't post an event
+//   (input ring full).  Throttled at the caller (drop counter aggregated).
+void audit_write_tui_tx_abort(int32_t pid, uint32_t console_id,
+                              uint32_t cells_dropped);
+void audit_write_input_mouse_dropped(int32_t pid, uint32_t console_id,
+                                     uint64_t total_dropped);

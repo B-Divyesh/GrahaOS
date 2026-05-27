@@ -151,6 +151,12 @@ typedef long ssize_t;
 #define SYS_CONSOLE_GFX_MAP_FB      1117
 #define SYS_CONSOLE_VSYNC_WAIT      1118
 
+// Phase 29 Session E — sprite animation + cell-grid atomic TX.
+#define SYS_CONSOLE_SPRITE_ANIMATE  1119
+#define SYS_CONSOLE_BEGIN_TX        1120
+#define SYS_CONSOLE_COMMIT_TX       1121
+#define SYS_CONSOLE_ABORT_TX        1122
+
 // Phase 24 W19: COW snapshot subsystem (slots reconciled to 1093-1096
 // because spec's original 1086-1089 collide with SPAWN_EX..MMIO_VMO_CREATE).
 #define SYS_SNAP_CREATE       1093
@@ -331,6 +337,13 @@ typedef struct {
 #define DEBUG_DIRTY_RECT_GET_COUNTS         87
 #define DEBUG_DIRTY_RECT_RESET              88
 #define DEBUG_CONSOLE_READ_CELL             89
+// Phase 29 Session E — animation + mouse + cell-grid TX test substrate.
+#define DEBUG_ANIM_TICK                     90
+#define DEBUG_ANIM_GET_FRAME                91
+#define DEBUG_ANIM_GET_STATE                92
+#define DEBUG_INJECT_MOUSE                  93
+#define DEBUG_FB_READ_PIXEL_AT              94
+#define DEBUG_MOUSE_CURSOR_VISIBLE          95
 #define DEBUG_FB_READ_PIXEL    61
 #define DEBUG_SET_WALL       51
 
@@ -1783,6 +1796,150 @@ static inline long syscall_console_attach_full(uint32_t console_id,
                    "S"(cap_token_raw),
                    "d"((uint64_t)out_cell_token),
                    "r"(r10)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// =====================================================================
+// Phase 29 Session E — sprite animation, cell-grid atomic TX, mouse.
+// =====================================================================
+
+// SYS_CONSOLE_SPRITE_ANIMATE (1119).
+//   RDI = console_id, RSI = sprite_id,
+//   RDX = const tui_cell_t *keyframes,
+//   R10 = n_frames, R8 = duration_ms_per_frame.
+static inline long syscall_console_sprite_animate(uint32_t console_id,
+                                                  uint32_t sprite_id,
+                                                  const void *keyframes,
+                                                  uint16_t n_frames,
+                                                  uint32_t duration_ms) {
+    long ret;
+    register uint64_t r10 asm("r10") = (uint64_t)n_frames;
+    register uint64_t r8  asm("r8")  = (uint64_t)duration_ms;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_SPRITE_ANIMATE),
+                   "D"((uint64_t)console_id),
+                   "S"((uint64_t)sprite_id),
+                   "d"((uint64_t)keyframes),
+                   "r"(r10), "r"(r8)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// SYS_CONSOLE_BEGIN_TX (1120).
+static inline long syscall_console_begin_tx(uint32_t console_id) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_BEGIN_TX), "D"((uint64_t)console_id)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// SYS_CONSOLE_COMMIT_TX (1121).
+static inline long syscall_console_commit_tx(uint32_t tx_handle) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_COMMIT_TX), "D"((uint64_t)tx_handle)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// SYS_CONSOLE_ABORT_TX (1122).
+static inline long syscall_console_abort_tx(uint32_t tx_handle) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_ABORT_TX), "D"((uint64_t)tx_handle)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Test-only Session E DEBUG wrappers.
+static inline long syscall_debug_anim_tick(uint32_t console_id) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_ANIM_TICK),
+                   "S"((uint64_t)console_id)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_debug_anim_get_frame(uint32_t console_id,
+                                                uint32_t slot) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_ANIM_GET_FRAME),
+                   "S"((uint64_t)console_id),
+                   "d"((uint64_t)slot)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_debug_anim_get_state(uint32_t console_id,
+                                                uint32_t slot) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_ANIM_GET_STATE),
+                   "S"((uint64_t)console_id),
+                   "d"((uint64_t)slot)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Inject a synthetic mouse event.  Packed:
+//   bits 0..7   kind  (1=button, 2=motion)
+//   bits 8..15  action(0=press, 1=release)
+//   bits 16..31 dx (int16)
+//   bits 32..47 dy (int16)
+//   bits 48..55 button (0=left,1=right,2=middle)
+static inline long syscall_debug_inject_mouse(uint8_t kind, uint8_t action,
+                                              int16_t dx, int16_t dy,
+                                              uint8_t button) {
+    uint64_t packed =
+        ((uint64_t)kind        & 0xFFu) |
+        (((uint64_t)action     & 0xFFu) << 8) |
+        (((uint64_t)(uint16_t)dx & 0xFFFFu) << 16) |
+        (((uint64_t)(uint16_t)dy & 0xFFFFu) << 32) |
+        (((uint64_t)button     & 0xFFu) << 48);
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_INJECT_MOUSE),
+                   "S"(packed)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_debug_mouse_cursor_visible(uint32_t console_id) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_MOUSE_CURSOR_VISIBLE),
+                   "S"((uint64_t)console_id)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_debug_fb_read_pixel_at(uint32_t x, uint32_t y) {
+    uint64_t packed = ((uint64_t)x & 0xFFFFFFFFu) |
+                      (((uint64_t)y & 0xFFFFFFFFu) << 32);
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_FB_READ_PIXEL_AT),
+                   "S"(packed)
                  : "rcx", "r11", "memory");
     return ret;
 }

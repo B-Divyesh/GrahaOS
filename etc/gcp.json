@@ -202,6 +202,34 @@
       "pledge": ["ipc_recv"],
       "caps": [],
       "description": "Phase 29 Session D: block until the next 60 Hz tick or max_wait_ns expires.  RDI = uint64_t max_wait_ns (0 = wait indefinitely).  Calibrated against g_tsc_hz (Phase 24a sub-phase H.1 substrate).  Returns 0 on tick, -ETIME on timeout.  Pledge: IPC_RECV.  Used by fbd's render loop for vsync pacing without burning CPU."
+    },
+
+    "SYS_CONSOLE_SPRITE_ANIMATE": {
+      "number": 1119,
+      "pledge": ["sys_control"],
+      "caps": [],
+      "description": "Phase 29 Session E: register N keyframes for a sprite slot; the kernel scheduler steps cur_frame on each timer tick.  RDI=console_id, RSI=sprite_id, RDX=keyframes user ptr, R10=n_frames (1..64), R8=duration_ms_per_frame.  Returns animation slot >=0 or negative -errno.  Auto-commits when cur_frame reaches n_frames."
+    },
+
+    "SYS_CONSOLE_BEGIN_TX": {
+      "number": 1120,
+      "pledge": ["sys_control"],
+      "caps": [],
+      "description": "Phase 29 Session E: atomic cell-grid transaction.  Snapshot the console's cell-VMO via COW; userspace writes go to the shadow.  RDI=console_id.  Returns tx_handle (>=1) or -EBUSY/-ENOMEM/-EINVAL."
+    },
+
+    "SYS_CONSOLE_COMMIT_TX": {
+      "number": 1121,
+      "pledge": ["sys_control"],
+      "caps": [],
+      "description": "Phase 29 Session E: atomic pointer swap — promote the shadow as the new live cell-VMO; free the saved original pages.  RDI=tx_handle.  Returns 0 on success, -EINVAL on bad handle, -EPERM if caller is not owner."
+    },
+
+    "SYS_CONSOLE_ABORT_TX": {
+      "number": 1122,
+      "pledge": ["sys_control"],
+      "caps": [],
+      "description": "Phase 29 Session E: drop the shadow; restore live cell-VMO from the saved original pages.  RDI=tx_handle.  Emits AUDIT_TUI_TX_ABORT (code 59).  Returns 0 on success, -EINVAL on bad handle, -EPERM if not owner."
     }
   },
 
@@ -215,12 +243,14 @@
   },
 
   "audit_events": {
-    "_note": "Phase 22 closeout: catalog of audit event ids (kernel/audit.h). Phase 22 added DEPRECATED_SYSCALL=17, CHAN_NAME_PUBLISH=39, CHAN_NAME_CONNECT=40. Phase 29 Session D added GFX_FB_MAPPED=57, TUI_INPUT_OVERFLOW=58 (codes 55+56 reserved for Session B TLS).",
+    "_note": "Phase 22 closeout: catalog of audit event ids (kernel/audit.h). Phase 22 added DEPRECATED_SYSCALL=17, CHAN_NAME_PUBLISH=39, CHAN_NAME_CONNECT=40. Phase 29 Session D added GFX_FB_MAPPED=57, TUI_INPUT_OVERFLOW=58 (codes 55+56 reserved for Session B TLS).  Session E added TUI_TX_ABORT=59, INPUT_MOUSE_DROPPED=60.",
     "AUDIT_DEPRECATED_SYSCALL":    17,
     "AUDIT_CHAN_NAME_PUBLISH":     39,
     "AUDIT_CHAN_NAME_CONNECT":     40,
     "AUDIT_GFX_FB_MAPPED":         57,
-    "AUDIT_TUI_INPUT_OVERFLOW":    58
+    "AUDIT_TUI_INPUT_OVERFLOW":    58,
+    "AUDIT_TUI_TX_ABORT":          59,
+    "AUDIT_INPUT_MOUSE_DROPPED":   60
   },
 
   "phase22_libnet_msg_ops": {

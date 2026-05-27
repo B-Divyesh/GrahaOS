@@ -28,7 +28,7 @@ LDFLAGS := -T linker.ld -nostdlib -static --build-id=none
 LIBC := ../libc/libc.a
 
 # Build all user programs
-PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot txnctl assertpledge wasm fbd/fbd wasmd/wasmd wasmd/wasmd_worker tui_demo tui_anim gsh
+PROGRAMS := grahai gash libctest sbrk_test printf_test spawntest cantest metatest eventtest nettest httptest dnstest aitest fdtest pipetest simtest clustertest ktest klog memstat caps auditq can-ctl fsversions ulimit mallocbomb schedbench schedbench_worker init drvctl drivers/e1000d drivers/ahcid blkctl netd ifconfig ping snapshot txnctl assertpledge wasm fbd/fbd wasmd/wasmd wasmd/wasmd_worker tui_demo tui_anim tui_demo_full gsh
 
 # Phase 12: TAP 1.4 test binaries. Each lives at user/tests/NAME.c
 # and is copied to initrd as /bin/tests/NAME.tap by the top-level
@@ -90,6 +90,10 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/fb_mmio_map \
              tests/vsync_wait \
              tests/dirty_rect \
+             tests/sprite_anim \
+             tests/cell_grid_atomic \
+             tests/mouse_basic \
+             tests/font_full_sweep \
              tests/gash_txn_commit \
              tests/gash_txn_abort \
              tests/gash_txn_abort_fs_revert \
@@ -271,6 +275,15 @@ tui_demo: tui_demo.o $(LIBTUI) $(LIBC)
 tui_anim: tui_anim.o $(LIBTUI) $(LIBC)
 	@echo "Linking user program: $@ (with libtui + libc)"
 	@$(LD) $(LDFLAGS) -o $@ tui_anim.o $(LIBTUI) $(LIBC)
+
+# Phase 29 Session E: tui_demo_full demonstrates animation, atomic TX, mouse.
+tui_demo_full: tui_demo_full.o $(LIBTUI) $(LIBC)
+	@echo "Linking user program: $@ (with libtui + libc)"
+	@$(LD) $(LDFLAGS) -o $@ tui_demo_full.o $(LIBTUI) $(LIBC)
+
+# Phase 29 Session E gate tests — sprite_anim + cell_grid_atomic +
+# mouse_basic + font_full_sweep.  No libtui link needed (they use syscall
+# wrappers directly).
 
 # Phase 27 Stage B1: console_sprite.tap links libtui (for TUI_SPRITE_BASE).
 tests/console_sprite: tests/console_sprite.o $(LIBTUI) $(LIBTAP) $(LIBC)

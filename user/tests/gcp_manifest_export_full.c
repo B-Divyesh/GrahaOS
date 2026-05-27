@@ -16,12 +16,13 @@
 extern int printf(const char *fmt, ...);
 
 // Mirror of kernel/manifest_blob.c constants.  Verified by asserts 2+3.
-// Updated 2026-05-28 (Phase 29 Session D): SYS_CONSOLE_{READ_INPUT,GFX_MAP_FB,
-// VSYNC_WAIT} added at slots 1116-1118 + AUDIT_GFX_FB_MAPPED/TUI_INPUT_OVERFLOW
-// (57/58), bumping blob bytes -> 17617 and FNV-1a -> 0xd5dbdf0fc8ec4239.
-// Test fails by design if gcp.json changes without the mirror being updated.
-#define EXPECTED_BLOB_SIZE   17617u
-#define EXPECTED_GENERATION  0xd5dbdf0fc8ec4239ull
+// Updated 2026-05-28 (Phase 29 Session E): SYS_CONSOLE_{SPRITE_ANIMATE,
+// BEGIN_TX,COMMIT_TX,ABORT_TX} at slots 1119-1122 +
+// AUDIT_TUI_TX_ABORT/INPUT_MOUSE_DROPPED (59/60), bumping blob bytes ->
+// 19231 and FNV-1a -> 0xa51d0bd125c77ae5.  Test fails by design if
+// gcp.json changes without the mirror being updated.
+#define EXPECTED_BLOB_SIZE   19231u
+#define EXPECTED_GENERATION  0xa51d0bd125c77ae5ull
 
 static uint8_t s_buf[32768];
 

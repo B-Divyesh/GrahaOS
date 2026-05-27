@@ -445,6 +445,41 @@
 // Returns 0 on tick, -ETIME on timeout.  Pledge: IPC_RECV.
 #define SYS_CONSOLE_VSYNC_WAIT     1118
 
+// Phase 29 Session E — sprite animation + cell-grid atomic TX (slots
+// 1119-1122).
+//
+// SYS_CONSOLE_SPRITE_ANIMATE — register N keyframes for a sprite + total
+// duration; the kernel's 60Hz timer steps frame.  Auto-commits at end.
+//   RDI = uint32_t console_id
+//   RSI = uint32_t sprite_id  (target sprite slot in the console's registry)
+//   RDX = const tui_cell_t *keyframes (user ptr to array of n_frames cells)
+//   R10 = uint16_t n_frames   (1..64)
+//   R8  = uint32_t duration_ms_per_frame (1..60000)
+// Returns animation slot (>= 0) on success, or -EINVAL / -ENOMEM / -EPERM.
+// Pledge: SYS_CONTROL.
+#define SYS_CONSOLE_SPRITE_ANIMATE 1119
+
+// SYS_CONSOLE_BEGIN_TX — snapshot the console's cell-VMO via COW; future
+// userspace writes to the mapped cell-VMO go to the shadow page.  Atomic
+// flip on commit.
+//   RDI = uint32_t console_id
+// Returns tx_handle (>=1) on success, or -EBUSY (a TX already active on
+// this console for this caller) / -ENOMEM / -EINVAL / -EPERM.
+// Pledge: SYS_CONTROL.
+#define SYS_CONSOLE_BEGIN_TX       1120
+
+// SYS_CONSOLE_COMMIT_TX — atomic pointer swap, replace live cell-VMO with
+// the shadow.  Old live is freed.  TX handle is consumed.
+//   RDI = uint32_t tx_handle
+// Returns 0 on success, -EINVAL on bad handle.  Pledge: SYS_CONTROL.
+#define SYS_CONSOLE_COMMIT_TX      1121
+
+// SYS_CONSOLE_ABORT_TX — drop the shadow + restore userspace mapping to
+// live cell-VMO.  Emits AUDIT_TUI_TX_ABORT (code 59).
+//   RDI = uint32_t tx_handle
+// Returns 0 on success, -EINVAL on bad handle.  Pledge: SYS_CONTROL.
+#define SYS_CONSOLE_ABORT_TX       1122
+
 // Resource identifiers for SYS_SETRLIMIT / SYS_GETRLIMIT.
 #define RLIMIT_MEM            1     // pages (4 KiB each); 0 = unlimited
 #define RLIMIT_CPU            2     // ns per 1-second epoch (max 1_000_000_000); 0 = unlimited
@@ -567,6 +602,27 @@
 #define DEBUG_DIRTY_RECT_GET_COUNTS         87
 #define DEBUG_DIRTY_RECT_RESET              88
 #define DEBUG_CONSOLE_READ_CELL             89
+// Phase 29 Session E — TUI animation + mouse + cell-grid TX test substrate.
+//   ANIM_TICK (90):  RSI = uint32_t console_id.  Force-ticks the animation
+//     scheduler for that console once (advances any active animation by 1
+//     frame, ignoring real-time delta).  Returns 0.
+//   ANIM_GET_FRAME (91): RSI = uint32_t console_id, RDX = uint32_t anim_slot.
+//     Returns cur_frame OR -1 if slot not active.
+//   ANIM_GET_STATE (92): RSI = uint32_t console_id, RDX = uint32_t anim_slot.
+//     Returns animation state (0=idle/1=running/2=committed/3=aborted), or -1.
+//   INJECT_MOUSE (93): RSI = uint64_t packed{kind:8|action:8|dx:16|dy:16|btn:8|_:8},
+//     synthesises a mouse event onto the selected console's input ring.
+//     Returns 0.
+//   FB_READ_PIXEL_AT (94): RSI = uint64_t packed{x:32|y:32}.  Returns raw
+//     framebuffer pixel; used by font_full_sweep.tap.
+//   MOUSE_CURSOR_VISIBLE (95): RSI = uint32_t console_id.  Returns 1 if
+//     mouse cursor sprite is currently visible on that console, 0 else.
+#define DEBUG_ANIM_TICK                     90
+#define DEBUG_ANIM_GET_FRAME                91
+#define DEBUG_ANIM_GET_STATE                92
+#define DEBUG_INJECT_MOUSE                  93
+#define DEBUG_FB_READ_PIXEL_AT              94
+#define DEBUG_MOUSE_CURSOR_VISIBLE          95
 
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);

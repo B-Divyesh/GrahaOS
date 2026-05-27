@@ -463,10 +463,15 @@ void kmain(void) {
     // and one channel per console).
     {
         extern void console_init(uint32_t fb_width_px, uint32_t fb_height_px);
+        extern void console_animation_init(void);
+        extern void console_mouse_init(void);
         extern uint32_t framebuffer_get_width(void);
         extern uint32_t framebuffer_get_height(void);
         klog(KLOG_INFO, SUBSYS_CORE, "Phase 27 Block A: console_init...");
         console_init(framebuffer_get_width(), framebuffer_get_height());
+        // Phase 29 Session E: sprite animation + PS/2 mouse.
+        console_animation_init();
+        console_mouse_init();
         framebuffer_draw_string("Phase 27 A Consoles Ready.", 50, y_pos, COLOR_GREEN, 0x00101828);
         y_pos += 20;
     }

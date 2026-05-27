@@ -576,6 +576,11 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@cp user/tests/fb_mmio_map              initrd_root/bin/tests/fb_mmio_map.tap
 	@cp user/tests/vsync_wait               initrd_root/bin/tests/vsync_wait.tap
 	@cp user/tests/dirty_rect               initrd_root/bin/tests/dirty_rect.tap
+	@# Phase 29 Session E: animation + cell-grid TX + mouse + full Unicode font.
+	@cp user/tests/sprite_anim              initrd_root/bin/tests/sprite_anim.tap
+	@cp user/tests/cell_grid_atomic         initrd_root/bin/tests/cell_grid_atomic.tap
+	@cp user/tests/mouse_basic              initrd_root/bin/tests/mouse_basic.tap
+	@cp user/tests/font_full_sweep          initrd_root/bin/tests/font_full_sweep.tap
 	@# Phase 26 closeout (FU25.A.2): gash txn{} parser integration tests.
 	@cp user/tests/gash_txn_commit         initrd_root/bin/tests/gash_txn_commit.tap
 	@cp user/tests/gash_txn_abort          initrd_root/bin/tests/gash_txn_abort.tap
@@ -926,6 +931,13 @@ endif
 	@echo "fb_mmio_map"              >> initrd_root/bin/tests/manifest.txt
 	@echo "vsync_wait"               >> initrd_root/bin/tests/manifest.txt
 	@echo "dirty_rect"               >> initrd_root/bin/tests/manifest.txt
+	@# Phase 29 Session E: sprite animation + cell-grid atomic TX + mouse
+	@# + full Unicode font sweep.  sprite_anim (5) + cell_grid_atomic (6)
+	@# + mouse_basic (4) + font_full_sweep (4) = +19 asserts.
+	@echo "sprite_anim"              >> initrd_root/bin/tests/manifest.txt
+	@echo "cell_grid_atomic"         >> initrd_root/bin/tests/manifest.txt
+	@echo "mouse_basic"              >> initrd_root/bin/tests/manifest.txt
+	@echo "font_full_sweep"          >> initrd_root/bin/tests/manifest.txt
 	@# Pre-Phase-28 sweep A.5 (resolves FU25.A.4): gash_txn_commit + gash_txn_abort
 	@# promoted to gate. Previously held back due to FU24.B/C wait/exit race
 	@# (intermittent INCOMPLETE on ~33-50% of TCG iters when ktest's syscall_wait

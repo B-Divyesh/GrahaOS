@@ -340,3 +340,48 @@ int tui_map_framebuffer(void **out_addr, struct fb_dims_u *out_dims) {
     *out_addr = (void *)(uintptr_t)va;
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 29 Session E.
+// ---------------------------------------------------------------------------
+
+int tui_sprite_animate(uint32_t console_id, uint32_t sprite_id,
+                       const void *keyframes, uint16_t n_frames,
+                       uint32_t duration_ms_per_frame,
+                       uint8_t interp_mode) {
+    (void)interp_mode;  // v1 STEP-only
+    return (int)syscall_console_sprite_animate(console_id, sprite_id,
+                                               keyframes, n_frames,
+                                               duration_ms_per_frame);
+}
+
+int tui_begin_tx(uint32_t console_id) {
+    return (int)syscall_console_begin_tx(console_id);
+}
+
+int tui_commit_tx(uint32_t tx_handle) {
+    return (int)syscall_console_commit_tx(tx_handle);
+}
+
+int tui_abort_tx(uint32_t tx_handle) {
+    return (int)syscall_console_abort_tx(tx_handle);
+}
+
+long tui_read_mouse(uint32_t console_id, struct input_event_u *out,
+                    uint32_t max_events) {
+    if (!out || max_events == 0) return -1;
+    // Drain into a local bounce; filter by kind on the way out.
+    input_event_u_t bounce[64];
+    if (max_events > 64) max_events = 64;
+    long rc = syscall_console_read_input(console_id, bounce, max_events);
+    if (rc < 0) return rc;
+    long count = rc & 0x3FFFFFFFFFFFFFFFLL;  // mask off the MORE flag
+    long out_n = 0;
+    input_event_u_t *uout = (input_event_u_t *)out;
+    for (long i = 0; i < count; i++) {
+        if (bounce[i].kind == 1 || bounce[i].kind == 2) {
+            uout[out_n++] = bounce[i];
+        }
+    }
+    return out_n;
+}

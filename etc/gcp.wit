@@ -154,6 +154,10 @@ interface sys-control {
   snap-restore: func(args: list<u64>) -> result<u64, sys-control-error>;
   snap-delete: func(args: list<u64>) -> result<u64, sys-control-error>;
   console-gfx-map-fb: func(args: list<u64>) -> result<u64, sys-control-error>;
+  console-sprite-animate: func(args: list<u64>) -> result<u64, sys-control-error>;
+  console-begin-tx: func(args: list<u64>) -> result<u64, sys-control-error>;
+  console-commit-tx: func(args: list<u64>) -> result<u64, sys-control-error>;
+  console-abort-tx: func(args: list<u64>) -> result<u64, sys-control-error>;
 }
 
 interface net-server {

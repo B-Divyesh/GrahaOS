@@ -136,3 +136,37 @@ int tui_vsync_wait(uint64_t max_wait_ns);
 // size_bytes) to *out_dims.  Returns 0 on success; -EPERM if not the FB
 // owner.  fbd-only path.
 int tui_map_framebuffer(void **out_addr, struct fb_dims_u *out_dims);
+
+// ---------------------------------------------------------------------------
+// Phase 29 Session E — sprite animation, cell-grid atomic TX, mouse.
+// ---------------------------------------------------------------------------
+
+// Register N keyframes for a sprite slot in `console_id`.  The kernel
+// scheduler advances cur_frame on its 60Hz timer; auto-commits at end.
+// `keyframes` is an array of `n_frames` 16-byte cells; each is interpreted
+// as both a tui_cell_t AND as an 8x16 sprite bitmap (so callers can use the
+// same memory representation for both kinds of animation).
+// `interp_mode` must be 0 (STEP) for v1.
+// Returns animation slot id (>=0) or negative -errno.
+int tui_sprite_animate(uint32_t console_id, uint32_t sprite_id,
+                       const void *keyframes, uint16_t n_frames,
+                       uint32_t duration_ms_per_frame,
+                       uint8_t interp_mode);
+
+// Begin a cell-grid atomic transaction on `console_id`.  Subsequent writes
+// to the mapped cell-VMO (and via DEBUG_CONSOLE_WRITE_CELL through
+// cell_vmo->pages[]) go to the shadow page set; commit promotes shadow,
+// abort discards it.  Returns tx_handle (>=1) or negative -errno.
+int tui_begin_tx(uint32_t console_id);
+
+// Commit a previously-begun TX.  After commit the handle is invalid.
+int tui_commit_tx(uint32_t tx_handle);
+
+// Abort a previously-begun TX.  Emits AUDIT_TUI_TX_ABORT.
+int tui_abort_tx(uint32_t tx_handle);
+
+// Drain mouse-kind events from the input ring.  Same semantics as
+// tui_read_input but post-filters for kind==1 (button) or kind==2
+// (motion).  Returns count copied.
+long tui_read_mouse(uint32_t console_id, struct input_event_u *out,
+                    uint32_t max_events);
