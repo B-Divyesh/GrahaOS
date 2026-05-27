@@ -2121,6 +2121,14 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = (uint64_t)debug_inject_reset_all();
                 break;
             }
+            // Phase 29 Session C (FU25.H): caller's handle-table count.
+            // Used by spawn_handles_inherit.tap to verify handles_to_inherit
+            // actually added entries to the child's table.
+            case DEBUG_HANDLE_COUNT: {
+                task_t *cur_hc = sched_get_current_task();
+                frame->rax = cur_hc ? (uint64_t)cur_hc->cap_handles.count : 0;
+                break;
+            }
             default:
                 frame->rax = (uint64_t)-1;
                 break;
@@ -3293,10 +3301,15 @@ void syscall_dispatcher(struct syscall_frame *frame) {
         }
 
         // Phase 20 U15: SYS_SPAWN_EX — spawn with optional rlimit overrides.
+        // Phase 29 Session C (FU25.H) — extended with handles_to_inherit[16].
         // attrs == NULL is equivalent to SYS_SPAWN. When
         // SPAWN_ATTR_HAS_RLIMIT is set in attrs.flags, the caller must hold
         // PLEDGE_SYS_CONTROL; the child's mem/cpu/io limits are overwritten
         // after inheritance but before the child is placed on the runq.
+        // When SPAWN_ATTR_HAS_HANDLES is set, the kernel walks the listed
+        // handle indices in the caller's table and cap_handle_insert each
+        // into the child's table (in addition to the existing capability
+        // inheritance via CAP_FLAG_INHERITABLE).
         case SYS_SPAWN_EX: {
             if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SPAWN,
                                         "pledge denied: spawn (ex)")) break;
@@ -3308,17 +3321,25 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             }
 
             // Snapshot attrs (if any) into a kernel-local buffer to avoid
-            // TOCTOU on post-spawn fields. MVP trusts the user ptr (same as
-            // every other syscall pre-Phase-20).
+            // TOCTOU on post-spawn fields.  Layout matches user-side
+            // spawn_rlimits_t in user/syscalls.h: flags + pad + 3 rlimit
+            // fields + handles_to_inherit[16] (cap_token_t raws) +
+            // n_handles_to_inherit.
             struct {
                 uint32_t flags;
                 uint32_t _pad;
                 uint64_t mem_pages;
                 uint64_t cpu_ns;
                 uint64_t io_bps;
+                uint64_t handles_to_inherit[16];
+                uint32_t n_handles_to_inherit;
             } attrs_snap = {0};
             const void *attrs_user = (const void *)frame->rsi;
             if (attrs_user) {
+                if (!is_user_pointer(attrs_user, sizeof(attrs_snap))) {
+                    frame->rax = (uint64_t)(int64_t)-14;  // -EFAULT
+                    break;
+                }
                 const uint8_t *src = (const uint8_t *)attrs_user;
                 uint8_t *dst = (uint8_t *)&attrs_snap;
                 for (size_t i = 0; i < sizeof(attrs_snap); i++) dst[i] = src[i];
@@ -3332,6 +3353,40 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
                     "pledge denied: sys_control (spawn_ex rlimit)")) {
                     // pledge_check_and_audit already populated frame->rax
+                    break;
+                }
+            }
+
+            // Phase 29 Session C (FU25.H): pre-validate handle tokens BEFORE
+            // spawn so we don't leave a child running with an incomplete
+            // handle transfer.  Each handles_to_inherit[i] is a cap_token_t
+            // raw value (returned from SYS_VMO_CREATE etc).  Resolve to
+            // object_idx + flags now; cap_handle_insert into the child's
+            // table happens AFTER sched_spawn_process succeeds.
+            uint32_t resolved_obj_idx[16] = {0};
+            uint8_t  resolved_flags[16] = {0};
+            uint32_t resolved_n = 0;
+            if (attrs_user && (attrs_snap.flags & SPAWN_ATTR_HAS_HANDLES)) {
+                if (!caller) {
+                    frame->rax = (uint64_t)(int64_t)-22;  // -EINVAL
+                    break;
+                }
+                if (attrs_snap.n_handles_to_inherit > 16) {
+                    frame->rax = (uint64_t)(int64_t)-22;  // -EINVAL
+                    break;
+                }
+                bool resolve_ok = true;
+                for (uint32_t i = 0; i < attrs_snap.n_handles_to_inherit; i++) {
+                    cap_token_t tok = { .raw = attrs_snap.handles_to_inherit[i] };
+                    cap_object_t *obj = cap_token_resolve(caller->id, tok, 0);
+                    if (!obj) { resolve_ok = false; break; }
+                    /* Get the object's index from the token's idx field. */
+                    resolved_obj_idx[i] = cap_token_idx(tok);
+                    resolved_flags[i]   = cap_token_flags(tok);
+                    resolved_n++;
+                }
+                if (!resolve_ok) {
+                    frame->rax = (uint64_t)(int64_t)-22;  // -EINVAL
                     break;
                 }
             }
@@ -3352,6 +3407,98 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                     (void)rlimit_set(child, RLIMIT_RES_CPU, attrs_snap.cpu_ns);
                     (void)rlimit_set(child, RLIMIT_RES_IO,  attrs_snap.io_bps);
                 }
+            }
+
+            // Phase 29 Session C (FU25.H): transfer pre-resolved handles
+            // into the child's table.  Best-effort — a failed insert is
+            // logged but does NOT roll back the spawn (the child is live;
+            // the worst case is a missing handle the child can detect).
+            if (resolved_n > 0) {
+                task_t *child = pid_hash_lookup(pid);
+                if (child) {
+                    cap_handle_table_t *cct = &child->cap_handles;
+                    for (uint32_t i = 0; i < resolved_n; i++) {
+                        uint32_t new_slot;
+                        (void)cap_handle_insert(cct, resolved_obj_idx[i],
+                                                resolved_flags[i], &new_slot);
+                    }
+                }
+            }
+
+            audit_write_spawn(caller ? caller->id : -1, pid, path_kernel);
+            frame->rax = (uint64_t)(int64_t)pid;
+            break;
+        }
+
+        // Phase 29 Session C (FU28.B): SYS_SPAWN_ARGV — spawn AND pass argv.
+        // Existing SYS_SPAWN/SYS_SPAWN_EX leave argc=0 at the child's _start;
+        // this variant copies path + argv[0..argc-1] into kernel scratch
+        // buffers, spawns the child, then writes argv into the child's top
+        // user-stack page and seeds regs.rdi=argc, regs.rsi=argv_user_va,
+        // regs.rsp adjusted below the argv data.
+        case SYS_SPAWN_ARGV: {
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SPAWN,
+                                        "pledge denied: spawn (argv)")) break;
+            const char *path_user = (const char *)frame->rdi;
+            char path_kernel[256];
+            if (copy_string_from_user(path_user, path_kernel, sizeof(path_kernel)) <= 0) {
+                frame->rax = (uint64_t)(int64_t)-14;  // -EFAULT
+                break;
+            }
+            char *const *argv_user = (char *const *)frame->rsi;
+            uint32_t argc = (uint32_t)frame->rdx;
+            if (argc > 16) {
+                frame->rax = (uint64_t)(int64_t)-7;   // -E2BIG
+                break;
+            }
+
+            /* Copy argv into kernel-local scratch.  Packed NUL-terminated
+             * strings + per-arg lengths.  Total ≤ 3 KiB so it fits in
+             * one stack page alongside the pointer array. */
+            static char     argv_kbuf[3072];
+            static uint16_t argv_klens[16];
+            uint32_t argv_kused = 0;
+            if (argc > 0) {
+                if (!is_user_pointer(argv_user, argc * sizeof(char *))) {
+                    frame->rax = (uint64_t)(int64_t)-14;  // -EFAULT
+                    break;
+                }
+                bool argv_ok = true;
+                for (uint32_t i = 0; i < argc; i++) {
+                    const char *arg_user_ptr = argv_user[i];
+                    if (!arg_user_ptr) { argv_ok = false; break; }
+                    /* copy_string_from_user copies up to N-1 + NUL.  We want
+                     * the actual length, so use a temp buffer + measure. */
+                    char tmp[256];
+                    int n = copy_string_from_user(arg_user_ptr, tmp, sizeof(tmp));
+                    if (n <= 0) { argv_ok = false; break; }
+                    /* n includes the NUL terminator. */
+                    uint32_t slen = (uint32_t)n - 1;
+                    if (argv_kused + slen + 1 > sizeof(argv_kbuf)) {
+                        argv_ok = false;
+                        break;
+                    }
+                    for (uint32_t b = 0; b < slen; b++) {
+                        argv_kbuf[argv_kused + b] = tmp[b];
+                    }
+                    argv_kbuf[argv_kused + slen] = 0;
+                    argv_klens[i] = (uint16_t)slen;
+                    argv_kused += slen + 1;
+                }
+                if (!argv_ok) {
+                    frame->rax = (uint64_t)(int64_t)-14;  // -EFAULT
+                    break;
+                }
+            }
+
+            task_t *caller = sched_get_current_task();
+            int pid = sched_spawn_process_argv(path_kernel,
+                                               caller ? caller->id : -1,
+                                               (int)argc, argv_kbuf,
+                                               argv_klens, argv_kused);
+            if (pid < 0) {
+                frame->rax = (uint64_t)(int64_t)pid;
+                break;
             }
 
             audit_write_spawn(caller ? caller->id : -1, pid, path_kernel);

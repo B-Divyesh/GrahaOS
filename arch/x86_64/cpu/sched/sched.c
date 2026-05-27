@@ -1307,6 +1307,131 @@ int sched_spawn_process(const char *path, int parent_id) {
     return pid;
 }
 
+// Phase 29 Session C (FU28.B): spawn AND seed argv on child's user stack.
+//
+// Layout written into the child's TOP user-stack page.  argv strings +
+// pointer array live at the TOP of the page; RSP starts BELOW them so the
+// child's stack growth (prologue pushes, locals) doesn't clobber argv.
+//
+//   user_stack_top (0x7FFFFFFFF000)              <-- top of stack
+//     [ argv strings, NUL-terminated, packed ]
+//     [ pad to 8-byte align ]
+//     [ argv[] array: (argc+1) * 8 bytes  ]      <-- argv_user_va
+//     [ pad to 16-byte align + 8-byte slot ]     <-- regs.rsp = new top
+//     ... rest of stack (free for child) ...
+//   user_stack_base
+//
+// GCC's `_start(int argc, char **argv)` reads argc from RDI and argv from
+// RSI (NOT from [rsp]/[rsp+8] — non-standard divergence from the SysV
+// ELF entry convention; matches user/grahai.c, user/ulimit.c, etc.).
+//
+// We reserve a single page (4 KiB) for argv data; total bytes for strings
+// is bounded to ≤ 3 KiB by the syscall to leave room for the pointer
+// array + alignment + the new stack-top slot.
+int sched_spawn_process_argv(const char *path, int parent_id,
+                             int argc, const char *argv_data,
+                             const uint16_t *argv_lens,
+                             uint32_t total_bytes) {
+    if (argc < 0 || argc > 16) {
+        return -22;  // -EINVAL
+    }
+    if (argc > 0 && (!argv_data || !argv_lens)) {
+        return -22;  // -EINVAL
+    }
+
+    /* Reserve space for: argv[] array of (argc+1) ptrs + argv strings +
+     * alignment + 8-byte SysV slot at the new RSP.  Whole budget must fit
+     * in one 4 KiB page (the top user-stack page; the new RSP sits BELOW
+     * the argv data so the rest of the stack is untouched). */
+    uint32_t array_bytes = (uint32_t)((argc + 1) * 8);
+    /* +24 cushion: 8B align slot at new RSP + up to 16B alignment pad. */
+    if (total_bytes + array_bytes + 24 > 4096) {
+        return -7;   // -E2BIG
+    }
+
+    int pid = sched_spawn_process(path, parent_id);
+    if (pid < 0) {
+        return pid;
+    }
+
+    /* Fast path: argc==0 means "no argv to seed". */
+    if (argc == 0) {
+        return pid;
+    }
+
+    /* Resolve the child's top user-stack page through its CR3 + HHDM. */
+    task_t *child = task_ptrs[pid];
+    if (!child) {
+        return pid;
+    }
+
+    uint64_t user_stack_top = 0x7FFFFFFFF000ULL;
+    uint64_t top_page_vaddr = user_stack_top - 0x1000ULL;
+    uint64_t top_page_phys  = vmm_get_physical_address(child->cr3, top_page_vaddr);
+    if (top_page_phys == 0) {
+        /* Stack page somehow not mapped — keep the child but skip argv. */
+        return pid;
+    }
+    top_page_phys &= ~0xFFFULL;
+    uint8_t *page_kv = (uint8_t *)(top_page_phys + g_hhdm_offset);
+
+    /* All offsets below are PAGE-LOCAL (0..4095).  Strings sit at the
+     * top of the page (highest user-virtual addresses), array sits below
+     * the strings (8-byte aligned), and new RSP sits below the array,
+     * 16-byte aligned + 8 (SysV invariant). */
+    uint32_t strings_end_off   = 0x1000;
+    uint32_t strings_start_off = strings_end_off - total_bytes;
+    /* Round DOWN to 8 so array stays aligned. */
+    uint32_t array_end_off     = strings_start_off & ~7u;
+    uint32_t array_start_off   = array_end_off - array_bytes;
+    /* New RSP: round array_start_off DOWN to 16, then subtract 8 so the
+     * post-`call` SysV invariant (RSP%16==8 at function entry) holds.
+     * In our case there's no `call` — we ENTER _start directly via iretq
+     * — but GCC's `_start` prologue assumes the same alignment so we
+     * keep the invariant matching sched_create_user_process's setup. */
+    uint32_t rsp_off_aligned   = array_start_off & ~15u;
+    uint32_t new_rsp_off       = (rsp_off_aligned >= 8) ? (rsp_off_aligned - 8) : 0;
+    if (new_rsp_off == 0) {
+        /* Should have been caught by the size guard above. */
+        return pid;
+    }
+
+    /* Write the argv strings. argv_data is packed NUL-terminated strings:
+     * "alpha\0beta\0gamma\0".  Copy verbatim into the page. */
+    uint64_t base_top_page_vaddr = top_page_vaddr;
+    uint64_t argv_user_ptrs[17];  /* up to 16 + NULL sentinel */
+    uint32_t data_cursor = 0;
+    for (int i = 0; i < argc; i++) {
+        uint16_t len = argv_lens[i];
+        for (uint16_t b = 0; b < len; b++) {
+            page_kv[strings_start_off + data_cursor + b] =
+                (uint8_t)argv_data[data_cursor + b];
+        }
+        page_kv[strings_start_off + data_cursor + len] = 0;
+        argv_user_ptrs[i] = base_top_page_vaddr + strings_start_off + data_cursor;
+        data_cursor += (uint32_t)len + 1;
+    }
+    argv_user_ptrs[argc] = 0;  /* NULL sentinel */
+
+    /* Write the argv[] array. */
+    for (int i = 0; i <= argc; i++) {
+        uint64_t *slot = (uint64_t *)(page_kv + array_start_off + (uint32_t)i * 8);
+        *slot = argv_user_ptrs[i];
+    }
+
+    /* Seed child registers. */
+    uint64_t argv_user_va = base_top_page_vaddr + array_start_off;
+    uint64_t new_rsp_user = base_top_page_vaddr + new_rsp_off;
+
+    spinlock_acquire(&sched_lock);
+    child->regs.rdi = (uint64_t)argc;
+    child->regs.rsi = argv_user_va;
+    child->regs.rsp = new_rsp_user;
+    spinlock_release(&sched_lock);
+
+    return pid;
+}
+
 // Phase 7d: Send a signal to a process
 int sched_send_signal(int pid, int signal) {
     if (signal < 1 || signal >= MAX_SIGNALS) {

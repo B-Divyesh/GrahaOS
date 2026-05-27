@@ -109,6 +109,7 @@ interface spawn {
   }
 
   spawn-ex: func(args: list<u64>) -> result<u64, spawn-error>;
+  spawn-argv: func(args: list<u64>) -> result<u64, spawn-error>;
 }
 
 interface sys-query {

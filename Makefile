@@ -566,6 +566,10 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@cp user/tests/gcp_manifest_export_full initrd_root/bin/tests/gcp_manifest_export_full.tap
 	@cp user/tests/gsh_completion           initrd_root/bin/tests/gsh_completion.tap
 	@cp user/tests/ai_txn_rollback          initrd_root/bin/tests/ai_txn_rollback.tap
+	@# Phase 29 Session C: kernel ABI polish (FU28.B + FU28.E + FU25.H).
+	@cp user/tests/spawn_argv               initrd_root/bin/tests/spawn_argv.tap
+	@cp user/tests/audit_query_since        initrd_root/bin/tests/audit_query_since.tap
+	@cp user/tests/spawn_handles_inherit    initrd_root/bin/tests/spawn_handles_inherit.tap
 	@# Phase 26 closeout (FU25.A.2): gash txn{} parser integration tests.
 	@cp user/tests/gash_txn_commit         initrd_root/bin/tests/gash_txn_commit.tap
 	@cp user/tests/gash_txn_abort          initrd_root/bin/tests/gash_txn_abort.tap
@@ -903,6 +907,11 @@ endif
 	@echo "gcp_manifest_export_full" >> initrd_root/bin/tests/manifest.txt
 	@echo "gsh_completion"           >> initrd_root/bin/tests/manifest.txt
 	@echo "ai_txn_rollback"          >> initrd_root/bin/tests/manifest.txt
+	@# Phase 29 Session C: kernel ABI polish.  spawn_argv (5) +
+	@# audit_query_since (4) + spawn_handles_inherit (5) = +14 asserts.
+	@echo "spawn_argv"               >> initrd_root/bin/tests/manifest.txt
+	@echo "audit_query_since"        >> initrd_root/bin/tests/manifest.txt
+	@echo "spawn_handles_inherit"    >> initrd_root/bin/tests/manifest.txt
 	@# Pre-Phase-28 sweep A.5 (resolves FU25.A.4): gash_txn_commit + gash_txn_abort
 	@# promoted to gate. Previously held back due to FU24.B/C wait/exit race
 	@# (intermittent INCOMPLETE on ~33-50% of TCG iters when ktest's syscall_wait

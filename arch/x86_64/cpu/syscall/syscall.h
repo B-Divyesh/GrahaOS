@@ -393,6 +393,34 @@
                                          // returns 0 on success / no-active-txn,
                                          // negative on resolution / pin failure.
 
+// Phase 29 Session C (FU28.B): SYS_SPAWN_ARGV — spawn a child AND pass
+// argv. The existing SYS_SPAWN (1017) and SYS_SPAWN_EX (1086) do not
+// propagate argv, so the child's _start sees argc=0 (or, for legacy
+// `_start(void)` binaries, simply ignores RDI/RSI). gsh's `wasm run
+// <file>` and similar tooling need argv to reach the child.
+//
+// ABI (RDI=path, RSI=argv, RDX=argc):
+//   RDI = const char *path             (user ptr, NUL-terminated, max 255 B)
+//   RSI = char *const *argv            (user ptr to array of char* ptrs;
+//                                        no NUL sentinel required — kernel
+//                                        treats argc as authoritative)
+//   RDX = uint32_t argc                (bounded to SYS_SPAWN_ARGV_MAX = 16;
+//                                        argc == 0 is legal and equivalent
+//                                        to SYS_SPAWN)
+//
+// Each argv[i] is copied into a kernel-side scratch buffer (max
+// SYS_SPAWN_ARGV_STRBYTES = 4096 bytes total). The kernel then maps the
+// child's top user-stack page via HHDM, writes a packed layout
+// (argv strings + array of char* pointers in user-virtual coords),
+// and seeds the child's regs.rdi = argc, regs.rsi = argv_user_ptr,
+// regs.rsp = user_stack_top - 8 (preserves the System V alignment
+// invariant SYS_SPAWN already relies on).
+//
+// Pledge: SPAWN (same as SYS_SPAWN).
+// Returns: child pid (>0) on success, or -EFAULT / -EINVAL / -E2BIG /
+//          -ENOMEM / -EPLEDGE.
+#define SYS_SPAWN_ARGV             1115  // RDI = path, RSI = argv, RDX = argc
+
 // Resource identifiers for SYS_SETRLIMIT / SYS_GETRLIMIT.
 #define RLIMIT_MEM            1     // pages (4 KiB each); 0 = unlimited
 #define RLIMIT_CPU            2     // ns per 1-second epoch (max 1_000_000_000); 0 = unlimited
@@ -494,6 +522,11 @@
 #define DEBUG_INJECT_CHAN_SEND_FAIL_RATE    82
 #define DEBUG_INJECT_SPINLOCK_TIMEOUT_RATE  83
 #define DEBUG_INJECT_RESET_ALL              84
+// Phase 29 Session C (FU25.H): expose current task's handle table count
+// so spawn_handles_inherit.tap can verify that handles_to_inherit added
+// the expected number of entries to the child's table.  No args; returns
+// caller's cap_handles.count (uint32 cast to uint64).
+#define DEBUG_HANDLE_COUNT                  85
 
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);

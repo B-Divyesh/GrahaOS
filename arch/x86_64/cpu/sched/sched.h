@@ -121,6 +121,12 @@ typedef struct {
 
 // spawn_attrs_t.flags bits.
 #define SPAWN_ATTR_HAS_RLIMIT  (1u << 0)
+// Phase 29 Session C (FU25.H): when set in attrs.flags, SYS_SPAWN_EX walks
+// attrs.handles_to_inherit[0..n-1] (slot indices in the caller's handle
+// table) and cap_handle_insert each into the child's handle table after
+// the spawn succeeds.  Bounded to spawn_attrs_t.nhandles_to_inherit ≤ 16.
+// Unblocks FU25.C external-peer multi-proc txn tests (Session H).
+#define SPAWN_ATTR_HAS_HANDLES (1u << 1)
 
 // Task structure
 typedef struct task_struct {
@@ -421,6 +427,36 @@ void wake_waiting_parent(int child_id);
  * @return Child PID on success, -1 on failure
  */
 int sched_spawn_process(const char *path, int parent_id);
+
+/**
+ * @brief Phase 29 Session C (FU28.B): spawn AND seed argv on child stack.
+ *
+ * Spawns the binary at `path` like sched_spawn_process, then writes the
+ * argv array + backing strings into the child's top user-stack page (via
+ * HHDM access to the page's physical backing) and patches the child's
+ * regs.rdi = argc, regs.rsi = user-virtual ptr to the argv[] array, and
+ * regs.rsp = user_stack_top - 8 (preserves the SysV alignment invariant
+ * sched_create_user_process enforces).
+ *
+ * GrahaOS uses GCC's calling convention for `_start(int argc, char **argv)`
+ * (argc in RDI, argv in RSI), not the standard SysV ELF entry convention
+ * (argc at [rsp], argv at [rsp+8]). This matches the existing pattern in
+ * user/grahai.c and user/ulimit.c.
+ *
+ * @param path        Path to ELF binary in initrd.
+ * @param parent_id   Parent PID (-1 for kernel-initiated spawn).
+ * @param argc        Number of arguments (bounded 0..16). argc==0 is
+ *                    equivalent to sched_spawn_process.
+ * @param argv_data   Packed argv strings, NUL-separated (kernel-owned).
+ * @param argv_lens   Per-arg length in bytes (excluding NUL terminator).
+ * @param total_bytes Total bytes in argv_data (incl. NULs). Must be ≤ 4 KiB
+ *                    so it fits in one stack page.
+ * @return Child PID on success, negative -errno on failure.
+ */
+int sched_spawn_process_argv(const char *path, int parent_id,
+                             int argc, const char *argv_data,
+                             const uint16_t *argv_lens,
+                             uint32_t total_bytes);
 
 /**
  * @brief Send a signal to a process

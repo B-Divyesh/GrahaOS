@@ -82,6 +82,9 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/gcp_manifest_export_full \
              tests/gsh_completion \
              tests/ai_txn_rollback \
+             tests/spawn_argv \
+             tests/audit_query_since \
+             tests/spawn_handles_inherit \
              tests/gash_txn_commit \
              tests/gash_txn_abort \
              tests/gash_txn_abort_fs_revert \

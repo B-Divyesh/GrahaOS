@@ -143,6 +143,9 @@ typedef long ssize_t;
 // Pre-Phase-28 sweep C.1 (FU25.A.3 substrate): expose grahafs_pin_version.
 #define SYS_GRAHAFS_PIN_VERSION     1113
 #define SYS_TXN_PIN_PATH            1114
+// Phase 29 Session C (FU28.B): SYS_SPAWN_ARGV — spawn child AND pass argv.
+// RDI = path, RSI = char *const *argv, RDX = uint32_t argc (≤ 16).
+#define SYS_SPAWN_ARGV              1115
 
 // Phase 24 W19: COW snapshot subsystem (slots reconciled to 1093-1096
 // because spec's original 1086-1089 collide with SPAWN_EX..MMIO_VMO_CREATE).
@@ -216,18 +219,31 @@ typedef struct {
     uint64_t timestamp_tsc;
 } drv_irq_msg_t;
 
-#define SPAWN_ATTR_HAS_RLIMIT_U  (1u << 0)
+#define SPAWN_ATTR_HAS_RLIMIT_U   (1u << 0)
+// Phase 29 Session C (FU25.H): when set, attrs.handles_to_inherit[0..n-1]
+// (slot indices in the caller's handle table) are cap_handle_insert'd into
+// the child's handle table AFTER the spawn succeeds (in addition to the
+// CAP_FLAG_INHERITABLE walk that runs unconditionally).  Pre-validated;
+// any unresolvable slot fails the syscall with -EINVAL BEFORE the spawn.
+#define SPAWN_ATTR_HAS_HANDLES_U  (1u << 1)
 
 // Userspace mirror of the kernel's spawn_attrs_t subset — same layout as the
 // kernel tail fields so the syscall can copy straight across. Fields not set
 // by the caller MUST be zeroed (the kernel reads trailing fields conditionally
 // on flag bits; stale pointer-like slots could be misinterpreted).
 typedef struct {
-    uint32_t flags;           // SPAWN_ATTR_HAS_RLIMIT_U, etc.
+    uint32_t flags;           // SPAWN_ATTR_HAS_RLIMIT_U / SPAWN_ATTR_HAS_HANDLES_U
     uint32_t _pad;
     uint64_t rlimit_mem_pages;
     uint64_t rlimit_cpu_ns;
     uint64_t rlimit_io_bps;
+    // Phase 29 Session C (FU25.H): handles_to_inherit holds cap_token_raw_t
+    // values (returned from SYS_VMO_CREATE, SYS_CHAN_CREATE, etc.); the
+    // kernel resolves each token + cap_handle_insert into the child's table.
+    // n_handles_to_inherit bounds the walk.  Only honored when
+    // SPAWN_ATTR_HAS_HANDLES_U is set in flags.
+    uint64_t handles_to_inherit[16];
+    uint32_t n_handles_to_inherit;
 } spawn_rlimits_t;
 
 // Resource identifiers for SYS_SETRLIMIT / SYS_GETRLIMIT. Value = 0 means "no
@@ -304,6 +320,8 @@ typedef struct {
 #define DEBUG_INJECT_CHAN_SEND_FAIL_RATE    82
 #define DEBUG_INJECT_SPINLOCK_TIMEOUT_RATE  83
 #define DEBUG_INJECT_RESET_ALL              84
+// Phase 29 Session C (FU25.H): caller's handle table count.
+#define DEBUG_HANDLE_COUNT                  85
 #define DEBUG_FB_READ_PIXEL    61
 #define DEBUG_SET_WALL       51
 
@@ -719,6 +737,26 @@ static inline int syscall_spawn_ex(const char *path, const spawn_rlimits_t *attr
     asm volatile("syscall"
         : "=a"(ret)
         : "a"(SYS_SPAWN_EX), "D"(path), "S"(attrs)
+        : "rcx", "r11", "memory");
+    return (int)ret;
+}
+
+// Phase 29 Session C (FU28.B): spawn AND pass argv.  argv MUST be an array
+// of at least argc valid `char *` pointers; each pointee MUST be a
+// NUL-terminated string (≤ 255 chars).  Kernel copies all strings into
+// scratch buffers, spawns the child, then seeds argc in RDI and an argv
+// pointer in RSI on the child's stack.  Total bytes across all argv
+// strings must be ≤ 3072 bytes.
+// Returns child pid (>0) or negative -errno (-EFAULT/-EINVAL/-E2BIG/
+// -EPLEDGE/-ENOMEM).
+static inline int syscall_spawn_argv(const char *path, int argc,
+                                     char *const argv[]) {
+    long ret;
+    register long r10 asm("r10") = 0;  /* unused */
+    (void)r10;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_SPAWN_ARGV), "D"(path), "S"(argv), "d"((long)argc)
         : "rcx", "r11", "memory");
     return (int)ret;
 }

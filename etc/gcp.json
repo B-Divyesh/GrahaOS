@@ -174,6 +174,13 @@
       "pledge": [],
       "caps": [],
       "description": "Phase 24 sub-phase H.1: returns the calibrated TSC frequency (g_tsc_hz, in Hz) — the substrate userspace busy-wait loops need to switch from cycle-count loops (calibrated for QEMU TCG; collapse under KVM) to rdtsc-based delays that work on both. No args, no pledge. Returns 0 only during very early boot before tsc_init() has measured against the PIT."
+    },
+
+    "SYS_SPAWN_ARGV": {
+      "number": 1115,
+      "pledge": ["spawn"],
+      "caps": [],
+      "description": "Phase 29 Session C (FU28.B): spawn child AND pass argv.  RDI = const char *path (≤ 255 B, NUL-terminated).  RSI = char *const *argv (user ptr to array of argc char* ptrs; each pointee NUL-terminated, ≤ 255 chars).  RDX = uint32_t argc (0..16; argc == 0 is equivalent to SYS_SPAWN).  Total bytes across all argv strings must be ≤ 3072 (fits in one stack page alongside the pointer array + alignment).  Kernel copies all strings into a kernel-local scratch buffer, spawns the binary via sched_spawn_process_argv (which seeds regs.rdi=argc, regs.rsi=user-virtual ptr to argv[] array on the child's top stack page, regs.rsp adjusted below the argv data so the prologue does not clobber it).  Pledge: SPAWN.  Returns child pid (> 0) or -EFAULT / -EINVAL / -E2BIG / -EPLEDGE / -ENOMEM.  Unblocks `gsh wasm run <file>` and similar tooling that propagate argv to child."
     }
   },
 
