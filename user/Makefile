@@ -85,6 +85,11 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/spawn_argv \
              tests/audit_query_since \
              tests/spawn_handles_inherit \
+             tests/console_read_input \
+             tests/console_attach_map \
+             tests/fb_mmio_map \
+             tests/vsync_wait \
+             tests/dirty_rect \
              tests/gash_txn_commit \
              tests/gash_txn_abort \
              tests/gash_txn_abort_fs_revert \

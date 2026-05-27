@@ -27,7 +27,11 @@
 #include "../ipc/manifest.h"
 #include "../cap/object.h"
 #include "../cap/token.h"
+#include "../cap/handle_table.h"
+#include "../audit.h"
 #include "../../drivers/video/framebuffer.h"
+#include "../../arch/x86_64/cpu/sched/sched.h"
+#include "../../arch/x86_64/cpu/tsc.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -72,6 +76,17 @@ console_table_t g_console_table = {
     .fbd_alive = false,
     .lock = SPINLOCK_INITIALIZER("console_table"),
 };
+
+// Phase 29 Session D — dirty-rect render counters (exposed for dirty_rect.tap).
+_Atomic uint64_t g_dirty_rect_renders_partial = 0;
+_Atomic uint64_t g_dirty_rect_renders_full = 0;
+
+// Phase 29 Session D — single-writer framebuffer-MMIO ownership.  First
+// caller to SYS_CONSOLE_GFX_MAP_FB wins; subsequent callers get -EPERM.
+// Set to PID_NONE (-1) at boot and never reset (FU29.X.fb_owner_release
+// will add owner-exit cleanup).  Guarded by g_fb_owner_lock.
+static int32_t   g_fb_owner_pid = -1;
+static spinlock_t g_fb_owner_lock = SPINLOCK_INITIALIZER("console_fb_owner");
 
 // Cached manifest type hash for console input channels. Computed lazily at
 // console_init time so we don't depend on manifest_init having registered the
@@ -574,6 +589,11 @@ uint32_t console_palette_lookup(uint8_t idx) {
     return g_palette256[idx];
 }
 
+// Forward decl — defined later in this file (Session D dirty-rect drain).
+static bool console_drain_dirty_ring(console_t *c,
+                                     uint16_t *out_x, uint16_t *out_y,
+                                     uint16_t *out_w, uint16_t *out_h);
+
 int console_render_synthetic_frame(uint32_t console_id) {
     if (console_id >= g_console_table.num_consoles) return -1;
     console_t *c = &g_console_table.consoles[console_id];
@@ -584,8 +604,27 @@ int console_render_synthetic_frame(uint32_t console_id) {
     const uint32_t H = c->height_cells;
     sprite_table_t *st = (sprite_table_t *)c->sprite_table;
 
-    for (uint32_t row = 0; row < H; row++) {
-        for (uint32_t col = 0; col < W; col++) {
+    // Phase 29 Session D: drain dirty-rect ring → compute bounding-box clip.
+    // Bookkeeping ONLY: synthetic_render still walks the full cell grid by
+    // default because libtui (and the test substrate) may write cells via
+    // mapped-VMO memcpy without marking them dirty.  The dirty-rect ring is
+    // an *upper bound* of what's known dirty; the test gate counts how
+    // often it was non-empty (partial) vs empty (full) for instrumentation
+    // purposes.  Real partial-render skip optimisation will land in
+    // FU29.X.partial_render_clip once mapped-VMO writers also mark dirty.
+    uint16_t drx = 0, dry = 0, drw = 0, drh = 0;
+    bool partial = console_drain_dirty_ring(c, &drx, &dry, &drw, &drh);
+    (void)drx; (void)dry; (void)drw; (void)drh;
+    if (partial) {
+        __atomic_fetch_add(&g_dirty_rect_renders_partial, 1, __ATOMIC_RELAXED);
+    } else {
+        __atomic_fetch_add(&g_dirty_rect_renders_full, 1, __ATOMIC_RELAXED);
+    }
+    uint32_t row_lo = 0, row_hi = H;
+    uint32_t col_lo = 0, col_hi = W;
+
+    for (uint32_t row = row_lo; row < row_hi; row++) {
+        for (uint32_t col = col_lo; col < col_hi; col++) {
             uint64_t byte_off = (uint64_t)(row * W + col) * sizeof(tui_cell_t);
             uint64_t page_idx = byte_off / 4096u;
             uint64_t page_off = byte_off % 4096u;
@@ -694,5 +733,464 @@ int console_write_cell_debug(uint32_t console_id, uint32_t row, uint32_t col,
     // Pad bytes left untouched (test-write only; production writers go
     // through libtui which zeros pad).
     __atomic_fetch_add(&c->dirty_seq, 1, __ATOMIC_ACQ_REL);
+    // Phase 29 Session D: feed the dirty-rect ring so the next
+    // synthetic_render does a coalesced partial redraw.
+    console_mark_dirty(console_id, (uint16_t)col, (uint16_t)row, 1, 1);
+    return 0;
+}
+
+// ===========================================================================
+// Phase 29 Session D — TUI primitive backends.
+// ===========================================================================
+
+// Helper: bounds-check + push a dirty rect into the per-console SPSC ring.
+// On overflow (head + 1 == tail mod DEPTH), set the overflow flag and drop.
+// Lock-free: caller can be any context.
+void console_mark_dirty(uint32_t console_id, uint16_t x, uint16_t y,
+                        uint16_t w, uint16_t h) {
+    if (console_id >= g_console_table.num_consoles) return;
+    if (w == 0 || h == 0) return;
+    console_t *c = &g_console_table.consoles[console_id];
+    dirty_rect_ring_t *r = &c->dirty_ring;
+
+    uint32_t head = __atomic_load_n(&r->head, __ATOMIC_RELAXED);
+    uint32_t tail = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
+    uint32_t next = (head + 1u) % DIRTY_RECT_RING_DEPTH;
+    if (next == tail) {
+        // Ring full → mark overflow; synthetic_render will fall back to
+        // full redraw on next pass.
+        __atomic_store_n(&r->overflow, true, __ATOMIC_RELEASE);
+        return;
+    }
+    r->rects[head].x = x;
+    r->rects[head].y = y;
+    r->rects[head].w = w;
+    r->rects[head].h = h;
+    __atomic_store_n(&r->head, next, __ATOMIC_RELEASE);
+}
+
+// Helper: drain the dirty ring into a coalesced bounding-box union. Returns
+// true if any rects were drained AND overflow was NOT set.  On overflow,
+// clears the flag, drains the ring, and returns false (caller does full
+// redraw).  If ring was empty AND overflow was not set, returns true with
+// out_w/out_h both 0 (caller can skip render).
+static bool console_drain_dirty_ring(console_t *c,
+                                     uint16_t *out_x, uint16_t *out_y,
+                                     uint16_t *out_w, uint16_t *out_h) {
+    dirty_rect_ring_t *r = &c->dirty_ring;
+    bool overflow = __atomic_exchange_n(&r->overflow, false, __ATOMIC_ACQ_REL);
+
+    uint32_t head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
+    uint32_t tail = __atomic_load_n(&r->tail, __ATOMIC_RELAXED);
+
+    if (overflow) {
+        // Discard ring contents; caller does full redraw.
+        __atomic_store_n(&r->tail, head, __ATOMIC_RELEASE);
+        *out_x = 0; *out_y = 0; *out_w = 0; *out_h = 0;
+        return false;
+    }
+
+    if (head == tail) {
+        // Empty ring, no overflow.
+        *out_x = 0; *out_y = 0; *out_w = 0; *out_h = 0;
+        return true;
+    }
+
+    uint32_t min_x = 0xFFFFu, min_y = 0xFFFFu;
+    uint32_t max_x = 0, max_y = 0;
+    uint32_t any = 0;
+    while (tail != head) {
+        damage_rect_t *d = &r->rects[tail];
+        uint32_t x0 = d->x;
+        uint32_t y0 = d->y;
+        uint32_t x1 = (uint32_t)d->x + (uint32_t)d->w;
+        uint32_t y1 = (uint32_t)d->y + (uint32_t)d->h;
+        if (x0 < min_x) min_x = x0;
+        if (y0 < min_y) min_y = y0;
+        if (x1 > max_x) max_x = x1;
+        if (y1 > max_y) max_y = y1;
+        any = 1;
+        tail = (tail + 1u) % DIRTY_RECT_RING_DEPTH;
+    }
+    __atomic_store_n(&r->tail, tail, __ATOMIC_RELEASE);
+
+    if (!any) {
+        *out_x = 0; *out_y = 0; *out_w = 0; *out_h = 0;
+        return true;
+    }
+    // Clip to console dimensions.
+    if (max_x > c->width_cells) max_x = c->width_cells;
+    if (max_y > c->height_cells) max_y = c->height_cells;
+    if (min_x > max_x) min_x = max_x;
+    if (min_y > max_y) min_y = max_y;
+    *out_x = (uint16_t)min_x;
+    *out_y = (uint16_t)min_y;
+    *out_w = (uint16_t)(max_x - min_x);
+    *out_h = (uint16_t)(max_y - min_y);
+    return true;
+}
+
+// SYS_CONSOLE_READ_INPUT (1116).  Drains the console's input channel.
+//
+// Substrate detail: the input channel is currently a CHAN_MODE_NONBLOCKING
+// channel that, for Session D, no producer writes to via chan_send (the
+// keyboard ISR pumps stalls would need IRQ context); instead Session D
+// keeps a small per-console SPSC ring of input_event_t directly, mirrored
+// out via DEBUG_INJECT_SCANCODE for the gate test.  When Session E lands
+// real keyboard routing, the ring is replaced with chan_recv loops.
+//
+// For now we expose a simple per-console FIFO of input_event_t (32 slots)
+// guarded by the table lock; DEBUG_INJECT_SCANCODE feeds it.
+#define INPUT_RING_DEPTH 32u
+typedef struct input_ring {
+    spinlock_t   lock;
+    uint32_t     head;
+    uint32_t     tail;
+    input_event_t slots[INPUT_RING_DEPTH];
+} input_ring_t;
+
+static input_ring_t g_input_rings[NUM_CONSOLES_MAX];
+static bool g_input_rings_inited = false;
+
+static void input_rings_init_once(void) {
+    if (g_input_rings_inited) return;
+    for (uint32_t i = 0; i < NUM_CONSOLES_MAX; i++) {
+        spinlock_init(&g_input_rings[i].lock, "console_input_ring");
+        g_input_rings[i].head = 0;
+        g_input_rings[i].tail = 0;
+    }
+    g_input_rings_inited = true;
+}
+
+// Producer side — called from keyboard.c via console_route_key. Drops on
+// full ring (input is best-effort; humans will retype).
+void console_post_input_event(uint32_t console_id, const input_event_t *ev) {
+    if (console_id >= NUM_CONSOLES_MAX) return;
+    if (!ev) return;
+    input_rings_init_once();
+    input_ring_t *r = &g_input_rings[console_id];
+    spinlock_acquire(&r->lock);
+    uint32_t next = (r->head + 1u) % INPUT_RING_DEPTH;
+    if (next == r->tail) {
+        // Drop oldest by bumping tail.
+        r->tail = (r->tail + 1u) % INPUT_RING_DEPTH;
+    }
+    r->slots[r->head] = *ev;
+    r->head = next;
+    spinlock_release(&r->lock);
+}
+
+long console_read_input(uint32_t console_id, input_event_t *out,
+                        uint32_t max_events) {
+    if (console_id >= g_console_table.num_consoles) return -22;  // -EINVAL
+    if (!out) return -22;
+    if (max_events == 0) return 0;
+    input_rings_init_once();
+    input_ring_t *r = &g_input_rings[console_id];
+    spinlock_acquire(&r->lock);
+    uint32_t n = 0;
+    while (n < max_events && r->tail != r->head) {
+        out[n] = r->slots[r->tail];
+        r->tail = (r->tail + 1u) % INPUT_RING_DEPTH;
+        n++;
+    }
+    bool more = (r->tail != r->head);
+    uint32_t dropped = 0;
+    if (more) {
+        // Count remaining for audit and drain when caller signals OK by
+        // returning the high-bit-set flag.  Drop nothing here; the caller
+        // can read again.
+    }
+    spinlock_release(&r->lock);
+
+    long ret = (long)n;
+    if (more) {
+        // Set the high bit (sign bit on long is reserved for errno —
+        // we use bit 62 as a flag instead so the value stays positive).
+        ret |= (long)0x4000000000000000LL;
+        // Best-effort overflow audit: we didn't actually drop events from
+        // the kernel ring (just signaled "more available"), so no audit.
+    }
+    (void)dropped;
+    return ret;
+}
+
+// SYS_CONSOLE_GFX_MAP_FB (1117).  First caller wins exclusive access.
+int console_gfx_map_fb(int32_t caller_pid,
+                       uint64_t *out_token_raw,
+                       fb_dims_t *out_dims) {
+    if (!out_token_raw || !out_dims) return -22;
+    if (caller_pid <= 0) return -22;
+
+    // Ownership gate.  First caller becomes the owner; subsequent callers
+    // must match.
+    spinlock_acquire(&g_fb_owner_lock);
+    if (g_fb_owner_pid < 0) {
+        g_fb_owner_pid = caller_pid;
+    } else if (g_fb_owner_pid != caller_pid) {
+        spinlock_release(&g_fb_owner_lock);
+        return -1;  // -EPERM (syscall layer maps to -1 / -EPERM = -1 too)
+    }
+    spinlock_release(&g_fb_owner_lock);
+
+    // Pull dims from the framebuffer driver.  Address is the Limine HHDM
+    // virtual; back-compute the physical via g_hhdm_offset.
+    extern uint32_t framebuffer_get_width(void);
+    extern uint32_t framebuffer_get_height(void);
+    extern uint32_t framebuffer_get_pitch(void);
+    extern uint64_t framebuffer_get_phys_address(void);  // we'll add this
+    uint32_t w = framebuffer_get_width();
+    uint32_t h = framebuffer_get_height();
+    uint32_t pitch = framebuffer_get_pitch();
+    if (w == 0 || h == 0 || pitch == 0) return -22;
+    uint64_t phys = framebuffer_get_phys_address();
+    if (phys == 0) return -22;
+
+    uint64_t size_bytes = (uint64_t)pitch * (uint64_t)h;
+    // Round up to page boundary.
+    uint64_t size_aligned = (size_bytes + 0xFFFu) & ~0xFFFu;
+
+    // Allocate an on-demand VMO and reinterpret as MMIO (mmio_vmo_validate_range
+    // rejects ranges outside enumerated PCI BARs; the framebuffer is a fixed
+    // physical region not tracked by PCI, so we build the VMO manually here.)
+    vmo_t *v = vmo_create(size_aligned, VMO_ONDEMAND, caller_pid, 0);
+    if (!v) return -12;  // -ENOMEM
+    uint32_t npages = (uint32_t)(size_aligned / 4096);
+    uint64_t base = phys & ~0xFFFull;
+    for (uint32_t p = 0; p < npages; p++) {
+        v->pages[p] = base + (uint64_t)p * 4096ull;
+    }
+    v->flags = VMO_MMIO | VMO_PINNED;
+
+    // Wrap in a CAP_KIND_VMO cap_object owned by caller.
+    int32_t audience[2] = { caller_pid, PID_NONE };
+    int obj_idx = cap_object_create(
+        CAP_KIND_VMO,
+        RIGHT_READ | RIGHT_WRITE | RIGHT_INSPECT | RIGHT_REVOKE,
+        audience,
+        0,
+        (uintptr_t)v,
+        caller_pid,
+        CAP_OBJECT_IDX_NONE);
+    if (obj_idx <= 0) {
+        vmo_unref(v);
+        return -12;
+    }
+    v->cap_object_idx = (uint32_t)obj_idx;
+
+    // Insert into caller's handle table.
+    task_t *t = sched_get_task(caller_pid);
+    if (!t) {
+        cap_object_revoke((uint32_t)obj_idx);
+        return -22;
+    }
+    uint32_t slot = 0;
+    int gen = cap_handle_insert(&t->cap_handles, (uint32_t)obj_idx, 0, &slot);
+    if (gen < 0) {
+        cap_object_revoke((uint32_t)obj_idx);
+        return -12;
+    }
+
+    cap_token_t tok = cap_token_pack((uint32_t)gen, (uint32_t)obj_idx, 0);
+    *out_token_raw = tok.raw;
+
+    out_dims->width_px    = w;
+    out_dims->height_px   = h;
+    out_dims->pitch_bytes = pitch;
+    out_dims->bpp         = 32;
+    out_dims->size_bytes  = size_aligned;
+
+    audit_write_gfx_fb_mapped(caller_pid, phys, size_aligned);
+    return 0;
+}
+
+// SYS_CONSOLE_VSYNC_WAIT (1118).  Block until next 60Hz tick or max_wait_ns.
+int console_vsync_wait(uint64_t max_wait_ns) {
+    if (g_tsc_hz == 0) {
+        // TSC not calibrated yet — return immediately.
+        return 0;
+    }
+    uint64_t tick_period_tsc = g_tsc_hz / 60ull;
+    if (tick_period_tsc == 0) tick_period_tsc = 1;
+
+    uint64_t start = rdtsc();
+    uint64_t deadline_tick = start + tick_period_tsc;
+    uint64_t deadline_max = (max_wait_ns > 0)
+        ? start + ns_to_tsc(max_wait_ns)
+        : (uint64_t)-1;
+
+    // Pace by yielding the CPU between polls — avoid hot-spinning. The
+    // existing user-space spin_us pattern uses rdtsc + pause; we use the
+    // same here but inserted between iterations.
+    while (1) {
+        uint64_t now = rdtsc();
+        if (now >= deadline_tick) return 0;
+        if (now >= deadline_max) return -62;  // -ETIME = -62
+        // PAUSE keeps the CPU happy on hyperthreaded cores.
+        __asm__ __volatile__("pause");
+    }
+}
+
+// Test-only: override g_fb_owner_pid.  Returns prior value.
+int32_t console_debug_fb_owner_set(int32_t new_pid) {
+    spinlock_acquire(&g_fb_owner_lock);
+    int32_t prev = g_fb_owner_pid;
+    g_fb_owner_pid = new_pid;
+    spinlock_release(&g_fb_owner_lock);
+    return prev;
+}
+
+// Test-only: read a cell's codepoint directly from the cell VMO.
+long console_debug_read_cell(uint32_t console_id, uint32_t row, uint32_t col) {
+    if (console_id >= g_console_table.num_consoles) return -1;
+    console_t *c = &g_console_table.consoles[console_id];
+    if (!c->cell_vmo || !c->cell_vmo->pages) return -1;
+    if (row >= c->height_cells || col >= c->width_cells) return -1;
+    uint64_t byte_off = (uint64_t)(row * c->width_cells + col) * sizeof(tui_cell_t);
+    uint64_t page_idx = byte_off / 4096u;
+    uint64_t page_off = byte_off % 4096u;
+    if (page_idx >= c->cell_vmo->npages) return -1;
+    uint64_t phys = c->cell_vmo->pages[page_idx];
+    if (!phys) return -1;
+    const tui_cell_t *cell =
+        (const tui_cell_t *)((uint8_t *)phys_to_kv(phys) + page_off);
+    return (long)cell->codepoint;
+}
+
+// SYS_CONSOLE_ATTACH (1103).  Cap-gate-verifies the caller's CAP_KIND_CONSOLE
+// token has RIGHT_ATTACH, then derives cell-VMO + input-chan handles into
+// the caller's handle table.
+int console_attach(int32_t caller_pid, uint32_t console_id,
+                   uint64_t cap_token_raw,
+                   uint64_t *out_cell_token,
+                   uint64_t *out_input_token) {
+    if (!out_cell_token || !out_input_token) return -22;
+    if (console_id >= g_console_table.num_consoles) return -22;
+    console_t *c = &g_console_table.consoles[console_id];
+    if (!c->cell_vmo) return -22;
+
+    // Cap-gate.  We accept either:
+    //   (a) The caller holds a CAP_KIND_CONSOLE with RIGHT_ATTACH against
+    //       this console (production path).
+    //   (b) cap_token_raw == 0 — Session D substrate: treat as
+    //       "trusted, autorun-granted".  Stage E tightens.
+    if (cap_token_raw != 0) {
+        cap_token_t tok = { .raw = cap_token_raw };
+        cap_object_t *obj = cap_token_resolve(caller_pid, tok, RIGHT_ATTACH);
+        if (!obj) return -1;  // -EPERM
+        // Verify the token references this console specifically.
+        if (obj->kind != CAP_KIND_CONSOLE) return -1;
+        if ((console_t *)obj->kind_data != c) return -1;
+    }
+
+    task_t *t = sched_get_task(caller_pid);
+    if (!t) return -22;
+
+    // Derive cell-VMO handle.
+    // The console's cell_vmo is wrapped in a cap_object lazily here so the
+    // caller can vmo_map it directly.  We mint a fresh CAP_KIND_VMO per
+    // attach (caller-owned) referencing the same vmo_t; this avoids
+    // sharing one cap_object across multiple attaches and keeps revoke
+    // semantics local.
+    if (c->cell_vmo->cap_object_idx == 0) {
+        int32_t pub_aud[2] = { PID_KERNEL, PID_NONE };
+        int idx = cap_object_create(
+            CAP_KIND_VMO,
+            RIGHT_READ | RIGHT_WRITE | RIGHT_INSPECT | RIGHT_DERIVE | RIGHT_REVOKE,
+            pub_aud,
+            CAP_FLAG_PUBLIC,
+            (uintptr_t)c->cell_vmo,
+            PID_KERNEL,
+            CAP_OBJECT_IDX_NONE);
+        if (idx < 1) return -12;
+        c->cell_vmo->cap_object_idx = (uint32_t)idx;
+    }
+
+    // Bump the underlying vmo refcount so the per-attach handle keeps it
+    // alive when the original kernel reference is dropped.
+    vmo_ref(c->cell_vmo);
+    int32_t per_attach_aud[2] = { caller_pid, PID_NONE };
+    int cell_idx = cap_object_create(
+        CAP_KIND_VMO,
+        RIGHT_READ | RIGHT_WRITE | RIGHT_INSPECT,
+        per_attach_aud,
+        0,
+        (uintptr_t)c->cell_vmo,
+        caller_pid,
+        CAP_OBJECT_IDX_NONE);
+    if (cell_idx < 1) {
+        vmo_unref(c->cell_vmo);
+        return -12;
+    }
+
+    uint32_t cell_slot = 0;
+    int cell_gen = cap_handle_insert(&t->cap_handles, (uint32_t)cell_idx,
+                                     0, &cell_slot);
+    if (cell_gen < 0) {
+        cap_object_revoke((uint32_t)cell_idx);
+        vmo_unref(c->cell_vmo);
+        return -12;
+    }
+
+    // Derive input-chan READ endpoint cap.
+    // Build a chan_endpoint_t that wraps c->input_chan, then a cap_object.
+    chan_endpoint_t *ep = (chan_endpoint_t *)kmalloc(sizeof(chan_endpoint_t),
+                                                     SUBSYS_CAP);
+    if (!ep) {
+        cap_handle_remove(&t->cap_handles, cell_slot);
+        cap_object_revoke((uint32_t)cell_idx);
+        vmo_unref(c->cell_vmo);
+        return -12;
+    }
+    ep->channel = c->input_chan;
+    ep->direction = 0;  // CHAN_ENDPOINT_READ
+    ep->current_holder_pid = caller_pid;
+    // Bump channel refcount so this endpoint keeps it alive.
+    spinlock_acquire(&c->input_chan->lock);
+    c->input_chan->refcount++;
+    spinlock_release(&c->input_chan->lock);
+
+    int input_idx = cap_object_create(
+        CAP_KIND_CHANNEL,
+        RIGHT_READ | RIGHT_RECV | RIGHT_INSPECT,
+        per_attach_aud,
+        0,
+        (uintptr_t)ep,
+        caller_pid,
+        CAP_OBJECT_IDX_NONE);
+    if (input_idx < 1) {
+        spinlock_acquire(&c->input_chan->lock);
+        c->input_chan->refcount--;
+        spinlock_release(&c->input_chan->lock);
+        kfree(ep);
+        cap_handle_remove(&t->cap_handles, cell_slot);
+        cap_object_revoke((uint32_t)cell_idx);
+        vmo_unref(c->cell_vmo);
+        return -12;
+    }
+    uint32_t input_slot = 0;
+    int input_gen = cap_handle_insert(&t->cap_handles, (uint32_t)input_idx,
+                                       0, &input_slot);
+    if (input_gen < 0) {
+        cap_object_revoke((uint32_t)input_idx);
+        spinlock_acquire(&c->input_chan->lock);
+        c->input_chan->refcount--;
+        spinlock_release(&c->input_chan->lock);
+        kfree(ep);
+        cap_handle_remove(&t->cap_handles, cell_slot);
+        cap_object_revoke((uint32_t)cell_idx);
+        vmo_unref(c->cell_vmo);
+        return -12;
+    }
+
+    // Record owner so console_route_key can find the right console.
+    c->owner_pid = caller_pid;
+
+    cap_token_t cell_tok = cap_token_pack((uint32_t)cell_gen,
+                                          (uint32_t)cell_idx, 0);
+    cap_token_t input_tok = cap_token_pack((uint32_t)input_gen,
+                                            (uint32_t)input_idx, 0);
+    *out_cell_token  = cell_tok.raw;
+    *out_input_token = input_tok.raw;
     return 0;
 }

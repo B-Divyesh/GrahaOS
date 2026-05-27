@@ -500,6 +500,15 @@ uint32_t framebuffer_get_pitch(void) {
     return fb_pitch;
 }
 
+// Phase 29 Session D — back-compute the framebuffer's physical address from
+// Limine's HHDM virtual via g_hhdm_offset. Used by SYS_CONSOLE_GFX_MAP_FB to
+// hand userspace a VMO_MMIO-backed view of the hardware framebuffer.
+extern uint64_t g_hhdm_offset;
+uint64_t framebuffer_get_phys_address(void) {
+    if (!fb_addr) return 0;
+    return (uint64_t)(uintptr_t)fb_addr - g_hhdm_offset;
+}
+
 // Phase 27 Stage A4: force-draw a single 8x16 cell into FB regardless of
 // g_fbd_alive / g_fb_active. Used by:
 //   (1) console_render_synthetic_frame() for the gate test fbd_render

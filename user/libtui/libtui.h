@@ -115,3 +115,24 @@ int tui_present(uint32_t console_id);
 // Mirror of kernel/console/console.c::console_palette_lookup so apps can
 // pre-compute colors before writing cells.
 uint32_t tui_palette_lookup(uint8_t idx);
+
+// ---------------------------------------------------------------------------
+// Phase 29 Session D — input + vsync + framebuffer-MMIO.
+// ---------------------------------------------------------------------------
+struct input_event_u;
+struct fb_dims_u;
+
+// Drain console's input chan non-blocking.  Returns count copied (high bit
+// 62 set if more remain queued).  Wraps SYS_CONSOLE_READ_INPUT.
+long tui_read_input(uint32_t console_id, struct input_event_u *out,
+                    uint32_t max_events);
+
+// Block until the next 60Hz tick or max_wait_ns expires.  Returns 0 on
+// tick, -ETIME on timeout.  Wraps SYS_CONSOLE_VSYNC_WAIT.
+int tui_vsync_wait(uint64_t max_wait_ns);
+
+// Map the hardware framebuffer into the caller's address space.  Writes the
+// mapped pointer to *out_addr and the dims (pitch / width / height /
+// size_bytes) to *out_dims.  Returns 0 on success; -EPERM if not the FB
+// owner.  fbd-only path.
+int tui_map_framebuffer(void **out_addr, struct fb_dims_u *out_dims);

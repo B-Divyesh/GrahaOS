@@ -570,6 +570,12 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@cp user/tests/spawn_argv               initrd_root/bin/tests/spawn_argv.tap
 	@cp user/tests/audit_query_since        initrd_root/bin/tests/audit_query_since.tap
 	@cp user/tests/spawn_handles_inherit    initrd_root/bin/tests/spawn_handles_inherit.tap
+	@# Phase 29 Session D: TUI primitives (5 syscalls + dirty-rect coalescing).
+	@cp user/tests/console_read_input       initrd_root/bin/tests/console_read_input.tap
+	@cp user/tests/console_attach_map       initrd_root/bin/tests/console_attach_map.tap
+	@cp user/tests/fb_mmio_map              initrd_root/bin/tests/fb_mmio_map.tap
+	@cp user/tests/vsync_wait               initrd_root/bin/tests/vsync_wait.tap
+	@cp user/tests/dirty_rect               initrd_root/bin/tests/dirty_rect.tap
 	@# Phase 26 closeout (FU25.A.2): gash txn{} parser integration tests.
 	@cp user/tests/gash_txn_commit         initrd_root/bin/tests/gash_txn_commit.tap
 	@cp user/tests/gash_txn_abort          initrd_root/bin/tests/gash_txn_abort.tap
@@ -912,6 +918,14 @@ endif
 	@echo "spawn_argv"               >> initrd_root/bin/tests/manifest.txt
 	@echo "audit_query_since"        >> initrd_root/bin/tests/manifest.txt
 	@echo "spawn_handles_inherit"    >> initrd_root/bin/tests/manifest.txt
+	@# Phase 29 Session D: TUI primitives.  console_read_input (5) +
+	@# console_attach_map (5) + fb_mmio_map (4) + vsync_wait (3) +
+	@# dirty_rect (4) = +21 asserts.
+	@echo "console_read_input"       >> initrd_root/bin/tests/manifest.txt
+	@echo "console_attach_map"       >> initrd_root/bin/tests/manifest.txt
+	@echo "fb_mmio_map"              >> initrd_root/bin/tests/manifest.txt
+	@echo "vsync_wait"               >> initrd_root/bin/tests/manifest.txt
+	@echo "dirty_rect"               >> initrd_root/bin/tests/manifest.txt
 	@# Pre-Phase-28 sweep A.5 (resolves FU25.A.4): gash_txn_commit + gash_txn_abort
 	@# promoted to gate. Previously held back due to FU24.B/C wait/exit race
 	@# (intermittent INCOMPLETE on ~33-50% of TCG iters when ktest's syscall_wait

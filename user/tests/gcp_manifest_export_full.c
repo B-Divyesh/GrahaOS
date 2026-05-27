@@ -16,14 +16,14 @@
 extern int printf(const char *fmt, ...);
 
 // Mirror of kernel/manifest_blob.c constants.  Verified by asserts 2+3.
-// Updated 2026-05-28 (Phase 29 Session C): SYS_SPAWN_ARGV added at slot 1115,
-// bumping blob bytes 14623 -> 15613 and FNV-1a 0xc744a504fd139597 ->
-// 0xaefff62e3365c3e0.  Test fails by design if gcp.json changes without
-// the mirror being updated.
-#define EXPECTED_BLOB_SIZE   15613u
-#define EXPECTED_GENERATION  0xaefff62e3365c3e0ull
+// Updated 2026-05-28 (Phase 29 Session D): SYS_CONSOLE_{READ_INPUT,GFX_MAP_FB,
+// VSYNC_WAIT} added at slots 1116-1118 + AUDIT_GFX_FB_MAPPED/TUI_INPUT_OVERFLOW
+// (57/58), bumping blob bytes -> 17617 and FNV-1a -> 0xd5dbdf0fc8ec4239.
+// Test fails by design if gcp.json changes without the mirror being updated.
+#define EXPECTED_BLOB_SIZE   17617u
+#define EXPECTED_GENERATION  0xd5dbdf0fc8ec4239ull
 
-static uint8_t s_buf[16384];
+static uint8_t s_buf[32768];
 
 // FNV-1a 64-bit.  Mirror of scripts/gen_manifest_blob.py + kernel/fs/simhash.c.
 static uint64_t fnv1a64(const uint8_t *p, long n) {

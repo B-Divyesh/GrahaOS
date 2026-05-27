@@ -181,6 +181,27 @@
       "pledge": ["spawn"],
       "caps": [],
       "description": "Phase 29 Session C (FU28.B): spawn child AND pass argv.  RDI = const char *path (≤ 255 B, NUL-terminated).  RSI = char *const *argv (user ptr to array of argc char* ptrs; each pointee NUL-terminated, ≤ 255 chars).  RDX = uint32_t argc (0..16; argc == 0 is equivalent to SYS_SPAWN).  Total bytes across all argv strings must be ≤ 3072 (fits in one stack page alongside the pointer array + alignment).  Kernel copies all strings into a kernel-local scratch buffer, spawns the binary via sched_spawn_process_argv (which seeds regs.rdi=argc, regs.rsi=user-virtual ptr to argv[] array on the child's top stack page, regs.rsp adjusted below the argv data so the prologue does not clobber it).  Pledge: SPAWN.  Returns child pid (> 0) or -EFAULT / -EINVAL / -E2BIG / -EPLEDGE / -ENOMEM.  Unblocks `gsh wasm run <file>` and similar tooling that propagate argv to child."
+    },
+
+    "SYS_CONSOLE_READ_INPUT": {
+      "number": 1116,
+      "pledge": ["ipc_recv"],
+      "caps": [],
+      "description": "Phase 29 Session D: drain a console's input chan non-blocking.  RDI = uint32_t console_id (0..NUM_CONSOLES-1).  RSI = input_event_t *out (user ptr).  RDX = uint32_t max_events (1..1024).  Returns the count of events copied; if more remain queued, the returned value has bit 62 (0x4000000000000000) set so it stays positive while signaling 'more available'.  On overflow (queued events exceed what the kernel can buffer), AUDIT_TUI_INPUT_OVERFLOW (code 58) is emitted.  Pledge: IPC_RECV.  Errors: -EINVAL (bad console_id / NULL buffer / max == 0), -EFAULT (out_buf unwriteable)."
+    },
+
+    "SYS_CONSOLE_GFX_MAP_FB": {
+      "number": 1117,
+      "pledge": ["sys_control"],
+      "caps": [],
+      "description": "Phase 29 Session D: mint a VMO_MMIO-backed cap_token referencing the hardware framebuffer's physical address range.  RDI = uint64_t *out_handle_raw (user ptr to receive packed cap_token).  RSI = fb_dims_t *out_dims (user ptr to 24-byte struct: width_px/height_px/pitch_bytes/bpp/size_bytes).  First caller wins exclusive write access; subsequent callers get -EPERM unless they're the recorded owner.  Emits AUDIT_GFX_FB_MAPPED (code 57).  Pledge: SYS_CONTROL.  Errors: -EFAULT (bad out ptr), -EPERM (not owner), -ENOMEM."
+    },
+
+    "SYS_CONSOLE_VSYNC_WAIT": {
+      "number": 1118,
+      "pledge": ["ipc_recv"],
+      "caps": [],
+      "description": "Phase 29 Session D: block until the next 60 Hz tick or max_wait_ns expires.  RDI = uint64_t max_wait_ns (0 = wait indefinitely).  Calibrated against g_tsc_hz (Phase 24a sub-phase H.1 substrate).  Returns 0 on tick, -ETIME on timeout.  Pledge: IPC_RECV.  Used by fbd's render loop for vsync pacing without burning CPU."
     }
   },
 
@@ -194,10 +215,12 @@
   },
 
   "audit_events": {
-    "_note": "Phase 22 closeout: catalog of audit event ids (kernel/audit.h). Phase 22 added DEPRECATED_SYSCALL=17, CHAN_NAME_PUBLISH=39, CHAN_NAME_CONNECT=40.",
+    "_note": "Phase 22 closeout: catalog of audit event ids (kernel/audit.h). Phase 22 added DEPRECATED_SYSCALL=17, CHAN_NAME_PUBLISH=39, CHAN_NAME_CONNECT=40. Phase 29 Session D added GFX_FB_MAPPED=57, TUI_INPUT_OVERFLOW=58 (codes 55+56 reserved for Session B TLS).",
     "AUDIT_DEPRECATED_SYSCALL":    17,
     "AUDIT_CHAN_NAME_PUBLISH":     39,
-    "AUDIT_CHAN_NAME_CONNECT":     40
+    "AUDIT_CHAN_NAME_CONNECT":     40,
+    "AUDIT_GFX_FB_MAPPED":         57,
+    "AUDIT_TUI_INPUT_OVERFLOW":    58
   },
 
   "phase22_libnet_msg_ops": {

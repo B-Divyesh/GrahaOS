@@ -154,3 +154,9 @@ void framebuffer_force_draw_sprite(uint32_t pixel_x, uint32_t pixel_y,
 // standard 8-bit alpha blend per channel.
 void framebuffer_force_blit_pixel(uint32_t pixel_x, uint32_t pixel_y,
                                   uint32_t argb);
+
+// Phase 29 Session D — back-compute the framebuffer's physical address
+// (Limine HHDM virt - g_hhdm_offset). Returns 0 if framebuffer_init has
+// not been called yet. Used by SYS_CONSOLE_GFX_MAP_FB to mint a
+// VMO_MMIO-backed handle for userspace direct blit.
+uint64_t framebuffer_get_phys_address(void);

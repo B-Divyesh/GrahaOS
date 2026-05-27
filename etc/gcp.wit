@@ -92,6 +92,8 @@ interface ipc-recv {
 
   chan-publish: func(args: list<u64>) -> result<u64, ipc-recv-error>;
   chan-connect: func(args: list<u64>) -> result<u64, ipc-recv-error>;
+  console-read-input: func(args: list<u64>) -> result<u64, ipc-recv-error>;
+  console-vsync-wait: func(args: list<u64>) -> result<u64, ipc-recv-error>;
 }
 
 interface spawn {
@@ -151,6 +153,7 @@ interface sys-control {
   snap-create: func(args: list<u64>) -> result<u64, sys-control-error>;
   snap-restore: func(args: list<u64>) -> result<u64, sys-control-error>;
   snap-delete: func(args: list<u64>) -> result<u64, sys-control-error>;
+  console-gfx-map-fb: func(args: list<u64>) -> result<u64, sys-control-error>;
 }
 
 interface net-server {

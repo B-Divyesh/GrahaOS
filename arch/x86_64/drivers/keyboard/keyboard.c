@@ -356,6 +356,24 @@ void keyboard_handle_scancode(uint8_t scancode) {
         return;
     }
 
+    // Phase 29 Session D — push raw scancode to the selected console's
+    // input ring so SYS_CONSOLE_READ_INPUT can consume it.  This is in
+    // ADDITION to the legacy ASCII key_buffer below (kept for gash).
+    {
+        extern uint32_t console_get_selected(void);
+        extern void console_post_input_event(uint32_t console_id, const void *ev);
+        // 16-byte input_event_t matches kernel/console/console.h ABI.
+        struct { uint8_t kind, action; uint16_t key; int16_t dx, dy;
+                 uint16_t mods; uint8_t pad[2]; uint64_t ts; } ev = {
+            .kind = 0, .action = 0, .key = (uint16_t)scancode,
+            .dx = 0, .dy = 0,
+            .mods = (uint16_t)((left_shift_pressed||right_shift_pressed)?0x4:0) |
+                    (uint16_t)((left_alt_pressed||right_alt_pressed)?0x2:0),
+            .pad = {0,0}, .ts = 0,
+        };
+        console_post_input_event(console_get_selected(), &ev);
+    }
+
     // Convert scancode to ASCII
     char ascii = 0;
 

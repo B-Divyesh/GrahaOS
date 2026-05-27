@@ -2129,6 +2129,46 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = cur_hc ? (uint64_t)cur_hc->cap_handles.count : 0;
                 break;
             }
+            // Phase 29 Session D — TUI test substrate subops.
+            case DEBUG_FB_OWNER_SET: {
+                // Test-only override of console.c::g_fb_owner_pid.
+                extern int32_t console_debug_fb_owner_set(int32_t pid);
+                int32_t pid = (int32_t)frame->rsi;
+                frame->rax = (uint64_t)(long)console_debug_fb_owner_set(pid);
+                break;
+            }
+            case DEBUG_DIRTY_RECT_GET_COUNTS: {
+                uint64_t *out = (uint64_t *)frame->rsi;
+                if (!out) { frame->rax = (uint64_t)(long)-14; break; }
+                extern _Atomic uint64_t g_dirty_rect_renders_partial;
+                extern _Atomic uint64_t g_dirty_rect_renders_full;
+                out[0] = __atomic_load_n(&g_dirty_rect_renders_partial,
+                                         __ATOMIC_ACQUIRE);
+                out[1] = __atomic_load_n(&g_dirty_rect_renders_full,
+                                         __ATOMIC_ACQUIRE);
+                frame->rax = 0;
+                break;
+            }
+            case DEBUG_DIRTY_RECT_RESET: {
+                extern _Atomic uint64_t g_dirty_rect_renders_partial;
+                extern _Atomic uint64_t g_dirty_rect_renders_full;
+                __atomic_store_n(&g_dirty_rect_renders_partial, 0,
+                                 __ATOMIC_RELEASE);
+                __atomic_store_n(&g_dirty_rect_renders_full, 0,
+                                 __ATOMIC_RELEASE);
+                frame->rax = 0;
+                break;
+            }
+            case DEBUG_CONSOLE_READ_CELL: {
+                extern long console_debug_read_cell(uint32_t cid,
+                                                    uint32_t row,
+                                                    uint32_t col);
+                uint32_t cid = (uint32_t)frame->rsi;
+                uint32_t row = (uint32_t)frame->rdx;
+                uint32_t col = (uint32_t)frame->r10;
+                frame->rax = (uint64_t)console_debug_read_cell(cid, row, col);
+                break;
+            }
             default:
                 frame->rax = (uint64_t)-1;
                 break;
@@ -3909,12 +3949,83 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             break;
         }
 
-        case SYS_CONSOLE_ATTACH:
+        case SYS_CONSOLE_ATTACH: {
+            // Phase 29 Session D: wire for real.  Cap-gate-verifies the
+            // caller's CAP_KIND_CONSOLE token + derives cell-VMO and
+            // input-chan handles into the caller's table.
+            //   RDI = console_id, RSI = cap_token_raw,
+            //   RDX = uint64_t *out_cell_token (user ptr),
+            //   R10 = uint64_t *out_input_token (user ptr).
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_RECV,
+                                        "pledge denied: ipc_recv")) break;
+            extern int console_attach(int32_t caller_pid, uint32_t console_id,
+                                      uint64_t cap_token_raw,
+                                      uint64_t *out_cell_token,
+                                      uint64_t *out_input_token);
+            uint32_t cid = (uint32_t)frame->rdi;
+            uint64_t tok = frame->rsi;
+            uint64_t *out_cell  = (uint64_t *)frame->rdx;
+            uint64_t *out_input = (uint64_t *)frame->r10;
+            if (!out_cell || !out_input) {
+                frame->rax = (uint64_t)(long)-14;  // -EFAULT
+                break;
+            }
+            task_t *cur_attach = sched_get_current_task();
+            int32_t pid = cur_attach ? cur_attach->id : -1;
+            uint64_t ct = 0, it = 0;
+            int rc = console_attach(pid, cid, tok, &ct, &it);
+            if (rc == 0) {
+                *out_cell = ct;
+                *out_input = it;
+            }
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
         case SYS_CONSOLE_INSPECT:
         case SYS_CONSOLE_OBSERVE: {
-            // Stage A4 will wire these once owner-pid + cap_token paths
-            // are needed by gsh / grahai. For now -ENOSYS.
+            // INSPECT + OBSERVE remain -ENOSYS until Session E.
             frame->rax = (uint64_t)(long)-38;
+            break;
+        }
+        case SYS_CONSOLE_READ_INPUT: {
+            // Phase 29 Session D — drain console input chan.
+            //   RDI = console_id, RSI = input_event_t *out, RDX = max_events.
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_RECV,
+                                        "pledge denied: ipc_recv")) break;
+            uint32_t cid = (uint32_t)frame->rdi;
+            input_event_t *out = (input_event_t *)frame->rsi;
+            uint32_t maxev = (uint32_t)frame->rdx;
+            if (!out) { frame->rax = (uint64_t)(long)-14; break; }
+            if (maxev > 1024) maxev = 1024;  // sanity cap
+            long rc = console_read_input(cid, out, maxev);
+            frame->rax = (uint64_t)rc;
+            break;
+        }
+        case SYS_CONSOLE_GFX_MAP_FB: {
+            // Phase 29 Session D — mint FB MMIO VMO handle.
+            //   RDI = uint64_t *out_handle_raw, RSI = fb_dims_t *out_dims.
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                        "pledge denied: sys_control")) break;
+            uint64_t *out_handle = (uint64_t *)frame->rdi;
+            fb_dims_t *out_dims = (fb_dims_t *)frame->rsi;
+            if (!out_handle || !out_dims) {
+                frame->rax = (uint64_t)(long)-14;
+                break;
+            }
+            task_t *cur_map = sched_get_current_task();
+            int32_t pid = cur_map ? cur_map->id : -1;
+            int rc = console_gfx_map_fb(pid, out_handle, out_dims);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+        case SYS_CONSOLE_VSYNC_WAIT: {
+            // Phase 29 Session D — block until next 60Hz tick or timeout.
+            if (!pledge_check_and_audit(frame, PLEDGE_CLASS_IPC_RECV,
+                                        "pledge denied: ipc_recv")) break;
+            extern int console_vsync_wait(uint64_t max_wait_ns);
+            uint64_t max_ns = frame->rdi;
+            int rc = console_vsync_wait(max_ns);
+            frame->rax = (uint64_t)(long)rc;
             break;
         }
 

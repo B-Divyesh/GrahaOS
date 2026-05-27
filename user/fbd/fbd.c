@@ -182,6 +182,26 @@ void _start(void) {
     printf("[fbd] phase 27 stage A4 compositor up; target=%u fps\n",
            (unsigned)FBD_TARGET_FPS);
 
+    // Phase 29 Session D: attempt to grab the FB MMIO handle (substrate —
+    // fbd is the canonical first caller, so this should succeed under
+    // autorun=init).  On failure, we silently fall back to the kernel
+    // synthetic-render path (the existing Stage A4 behaviour).
+    {
+        void *fb_addr = 0;
+        fb_dims_u_t dims;
+        int map_rc = tui_map_framebuffer(&fb_addr, &dims);
+        if (map_rc == 0) {
+            printf("[fbd] FB MMIO mapped: %p (%ux%u, pitch=%u, %lu B)\n",
+                   fb_addr, (unsigned)dims.width_px,
+                   (unsigned)dims.height_px,
+                   (unsigned)dims.pitch_bytes,
+                   (unsigned long)dims.size_bytes);
+        } else {
+            printf("[fbd] FB MMIO map rc=%d (fallback to kernel composite)\n",
+                   map_rc);
+        }
+    }
+
     // Render a welcome banner BEFORE flipping g_fbd_alive=true. While the
     // bypass flag is still false, the kernel-side console_render_synthetic
     // path's framebuffer_force_draw_cell() acquires the framebuffer lock
@@ -202,7 +222,8 @@ void _start(void) {
     printf("[fbd] banner rendered; ack_render(0, 1) ok; g_fbd_alive=true\n");
 
     // Render loop. Substrate-only at A4 — Stage A5 replaces synthetic render
-    // with real userspace blits via cell-VMO maps + libtui font.
+    // with real userspace blits via cell-VMO maps + libtui font.  Session D
+    // adds optional vsync pacing via SYS_CONSOLE_VSYNC_WAIT (60Hz).
     uint64_t frame = 1;
     while (1) {
         uint32_t selected = syscall_debug_console_get_selected();
@@ -217,6 +238,11 @@ void _start(void) {
         frame++;
         (void)syscall_console_ack_render(selected, frame);
 
-        fbd_sleep_ms(FBD_TICK_MS);
+        // Phase 29 Session D: prefer vsync pacing.  Fall back to the
+        // existing sleep_ms if the syscall is unwired or fails.
+        int vrc = tui_vsync_wait((uint64_t)FBD_TICK_MS * 1000000ull * 4ull);
+        if (vrc != 0) {
+            fbd_sleep_ms(FBD_TICK_MS);
+        }
     }
 }

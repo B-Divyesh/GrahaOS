@@ -106,7 +106,13 @@
 #define AUDIT_PLAN_COMMIT             52  // plan committed (txn closed)
 #define AUDIT_PLAN_ABORT              53  // plan aborted
 #define AUDIT_RLIMIT_SYSCALL_RATE     54  // syscall-rate quota exceeded (Stage C2 emits)
-#define AUDIT_EVENT_MAX               54
+// Phase 29 codes.  55 + 56 are RESERVED for Phase 29 Session B (TLS):
+//   AUDIT_TLS_HANDSHAKE_FAIL     55  (TBD — Session B BearSSL bring-up)
+//   AUDIT_TLS_CERT_REJECT        56  (TBD — Session B)
+// Session D (TUI primitives) consumes 57 + 58:
+#define AUDIT_GFX_FB_MAPPED           57  // SYS_CONSOLE_GFX_MAP_FB: caller got FB MMIO handle
+#define AUDIT_TUI_INPUT_OVERFLOW      58  // SYS_CONSOLE_READ_INPUT: events dropped (user buffer too small)
+#define AUDIT_EVENT_MAX               58
 
 // Source of the event.
 #define AUDIT_SRC_NATIVE  0   // Native v2 API.
@@ -513,3 +519,11 @@ void audit_write_plan_abort(int32_t pid, uint64_t plan_id, const char *reason);
 // Stage C2 — rate-quota audit code 54.
 void audit_write_rlimit_syscall_rate(int32_t pid, uint64_t limit_per_sec,
                                      uint64_t observed_per_sec);
+
+// Phase 29 Session D writers.
+//   GFX_FB_MAPPED fires when SYS_CONSOLE_GFX_MAP_FB grants the FB MMIO VMO.
+//   TUI_INPUT_OVERFLOW fires when SYS_CONSOLE_READ_INPUT drops events.
+void audit_write_gfx_fb_mapped(int32_t pid, uint64_t phys_addr,
+                               uint64_t size_bytes);
+void audit_write_tui_input_overflow(int32_t pid, uint32_t console_id,
+                                    uint32_t dropped);

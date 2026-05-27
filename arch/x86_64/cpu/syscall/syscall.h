@@ -421,6 +421,30 @@
 //          -ENOMEM / -EPLEDGE.
 #define SYS_SPAWN_ARGV             1115  // RDI = path, RSI = argv, RDX = argc
 
+// Phase 29 Session D — TUI primitives (slots 1116-1118).  SYS_CONSOLE_ATTACH
+// (1103) is also wired for real in this session (was -ENOSYS).
+//
+// SYS_CONSOLE_READ_INPUT — drain console input chan non-blocking.
+//   RDI = uint32_t console_id
+//   RSI = input_event_t *out (user ptr)
+//   RDX = uint32_t max_events
+// Returns the count copied; if more events are still queued, the high bit
+// (bit 62, 0x4000_0000_0000_0000) is set so the value stays positive.
+// Pledge: IPC_RECV.  Errors: -EINVAL / -EFAULT.
+#define SYS_CONSOLE_READ_INPUT     1116
+// SYS_CONSOLE_GFX_MAP_FB — mint a VMO_MMIO handle backed by the hardware
+// framebuffer's physical address range.
+//   RDI = uint64_t *out_handle_raw (user ptr)
+//   RSI = fb_dims_t *out_dims      (user ptr, 24 B)
+// Returns 0 on success.  First caller wins exclusive write; subsequent
+// callers get -EPERM unless they're the recorded owner.
+// Pledge: SYS_CONTROL.  Errors: -EFAULT / -EPERM / -ENOMEM.
+#define SYS_CONSOLE_GFX_MAP_FB     1117
+// SYS_CONSOLE_VSYNC_WAIT — block until the next 60 Hz tick or max_wait_ns.
+//   RDI = uint64_t max_wait_ns (0 = wait indefinitely)
+// Returns 0 on tick, -ETIME on timeout.  Pledge: IPC_RECV.
+#define SYS_CONSOLE_VSYNC_WAIT     1118
+
 // Resource identifiers for SYS_SETRLIMIT / SYS_GETRLIMIT.
 #define RLIMIT_MEM            1     // pages (4 KiB each); 0 = unlimited
 #define RLIMIT_CPU            2     // ns per 1-second epoch (max 1_000_000_000); 0 = unlimited
@@ -527,6 +551,22 @@
 // the expected number of entries to the child's table.  No args; returns
 // caller's cap_handles.count (uint32 cast to uint64).
 #define DEBUG_HANDLE_COUNT                  85
+// Phase 29 Session D — TUI test substrate.
+//   FB_OWNER_SET (86):  RSI = int32_t pid (or -1 to clear).  Test-only
+//     override of the SYS_CONSOLE_GFX_MAP_FB exclusive-owner pid so
+//     fb_mmio_map.tap can simulate the fbd ownership handshake without
+//     spawning fbd.  Returns the prior owner pid.
+//   DIRTY_RECT_GET_COUNTS (87):  RSI = uint64_t *out (user ptr to two
+//     uint64_t: [partial, full]).  Reads the global dirty-rect render
+//     counters atomic.  Returns 0.
+//   DIRTY_RECT_RESET (88):  no args.  Zero both counters.  Returns 0.
+//   CONSOLE_READ_CELL (89):  RSI = uint32_t console_id, RDX = uint32_t row,
+//     R10 = uint32_t col.  Returns the cell's codepoint OR -1 on error.
+//     Test-only readback for console_attach_map.tap.
+#define DEBUG_FB_OWNER_SET                  86
+#define DEBUG_DIRTY_RECT_GET_COUNTS         87
+#define DEBUG_DIRTY_RECT_RESET              88
+#define DEBUG_CONSOLE_READ_CELL             89
 
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);

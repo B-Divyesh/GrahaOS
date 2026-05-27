@@ -124,6 +124,51 @@ typedef struct damage_rect {
 } damage_rect_t;
 
 // ---------------------------------------------------------------------------
+// Phase 29 Session D — input event ABI.
+// 16 bytes. Drained from a console's input chan by SYS_CONSOLE_READ_INPUT.
+// kind=0 → keyboard event (key=scancode, action=0 press / 1 release).
+// kind=1 → mouse button (Session E).  kind=2 → mouse motion (Session E).
+// ---------------------------------------------------------------------------
+typedef struct __attribute__((packed)) input_event {
+    uint8_t  kind;            // 0=key, 1=mouse_btn, 2=mouse_motion
+    uint8_t  action;          // for key: 0=press 1=release
+    uint16_t key;             // scancode
+    int16_t  x_or_dx;
+    int16_t  y_or_dy;
+    uint16_t modifiers;
+    uint8_t  _pad[2];
+    uint64_t timestamp_tsc;
+} input_event_t;
+// Total: 1+1+2+2+2+2+2+8 = 20 bytes.
+_Static_assert(sizeof(input_event_t) == 20, "input_event_t must be 20 bytes");
+
+// ---------------------------------------------------------------------------
+// Phase 29 Session D — dirty-rect ring per console.
+// 16 SPSC slots; producer is whoever writes a cell (libtui via mapped VMO or
+// DEBUG_CONSOLE_WRITE_CELL); consumer is console_render_synthetic_frame.
+// On overflow, the ring sets the overflow flag and synthetic_render falls
+// back to a full redraw + clears the flag.
+// ---------------------------------------------------------------------------
+#define DIRTY_RECT_RING_DEPTH  16u
+typedef struct dirty_rect_ring {
+    _Atomic uint32_t head;
+    _Atomic uint32_t tail;
+    damage_rect_t    rects[DIRTY_RECT_RING_DEPTH];
+    _Atomic bool     overflow;
+} dirty_rect_ring_t;
+
+// Phase 29 Session D — fb_dims_t carries pitch / width / height back from
+// SYS_CONSOLE_GFX_MAP_FB so userspace doesn't have to ask separately.
+typedef struct __attribute__((packed)) fb_dims {
+    uint32_t width_px;
+    uint32_t height_px;
+    uint32_t pitch_bytes;
+    uint32_t bpp;
+    uint64_t size_bytes;
+} fb_dims_t;
+_Static_assert(sizeof(fb_dims_t) == 24, "fb_dims_t must be 24 bytes");
+
+// ---------------------------------------------------------------------------
 // Per-console kernel record.
 // ---------------------------------------------------------------------------
 typedef struct console {
@@ -144,6 +189,11 @@ typedef struct console {
     uint8_t         damage_head;
     uint8_t         damage_tail;
     uint8_t         _pad_b[6];
+    // Phase 29 Session D — dirty-rect SPSC ring for synthetic_render
+    // coalescing.  Producer = libtui / DEBUG_CONSOLE_WRITE_CELL; consumer =
+    // synthetic_render.  On overflow, synthetic_render does a full redraw
+    // and clears the overflow flag.
+    dirty_rect_ring_t dirty_ring;
 } console_t;
 
 // ---------------------------------------------------------------------------
@@ -274,3 +324,54 @@ struct vmo *console_gfx_enable(uint32_t console_id, uint32_t w_px, uint32_t h_px
 
 // Append a damage rect to the console's overlay damage ring.
 int console_gfx_damage(uint32_t console_id, const damage_rect_t *rect);
+
+// ---------------------------------------------------------------------------
+// Phase 29 Session D — TUI primitive backends.
+// ---------------------------------------------------------------------------
+
+// Mark a region of the cell grid dirty.  Best-effort SPSC push into the
+// console's dirty_ring; on overflow, sets the overflow flag (synthetic_render
+// will fall back to a full redraw + clear the flag).  Safe to call from any
+// context.
+void console_mark_dirty(uint32_t console_id, uint16_t x, uint16_t y,
+                        uint16_t w, uint16_t h);
+
+// SYS_CONSOLE_READ_INPUT (slot 1116) backend.  Drains the console's input
+// chan non-blocking, copying up to `max_events` input_event_t records into
+// `out`.  Returns the number copied; if more events were available than
+// max_events, the high bit (0x8000_0000_0000_0000) is set in the return so
+// userspace can detect "more available".  On overflow (dropped events
+// because the user buffer is smaller than what was queued for delivery),
+// AUDIT_TUI_INPUT_OVERFLOW is emitted.  Returns negative -errno on bad args.
+long console_read_input(uint32_t console_id, input_event_t *out,
+                        uint32_t max_events);
+
+// SYS_CONSOLE_GFX_MAP_FB (slot 1117) backend.  Derives a VMO_MMIO-backed
+// VMO covering the hardware framebuffer, inserts a cap_object + handle
+// into the caller's handle table, and writes the framebuffer dims into
+// *out_dims.  First caller wins exclusive write access; subsequent callers
+// get -EPERM unless they're the recorded owner.  Returns 0 on success.
+// out_handle_slot receives the caller's handle slot index; the userspace
+// wrapper packs it into a cap_token.
+int console_gfx_map_fb(int32_t caller_pid,
+                       uint64_t *out_token_raw,
+                       fb_dims_t *out_dims);
+
+// SYS_CONSOLE_VSYNC_WAIT (slot 1118) backend.  Blocks (TSC-calibrated busy
+// wait under cli; yields between iterations) until the next 60 Hz tick or
+// `max_wait_ns` expires.  Returns 0 on tick, -ETIME on timeout.
+int console_vsync_wait(uint64_t max_wait_ns);
+
+// SYS_CONSOLE_ATTACH (slot 1103) backend.  Cap-gate-verifies the caller's
+// CAP_KIND_CONSOLE token has RIGHT_ATTACH, then derives a cell-VMO handle
+// + input-chan handle into the caller's handle table.  Writes the packed
+// cap_token raws to *out_cell_token and *out_input_token.  Returns 0.
+int console_attach(int32_t caller_pid, uint32_t console_id,
+                   uint64_t cap_token_raw,
+                   uint64_t *out_cell_token,
+                   uint64_t *out_input_token);
+
+// Debug counters exposed for dirty_rect.tap so the test can verify the
+// coalesced render path actually fires.
+extern _Atomic uint64_t g_dirty_rect_renders_partial;
+extern _Atomic uint64_t g_dirty_rect_renders_full;

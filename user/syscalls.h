@@ -146,6 +146,10 @@ typedef long ssize_t;
 // Phase 29 Session C (FU28.B): SYS_SPAWN_ARGV — spawn child AND pass argv.
 // RDI = path, RSI = char *const *argv, RDX = uint32_t argc (≤ 16).
 #define SYS_SPAWN_ARGV              1115
+// Phase 29 Session D — TUI primitives.
+#define SYS_CONSOLE_READ_INPUT      1116
+#define SYS_CONSOLE_GFX_MAP_FB      1117
+#define SYS_CONSOLE_VSYNC_WAIT      1118
 
 // Phase 24 W19: COW snapshot subsystem (slots reconciled to 1093-1096
 // because spec's original 1086-1089 collide with SPAWN_EX..MMIO_VMO_CREATE).
@@ -322,6 +326,11 @@ typedef struct {
 #define DEBUG_INJECT_RESET_ALL              84
 // Phase 29 Session C (FU25.H): caller's handle table count.
 #define DEBUG_HANDLE_COUNT                  85
+// Phase 29 Session D — TUI test substrate.
+#define DEBUG_FB_OWNER_SET                  86
+#define DEBUG_DIRTY_RECT_GET_COUNTS         87
+#define DEBUG_DIRTY_RECT_RESET              88
+#define DEBUG_CONSOLE_READ_CELL             89
 #define DEBUG_FB_READ_PIXEL    61
 #define DEBUG_SET_WALL       51
 
@@ -1685,6 +1694,146 @@ static inline long syscall_debug_console_gfx_fill(uint32_t console_id,
                    "D"((uint64_t)DEBUG_CONSOLE_GFX_FILL),
                    "S"((uint64_t)console_id),
                    "d"(packed),
+                   "r"(r10)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// =====================================================================
+// Phase 29 Session D — TUI primitives.
+// =====================================================================
+
+// 20-byte input event ABI (mirror of kernel/console/console.h input_event_t).
+typedef struct __attribute__((packed)) input_event_u {
+    uint8_t  kind;            // 0=key, 1=mouse_btn, 2=mouse_motion
+    uint8_t  action;          // for key: 0=press 1=release
+    uint16_t key;             // scancode
+    int16_t  x_or_dx;
+    int16_t  y_or_dy;
+    uint16_t modifiers;
+    uint8_t  _pad[2];
+    uint64_t timestamp_tsc;
+} input_event_u_t;
+_Static_assert(sizeof(input_event_u_t) == 20, "input_event_u_t must be 20 bytes");
+
+// 24-byte framebuffer dimensions returned by SYS_CONSOLE_GFX_MAP_FB.
+typedef struct __attribute__((packed)) fb_dims_u {
+    uint32_t width_px;
+    uint32_t height_px;
+    uint32_t pitch_bytes;
+    uint32_t bpp;
+    uint64_t size_bytes;
+} fb_dims_u_t;
+_Static_assert(sizeof(fb_dims_u_t) == 24, "fb_dims_u_t must be 24 bytes");
+
+// Bit 62 in SYS_CONSOLE_READ_INPUT return value: more events queued.
+#define CONSOLE_INPUT_MORE_FLAG (1ULL << 62)
+
+// SYS_CONSOLE_READ_INPUT (1116) — drain console's input chan.
+static inline long syscall_console_read_input(uint32_t console_id,
+                                               input_event_u_t *out,
+                                               uint32_t max_events) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_READ_INPUT),
+                   "D"((uint64_t)console_id),
+                   "S"((uint64_t)out),
+                   "d"((uint64_t)max_events)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// SYS_CONSOLE_GFX_MAP_FB (1117) — mint FB MMIO handle.
+static inline long syscall_console_gfx_map_fb(uint64_t *out_handle_raw,
+                                               fb_dims_u_t *out_dims) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_GFX_MAP_FB),
+                   "D"((uint64_t)out_handle_raw),
+                   "S"((uint64_t)out_dims)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// SYS_CONSOLE_VSYNC_WAIT (1118) — block until next 60Hz tick or timeout.
+static inline long syscall_console_vsync_wait(uint64_t max_wait_ns) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_VSYNC_WAIT), "D"(max_wait_ns)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// SYS_CONSOLE_ATTACH (1103) — wired in Session D.  RDI = console_id,
+// RSI = cap_token_raw (or 0 for substrate "trusted" mode), RDX/R10 =
+// uint64_t *out_cell_token / *out_input_token.
+static inline long syscall_console_attach_full(uint32_t console_id,
+                                                uint64_t cap_token_raw,
+                                                uint64_t *out_cell_token,
+                                                uint64_t *out_input_token) {
+    long ret;
+    register uint64_t r10 asm("r10") = (uint64_t)out_input_token;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_CONSOLE_ATTACH),
+                   "D"((uint64_t)console_id),
+                   "S"(cap_token_raw),
+                   "d"((uint64_t)out_cell_token),
+                   "r"(r10)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Test-only: override SYS_CONSOLE_GFX_MAP_FB's exclusive owner.
+static inline long syscall_debug_fb_owner_set(int32_t pid) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_FB_OWNER_SET),
+                   "S"((uint64_t)(int64_t)pid)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Test-only: read dirty-rect render counters.
+static inline long syscall_debug_dirty_rect_get_counts(uint64_t out[2]) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_DIRTY_RECT_GET_COUNTS),
+                   "S"((uint64_t)out)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Test-only: reset dirty-rect counters.
+static inline long syscall_debug_dirty_rect_reset(void) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_DIRTY_RECT_RESET)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Test-only: read a cell's codepoint from the cell VMO.
+static inline long syscall_debug_console_read_cell(uint32_t console_id,
+                                                    uint32_t row,
+                                                    uint32_t col) {
+    long ret;
+    register uint64_t r10 asm("r10") = (uint64_t)col;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_CONSOLE_READ_CELL),
+                   "S"((uint64_t)console_id),
+                   "d"((uint64_t)row),
                    "r"(r10)
                  : "rcx", "r11", "memory");
     return ret;

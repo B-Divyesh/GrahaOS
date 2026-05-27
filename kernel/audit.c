@@ -121,6 +121,8 @@ static const char *event_name(uint16_t ev) {
         [AUDIT_PLAN_COMMIT]           = "PLAN_COMMIT",
         [AUDIT_PLAN_ABORT]            = "PLAN_ABORT",
         [AUDIT_RLIMIT_SYSCALL_RATE]   = "RLIMIT_SYSCALL_RATE",
+        [AUDIT_GFX_FB_MAPPED]         = "GFX_FB_MAPPED",
+        [AUDIT_TUI_INPUT_OVERFLOW]    = "TUI_INPUT_OVERFLOW",
     };
     if (ev > AUDIT_EVENT_MAX) return "UNKNOWN";
     const char *n = names[ev];
@@ -354,6 +356,29 @@ void audit_write_rlimit_syscall_rate(int32_t pid, uint64_t limit_per_sec,
     ksnprintf(e.detail, sizeof(e.detail),
               "limit=%lu observed=%lu",
               (unsigned long)limit_per_sec, (unsigned long)observed_per_sec);
+    audit_enqueue(&e);
+}
+
+// Phase 29 Session D writers.
+void audit_write_gfx_fb_mapped(int32_t pid, uint64_t phys_addr,
+                               uint64_t size_bytes) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_GFX_FB_MAPPED, pid, AUDIT_SRC_NATIVE);
+    e.subject_pid = pid;
+    ksnprintf(e.detail, sizeof(e.detail),
+              "phys=0x%lx size=%lu",
+              (unsigned long)phys_addr, (unsigned long)size_bytes);
+    audit_enqueue(&e);
+}
+
+void audit_write_tui_input_overflow(int32_t pid, uint32_t console_id,
+                                    uint32_t dropped) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_TUI_INPUT_OVERFLOW, pid, AUDIT_SRC_NATIVE);
+    e.subject_pid = pid;
+    ksnprintf(e.detail, sizeof(e.detail),
+              "console=%u dropped=%u",
+              (unsigned int)console_id, (unsigned int)dropped);
     audit_enqueue(&e);
 }
 
