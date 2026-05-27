@@ -81,6 +81,7 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/soak_inject_apply \
              tests/gcp_manifest_export_full \
              tests/gsh_completion \
+             tests/gsh_chrome \
              tests/ai_txn_rollback \
              tests/spawn_argv \
              tests/audit_query_since \
@@ -421,10 +422,11 @@ gash: gash.o json.o $(LIBHTTP) $(LIBTLS) $(LIBNET) $(LIBC)
 	@$(LD) $(LDFLAGS) -o $@ gash.o json.o $(LIBHTTP) --whole-archive $(LIBTLS) --no-whole-archive $(LIBNET) $(LIBC)
 
 # Phase 28 Session G.3 — gsh shell (full rewrite, TUI-first, parallel
-# to gash).  Links only libc; no libtls / libhttp dependency.
-gsh: gsh.o $(LIBC)
-	@echo "Linking user program: $@ (with libc)"
-	@$(LD) $(LDFLAGS) -o $@ gsh.o $(LIBC)
+# to gash).  Phase 29 Session F links libtui for the chrome rendering
+# (frame + title + status footer + cap sidebar via mapped cell-VMO).
+gsh: gsh.o $(LIBTUI) $(LIBC)
+	@echo "Linking user program: $@ (with libtui + libc)"
+	@$(LD) $(LDFLAGS) -o $@ gsh.o $(LIBTUI) $(LIBC)
 
 # Build libc test program
 libctest: libctest.o $(LIBC)

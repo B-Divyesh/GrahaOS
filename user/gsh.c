@@ -1,6 +1,9 @@
 // user/gsh.c
 //
 // Phase 28 Session G.3 — gsh: GrahaOS Shell.
+// Phase 29 Session F — TUI chrome + libtui mapped-cell-VMO rendering +
+// autorun cutover from bin/gash.  See gsh_draw_chrome /
+// gsh_refresh_cap_sidebar.
 //
 // A TUI-first interactive shell parallel to gash.  Features:
 //   - manifest-driven tab completion (built-ins + every GCP syscall name)
@@ -8,13 +11,18 @@
 //   - built-ins: cd, pwd, ls, cap-list, snapshot, restore, wasm, ai, txn { } commit|abort, exit
 //   - external command spawn (anything in /bin)
 //   - script mode via /.gsh-script sentinel for headless gate tests
+//   - TUI chrome (double-line outer frame, title bar, status footer,
+//     capability sidebar) — drawn through libtui's mapped-cell-VMO
+//     fast path (1000x fewer syscalls than DEBUG_CONSOLE_WRITE_CELL).
 //
 // This is a deliberate full rewrite (NOT a gash extension) per the
 // Phase 28 spec.  Where logic mirrors gash exactly (history ring,
 // arrow-key readline) we copy the pattern; where it diverges
-// (manifest cache, tab completion, ?-help) we author fresh.
+// (manifest cache, tab completion, ?-help, TUI chrome) we author fresh.
 
 #include "syscalls.h"
+#include "libtui/libtui.h"
+#include "../kernel/state.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -51,6 +59,176 @@ static void strncpy_local(char *dst, const char *src, int max) {
     int i = 0;
     while (src[i] && i < max - 1) { dst[i] = src[i]; i++; }
     dst[i] = '\0';
+}
+
+// =========================================================================
+//   TUI chrome (Phase 29 Session F)
+// =========================================================================
+//
+// gsh attaches to console_id=0 at startup.  If the attach succeeds we route
+// startup banner + chrome drawing through libtui (which writes into the
+// mapped cell-VMO — one memcpy per cell vs one syscall per cell).  Per-
+// keystroke output still goes through syscall_putc because the existing
+// readline + history pattern depends on \b\b \b sequences only the serial
+// console interprets — libtui's cell grid has no concept of backspace
+// erase.  The chrome is a static frame painted once at startup plus a
+// 30-prompt-periodic capability sidebar refresh.
+//
+// Chrome layout (80x24 window inside the 160x50 cell grid):
+//   row 0:    ╔═══════════════════════════════════════════ ╗ (top frame)
+//   row 1:    ║       gsh @ Phase 29                      ║ (title bar)
+//   row 2..22 ║ (work area)                  │ caps │ ║   (sidebar at 60..78)
+//   row 23:   ╚ cwd:/ | N caps | PID p       ═══════════╝ (status footer)
+//
+// On TUI-attach failure the fallback path is plain print() over syscall_putc
+// (used by test mode + serial-only boot).
+
+#define GSH_CHROME_CONSOLE_ID 0u
+#define GSH_CHROME_ROWS       24u
+#define GSH_CHROME_COLS       80u
+#define GSH_SIDEBAR_COL       60u
+#define GSH_SIDEBAR_WIDTH     20u
+#define GSH_SIDEBAR_ROW_TOP   3u
+#define GSH_SIDEBAR_ROW_BOT   21u
+#define GSH_CAP_REFRESH_EVERY 30u
+
+static int       g_tui_active = 0;
+static uint32_t  g_prompt_count = 0;
+static state_cap_list_t g_cap_list;
+
+static void int_to_str(long v, char *out, int outsz) {
+    int n = 0;
+    int neg = 0;
+    if (outsz < 2) { if (outsz > 0) out[0] = '\0'; return; }
+    if (v < 0) { neg = 1; v = -v; }
+    char tmp[24];
+    if (v == 0) tmp[n++] = '0';
+    while (v > 0 && n < (int)sizeof(tmp)) { tmp[n++] = (char)('0' + v % 10); v /= 10; }
+    int oi = 0;
+    if (neg && oi < outsz - 1) out[oi++] = '-';
+    while (n > 0 && oi < outsz - 1) out[oi++] = tmp[--n];
+    out[oi] = '\0';
+}
+
+static void tui_print_str(uint32_t row, uint32_t col,
+                          uint8_t fg, uint8_t bg, const char *s) {
+    (void)tui_print(GSH_CHROME_CONSOLE_ID, row, col, fg, bg, 0, s);
+}
+
+// Draw the static chrome — frame + title bar + footer skeleton.  The cwd /
+// cap count / pid text inside the footer is refreshed at every prompt by
+// gsh_redraw_status.
+//
+// Implementation note: we intentionally do NOT wrap chrome paint in
+// tui_begin_tx/commit_tx.  v1 of the cell-grid TX system (see
+// kernel/console/cell_tx.c) swaps cell_vmo->pages → shadow but leaves
+// existing user PTEs pointing at the original pages, so writes through a
+// previously-mapped cell-VMO land in the *originals* rather than the
+// shadow.  After commit, the shadow (= clean snapshot) wins and the writes
+// are effectively lost.  This is documented as "FU29.X.tx_ptes_remap" in
+// cell_tx.c.  Direct paint (no TX) sidesteps it: live writes go straight
+// to live cells.  The intended "no-flicker" optimisation will follow once
+// FU29.X.tx_ptes_remap remaps PTEs on begin_tx.
+static void gsh_draw_chrome(void) {
+    if (!g_tui_active) return;
+
+    // Outer double-line frame, 80x24.
+    (void)tui_draw_box_double(GSH_CHROME_CONSOLE_ID, 0, 0,
+                              GSH_CHROME_ROWS, GSH_CHROME_COLS, 15, 0);
+
+    // Title bar — row 1, fg=bright white on default bg.
+    const char *title = "gsh @ Phase 29 — GrahaOS Shell";
+    tui_print_str(1, 2, 15, 0, title);
+
+    // Footer placeholder ("cwd:") at row 23 col 2 — refreshed later.
+    tui_print_str(23, 2, 15, 0, "cwd:/  | 0 caps | pid 0");
+
+    // Sidebar separator: a vertical bar at col 59.
+    for (uint32_t r = 2; r <= 22; r++) {
+        (void)tui_write_cell(GSH_CHROME_CONSOLE_ID, r,
+                             GSH_SIDEBAR_COL - 1u,
+                             TUI_BOX2_VERT, 8, 0, 0);
+    }
+    tui_print_str(2, GSH_SIDEBAR_COL, 11, 0, " capabilities ");
+
+    (void)tui_present(GSH_CHROME_CONSOLE_ID);
+}
+
+// Poll STATE_CAT_CAPABILITIES + render up to 19 entries in the right
+// sidebar (rows 3..21, cols 60..78).  Empty rows are cleared.  TX wrap is
+// intentionally omitted (see gsh_draw_chrome rationale).
+static void gsh_refresh_cap_sidebar(void) {
+    if (!g_tui_active) return;
+    long rc = syscall_get_system_state(STATE_CAT_CAPABILITIES,
+                                       &g_cap_list, sizeof(g_cap_list));
+    if (rc < 0) return;
+
+    uint32_t shown = 0;
+    uint32_t row = GSH_SIDEBAR_ROW_TOP;
+    for (uint32_t i = 0;
+         i < g_cap_list.count && i < STATE_MAX_CAPS &&
+         row <= GSH_SIDEBAR_ROW_BOT;
+         i++) {
+        state_cap_entry_t *e = &g_cap_list.caps[i];
+        if (e->deleted) continue;
+
+        // Clear the row first (cols 60..78).
+        for (uint32_t c = GSH_SIDEBAR_COL; c < GSH_SIDEBAR_COL + GSH_SIDEBAR_WIDTH - 1; c++) {
+            (void)tui_write_cell(GSH_CHROME_CONSOLE_ID, row, c, ' ', 7, 0, 0);
+        }
+
+        // Build "<state>:<name>" truncated to fit.
+        char buf[20];
+        int bi = 0;
+        char marker = (e->state == 2) ? '*' : '.';
+        if (bi < (int)sizeof(buf) - 1) buf[bi++] = marker;
+        if (bi < (int)sizeof(buf) - 1) buf[bi++] = ' ';
+        for (int k = 0; e->name[k] && bi < (int)sizeof(buf) - 1; k++) {
+            buf[bi++] = e->name[k];
+        }
+        buf[bi] = '\0';
+        uint8_t fg = (e->state == 2) ? 10 : 7;  // green if ON, grey otherwise
+        tui_print_str(row, GSH_SIDEBAR_COL, fg, 0, buf);
+        row++;
+        shown++;
+    }
+    // Clear any remaining unused sidebar rows.
+    while (row <= GSH_SIDEBAR_ROW_BOT) {
+        for (uint32_t c = GSH_SIDEBAR_COL; c < GSH_SIDEBAR_COL + GSH_SIDEBAR_WIDTH - 1; c++) {
+            (void)tui_write_cell(GSH_CHROME_CONSOLE_ID, row, c, ' ', 7, 0, 0);
+        }
+        row++;
+    }
+
+    (void)shown;
+    (void)tui_present(GSH_CHROME_CONSOLE_ID);
+}
+
+// Refresh footer ("cwd:X | N caps | pid P") at row 23 cols 2..77.
+static void gsh_redraw_status(const char *cwd, uint32_t ncaps, int pid) {
+    if (!g_tui_active) return;
+    // Clear inside footer (cols 2..77).
+    for (uint32_t c = 2; c < GSH_CHROME_COLS - 2; c++) {
+        (void)tui_write_cell(GSH_CHROME_CONSOLE_ID, 23, c, ' ', 15, 0, 0);
+    }
+    char line[80];
+    int li = 0;
+    const char *prefix = "cwd:";
+    for (int i = 0; prefix[i] && li < (int)sizeof(line) - 1; i++) line[li++] = prefix[i];
+    for (int i = 0; cwd[i] && li < (int)sizeof(line) - 1; i++) line[li++] = cwd[i];
+    if (li < (int)sizeof(line) - 1) line[li++] = ' ';
+    if (li < (int)sizeof(line) - 1) line[li++] = '|';
+    if (li < (int)sizeof(line) - 1) line[li++] = ' ';
+    char num[24];
+    int_to_str((long)ncaps, num, sizeof(num));
+    for (int i = 0; num[i] && li < (int)sizeof(line) - 1; i++) line[li++] = num[i];
+    const char *mid = " caps | pid ";
+    for (int i = 0; mid[i] && li < (int)sizeof(line) - 1; i++) line[li++] = mid[i];
+    int_to_str((long)pid, num, sizeof(num));
+    for (int i = 0; num[i] && li < (int)sizeof(line) - 1; i++) line[li++] = num[i];
+    line[li] = '\0';
+    tui_print_str(23, 2, 15, 0, line);
+    (void)tui_present(GSH_CHROME_CONSOLE_ID);
 }
 
 // =========================================================================
@@ -625,6 +803,17 @@ static void process_cmdline(char *line) {
         int code = (argc >= 2) ? gsh_atoi(argv[1]) : 0;
         syscall_exit(code);
     }
+    // Phase 29 Session F back-compat — `exec <path> [args...]` runs an
+    // arbitrary binary (typically bin/gash) and waits.  Drops the "bin/"
+    // auto-prefix the regular spawn path applies.
+    if (strcmp(argv[0], "exec") == 0) {
+        if (argc < 2) { print("exec: usage: exec <path> [args...]\n"); return; }
+        long pid = syscall_spawn(argv[1]);
+        if (pid < 0) { print("exec: spawn failed\n"); return; }
+        int status = 0;
+        syscall_wait(&status);
+        return;
+    }
     if (strcmp(argv[0], "cd") == 0)        { cmd_cd(argc, argv);    return; }
     if (strcmp(argv[0], "pwd") == 0)       { cmd_pwd();             return; }
     if (strcmp(argv[0], "ls") == 0)        { cmd_ls(argc, argv);    return; }
@@ -745,13 +934,27 @@ void _start(int argc, char **argv) {
     seed_builtins();
     load_manifest();
 
+    // Phase 29 Session F — attempt TUI attach.  When this succeeds gsh
+    // routes its chrome (frame, title, footer, sidebar) through the
+    // mapped cell-VMO.  Failure is silent and harmless: the existing
+    // syscall_putc path stays in effect.  We do this BEFORE the script-
+    // mode branch so the chrome appears under both interactive AND
+    // script-mode (the latter is how gsh_chrome.tap reads cells back).
+    (void)tui_init();
+    if (tui_attach(GSH_CHROME_CONSOLE_ID) == 0) {
+        g_tui_active = 1;
+        gsh_draw_chrome();
+        gsh_refresh_cap_sidebar();
+        gsh_redraw_status(g_cwd, g_cap_list.count, syscall_getpid());
+    }
+
     // Script-mode sentinel takes precedence over interactive prompt.
     if (try_run_script_sentinel()) {
         // unreachable — script_run exits.
     }
 
     print("\n");
-    print("gsh — GrahaOS Shell (Phase 28). Type `help` or `?<word>`.\n");
+    print("gsh — GrahaOS Shell (Phase 29). Type `help` or `?<word>`.\n");
     print("Manifest: ");
     print_int(g_manifest_bytes);
     print(" bytes, ");
@@ -763,6 +966,13 @@ void _start(int argc, char **argv) {
         print("gsh");
         if (g_cwd[0] && g_cwd[1]) { print(":"); print(g_cwd); }
         print("$ ");
+        g_prompt_count++;
+        // Periodic cap-sidebar refresh.  Cheap (one syscall + ~20 cell
+        // writes); user-imperceptible because it's wrapped in a TX.
+        if (g_tui_active && (g_prompt_count % GSH_CAP_REFRESH_EVERY) == 1u) {
+            gsh_refresh_cap_sidebar();
+            gsh_redraw_status(g_cwd, g_cap_list.count, syscall_getpid());
+        }
         readline(line, sizeof(line));
         if (line[0]) history_add(line);
         process_cmdline(line);

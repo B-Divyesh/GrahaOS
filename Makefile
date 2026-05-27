@@ -565,6 +565,7 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@# Phase 28 Session G.4: spec-mandated gate tests.
 	@cp user/tests/gcp_manifest_export_full initrd_root/bin/tests/gcp_manifest_export_full.tap
 	@cp user/tests/gsh_completion           initrd_root/bin/tests/gsh_completion.tap
+	@cp user/tests/gsh_chrome               initrd_root/bin/tests/gsh_chrome.tap
 	@cp user/tests/ai_txn_rollback          initrd_root/bin/tests/ai_txn_rollback.tap
 	@# Phase 29 Session C: kernel ABI polish (FU28.B + FU28.E + FU25.H).
 	@cp user/tests/spawn_argv               initrd_root/bin/tests/spawn_argv.tap
@@ -760,7 +761,10 @@ ifdef TEST_HARNESS
 	@# Production boot does NOT carry this; only `make TEST_HARNESS=1 ...`.
 	@echo "daemon=bin/echod:net_server,net_client,ipc_send,ipc_recv" >> initrd_root/etc/init.conf
 endif
-	@echo "autorun=bin/gash" >> initrd_root/etc/init.conf
+	@# Phase 29 Session F: autorun flipped to bin/gsh.  bin/gash is still
+	@# shipped in initrd_root/bin/ and remains spawnable via
+	@# `gsh> exec bin/gash` (back-compat path for legacy gash workflows).
+	@echo "autorun=bin/gsh" >> initrd_root/etc/init.conf
 	@# Phase 22 closeout (G1.4): ship the Mozilla NSS root CA bundle so
 	@# libtls-mg can validate TLS server certificates.  ~224 KiB / 146 roots.
 	@mkdir -p initrd_root/etc/tls
@@ -917,6 +921,7 @@ endif
 	@# Phase 28 Session G.4: spec-mandated gate tests (5+5+8 = 18 asserts).
 	@echo "gcp_manifest_export_full" >> initrd_root/bin/tests/manifest.txt
 	@echo "gsh_completion"           >> initrd_root/bin/tests/manifest.txt
+	@echo "gsh_chrome"               >> initrd_root/bin/tests/manifest.txt
 	@echo "ai_txn_rollback"          >> initrd_root/bin/tests/manifest.txt
 	@# Phase 29 Session C: kernel ABI polish.  spawn_argv (5) +
 	@# audit_query_since (4) + spawn_handles_inherit (5) = +14 asserts.

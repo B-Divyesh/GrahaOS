@@ -35,7 +35,8 @@
 #define TEST_EXT           ".tap"
 // Phase 27 bumped 64 → 96 to fit the new console / fbd / tui / sprite /
 // gfx / audit / wasm gate tests (B1 + C1 + C2 + D2 add ~28 entries).
-#define MAX_TESTS          96
+// Phase 29 Session F bumped 96 → 128 to fit gsh_chrome + room for Sessions G+.
+#define MAX_TESTS          128
 #define MAX_NAME           48
 #define READ_BUF_BYTES     4096
 
