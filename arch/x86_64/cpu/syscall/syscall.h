@@ -632,6 +632,12 @@
 #define DEBUG_MOUSE_CURSOR_VISIBLE          95
 // Phase 29 Session I (FU28.D): read g_spinlock_timeout_count diagnostic.
 #define DEBUG_SPINLOCK_TIMEOUT_COUNT        96
+// Phase 29 Session I (FU27.X.rate_check_syscall_path): set caller's
+// syscall_rate_limit_per_sec (RSI) + syscall_rate_hard_mode (RDX, 0/1).
+// Returns the previous limit.
+#define DEBUG_SYSCALL_RATE_SET              97
+// Read caller's syscall_rate_exceeded_count diagnostic.
+#define DEBUG_SYSCALL_RATE_EXCEEDED         98
 
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);

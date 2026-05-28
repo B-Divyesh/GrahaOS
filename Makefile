@@ -604,6 +604,7 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@# Phase 29 Session I: perf phase tests (cpu_affinity, zero_copy_dma, spinlock_timeout, rate_quota).
 	@cp user/tests/cpu_affinity             initrd_root/bin/tests/cpu_affinity.tap
 	@cp user/tests/spinlock_timeout         initrd_root/bin/tests/spinlock_timeout.tap
+	@cp user/tests/rate_quota               initrd_root/bin/tests/rate_quota.tap
 	@# Phase 26 closeout (FU25.A.2): gash txn{} parser integration tests.
 	@cp user/tests/gash_txn_commit         initrd_root/bin/tests/gash_txn_commit.tap
 	@cp user/tests/gash_txn_abort          initrd_root/bin/tests/gash_txn_abort.tap
@@ -972,6 +973,7 @@ endif
 	@# whether gsh_completion's helper-process flake fires.
 	@echo "cpu_affinity"             >> initrd_root/bin/tests/manifest.txt
 	@echo "spinlock_timeout"         >> initrd_root/bin/tests/manifest.txt
+	@echo "rate_quota"               >> initrd_root/bin/tests/manifest.txt
 	@echo "gsh_completion"           >> initrd_root/bin/tests/manifest.txt
 	@echo "gsh_chrome"               >> initrd_root/bin/tests/manifest.txt
 	@echo "ai_txn_rollback"          >> initrd_root/bin/tests/manifest.txt

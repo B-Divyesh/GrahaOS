@@ -95,6 +95,20 @@ void rlimit_init_defaults(task_t *child, const task_t *parent) {
     child->hash_next   = NULL;
     child->global_next = NULL;
     child->global_prev = NULL;
+
+    // Phase 29 Session I (FU27.X.rate_check_syscall_path): syscall rate
+    // quota defaults.  Inherit from parent if present (so a rate-limited
+    // parent's children inherit by default); else unlimited.
+    if (parent) {
+        child->syscall_rate_limit_per_sec = parent->syscall_rate_limit_per_sec;
+        child->syscall_rate_hard_mode     = parent->syscall_rate_hard_mode;
+    } else {
+        child->syscall_rate_limit_per_sec = 0; // unlimited
+        child->syscall_rate_hard_mode     = 0;
+    }
+    child->syscall_count_sampled        = 0;
+    child->last_rate_refill_tsc         = 0;
+    child->syscall_rate_exceeded_count  = 0;
 }
 
 // ---------------------------------------------------------------------------

@@ -314,6 +314,25 @@ typedef struct task_struct {
         uint32_t            reserved;
     } active_txn;
     uint8_t replay_in_progress;
+
+    // Phase 29 Session I (FU27.X.rate_check_syscall_path): per-task syscall
+    // rate quota.  Sample-gated check at dispatch entry: every 1/256 calls
+    // we (a) increment syscall_count_sampled and (b) compare against the
+    // per-second budget.  On overflow → audit_write_rlimit_syscall_rate +
+    // (soft mode) audit-only / (hard mode) the dispatcher returns -EAGAIN.
+    //
+    // Refill is lazy: at sample time, if (now_tsc - last_refill_tsc) ≥
+    // 1s worth of ticks, reset syscall_count_sampled back to 0 and adjust
+    // last_refill_tsc.
+    //
+    // Default: syscall_rate_limit_per_sec = 0 (unlimited).  Tests opt in via
+    // SYS_SETRLIMIT with a Phase 29 extension (RLIMIT_SYSCALL_RATE) — for
+    // now the field is set directly by debug helpers.
+    uint64_t syscall_rate_limit_per_sec;   // 0 = unlimited
+    uint64_t syscall_count_sampled;        // count of sampled syscalls this epoch
+    uint64_t last_rate_refill_tsc;         // last refill TSC
+    uint64_t syscall_rate_exceeded_count;  // diagnostic
+    uint8_t  syscall_rate_hard_mode;       // 0 = audit-only, 1 = return -EAGAIN
 } task_t;
 
 /**

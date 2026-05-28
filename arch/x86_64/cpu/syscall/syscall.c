@@ -11,6 +11,7 @@ extern spinlock_t sched_lock;
 #include "../../../../kernel/gcp.h"
 #include "../../../../kernel/elf.h"
 #include "../sched/sched.h"
+#include "../tsc.h"
 #include "../../../../kernel/initrd.h"
 #include "../../mm/pmm.h"
 #include "../../mm/vmm.h"
@@ -223,6 +224,44 @@ void syscall_dispatcher(struct syscall_frame *frame) {
     // there. Doing it dispatcher-wide cost ~2 rdmsr per syscall (per-CPU
     // lookup) and tipped snap_stress_cycle past the gate budget. Localised
     // is essentially free.
+
+    // Phase 29 Session I (FU27.X.rate_check_syscall_path): token-bucket
+    // rate quota.  Sample-gated (1/256 dispatches via rdtsc low byte) to
+    // keep the per-call cost at ~3 instructions in the common case.  On
+    // sample, if the task's syscall_rate_limit_per_sec > 0 and the
+    // 1-second epoch budget is exceeded, emit AUDIT_RLIMIT_SYSCALL_RATE
+    // and (hard mode) overwrite frame->rax with -EAGAIN before dispatch.
+    {
+        uint64_t tsc;
+        asm volatile("rdtsc" : "=A"(tsc));
+        if ((tsc & 0xFFu) == 0) {
+            task_t *cur_rate = sched_get_current_task();
+            if (cur_rate && cur_rate->syscall_rate_limit_per_sec > 0) {
+                // Lazy refill: if >= 1s elapsed since last refill, reset.
+                uint64_t elapsed_ns = tsc_is_ready()
+                    ? tsc_to_ns(tsc - cur_rate->last_rate_refill_tsc)
+                    : 0;
+                if (elapsed_ns >= 1000000000ULL) {
+                    cur_rate->syscall_count_sampled = 0;
+                    cur_rate->last_rate_refill_tsc = tsc;
+                }
+                // Track samples (each sample == ~256 real syscalls).
+                cur_rate->syscall_count_sampled += 256;
+                if (cur_rate->syscall_count_sampled >
+                    cur_rate->syscall_rate_limit_per_sec) {
+                    cur_rate->syscall_rate_exceeded_count++;
+                    audit_write_rlimit_syscall_rate(
+                        cur_rate->id,
+                        cur_rate->syscall_rate_limit_per_sec,
+                        cur_rate->syscall_count_sampled);
+                    if (cur_rate->syscall_rate_hard_mode) {
+                        frame->rax = (uint64_t)(long)-11; // -EAGAIN
+                        return;
+                    }
+                }
+            }
+        }
+    }
 
     uint64_t syscall_num = frame->int_no;
     
@@ -2230,6 +2269,29 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 extern uint64_t g_spinlock_timeout_count;
                 frame->rax = __atomic_load_n(&g_spinlock_timeout_count,
                                              __ATOMIC_ACQUIRE);
+                break;
+            }
+            // Phase 29 Session I (FU27.X.rate_check_syscall_path):
+            // set caller's syscall rate limit + mode.  RSI = new limit,
+            // RDX = hard mode (0 audit-only / 1 -EAGAIN).  Returns prior
+            // limit.
+            case DEBUG_SYSCALL_RATE_SET: {
+                task_t *cur_srs = sched_get_current_task();
+                if (!cur_srs) { frame->rax = 0; break; }
+                uint64_t prior = cur_srs->syscall_rate_limit_per_sec;
+                cur_srs->syscall_rate_limit_per_sec = frame->rsi;
+                cur_srs->syscall_rate_hard_mode = (uint8_t)(frame->rdx & 1);
+                cur_srs->syscall_count_sampled = 0;
+                uint64_t tsc;
+                asm volatile("rdtsc" : "=A"(tsc));
+                cur_srs->last_rate_refill_tsc = tsc;
+                frame->rax = prior;
+                break;
+            }
+            // Read caller's syscall_rate_exceeded_count.
+            case DEBUG_SYSCALL_RATE_EXCEEDED: {
+                task_t *cur_sre = sched_get_current_task();
+                frame->rax = cur_sre ? cur_sre->syscall_rate_exceeded_count : 0;
                 break;
             }
             default:

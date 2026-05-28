@@ -348,6 +348,8 @@ typedef struct {
 #define DEBUG_FB_READ_PIXEL_AT              94
 #define DEBUG_MOUSE_CURSOR_VISIBLE          95
 #define DEBUG_SPINLOCK_TIMEOUT_COUNT        96
+#define DEBUG_SYSCALL_RATE_SET              97
+#define DEBUG_SYSCALL_RATE_EXCEEDED         98
 #define DEBUG_FB_READ_PIXEL    61
 #define DEBUG_SET_WALL       51
 
@@ -2146,6 +2148,31 @@ static inline long syscall_debug_spinlock_timeout_count(void) {
                  : "=a"(ret)
                  : "a"(SYS_DEBUG),
                    "D"((uint64_t)DEBUG_SPINLOCK_TIMEOUT_COUNT)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Phase 29 Session I (FU27.X.rate_check_syscall_path).  Set caller's
+// syscall rate limit and mode; returns the prior limit.
+static inline long syscall_debug_syscall_rate_set(uint64_t limit_per_sec,
+                                                  uint64_t hard_mode) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_SYSCALL_RATE_SET),
+                   "S"(limit_per_sec),
+                   "d"(hard_mode)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long syscall_debug_syscall_rate_exceeded(void) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_SYSCALL_RATE_EXCEEDED)
                  : "rcx", "r11", "memory");
     return ret;
 }
