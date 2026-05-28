@@ -57,7 +57,14 @@ static uint64_t next_chan_id(void) {
 
 channel_t *chan_lookup_by_id(uint64_t chan_id) {
     if (chan_id == 0) return NULL;
-    spinlock_acquire(&g_chan_reg_lock);
+    // Phase 29 Session I (FU28.D): try the timeout variant first to advance
+    // the g_spinlock_timeout_count diagnostic on real contention.  On
+    // timeout, fall back to the panic-on-budget legacy path so semantics
+    // are unchanged (a truly stuck lock will still die loudly).  500 ms
+    // is a generous timeout for what should be a microsecond lookup.
+    if (!spinlock_acquire_with_timeout(&g_chan_reg_lock, 500000000ULL)) {
+        spinlock_acquire(&g_chan_reg_lock);
+    }
     channel_t *c = g_chan_reg_head;
     while (c) {
         if (c->id == chan_id) {
