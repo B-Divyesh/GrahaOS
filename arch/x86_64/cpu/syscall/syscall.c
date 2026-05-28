@@ -2224,6 +2224,14 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = mouse_cursor_visible(cid) ? 1u : 0u;
                 break;
             }
+            // Phase 29 Session I (FU28.D): read the timeout-variant
+            // diagnostic counter.  No reset; tests sample before+after.
+            case DEBUG_SPINLOCK_TIMEOUT_COUNT: {
+                extern uint64_t g_spinlock_timeout_count;
+                frame->rax = __atomic_load_n(&g_spinlock_timeout_count,
+                                             __ATOMIC_ACQUIRE);
+                break;
+            }
             default:
                 frame->rax = (uint64_t)-1;
                 break;

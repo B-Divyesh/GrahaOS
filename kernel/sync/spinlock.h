@@ -86,6 +86,35 @@ void _spinlock_acquire_with_budget(spinlock_t *lock, uint64_t budget_ns,
     _spinlock_acquire_with_budget((lock), (budget_ns), NULL, 0)
 #endif
 
+// ---------------------------------------------------------------------------
+// Phase 29 Session I (FU28.D): non-panicking timeout variant.
+//
+// _spinlock_acquire_with_timeout returns true on acquire, false on timeout.
+// The caller decides the failure policy.  Existing callers that wrap the
+// original spinlock_acquire() still hit the panic-on-budget path; new
+// callers that want graceful degradation (e.g. diagnostic logging, retry,
+// fall-back) use this variant.
+//
+// Recursive (same-CPU re-entry) returns true immediately and bumps count.
+// On timeout the lock is NOT held and the saved-interrupt-state is NOT
+// touched (caller's interrupt mask is preserved).
+// ---------------------------------------------------------------------------
+bool _spinlock_acquire_with_timeout(spinlock_t *lock, uint64_t budget_ns,
+                                    const char *file, int line);
+
+#ifdef DEBUG_LOCKS
+#define spinlock_acquire_with_timeout(lock, budget_ns) \
+    _spinlock_acquire_with_timeout((lock), (budget_ns), __FILE__, __LINE__)
+#else
+#define spinlock_acquire_with_timeout(lock, budget_ns) \
+    _spinlock_acquire_with_timeout((lock), (budget_ns), NULL, 0)
+#endif
+
+// Diagnostic counter: incremented every time a timeout-variant acquire
+// returns false because the budget was exceeded.  Tests use this to verify
+// the variant degraded gracefully rather than panicking.
+extern uint64_t g_spinlock_timeout_count;
+
 // spinlock_oops_t — structured payload passed to kpanic_at when a spinlock
 // budget is exceeded (or an illegal release is attempted). Flattened into
 // the ==OOPS== frame's detail string by the kpanic handler.

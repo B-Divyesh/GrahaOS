@@ -235,6 +235,88 @@ void _spinlock_acquire(spinlock_t *lock, const char *file, int line) {
     _spinlock_acquire_with_budget(lock, SPINLOCK_DEFAULT_BUDGET_NS, file, line);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 29 Session I (FU28.D): non-panicking timeout variant.
+//
+// Mirrors _spinlock_acquire_with_budget but returns false on overrun
+// instead of calling kpanic_at.  The lock is NOT held on false return.
+// ---------------------------------------------------------------------------
+uint64_t g_spinlock_timeout_count = 0;
+
+bool _spinlock_acquire_with_timeout(spinlock_t *lock, uint64_t budget_ns,
+                                    const char *file, int line) {
+    (void)file; (void)line;
+    if (!lock) return false;
+
+    uint64_t cpu_id = get_cpu_id();
+
+    // Recursive acquisition: same CPU already holds it.
+    if (lock->locked && lock->owner == cpu_id) {
+        lock->count++;
+        return true;
+    }
+
+    // Save interrupt state and disable interrupts BEFORE the contended
+    // spin so that we never leave the lock-acquire window with IRQs
+    // enabled by mistake.  On timeout we restore the state before
+    // returning.
+    uint64_t flags;
+    asm volatile(
+        "pushfq\n"
+        "pop %0\n"
+        "cli"
+        : "=r"(flags)
+    );
+
+    // Fast path: single test_and_set.
+    if (!__atomic_test_and_set(&lock->locked, __ATOMIC_ACQUIRE)) {
+        lock->interrupt_state = flags;
+        lock->owner = cpu_id;
+        lock->count = 1;
+        lock->last_file = file;
+        lock->last_line = line;
+        return true;
+    }
+
+    // Contended path: spin with a deadline.
+    bool tsc_mode = tsc_is_ready();
+    uint64_t start_tsc = tsc_mode ? rdtsc() : 0;
+    uint32_t iter_cap = SPINLOCK_PRE_TSC_ITER_CAP;
+
+    uint32_t iter = 0;
+    while (__atomic_test_and_set(&lock->locked, __ATOMIC_ACQUIRE)) {
+        iter++;
+        if ((iter & 1023) == 0) {
+            if (tsc_mode) {
+                uint64_t elapsed_ns = tsc_to_ns(rdtsc() - start_tsc);
+                if (elapsed_ns > budget_ns) {
+                    // Restore interrupt mask and surrender.
+                    if (flags & 0x200) asm volatile("sti");
+                    __atomic_fetch_add(&g_spinlock_timeout_count, 1,
+                                       __ATOMIC_RELAXED);
+                    return false;
+                }
+            } else {
+                if (iter > iter_cap) {
+                    if (flags & 0x200) asm volatile("sti");
+                    __atomic_fetch_add(&g_spinlock_timeout_count, 1,
+                                       __ATOMIC_RELAXED);
+                    return false;
+                }
+            }
+        }
+        asm volatile("pause");
+    }
+
+    // Got it.
+    lock->interrupt_state = flags;
+    lock->owner = cpu_id;
+    lock->count = 1;
+    lock->last_file = file;
+    lock->last_line = line;
+    return true;
+}
+
 void _spinlock_release(spinlock_t *lock, const char *file, int line) {
     if (!lock) {
         kernel_panic("spinlock_release: NULL lock pointer");

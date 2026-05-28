@@ -347,6 +347,7 @@ typedef struct {
 #define DEBUG_INJECT_MOUSE                  93
 #define DEBUG_FB_READ_PIXEL_AT              94
 #define DEBUG_MOUSE_CURSOR_VISIBLE          95
+#define DEBUG_SPINLOCK_TIMEOUT_COUNT        96
 #define DEBUG_FB_READ_PIXEL    61
 #define DEBUG_SET_WALL       51
 
@@ -2134,6 +2135,17 @@ static inline long syscall_debug_inject_reset_all(void) {
                  : "=a"(ret)
                  : "a"(SYS_DEBUG),
                    "D"((uint64_t)DEBUG_INJECT_RESET_ALL)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Phase 29 Session I (FU28.D): read g_spinlock_timeout_count.
+static inline long syscall_debug_spinlock_timeout_count(void) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_DEBUG),
+                   "D"((uint64_t)DEBUG_SPINLOCK_TIMEOUT_COUNT)
                  : "rcx", "r11", "memory");
     return ret;
 }

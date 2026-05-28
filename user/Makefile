@@ -104,6 +104,7 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/mouse_basic \
              tests/font_full_sweep \
              tests/cpu_affinity \
+             tests/spinlock_timeout \
              tests/gash_txn_commit \
              tests/gash_txn_abort \
              tests/gash_txn_abort_fs_revert \
