@@ -243,10 +243,12 @@
   },
 
   "audit_events": {
-    "_note": "Phase 22 closeout: catalog of audit event ids (kernel/audit.h). Phase 22 added DEPRECATED_SYSCALL=17, CHAN_NAME_PUBLISH=39, CHAN_NAME_CONNECT=40. Phase 29 Session D added GFX_FB_MAPPED=57, TUI_INPUT_OVERFLOW=58 (codes 55+56 reserved for Session B TLS).  Session E added TUI_TX_ABORT=59, INPUT_MOUSE_DROPPED=60.",
+    "_note": "Phase 22 closeout: catalog of audit event ids (kernel/audit.h). Phase 22 added DEPRECATED_SYSCALL=17, CHAN_NAME_PUBLISH=39, CHAN_NAME_CONNECT=40. Phase 29 Session B (FU28.A) added TLS_HANDSHAKE_FAIL=55, TLS_CERT_VERIFY_FAIL=56.  Session D added GFX_FB_MAPPED=57, TUI_INPUT_OVERFLOW=58.  Session E added TUI_TX_ABORT=59, INPUT_MOUSE_DROPPED=60.",
     "AUDIT_DEPRECATED_SYSCALL":    17,
     "AUDIT_CHAN_NAME_PUBLISH":     39,
     "AUDIT_CHAN_NAME_CONNECT":     40,
+    "AUDIT_TLS_HANDSHAKE_FAIL":    55,
+    "AUDIT_TLS_CERT_VERIFY_FAIL":  56,
     "AUDIT_GFX_FB_MAPPED":         57,
     "AUDIT_TUI_INPUT_OVERFLOW":    58,
     "AUDIT_TUI_TX_ABORT":          59,

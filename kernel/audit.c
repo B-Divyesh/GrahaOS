@@ -123,6 +123,10 @@ static const char *event_name(uint16_t ev) {
         [AUDIT_RLIMIT_SYSCALL_RATE]   = "RLIMIT_SYSCALL_RATE",
         [AUDIT_GFX_FB_MAPPED]         = "GFX_FB_MAPPED",
         [AUDIT_TUI_INPUT_OVERFLOW]    = "TUI_INPUT_OVERFLOW",
+        [AUDIT_TUI_TX_ABORT]          = "TUI_TX_ABORT",
+        [AUDIT_INPUT_MOUSE_DROPPED]   = "INPUT_MOUSE_DROPPED",
+        [AUDIT_TLS_HANDSHAKE_FAIL]    = "TLS_HANDSHAKE_FAIL",
+        [AUDIT_TLS_CERT_VERIFY_FAIL]  = "TLS_CERT_VERIFY_FAIL",
     };
     if (ev > AUDIT_EVENT_MAX) return "UNKNOWN";
     const char *n = names[ev];
@@ -402,6 +406,54 @@ void audit_write_input_mouse_dropped(int32_t pid, uint32_t console_id,
     ksnprintf(e.detail, sizeof(e.detail),
               "console=%u total_dropped=%lu",
               (unsigned int)console_id, (unsigned long)total_dropped);
+    audit_enqueue(&e);
+}
+
+// Phase 29 Session B (FU28.A) writers — TLS handshake observability.
+//
+// Detail format mirrors the other AUDIT_*_FAIL writers: short key=value
+// pairs that fit in audit_entry_t's 192-byte detail field even after the
+// audit_enqueue seq= prefix.  Host name is capped at 64 chars; longer
+// names get truncated with '...' so the line stays inside the buffer.
+static void copy_host_truncated(char *dst, size_t cap, const char *host) {
+    if (!dst || cap == 0) return;
+    if (!host) { dst[0] = '\0'; return; }
+    size_t hlen = 0;
+    while (host[hlen]) hlen++;
+    if (hlen >= cap) {
+        size_t keep = cap - 4;  // leave room for "..." + NUL
+        for (size_t i = 0; i < keep; i++) dst[i] = host[i];
+        dst[keep + 0] = '.'; dst[keep + 1] = '.'; dst[keep + 2] = '.';
+        dst[keep + 3] = '\0';
+    } else {
+        for (size_t i = 0; i < hlen; i++) dst[i] = host[i];
+        dst[hlen] = '\0';
+    }
+}
+
+void audit_write_tls_handshake_fail(int32_t pid, const char *host,
+                                    int32_t phase_code) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_TLS_HANDSHAKE_FAIL, pid, AUDIT_SRC_NATIVE);
+    e.subject_pid = pid;
+    e.result_code = phase_code;
+    char host_buf[65];
+    copy_host_truncated(host_buf, sizeof(host_buf), host);
+    ksnprintf(e.detail, sizeof(e.detail),
+              "host=%s phase=%d", host_buf, (int)phase_code);
+    audit_enqueue(&e);
+}
+
+void audit_write_tls_cert_verify_fail(int32_t pid, const char *host,
+                                      int32_t x509_err) {
+    audit_entry_t e;
+    fill_base(&e, AUDIT_TLS_CERT_VERIFY_FAIL, pid, AUDIT_SRC_NATIVE);
+    e.subject_pid = pid;
+    e.result_code = x509_err;
+    char host_buf[65];
+    copy_host_truncated(host_buf, sizeof(host_buf), host);
+    ksnprintf(e.detail, sizeof(e.detail),
+              "host=%s x509_err=%d", host_buf, (int)x509_err);
     audit_enqueue(&e);
 }
 

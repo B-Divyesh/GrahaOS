@@ -119,6 +119,7 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/tcp_fuzz \
              tests/gcp_manifest \
              tests/libtls \
+             tests/libtls_handshake \
              tests/tcp_stress_1000 \
              tests/userdrv_respawn_stress
 # Phase 23 S7.1: ahcid_register builds but is kept OUT of the gate
@@ -179,10 +180,16 @@ LIBHTTP := libhttp/libhttp.a
 # Phase 27 Block A (Stage A5): libtui userspace TUI primitives library.
 # Linked into apps that drive the virtual consoles (tui_demo, gsh in P28).
 LIBTUI := libtui/libtui.a
+# Phase 29 Session B (FU28.A): libtls userspace TLS 1.2/1.3 client.
+# Substrate-only landing: provides the public API surface (libtls_init /
+# connect / send / recv / close) over a stub that returns -ENOSYS.  Once
+# vendor/bearssl/ is wired (scripts/vendor-bearssl.sh), libtls links
+# against libbearssl.a and libhttp swaps off libtls-mg.a.
+LIBTLS_NEW := libtls/libtls.a
 
 .PHONY: all clean libc
 
-all: libc $(LIBTAP) $(LIBNET) $(LIBNETD) $(LIBHTTP) $(LIBTLS) $(LIBTUI) $(LIBWASM3) $(PROGRAMS) $(TAP_TESTS)
+all: libc $(LIBTAP) $(LIBNET) $(LIBNETD) $(LIBHTTP) $(LIBTLS) $(LIBTLS_NEW) $(LIBTUI) $(LIBWASM3) $(PROGRAMS) $(TAP_TESTS)
 
 # Build libc first
 libc:
@@ -220,6 +227,14 @@ $(LIBHTTP): libhttp/libhttp.o
 # the Phase 27 console subsystem. Apps link against it; gsh in Phase 28.
 $(LIBTUI): libtui/libtui.o
 	@echo "Creating $@"
+	@$(AR) rcs $@ $^
+
+# Phase 29 Session B (FU28.A): libtls.a — BearSSL-backed TLS 1.2/1.3 client.
+# Substrate-only: libtls.c stubs every entry point with -ENOSYS until the
+# vendor/bearssl/ wiring lands.  Builds clean either way so the rest of the
+# tree keeps compiling.
+$(LIBTLS_NEW): libtls/libtls.o
+	@echo "Creating $@ (libtls — BearSSL substrate)"
 	@$(AR) rcs $@ $^
 
 # Phase 22 Stage D U18: libtls-mg.a — Mongoose-backed TLS 1.3 client. The
@@ -394,13 +409,21 @@ tests/gcp_manifest: tests/gcp_manifest.o $(LIBTAP) $(LIBC)
 	@echo "Linking TAP test: $@"
 	@$(LD) $(LDFLAGS) -o $@ tests/gcp_manifest.o $(LIBTAP) $(LIBC)
 
-# Phase 22 closeout (G1.6): libtls.tap exercises the libtls-mg.a crypto
-# primitives (SHA-256, X25519) against RFC vectors.  --whole-archive on
-# $(LIBTLS) so the linker pulls in mongoose_tls_core.o despite the test
-# code only having weak references to libtls_connect (via libhttp's decl).
-tests/libtls: tests/libtls.o $(LIBTAP) $(LIBTLS) $(LIBNET) $(LIBC)
+# Phase 29 Session B (FU28.A): libtls.tap exercises BearSSL primitives via
+# libtls.a.  In substrate landing libtls_backend_available() returns 0 and
+# the test tap_skip's every assert with a single "BearSSL not yet wired"
+# reason; once vendor/bearssl/ is wired the sentinel flips to 1 and the
+# real SHA-256/AES/X.509 checks run.
+tests/libtls: tests/libtls.o $(LIBTAP) $(LIBTLS_NEW) $(LIBNET) $(LIBC)
+	@echo "Linking TAP test (with libtls — BearSSL): $@"
+	@$(LD) $(LDFLAGS) -o $@ tests/libtls.o $(LIBTLS_NEW) $(LIBNET) $(LIBTAP) $(LIBC)
+
+# Phase 29 Session B (FU28.A): libtls_handshake.tap exercises a full TLS
+# handshake against scripts/run_tls_test_server.sh.  Skip-all today; real
+# asserts when BearSSL is wired.
+tests/libtls_handshake: tests/libtls_handshake.o $(LIBTAP) $(LIBTLS_NEW) $(LIBNET) $(LIBC)
 	@echo "Linking TAP test (with libtls): $@"
-	@$(LD) $(LDFLAGS) -o $@ tests/libtls.o --whole-archive $(LIBTLS) --no-whole-archive $(LIBNET) $(LIBTAP) $(LIBC)
+	@$(LD) $(LDFLAGS) -o $@ tests/libtls_handshake.o $(LIBTLS_NEW) $(LIBNET) $(LIBTAP) $(LIBC)
 
 # Phase 22 closeout (G6): offline 1000-socket stress test against
 # netd_tcp.c.  In-process — no daemons, no wire.  Live-stack 1000-conn

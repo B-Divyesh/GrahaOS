@@ -106,9 +106,13 @@
 #define AUDIT_PLAN_COMMIT             52  // plan committed (txn closed)
 #define AUDIT_PLAN_ABORT              53  // plan aborted
 #define AUDIT_RLIMIT_SYSCALL_RATE     54  // syscall-rate quota exceeded (Stage C2 emits)
-// Phase 29 codes.  55 + 56 are RESERVED for Phase 29 Session B (TLS):
-//   AUDIT_TLS_HANDSHAKE_FAIL     55  (TBD — Session B BearSSL bring-up)
-//   AUDIT_TLS_CERT_REJECT        56  (TBD — Session B)
+// Phase 29 Session B (FU28.A) — TLS handshake observability.
+// Substrate writers live in kernel/audit.c; libtls calls them from
+// userspace via SYS_AUDIT_WRITE_TLS (Phase 29 follow-up) once BearSSL is
+// wired.  Until then the codes + writers exist so AUDIT_EVENT_MAX is
+// stable across the cutover.
+#define AUDIT_TLS_HANDSHAKE_FAIL      55  // libtls_connect: handshake aborted before Finished
+#define AUDIT_TLS_CERT_VERIFY_FAIL    56  // libtls_connect: peer cert chain failed X.509 verify
 // Session D (TUI primitives) consumes 57 + 58:
 #define AUDIT_GFX_FB_MAPPED           57  // SYS_CONSOLE_GFX_MAP_FB: caller got FB MMIO handle
 #define AUDIT_TUI_INPUT_OVERFLOW      58  // SYS_CONSOLE_READ_INPUT: events dropped (user buffer too small)
@@ -540,3 +544,16 @@ void audit_write_tui_tx_abort(int32_t pid, uint32_t console_id,
                               uint32_t cells_dropped);
 void audit_write_input_mouse_dropped(int32_t pid, uint32_t console_id,
                                      uint64_t total_dropped);
+
+// Phase 29 Session B (FU28.A) writers.
+//   TLS_HANDSHAKE_FAIL fires when libtls_connect's BearSSL handshake
+//   aborts before sending Finished.  `host` is the SNI string (capped at
+//   64 chars; truncated with '...' if longer); `phase_code` is the BearSSL
+//   br_ssl_engine_last_error() value (0 = unknown).
+//   TLS_CERT_VERIFY_FAIL fires when the peer's certificate chain fails
+//   X.509 validation against /etc/tls/trust.pem.  `host` is the SNI;
+//   `x509_err` is BearSSL's br_x509_decoder error code.
+void audit_write_tls_handshake_fail(int32_t pid, const char *host,
+                                    int32_t phase_code);
+void audit_write_tls_cert_verify_fail(int32_t pid, const char *host,
+                                      int32_t x509_err);

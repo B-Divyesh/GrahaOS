@@ -490,6 +490,8 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@cp user/tests/gcp_manifest     initrd_root/bin/tests/gcp_manifest.tap
 	@# Phase 22 closeout (G1.6): libtls RFC test vectors (SHA-256 + X25519).
 	@cp user/tests/libtls           initrd_root/bin/tests/libtls.tap
+	@# Phase 29 Session B (FU28.A): libtls TLS handshake end-to-end gate.
+	@cp user/tests/libtls_handshake initrd_root/bin/tests/libtls_handshake.tap
 	@# Phase 22 closeout (G6): offline 1000-socket TCP stress test.
 	@cp user/tests/tcp_stress_1000  initrd_root/bin/tests/tcp_stress_1000.tap
 	@# Phase 23 S1: userdrv MMIO/IRQ/chan synchronous-cleanup stress (P22.G.4).
@@ -788,10 +790,17 @@ endif
 	@# shipped in initrd_root/bin/ and remains spawnable via
 	@# `gsh> exec bin/gash` (back-compat path for legacy gash workflows).
 	@echo "autorun=bin/gsh" >> initrd_root/etc/init.conf
-	@# Phase 22 closeout (G1.4): ship the Mozilla NSS root CA bundle so
-	@# libtls-mg can validate TLS server certificates.  ~224 KiB / 146 roots.
+	@# Phase 22 closeout (G1.4) / Phase 29 Session B (FU28.A): ship the
+	@# Mozilla NSS root CA bundle.  Phase 29 migrates the canonical copy
+	@# from user/libtls-mg/assets/ to etc/tls/ so libtls (BearSSL backend)
+	@# can find it without the libtls-mg subtree present.  The legacy
+	@# location is still consulted as a fallback during the cutover.
 	@mkdir -p initrd_root/etc/tls
-	@cp user/libtls-mg/assets/trust.pem initrd_root/etc/tls/trust.pem
+	@if [ -f etc/tls/trust.pem ]; then \
+	    cp etc/tls/trust.pem initrd_root/etc/tls/trust.pem; \
+	else \
+	    cp user/libtls-mg/assets/trust.pem initrd_root/etc/tls/trust.pem; \
+	fi
 	@# Phase 12: test manifest — one name per line, loaded by ktest.
 	@# Keep in sync with TAP_TESTS in user/Makefile.
 	@echo "# GrahaOS TAP test manifest (Phase 12) — one test name per line" > initrd_root/bin/tests/manifest.txt
@@ -1052,6 +1061,9 @@ endif
 	@echo "gcp_manifest" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 22 closeout (G1.6): libtls RFC test vectors (SHA-256 + X25519).
 	@echo "libtls" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 29 Session B (FU28.A): libtls handshake end-to-end gate (skip
+	@# until vendor/bearssl/ is wired).
+	@echo "libtls_handshake" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 22 closeout (G6): 1000-socket TCP stress.
 	@echo "tcp_stress_1000" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 23 Stage-2 cutover: ahcid_register tested in-gate after

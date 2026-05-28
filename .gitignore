@@ -110,6 +110,9 @@ user/tests/pledgetest
 user/tests/audittest
 user/tests/panic_test
 user/tests/kpf_test
+# Phase 29 Session B (FU28.A) — libtls gate test binaries.
+user/tests/libtls
+user/tests/libtls_handshake
 
 # Build artifacts, local state
 .disk_formatted
