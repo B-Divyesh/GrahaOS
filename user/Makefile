@@ -317,6 +317,29 @@ tests/wasm_concurrent_serial: tests/wasm_concurrent_serial.o $(LIBTAP) $(LIBNET)
 	@echo "Linking TAP test: $@ (with libnet + libtap + libc)"
 	@$(LD) $(LDFLAGS) -o $@ tests/wasm_concurrent_serial.o $(LIBNET) $(LIBTAP) $(LIBC)
 
+# Phase 29 Session G (FU27.WASM.D2_worker): 5 fault-isolation + AI-bindings
+# gates.  Each spawns its own wasmd, exercises one fault axis, then kills
+# wasmd to keep subsequent tests undisturbed.
+tests/wasm_fault_sigkill: tests/wasm_fault_sigkill.o $(LIBTAP) $(LIBNET) $(LIBC)
+	@echo "Linking TAP test: $@ (with libnet + libtap + libc)"
+	@$(LD) $(LDFLAGS) -o $@ tests/wasm_fault_sigkill.o $(LIBNET) $(LIBTAP) $(LIBC)
+
+tests/wasm_sandbox_path_narrow: tests/wasm_sandbox_path_narrow.o $(LIBTAP) $(LIBNET) $(LIBC)
+	@echo "Linking TAP test: $@ (with libnet + libtap + libc)"
+	@$(LD) $(LDFLAGS) -o $@ tests/wasm_sandbox_path_narrow.o $(LIBNET) $(LIBTAP) $(LIBC)
+
+tests/wasm_fault_fuel: tests/wasm_fault_fuel.o $(LIBTAP) $(LIBNET) $(LIBC)
+	@echo "Linking TAP test: $@ (with libnet + libtap + libc)"
+	@$(LD) $(LDFLAGS) -o $@ tests/wasm_fault_fuel.o $(LIBNET) $(LIBTAP) $(LIBC)
+
+tests/wasm_lacks_cap: tests/wasm_lacks_cap.o $(LIBTAP) $(LIBNET) $(LIBC)
+	@echo "Linking TAP test: $@ (with libnet + libtap + libc)"
+	@$(LD) $(LDFLAGS) -o $@ tests/wasm_lacks_cap.o $(LIBNET) $(LIBTAP) $(LIBC)
+
+tests/wasm_ai_bindings: tests/wasm_ai_bindings.o $(LIBTAP) $(LIBNET) $(LIBC)
+	@echo "Linking TAP test: $@ (with libnet + libtap + libc)"
+	@$(LD) $(LDFLAGS) -o $@ tests/wasm_ai_bindings.o $(LIBNET) $(LIBTAP) $(LIBC)
+
 # Phase 12: generic rule for tests/NAME: tests/NAME.o libtap.a libc.a
 tests/%: tests/%.o $(LIBTAP) $(LIBC)
 	@echo "Linking TAP test: $@"

@@ -105,6 +105,13 @@ typedef struct wasmd_response_header {
 #define WASMD_E_WORKER_SPAWN        -7
 #define WASMD_E_WORKER_CRASH        -8
 #define WASMD_E_INTERNAL            -9
+/* Phase 29 Session G — additional status codes for the FU27.WASM.D2_worker
+ * orchestrator. Returned when the worker hits a host-binding cap-check
+ * failure (-10), the wall-clock watchdog (-11), or an external SIGKILL
+ * delivered to the worker mid-run (-12). */
+#define WASMD_E_CAP_DENIED          -10
+#define WASMD_E_FUEL_EXHAUSTED      -11
+#define WASMD_E_WORKER_KILLED       -12
 
 /* Single-slot staging filenames — D1 v1 only. D2 extends. */
 #define WASMD_PENDING_PATH           "/tmp/wasmd_pending.wasm"

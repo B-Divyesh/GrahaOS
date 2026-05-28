@@ -15,6 +15,7 @@
 #include "object.h"
 #include "handle_table.h"
 
+#include "../audit.h"
 #include "../log.h"
 #include "../mm/kheap.h"
 #include "../mm/slab.h"
@@ -91,7 +92,19 @@ int cap_wasm_instance_create(int32_t parent_pid, int32_t worker_pid,
     spec->instance_id    = instance_id;
     spec->started_ns     = 0;  // wasmd fills in via SYS_KCLOCK_NS at minted time
     spec->rights_summary = rights_summary;
+    spec->audit_subscription_slot = -1;
+    spec->_pad0          = 0;
     copy_module_name(spec->module_name, module_name);
+
+    // FU27.X.wasmd_audit_subscription — claim a per-instance audit slot.
+    // ~0 filter mask: receive every event type.  Failure (-EAGAIN, all 16
+    // slots taken) is non-fatal — the worker can still rely on the global
+    // audit_query path.  Slot is auto-released when the worker task exits
+    // via sched_reap_zombie -> audit_unsubscribe_all_for_pid(worker_pid).
+    int aud_slot = audit_subscribe(worker_pid, ~0ULL);
+    if (aud_slot >= 0) {
+        spec->audit_subscription_slot = aud_slot;
+    }
 
     // Audience starts as { parent_pid, worker_pid } — both processes can
     // resolve the handle. Sub-tokens derived later may narrow audience.
@@ -133,6 +146,7 @@ cap_kind_wasm_instance_t *cap_wasm_instance_resolve(int32_t caller_pid,
 void cap_wasm_task_exit_cleanup(int32_t dying_pid) {
     if (!g_cap_wasm_spec_cache) return;  // never initialised — nothing to do
     int revoked = 0;
+    int aud_released = 0;
     for (uint32_t i = 1; i < CAP_OBJECT_CAPACITY; i++) {
         cap_object_t *obj = g_cap_object_ptrs[i];
         if (!obj || obj->kind != CAP_KIND_WASM_INSTANCE) continue;
@@ -142,6 +156,16 @@ void cap_wasm_task_exit_cleanup(int32_t dying_pid) {
         if (spec->owner_pid != dying_pid && spec->parent_pid != dying_pid) {
             continue;
         }
+        // FU27.X.wasmd_audit_subscription — release the audit slot first
+        // so a re-spawned worker can claim a fresh slot.  This is also
+        // covered defensively by sched_reap_zombie's call to
+        // audit_unsubscribe_all_for_pid(worker_pid), but doing it here
+        // makes the lifetime of the slot match the lifetime of the cap.
+        if (spec->audit_subscription_slot >= 0) {
+            audit_unsubscribe(spec->audit_subscription_slot);
+            spec->audit_subscription_slot = -1;
+            aud_released++;
+        }
         // Revoke the cap_object. CAP_FLAG_EAGER_REVOKE cascades to derived
         // tokens automatically. We do NOT free the spec block here — the
         // cap_object_revoke handler is the canonical owner; reaper will
@@ -150,9 +174,10 @@ void cap_wasm_task_exit_cleanup(int32_t dying_pid) {
             revoked++;
         }
     }
-    if (revoked > 0) {
+    if (revoked > 0 || aud_released > 0) {
         klog(KLOG_INFO, SUBSYS_CAP,
-             "cap_wasm_task_exit_cleanup: dying pid=%d, revoked %d wasm caps",
-             dying_pid, revoked);
+             "cap_wasm_task_exit_cleanup: dying pid=%d, revoked %d wasm caps, "
+             "released %d audit slots",
+             dying_pid, revoked, aud_released);
     }
 }

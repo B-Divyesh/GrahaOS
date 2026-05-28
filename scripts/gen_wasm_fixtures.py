@@ -290,12 +290,166 @@ def build_demo_net() -> bytes:
            sec_export + sec_code
 
 
+def build_ai_demo() -> bytes:
+    """ai_demo.wasm — exercises 3 host bindings.
+       (module
+         (import "gcp" "print"     (func $print     (param i32 i32)))
+         (import "gcp" "tui_write" (func $tui_write (param i32 i32 i32 i32) (result i32)))
+         (memory (export "memory") 1)
+         (data (i32.const 16) "ai-demo")
+         (func $start
+           ;; Print marker so the test can verify the binding ran.
+           (call $print (i32.const 16) (i32.const 7))
+           ;; Write 'X' at console 0, (col=1,row=1).
+           (call $tui_write (i32.const 0) (i32.const 1) (i32.const 1) (i32.const 0x58))
+           (drop))
+         (export "_start" (func $start)))
+    """
+    msg = b"ai-demo"
+    DATA_OFFSET = 16
+    sec_type = section(SECTION_TYPE, vec([
+        func_type([], []),                                            # type 0
+        func_type([TYPE_I32, TYPE_I32], []),                          # type 1 print
+        func_type([TYPE_I32, TYPE_I32, TYPE_I32, TYPE_I32], [TYPE_I32]),  # type 2 tui_write
+    ]))
+    sec_import = section(SECTION_IMPORT, vec([
+        import_func("gcp", "print", 1),       # func 0
+        import_func("gcp", "tui_write", 2),   # func 1
+    ]))
+    sec_function = section(SECTION_FUNCTION, vec([leb128_u(0)]))     # func 2 of type 0
+    sec_memory = section(SECTION_MEMORY, vec([memory_def(1)]))
+    sec_export = section(SECTION_EXPORT, vec([
+        export_def("_start", KIND_FUNC, 2),
+        export_def("memory", KIND_MEM, 0),
+    ]))
+    body = (i32_const(DATA_OFFSET) + i32_const(len(msg)) +
+            bytes([OP_CALL]) + leb128_u(0) +
+            i32_const(0) + i32_const(1) + i32_const(1) + i32_const(0x58) +
+            bytes([OP_CALL]) + leb128_u(1) +
+            bytes([OP_DROP]))
+    sec_code = section(SECTION_CODE, vec([code_locals_zero(body)]))
+    offset_expr = i32_const(DATA_OFFSET) + bytes([OP_END])
+    sec_data = section(SECTION_DATA, vec([data_active(0, offset_expr, msg)]))
+    return HEADER + sec_type + sec_import + sec_function + sec_memory + \
+           sec_export + sec_code + sec_data
+
+
+def build_sigkill() -> bytes:
+    """sigkill.wasm — enters infinite loop after printing marker.
+       Used to verify wasmd survives an externally-killed worker."""
+    msg = b"sigkill-loop"
+    DATA_OFFSET = 16
+    sec_type = section(SECTION_TYPE, vec([
+        func_type([], []),
+        func_type([TYPE_I32, TYPE_I32], []),
+    ]))
+    sec_import = section(SECTION_IMPORT, vec([
+        import_func("gcp", "print", 1),
+    ]))
+    sec_function = section(SECTION_FUNCTION, vec([leb128_u(0)]))
+    sec_memory = section(SECTION_MEMORY, vec([memory_def(1)]))
+    sec_export = section(SECTION_EXPORT, vec([
+        export_def("_start", KIND_FUNC, 1),
+        export_def("memory", KIND_MEM, 0),
+    ]))
+    body = (i32_const(DATA_OFFSET) + i32_const(len(msg)) +
+            bytes([OP_CALL]) + leb128_u(0) +
+            bytes([OP_BLOCK, 0x40, OP_LOOP, 0x40, OP_BR, 0x00, OP_END, OP_END]))
+    sec_code = section(SECTION_CODE, vec([code_locals_zero(body)]))
+    offset_expr = i32_const(DATA_OFFSET) + bytes([OP_END])
+    sec_data = section(SECTION_DATA, vec([data_active(0, offset_expr, msg)]))
+    return HEADER + sec_type + sec_import + sec_function + sec_memory + \
+           sec_export + sec_code + sec_data
+
+
+def build_path_narrow_violator() -> bytes:
+    """path_narrow_violator.wasm — calls gcp.fs_write on a path outside the
+       sandbox (must NOT start with /tmp/).  The worker traps with
+       'cap denied: fs_write path outside sandbox' which the daemon maps
+       to WASMD_E_CAP_DENIED."""
+    # Path string: "evil.txt" (no /tmp/ prefix).
+    path = b"evil.txt"
+    content = b"data"
+    PATH_OFF = 16
+    CONTENT_OFF = 64
+    sec_type = section(SECTION_TYPE, vec([
+        func_type([], []),
+        func_type([TYPE_I32, TYPE_I32, TYPE_I32, TYPE_I32], [TYPE_I32]),  # fs_write
+    ]))
+    sec_import = section(SECTION_IMPORT, vec([
+        import_func("gcp", "fs_write", 1),
+    ]))
+    sec_function = section(SECTION_FUNCTION, vec([leb128_u(0)]))
+    sec_memory = section(SECTION_MEMORY, vec([memory_def(1)]))
+    sec_export = section(SECTION_EXPORT, vec([
+        export_def("_start", KIND_FUNC, 1),
+        export_def("memory", KIND_MEM, 0),
+    ]))
+    body = (i32_const(PATH_OFF) + i32_const(len(path)) +
+            i32_const(CONTENT_OFF) + i32_const(len(content)) +
+            bytes([OP_CALL]) + leb128_u(0) +
+            bytes([OP_DROP]))
+    sec_code = section(SECTION_CODE, vec([code_locals_zero(body)]))
+    offset_expr_p = i32_const(PATH_OFF) + bytes([OP_END])
+    offset_expr_c = i32_const(CONTENT_OFF) + bytes([OP_END])
+    sec_data = section(SECTION_DATA, vec([
+        data_active(0, offset_expr_p, path),
+        data_active(0, offset_expr_c, content),
+    ]))
+    return HEADER + sec_type + sec_import + sec_function + sec_memory + \
+           sec_export + sec_code + sec_data
+
+
+def build_fuel_exhaust() -> bytes:
+    """fuel_exhaust.wasm — tight infinite loop with no host I/O.
+       Worker's wall-clock watchdog cannot wake without a host call,
+       so this fixture is functionally identical to long_running until
+       we add an interpreter-level instruction budget. Worker is then
+       SIGKILL'd by the orchestrator after a timeout, mapped to
+       WASMD_E_FUEL_EXHAUSTED."""
+    sec_type = section(SECTION_TYPE, vec([func_type([], [])]))
+    sec_function = section(SECTION_FUNCTION, vec([leb128_u(0)]))
+    sec_export = section(SECTION_EXPORT, vec([
+        export_def("_start", KIND_FUNC, 0),
+    ]))
+    body = bytes([OP_BLOCK, 0x40, OP_LOOP, 0x40, OP_BR, 0x00, OP_END, OP_END])
+    sec_code = section(SECTION_CODE, vec([code_locals_zero(body)]))
+    return HEADER + sec_type + sec_function + sec_export + sec_code
+
+
+def build_lacks_cap() -> bytes:
+    """lacks_cap.wasm — calls gcp.tui_write but is spawned with the
+       TUI_WRITE cap denied via /tmp/wasmd_pending.caps gate-file."""
+    sec_type = section(SECTION_TYPE, vec([
+        func_type([], []),
+        func_type([TYPE_I32, TYPE_I32, TYPE_I32, TYPE_I32], [TYPE_I32]),
+    ]))
+    sec_import = section(SECTION_IMPORT, vec([
+        import_func("gcp", "tui_write", 1),
+    ]))
+    sec_function = section(SECTION_FUNCTION, vec([leb128_u(0)]))
+    sec_export = section(SECTION_EXPORT, vec([
+        export_def("_start", KIND_FUNC, 1),
+    ]))
+    body = (i32_const(0) + i32_const(0) + i32_const(0) + i32_const(0x41) +
+            bytes([OP_CALL]) + leb128_u(0) +
+            bytes([OP_DROP]))
+    sec_code = section(SECTION_CODE, vec([code_locals_zero(body)]))
+    return HEADER + sec_type + sec_import + sec_function + sec_export + sec_code
+
+
 FIXTURES = {
-    "hello.wasm":         build_hello,
-    "oopsie.wasm":        build_oopsie,
-    "long_running.wasm":  build_long_running,
-    "fn_call_bench.wasm": build_fn_call_bench,
-    "demo_net.wasm":      build_demo_net,
+    "hello.wasm":               build_hello,
+    "oopsie.wasm":               build_oopsie,
+    "long_running.wasm":         build_long_running,
+    "fn_call_bench.wasm":        build_fn_call_bench,
+    "demo_net.wasm":             build_demo_net,
+    # Phase 29 Session G — FU27.WASM.D2_worker fixtures.
+    "ai_demo.wasm":              build_ai_demo,
+    "sigkill.wasm":              build_sigkill,
+    "path_narrow_violator.wasm": build_path_narrow_violator,
+    "fuel_exhaust.wasm":         build_fuel_exhaust,
+    "lacks_cap.wasm":            build_lacks_cap,
 }
 
 

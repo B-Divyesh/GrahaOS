@@ -25,12 +25,19 @@
 // Specialisation block stored in cap_object_t.kind_data (cast to uintptr_t).
 // 64 bytes (multiple of 8 for natural alignment); slab-allocated alongside
 // the cap_object_t when CAP_KIND_WASM_INSTANCE is created.
+//
+// Phase 29 Session G (FU27.X.wasmd_audit_subscription): audit_subscription_slot
+// tracks which AUDIT_SUB_MAX slot is reserved for this worker.  Set at
+// cap_wasm_instance_create; -1 if subscribe failed (slots full) or after
+// the worker's task_exit hook auto-unsubscribed via audit_unsubscribe_all_for_pid.
 typedef struct cap_kind_wasm_instance_s {
     int32_t  owner_pid;       // wasmd-worker PID (the actual sandbox)
     int32_t  parent_pid;      // wasmd daemon PID (the cap minter)
     uint64_t instance_id;     // monotonic, assigned at create time
     uint64_t started_ns;      // boot-relative
     uint64_t rights_summary;  // copy of rights_bitmap for fast read
+    int32_t  audit_subscription_slot;  // FU27.X.wasmd_audit_subscription
+    uint32_t _pad0;
     char     module_name[WASM_INSTANCE_NAME_MAX];
 } cap_kind_wasm_instance_t;
 

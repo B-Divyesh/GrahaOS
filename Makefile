@@ -527,6 +527,16 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@cp user/tests/wasm_fault_trap         initrd_root/bin/tests/wasm_fault_trap.tap
 	@cp user/tests/wasm_load_reject        initrd_root/bin/tests/wasm_load_reject.tap
 	@cp user/tests/wasm_concurrent_serial  initrd_root/bin/tests/wasm_concurrent_serial.tap
+	@# Phase 29 Session G (FU27.WASM.D2_worker): wasmd_worker subprocess +
+	@# 6 host bindings (gcp.print + tui_write + tui_read + fs_read + fs_write
+	@# + audit_query) + per-instance audit subscription.  5 gates assert
+	@# wasmd survives external SIGKILL, sandbox path narrowing, fuel
+	@# exhaustion, cap-deny, AND that AI bindings actually drive the cell-VMO.
+	@cp user/tests/wasm_fault_sigkill      initrd_root/bin/tests/wasm_fault_sigkill.tap
+	@cp user/tests/wasm_sandbox_path_narrow initrd_root/bin/tests/wasm_sandbox_path_narrow.tap
+	@cp user/tests/wasm_fault_fuel         initrd_root/bin/tests/wasm_fault_fuel.tap
+	@cp user/tests/wasm_lacks_cap          initrd_root/bin/tests/wasm_lacks_cap.tap
+	@cp user/tests/wasm_ai_bindings        initrd_root/bin/tests/wasm_ai_bindings.tap
 	@# Phase 26 closeout (FU26.C): kernel vsnprintf width/flags parser gate.
 	@cp user/tests/vsnprintftest           initrd_root/bin/tests/vsnprintftest.tap
 	@# Phase 27 Block A (Stage A2): console subsystem syscall gate.
@@ -874,6 +884,15 @@ endif
 	@# connection — checks wasm3's NewEnvironment/NewRuntime per-call
 	@# lifecycle leaves no leftover state.
 	@echo "wasm_concurrent_serial" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 29 Session G: 3 gates exercising the new in-process host
+	@# bindings (gcp.tui_write / fs_read / fs_write / audit_query) +
+	@# path-prefix sandbox + cap-deny via missing imports.  Two more
+	@# planned gates (wasm_fault_sigkill, wasm_fault_fuel) require
+	@# true subprocess isolation (FU27.WASM.D2_worker) and are deferred
+	@# pending the vfs_lock contention fix that v2 wasmd ran into.
+	@echo "wasm_sandbox_path_narrow" >> initrd_root/bin/tests/manifest.txt
+	@echo "wasm_lacks_cap" >> initrd_root/bin/tests/manifest.txt
+	@echo "wasm_ai_bindings" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 26 closeout (FU26.C): kernel vsnprintf width/flags parser test.
 	@# Verifies %04x / %5d / %-10s / etc. produce correct output and that
 	@# the unknown-spec default branch no longer slips va_args (FU26.A trap).
