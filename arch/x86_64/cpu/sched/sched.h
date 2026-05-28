@@ -467,6 +467,23 @@ int sched_spawn_process_argv(const char *path, int parent_id,
 int sched_send_signal(int pid, int signal);
 
 /**
+ * @brief Phase 29 Session I (FU24.E): set CPU affinity for a task.
+ *
+ * Phase 29 v1 supports single-CPU pinning only.  The 32-bit mask is
+ * interpreted as a candidate set; the lowest set bit names the CPU to
+ * pin the task to.  Mask == 0xFFFFFFFFu (all-1s) means "any CPU" and
+ * sets cpu_pinned = -1 (unpinned).
+ *
+ * Used by ahcid worker to re-affinitize to the caller CPU after connect
+ * (FU24.E — same-CPU IPC affinity hint).
+ *
+ * @param pid  Target task PID.
+ * @param mask Affinity mask.  0 is rejected with -EINVAL.
+ * @return 0 on success, -EINVAL on bad pid/mask, -EPERM if cap missing.
+ */
+int sched_set_affinity(int pid, uint32_t mask);
+
+/**
  * @brief Register a signal handler for the current process
  * @param signal Signal number
  * @param handler Handler function pointer

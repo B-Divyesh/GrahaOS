@@ -103,6 +103,7 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/cell_grid_atomic \
              tests/mouse_basic \
              tests/font_full_sweep \
+             tests/cpu_affinity \
              tests/gash_txn_commit \
              tests/gash_txn_abort \
              tests/gash_txn_abort_fs_revert \

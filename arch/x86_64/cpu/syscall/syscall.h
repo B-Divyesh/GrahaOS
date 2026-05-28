@@ -480,6 +480,13 @@
 // Returns 0 on success, -EINVAL on bad handle.  Pledge: SYS_CONTROL.
 #define SYS_CONSOLE_ABORT_TX       1122
 
+// Phase 29 Session I (FU24.E): set CPU affinity for a task.
+//   RDI = int32_t pid       (target task; -1 / 0 → self)
+//   RSI = uint32_t mask     (lowest set bit = pinned CPU; 0xFFFFFFFFu = unpin)
+// Returns 0 on success, -EINVAL on bad args, -EPERM if target_pid != self and
+// caller lacks SYS_CONTROL.  Pledge: SYS_CONTROL unless target_pid == self.
+#define SYS_SET_CPU_AFFINITY       1123
+
 // Resource identifiers for SYS_SETRLIMIT / SYS_GETRLIMIT.
 #define RLIMIT_MEM            1     // pages (4 KiB each); 0 = unlimited
 #define RLIMIT_CPU            2     // ns per 1-second epoch (max 1_000_000_000); 0 = unlimited

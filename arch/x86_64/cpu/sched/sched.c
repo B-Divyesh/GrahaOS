@@ -1433,6 +1433,43 @@ int sched_spawn_process_argv(const char *path, int parent_id,
 }
 
 // Phase 7d: Send a signal to a process
+// Phase 29 Session I (FU24.E): set CPU affinity for a task.
+// Maps the affinity mask onto the existing cpu_pinned field — mask==all-1s
+// means unpinned (cpu_pinned = -1); otherwise pin to the lowest set bit's
+// CPU.  Future v2 could honor multi-CPU masks once the runq selector
+// understands set membership.  For now this is sufficient for FU24.E's
+// "ahcid worker re-affinitizes to caller CPU" use case.
+int sched_set_affinity(int pid, uint32_t mask) {
+    if (pid < 0 || pid >= next_task_id || pid >= MAX_TASKS) return -22; // -EINVAL
+    if (mask == 0) return -22;
+    if (task_ptrs[pid] == NULL) return -22;
+    task_t *target = task_ptrs[pid];
+    if (target->state == TASK_STATE_ZOMBIE) return -22;
+
+    int32_t new_pinned;
+    if (mask == 0xFFFFFFFFu) {
+        new_pinned = -1;  // unpinned (any CPU)
+    } else {
+        // Lowest set bit.
+        int bit = __builtin_ctz(mask);
+        if ((uint32_t)bit >= g_cpu_count) {
+            // Bit refers to a CPU we don't have; clamp down to a valid one.
+            // Reject for safety.
+            return -22;
+        }
+        new_pinned = (int32_t)bit;
+    }
+
+    // Idle tasks must remain pinned to their CPU — bail out cleanly rather
+    // than corrupting the per-CPU dispatch invariant.
+    if (target->is_idle) return -1; // -EPERM
+
+    spinlock_acquire(&sched_lock);
+    target->cpu_pinned = new_pinned;
+    spinlock_release(&sched_lock);
+    return 0;
+}
+
 int sched_send_signal(int pid, int signal) {
     if (signal < 1 || signal >= MAX_SIGNALS) {
         klog(KLOG_ERROR, SUBSYS_SCHED, "[SIGNAL] ERROR: Invalid signal number");

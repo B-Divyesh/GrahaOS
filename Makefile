@@ -601,6 +601,8 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@cp user/tests/cell_grid_atomic         initrd_root/bin/tests/cell_grid_atomic.tap
 	@cp user/tests/mouse_basic              initrd_root/bin/tests/mouse_basic.tap
 	@cp user/tests/font_full_sweep          initrd_root/bin/tests/font_full_sweep.tap
+	@# Phase 29 Session I: perf phase tests (cpu_affinity, zero_copy_dma, spinlock_timeout, rate_quota).
+	@cp user/tests/cpu_affinity             initrd_root/bin/tests/cpu_affinity.tap
 	@# Phase 26 closeout (FU25.A.2): gash txn{} parser integration tests.
 	@cp user/tests/gash_txn_commit         initrd_root/bin/tests/gash_txn_commit.tap
 	@cp user/tests/gash_txn_abort          initrd_root/bin/tests/gash_txn_abort.tap
@@ -963,6 +965,11 @@ endif
 	@echo "txn_fault_during_replay"        >> initrd_root/bin/tests/manifest.txt
 	@# Phase 28 Session G.4: spec-mandated gate tests (5+5+8 = 18 asserts).
 	@echo "gcp_manifest_export_full" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 29 Session I (FU24.E): SYS_SET_CPU_AFFINITY gate test.  Placed
+	@# BEFORE gsh_completion (which has a known FU25.A.4 wait/exit race) so
+	@# the cpu_affinity asserts run in every gate iteration regardless of
+	@# whether gsh_completion's helper-process flake fires.
+	@echo "cpu_affinity"             >> initrd_root/bin/tests/manifest.txt
 	@echo "gsh_completion"           >> initrd_root/bin/tests/manifest.txt
 	@echo "gsh_chrome"               >> initrd_root/bin/tests/manifest.txt
 	@echo "ai_txn_rollback"          >> initrd_root/bin/tests/manifest.txt

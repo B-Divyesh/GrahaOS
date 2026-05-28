@@ -157,6 +157,9 @@ typedef long ssize_t;
 #define SYS_CONSOLE_COMMIT_TX       1121
 #define SYS_CONSOLE_ABORT_TX        1122
 
+// Phase 29 Session I (FU24.E).
+#define SYS_SET_CPU_AFFINITY        1123
+
 // Phase 24 W19: COW snapshot subsystem (slots reconciled to 1093-1096
 // because spec's original 1086-1089 collide with SPAWN_EX..MMIO_VMO_CREATE).
 #define SYS_SNAP_CREATE       1093
@@ -1853,6 +1856,20 @@ static inline long syscall_console_abort_tx(uint32_t tx_handle) {
     asm volatile("syscall"
                  : "=a"(ret)
                  : "a"(SYS_CONSOLE_ABORT_TX), "D"((uint64_t)tx_handle)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+
+// SYS_SET_CPU_AFFINITY (1123) — FU24.E.
+// pid <= 0 → self; mask = 0xFFFFFFFFu → unpinned (any CPU); other masks
+// pin to the lowest set bit's CPU.  Mask = 0 returns -EINVAL.
+static inline long syscall_set_cpu_affinity(int32_t pid, uint32_t mask) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_SET_CPU_AFFINITY),
+                   "D"((uint64_t)(int64_t)pid),
+                   "S"((uint64_t)mask)
                  : "rcx", "r11", "memory");
     return ret;
 }

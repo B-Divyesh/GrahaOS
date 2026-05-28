@@ -4230,6 +4230,28 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             break;
         }
 
+        // Phase 29 Session I (FU24.E): set CPU affinity.  Targeting self
+        // (pid <= 0 or pid == own pid) requires only PLEDGE_COMPUTE; targeting
+        // another task requires PLEDGE_SYS_CONTROL.  See sched_set_affinity.
+        case SYS_SET_CPU_AFFINITY: {
+            int32_t target_pid = (int32_t)frame->rdi;
+            uint32_t mask = (uint32_t)frame->rsi;
+            task_t *cur_aff = sched_get_current_task();
+            int32_t self_pid = cur_aff ? cur_aff->id : -1;
+            // Normalize: <= 0 means self.
+            if (target_pid <= 0) target_pid = self_pid;
+            if (target_pid != self_pid) {
+                if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_CONTROL,
+                                            "pledge denied: sys_control")) break;
+            } else {
+                if (!pledge_check_and_audit(frame, PLEDGE_CLASS_COMPUTE,
+                                            "pledge denied: compute")) break;
+            }
+            int rc = sched_set_affinity(target_pid, mask);
+            frame->rax = (uint64_t)(long)rc;
+            break;
+        }
+
         case SYS_AUDIT_SUBSCRIBE: {
             // Pledge SYS_QUERY (read-only observation).
             if (!pledge_check_and_audit(frame, PLEDGE_CLASS_SYS_QUERY,
