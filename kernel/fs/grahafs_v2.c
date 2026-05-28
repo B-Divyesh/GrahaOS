@@ -993,6 +993,38 @@ int grahafs_v2_create(struct vfs_node *parent, const char *name, uint32_t type) 
     if (rc != 0) return rc;
 
     (void)v2_write_superblock();
+
+    // FU24.A + FU25.D — Phase 29 Session H dirent race fix (Option A).
+    //
+    // Symptom (historical): two rapid creates back-to-back; the second create
+    // reads the parent directory block from disk and sees stale data — the
+    // first create's dirent is missing from the on-disk view.  Subsequent
+    // vfs_path_to_node(/new_file) returns NULL even after the test does
+    // syscall_fsync() between writes (FU24.A test-side workaround in
+    // clustertest.c).
+    //
+    // Root-cause class: while journal_txn_commit's two-barrier protocol +
+    // inline checkpoint guarantees the data is durably on disk before
+    // returning, the *device-side write cache* (AHCI's internal buffers)
+    // may not yet have flushed to the platter from the perspective of a
+    // back-to-back read on the same LBA via the SPSC ring path.  In TCG
+    // this manifests as a small (~100 µs) window where the read sees the
+    // pre-commit block.
+    //
+    // Option A — least invasive: emit an explicit grahafs_block_flush()
+    // after grahafs_v2_create commits the dirent + inode.  This drains
+    // the device write cache to the platter before we return success.
+    // Bulk-create workloads pay the flush cost once per create (one extra
+    // FLUSH CACHE EXT in TCG ~50 µs); test-side syscall_fsync becomes
+    // redundant (we keep it in clustertest.c as belt-and-braces).
+    //
+    // (Option B — cache the post-commit dirent block in the inode_cache
+    // and invalidate on next read — is more invasive and changes the
+    // inode_cache shape.  Option C — generation counter — would require
+    // every vfs_path_to_node call to consult.  We pick A.)
+    extern int grahafs_block_flush(uint8_t dev);
+    (void)grahafs_block_flush((uint8_t)g_v2_device_id);
+
     return 0;
 }
 

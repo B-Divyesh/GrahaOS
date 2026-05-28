@@ -581,6 +581,15 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@cp user/tests/spawn_argv               initrd_root/bin/tests/spawn_argv.tap
 	@cp user/tests/audit_query_since        initrd_root/bin/tests/audit_query_since.tap
 	@cp user/tests/spawn_handles_inherit    initrd_root/bin/tests/spawn_handles_inherit.tap
+	@# Phase 29 Session H: 8 external-peer multi-process txn tests (FU25.C).
+	@cp user/tests/txn_replay_order          initrd_root/bin/tests/txn_replay_order.tap
+	@cp user/tests/txn_abort_drops           initrd_root/bin/tests/txn_abort_drops.tap
+	@cp user/tests/txn_exit_cleanup          initrd_root/bin/tests/txn_exit_cleanup.tap
+	@cp user/tests/txn_commit_retry          initrd_root/bin/tests/txn_commit_retry.tap
+	@cp user/tests/txn_concurrent_abort      initrd_root/bin/tests/txn_concurrent_abort.tap
+	@cp user/tests/txn_buffer_overflow       initrd_root/bin/tests/txn_buffer_overflow.tap
+	@cp user/tests/txn_child_abort_parent_commit initrd_root/bin/tests/txn_child_abort_parent_commit.tap
+	@cp user/tests/txn_fault_during_replay   initrd_root/bin/tests/txn_fault_during_replay.tap
 	@# Phase 29 Session D: TUI primitives (5 syscalls + dirty-rect coalescing).
 	@cp user/tests/console_read_input       initrd_root/bin/tests/console_read_input.tap
 	@cp user/tests/console_attach_map       initrd_root/bin/tests/console_attach_map.tap
@@ -937,6 +946,21 @@ endif
 	@# Phase 28 Session G.2: soak inject front-end (2 asserts).  Listed
 	@# first so it runs before the test suite in soak iterations.
 	@echo "soak_inject_apply"        >> initrd_root/bin/tests/manifest.txt
+	@# Phase 29 Session H: 8 external-peer multi-process txn tests (FU25.C).
+	@# 5 asserts each = +40 gate assertions.  Each test self-spawns a helper
+	@# instance of the same binary (sentinel-driven role detection) and
+	@# uses chan_publish/connect to exchange channel endpoints.  Listed
+	@# BEFORE gsh_completion (which has a pre-existing FU24.B/C wait/exit
+	@# race that intermittently hangs the runner) so these run in every
+	@# iteration regardless of gsh_completion's outcome.
+	@echo "txn_replay_order"               >> initrd_root/bin/tests/manifest.txt
+	@echo "txn_abort_drops"                >> initrd_root/bin/tests/manifest.txt
+	@echo "txn_exit_cleanup"               >> initrd_root/bin/tests/manifest.txt
+	@echo "txn_commit_retry"               >> initrd_root/bin/tests/manifest.txt
+	@echo "txn_concurrent_abort"           >> initrd_root/bin/tests/manifest.txt
+	@echo "txn_buffer_overflow"            >> initrd_root/bin/tests/manifest.txt
+	@echo "txn_child_abort_parent_commit"  >> initrd_root/bin/tests/manifest.txt
+	@echo "txn_fault_during_replay"        >> initrd_root/bin/tests/manifest.txt
 	@# Phase 28 Session G.4: spec-mandated gate tests (5+5+8 = 18 asserts).
 	@echo "gcp_manifest_export_full" >> initrd_root/bin/tests/manifest.txt
 	@echo "gsh_completion"           >> initrd_root/bin/tests/manifest.txt

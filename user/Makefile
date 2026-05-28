@@ -86,6 +86,14 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/spawn_argv \
              tests/audit_query_since \
              tests/spawn_handles_inherit \
+             tests/txn_replay_order \
+             tests/txn_abort_drops \
+             tests/txn_exit_cleanup \
+             tests/txn_commit_retry \
+             tests/txn_concurrent_abort \
+             tests/txn_buffer_overflow \
+             tests/txn_child_abort_parent_commit \
+             tests/txn_fault_during_replay \
              tests/console_read_input \
              tests/console_attach_map \
              tests/fb_mmio_map \
