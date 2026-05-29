@@ -1096,7 +1096,11 @@ endif
 	@# Phase 19: versioned GrahaFS v2.
 	@echo "fstest_v2" >> initrd_root/bin/tests/manifest.txt
 	@echo "schedtest" >> initrd_root/bin/tests/manifest.txt
-	@echo "rlimittest" >> initrd_root/bin/tests/manifest.txt
+	@# rlimittest relocated to the VERY END (after the shell-spawn cluster) —
+	@# FU24.B: it intermittently hangs on the second mallocbomb spawn/wait
+	@# (rlimit + wait/exit interaction under kheap load).  Listed last so that
+	@# intermittent hang can't truncate the deterministic userdrv / pipetest /
+	@# txn_stress tests below.
 	@# Phase 21: userdrv substrate tests (kernel-side framework only;
 	@# full e1000d daemon test in e1000dtest below).
 	@echo "userdrv" >> initrd_root/bin/tests/manifest.txt
@@ -1138,6 +1142,9 @@ endif
 	@echo "gash_txn_abort"           >> initrd_root/bin/tests/manifest.txt
 	@echo "grahai_txn_commit"        >> initrd_root/bin/tests/manifest.txt
 	@echo "grahai_txn_abort"         >> initrd_root/bin/tests/manifest.txt
+	@# FU24.B: rlimittest LAST of all — its intermittent second-mallocbomb
+	@# spawn/wait hang can then truncate nothing.
+	@echo "rlimittest"               >> initrd_root/bin/tests/manifest.txt
 	@# Phase 23 Step 4: blk_stress_random_read NOT yet in gate — assertion 1
 	@# (/etc/gcp.json opens) trips at the late position the test would land
 	@# in, even though gcp_manifest opens the same file successfully ~14 s
