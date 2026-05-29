@@ -75,8 +75,13 @@ typedef struct libtls_ctx libtls_ctx_t;
 
 int      libtls_init(const char *ca_bundle_path);
 
-int      libtls_connect(libtls_ctx_t **out_ctx, libnet_client_ctx_t *nc,
-                        uint32_t tcp_cookie, const char *hostname);
+// libtls_connect — argument order MUST match libhttp.c's weak declaration
+// (nc, tcp_cookie, sni, out_ctx) so the strong symbol in libtls.a resolves
+// libhttp's weak reference without touching libhttp.  On success populates
+// *out_ctx with a heap-allocated session handle and returns 0; on failure
+// returns a negative errno and leaves *out_ctx NULL.
+int      libtls_connect(libnet_client_ctx_t *nc, uint32_t tcp_cookie,
+                        const char *hostname, libtls_ctx_t **out_ctx);
 
 int      libtls_send(libtls_ctx_t *ctx, const void *buf, size_t len);
 

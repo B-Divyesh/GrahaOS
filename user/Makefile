@@ -187,9 +187,21 @@ LIBTUI := libtui/libtui.a
 # against libbearssl.a and libhttp swaps off libtls-mg.a.
 LIBTLS_NEW := libtls/libtls.a
 
+# Phase 29 FU29.B.bearssl_wire: the BearSSL-backed TLS link group.  This
+# REPLACES the dead Phase 22 libtls-mg.a ($(LIBTLS)) in every HTTPS consumer
+# (grahai / gash / aitest / dnstest + the libtls tests).  --whole-archive
+# forces the strong libtls_* symbols out of libtls.a so they resolve
+# libhttp's weak references; trust_anchors.o supplies g_grahaos_TAs;
+# libbearssl.a provides the crypto engine.  Link order in each consumer:
+#   caller (libhttp) -> $(TLS_LINK) -> transport (libnet) -> libc.
+# (LIBBEARSSL is defined alongside its build rule further below.)
+LIBBEARSSL := ../vendor/bearssl/libbearssl.a
+TLS_LINK := --whole-archive $(LIBTLS_NEW) libtls/trust_anchors.o --no-whole-archive $(LIBBEARSSL)
+TLS_DEPS := $(LIBTLS_NEW) libtls/trust_anchors.o $(LIBBEARSSL)
+
 .PHONY: all clean libc
 
-all: libc $(LIBTAP) $(LIBNET) $(LIBNETD) $(LIBHTTP) $(LIBTLS) $(LIBTLS_NEW) $(LIBTUI) $(LIBWASM3) $(PROGRAMS) $(TAP_TESTS)
+all: libc $(LIBTAP) $(LIBNET) $(LIBNETD) $(LIBHTTP) $(LIBTLS) $(LIBBEARSSL) libtls/trust_anchors.o $(LIBTLS_NEW) $(LIBTUI) $(LIBWASM3) $(PROGRAMS) $(TAP_TESTS)
 
 # Build libc first
 libc:
@@ -233,8 +245,13 @@ $(LIBTUI): libtui/libtui.o
 # Substrate-only: libtls.c stubs every entry point with -ENOSYS until the
 # vendor/bearssl/ wiring lands.  Builds clean either way so the rest of the
 # tree keeps compiling.
+# libtls.c needs the BearSSL public headers; override the generic %.o rule.
+libtls/libtls.o: libtls/libtls.c
+	@echo "Compiling user C: $< (BearSSL backend)"
+	@$(CC) $(CFLAGS) -I../vendor/bearssl/inc -c $< -o $@
+
 $(LIBTLS_NEW): libtls/libtls.o
-	@echo "Creating $@ (libtls — BearSSL substrate)"
+	@echo "Creating $@ (libtls — BearSSL backend)"
 	@$(AR) rcs $@ $^
 
 # Phase 22 Stage D U18: libtls-mg.a — Mongoose-backed TLS 1.3 client. The
@@ -285,6 +302,102 @@ WASM3_CFLAGS := $(CFLAGS) -Dd_m3HasFloat=0 -Dd_m3LogOutput=0 \
 $(LIBWASM3): $(WASM3_OBJS)
 	@echo "Creating $@ (FU27.WASM Stage D0; 11 core files)"
 	@$(AR) rcs $@ $^
+
+# ---------------------------------------------------------------------------
+# Phase 29 FU29.B.bearssl_wire: vendored BearSSL 0.6 (MIT) built into
+# libbearssl.a from vendor/bearssl/src/.  Modeled on the LIBWASM3 rule above.
+#
+# The file list is EXPLICIT (not a wildcard): the x86 intrinsic files
+# (aes_x86ni*, chacha20_sse2, ghash_pclmul, poly1305_ctmulq) are INCLUDED
+# because the "default" engine selectors reference their `_get_vtable()`
+# accessors — but at -march=x86-64 their crypto bodies compile to an empty
+# CPU-unsupported fallback that returns NULL, so the portable constant-time
+# implementations (aes_ct*, chacha20_ct, ghash_ctmul64, poly1305_ctmul) are
+# what actually run.  A wildcard would otherwise double-include nothing
+# useful; we list every portable + accessor TU verified to link with zero
+# undefined symbols against the SSL client engine.
+#
+# CFLAGS:
+#   -Ivendor/bearssl/inc -Ivendor/bearssl/src — public + private headers.
+#   -DBR_USE_URANDOM=0 -DBR_USE_WIN32_RAND=0  — no host OS entropy source
+#       (GrahaOS has no /dev/urandom; entropy is injected from userspace in
+#       libtls.c via RDRAND+rdtsc).
+#   -Wno-unused — upstream has unused statics under our feature subset.
+# (LIBBEARSSL is defined near the top alongside the TLS link group.)
+BEARSSL_SRCS := aead/ccm aead/gcm codec/ccopy codec/dec16be \
+              codec/dec16le codec/dec32be codec/dec32le codec/dec64be \
+              codec/dec64le codec/enc16be codec/enc16le codec/enc32be \
+              codec/enc32le codec/enc64be codec/enc64le codec/pemdec \
+              codec/pemenc ec/ec_all_m15 ec/ec_all_m31 ec/ec_c25519_i15 \
+              ec/ec_c25519_i31 ec/ec_c25519_m15 ec/ec_c25519_m31 ec/ec_curve25519 \
+              ec/ec_default ec/ecdsa_atr ec/ecdsa_default_sign_asn1 ec/ecdsa_default_sign_raw \
+              ec/ecdsa_default_vrfy_asn1 ec/ecdsa_default_vrfy_raw ec/ecdsa_i31_bits ec/ecdsa_i31_sign_asn1 \
+              ec/ecdsa_i31_sign_raw ec/ecdsa_i31_vrfy_asn1 ec/ecdsa_i31_vrfy_raw ec/ec_keygen \
+              ec/ec_p256_m15 ec/ec_p256_m31 ec/ec_prime_i15 ec/ec_prime_i31 \
+              ec/ec_pubkey ec/ec_secp256r1 ec/ec_secp384r1 ec/ec_secp521r1 \
+              hash/dig_oid hash/dig_size hash/ghash_ctmul64 hash/ghash_ctmul \
+              hash/ghash_pclmul hash/md5 hash/md5sha1 hash/mgf1 \
+              hash/multihash hash/sha1 hash/sha2big hash/sha2small \
+              int/i15_add int/i15_bitlen int/i15_decmod int/i15_decode \
+              int/i15_decred int/i15_encode int/i15_fmont int/i15_iszero \
+              int/i15_moddiv int/i15_modpow2 int/i15_modpow int/i15_montmul \
+              int/i15_mulacc int/i15_muladd int/i15_ninv15 int/i15_reduce \
+              int/i15_rshift int/i15_sub int/i15_tmont int/i31_add \
+              int/i31_bitlen int/i31_decmod int/i31_decode int/i31_decred \
+              int/i31_encode int/i31_fmont int/i31_iszero int/i31_moddiv \
+              int/i31_modpow2 int/i31_modpow int/i31_montmul int/i31_mulacc \
+              int/i31_muladd int/i31_ninv31 int/i31_reduce int/i31_rshift \
+              int/i31_sub int/i31_tmont int/i32_div32 int/i62_modpow2 \
+              kdf/hkdf mac/hmac mac/hmac_ct rand/hmac_drbg \
+              rand/sysrng rsa/rsa_default_modulus rsa/rsa_default_pkcs1_sign rsa/rsa_default_pkcs1_vrfy \
+              rsa/rsa_default_priv rsa/rsa_default_privexp rsa/rsa_default_pub rsa/rsa_default_pubexp \
+              rsa/rsa_i31_modulus rsa/rsa_i31_pkcs1_sign rsa/rsa_i31_pkcs1_vrfy rsa/rsa_i31_priv \
+              rsa/rsa_i31_privexp rsa/rsa_i31_pub rsa/rsa_i31_pubexp rsa/rsa_i62_keygen \
+              rsa/rsa_i62_oaep_decrypt rsa/rsa_i62_oaep_encrypt rsa/rsa_i62_pkcs1_sign rsa/rsa_i62_pkcs1_vrfy \
+              rsa/rsa_i62_priv rsa/rsa_i62_pub rsa/rsa_pkcs1_sig_pad rsa/rsa_pkcs1_sig_unpad \
+              rsa/rsa_ssl_decrypt settings ssl/prf ssl/prf_md5sha1 \
+              ssl/prf_sha256 ssl/prf_sha384 ssl/ssl_ccert_single_ec ssl/ssl_ccert_single_rsa \
+              ssl/ssl_client ssl/ssl_client_default_rsapub ssl/ssl_client_full ssl/ssl_engine \
+              ssl/ssl_engine_default_aescbc ssl/ssl_engine_default_aesccm ssl/ssl_engine_default_aesgcm ssl/ssl_engine_default_chapol \
+              ssl/ssl_engine_default_descbc ssl/ssl_engine_default_ec ssl/ssl_engine_default_ecdsa ssl/ssl_engine_default_rsavrfy \
+              ssl/ssl_hashes ssl/ssl_hs_client ssl/ssl_io ssl/ssl_keyexport \
+              ssl/ssl_lru ssl/ssl_rec_cbc ssl/ssl_rec_ccm ssl/ssl_rec_chapol \
+              ssl/ssl_rec_gcm ssl/ssl_scert_single_ec ssl/ssl_scert_single_rsa symcipher/aes_common \
+              symcipher/aes_ct64 symcipher/aes_ct64_cbcdec symcipher/aes_ct64_cbcenc symcipher/aes_ct64_ctr \
+              symcipher/aes_ct64_ctrcbc symcipher/aes_ct64_dec symcipher/aes_ct64_enc symcipher/aes_ct \
+              symcipher/aes_ct_cbcdec symcipher/aes_ct_cbcenc symcipher/aes_ct_ctr symcipher/aes_ct_ctrcbc \
+              symcipher/aes_ct_dec symcipher/aes_ct_enc symcipher/aes_x86ni symcipher/aes_x86ni_cbcdec \
+              symcipher/aes_x86ni_cbcenc symcipher/aes_x86ni_ctr symcipher/aes_x86ni_ctrcbc symcipher/chacha20_ct \
+              symcipher/chacha20_sse2 symcipher/des_ct symcipher/des_ct_cbcdec symcipher/des_ct_cbcenc \
+              symcipher/des_support symcipher/des_tab symcipher/des_tab_cbcdec symcipher/des_tab_cbcenc \
+              symcipher/poly1305_ctmul32 symcipher/poly1305_ctmul symcipher/poly1305_ctmulq symcipher/poly1305_i15 \
+              x509/asn1enc x509/encode_ec_pk8der x509/encode_ec_rawder x509/encode_rsa_pk8der \
+              x509/encode_rsa_rawder x509/skey_decoder x509/x509_decoder x509/x509_knownkey \
+              x509/x509_minimal x509/x509_minimal_full
+BEARSSL_OBJS := $(addprefix ../vendor/bearssl/obj/,$(addsuffix .o,$(BEARSSL_SRCS)))
+BEARSSL_CFLAGS := $(CFLAGS) -I../vendor/bearssl/inc -I../vendor/bearssl/src \
+                  -DBR_USE_URANDOM=0 -DBR_USE_WIN32_RAND=0 -Wno-unused
+
+../vendor/bearssl/obj/%.o: ../vendor/bearssl/src/%.c
+	@mkdir -p $(dir $@)
+	@echo "Compiling vendor/bearssl: $<"
+	@$(CC) $(BEARSSL_CFLAGS) -c $< -o $@
+
+$(LIBBEARSSL): $(BEARSSL_OBJS)
+	@echo "Creating $@ (FU29.B; BearSSL portable build)"
+	@$(AR) rcs $@ $^
+
+# Phase 29 FU29.B.bearssl_wire: generated trust-anchor table (Mozilla CA
+# bundle baked into rodata by scripts/gen_trust_anchors.py).  Regenerated
+# when etc/tls/trust.pem changes.
+TRUST_ANCHORS_SRC := libtls/trust_anchors.c
+$(TRUST_ANCHORS_SRC): ../etc/tls/trust.pem ../scripts/gen_trust_anchors.py
+	@echo "Generating $@ from etc/tls/trust.pem"
+	@python3 ../scripts/gen_trust_anchors.py ../etc/tls/trust.pem --out $@
+
+libtls/trust_anchors.o: $(TRUST_ANCHORS_SRC)
+	@echo "Compiling user C: $< (BearSSL trust anchors)"
+	@$(CC) $(CFLAGS) -I../vendor/bearssl/inc -c $< -o $@
 
 # Phase 26 Stage H.1: wasmtest links additionally against the loader.o
 # from user/wasmd/src/loader.c. Override of the generic TAP rule.
@@ -409,21 +522,25 @@ tests/gcp_manifest: tests/gcp_manifest.o $(LIBTAP) $(LIBC)
 	@echo "Linking TAP test: $@"
 	@$(LD) $(LDFLAGS) -o $@ tests/gcp_manifest.o $(LIBTAP) $(LIBC)
 
-# Phase 29 Session B (FU28.A): libtls.tap exercises BearSSL primitives via
-# libtls.a.  In substrate landing libtls_backend_available() returns 0 and
-# the test tap_skip's every assert with a single "BearSSL not yet wired"
-# reason; once vendor/bearssl/ is wired the sentinel flips to 1 and the
-# real SHA-256/AES/X.509 checks run.
-tests/libtls: tests/libtls.o $(LIBTAP) $(LIBTLS_NEW) $(LIBNET) $(LIBC)
-	@echo "Linking TAP test (with libtls — BearSSL): $@"
-	@$(LD) $(LDFLAGS) -o $@ tests/libtls.o $(LIBTLS_NEW) $(LIBNET) $(LIBTAP) $(LIBC)
+# Phase 29 FU29.B.bearssl_wire: libtls.tap exercises real BearSSL crypto
+# primitives (RFC SHA-256 vectors).  libtls_backend_available() now returns
+# 1, so the test runs the live br_sha256_* path.  Compiled with -DWITH_BEARSSL
+# + the BearSSL include path so the br_sha256_ctx forward decls resolve.
+tests/libtls.o: tests/libtls.c
+	@echo "Compiling user C: $< (BearSSL primitives test)"
+	@$(CC) $(CFLAGS) -I../vendor/bearssl/inc -DWITH_BEARSSL -c $< -o $@
 
-# Phase 29 Session B (FU28.A): libtls_handshake.tap exercises a full TLS
-# handshake against scripts/run_tls_test_server.sh.  Skip-all today; real
-# asserts when BearSSL is wired.
-tests/libtls_handshake: tests/libtls_handshake.o $(LIBTAP) $(LIBTLS_NEW) $(LIBNET) $(LIBC)
-	@echo "Linking TAP test (with libtls): $@"
-	@$(LD) $(LDFLAGS) -o $@ tests/libtls_handshake.o $(LIBTLS_NEW) $(LIBNET) $(LIBTAP) $(LIBC)
+tests/libtls: tests/libtls.o $(LIBTAP) $(TLS_DEPS) $(LIBNET) $(LIBC)
+	@echo "Linking TAP test (with libtls — BearSSL): $@"
+	@$(LD) $(LDFLAGS) -o $@ tests/libtls.o $(TLS_LINK) $(LIBNET) $(LIBTAP) $(LIBC)
+
+# Phase 29 FU29.B.bearssl_wire: libtls_handshake.tap exercises a full TLS
+# handshake against scripts/run_tls_test_server.sh.  SKIPS in the automated
+# gate (no TLS server reachable under SLIRP); real asserts when run
+# interactively against a launched test server.
+tests/libtls_handshake: tests/libtls_handshake.o $(LIBTAP) $(TLS_DEPS) $(LIBNET) $(LIBC)
+	@echo "Linking TAP test (with libtls — BearSSL): $@"
+	@$(LD) $(LDFLAGS) -o $@ tests/libtls_handshake.o $(TLS_LINK) $(LIBNET) $(LIBTAP) $(LIBC)
 
 # Phase 22 closeout (G6): offline 1000-socket stress test against
 # netd_tcp.c.  In-process — no daemons, no wire.  Live-stack 1000-conn
@@ -455,18 +572,16 @@ tests/httptest: tests/httptest.o $(LIBTAP) $(LIBNET) $(LIBC)
 	@echo "Linking TAP test (with libnet): $@"
 	@$(LD) $(LDFLAGS) -o $@ tests/httptest.o $(LIBNET) $(LIBTAP) $(LIBC)
 
-tests/dnstest: tests/dnstest.o $(LIBTAP) $(LIBHTTP) $(LIBTLS) $(LIBNET) $(LIBC)
-	@echo "Linking TAP test (with libhttp + libtls + libnet): $@"
-	@$(LD) $(LDFLAGS) -o $@ tests/dnstest.o $(LIBHTTP) $(LIBTLS) $(LIBNET) $(LIBTAP) $(LIBC)
+tests/dnstest: tests/dnstest.o $(LIBTAP) $(LIBHTTP) $(TLS_DEPS) $(LIBNET) $(LIBC)
+	@echo "Linking TAP test (with libhttp + libtls/BearSSL + libnet): $@"
+	@$(LD) $(LDFLAGS) -o $@ tests/dnstest.o $(LIBHTTP) $(TLS_LINK) $(LIBNET) $(LIBTAP) $(LIBC)
 
 # Build grahai with its JSON parser. Phase 22 Stage E U21c: links
-# libhttp + libnet. Phase 22 closeout (G1.5): adds libtls so the HTTPS
-# branch in libhttp resolves to the real handshake driver, not the weak
-# -EPROTO fallback.  Link order: caller (libhttp) → callee (libtls) →
-# transport (libnet) → libc.
-grahai: grahai.o json.o $(LIBHTTP) $(LIBTLS) $(LIBNET) $(LIBC)
-	@echo "Linking user program: $@ (with libhttp + libtls + libnet + libc)"
-	@$(LD) $(LDFLAGS) -o $@ grahai.o json.o $(LIBHTTP) --whole-archive $(LIBTLS) --no-whole-archive $(LIBNET) $(LIBC)
+# libhttp + libnet. Phase 29 FU29.B: HTTPS branch now resolves to the real
+# BearSSL handshake driver (was the dead libtls-mg weak -EPROTO fallback).
+grahai: grahai.o json.o $(LIBHTTP) $(TLS_DEPS) $(LIBNET) $(LIBC)
+	@echo "Linking user program: $@ (with libhttp + libtls/BearSSL + libnet + libc)"
+	@$(LD) $(LDFLAGS) -o $@ grahai.o json.o $(LIBHTTP) $(TLS_LINK) $(LIBNET) $(LIBC)
 
 # Build gash shell (with JSON parser for AI command). Phase 22 closeout
 # (G1.5): adds libtls so `gash> ai ...` actually exercises HTTPS to
@@ -474,9 +589,9 @@ grahai: grahai.o json.o $(LIBHTTP) $(LIBTLS) $(LIBNET) $(LIBC)
 # --whole-archive forces the linker to pull libtls-mg.a in even though
 # libhttp.c declares libtls_* as weak symbols (which the linker would
 # otherwise resolve to NULL and skip the archive).
-gash: gash.o json.o $(LIBHTTP) $(LIBTLS) $(LIBNET) $(LIBC)
-	@echo "Linking user program: $@ (with libhttp + libtls + libnet + libc)"
-	@$(LD) $(LDFLAGS) -o $@ gash.o json.o $(LIBHTTP) --whole-archive $(LIBTLS) --no-whole-archive $(LIBNET) $(LIBC)
+gash: gash.o json.o $(LIBHTTP) $(TLS_DEPS) $(LIBNET) $(LIBC)
+	@echo "Linking user program: $@ (with libhttp + libtls/BearSSL + libnet + libc)"
+	@$(LD) $(LDFLAGS) -o $@ gash.o json.o $(LIBHTTP) $(TLS_LINK) $(LIBNET) $(LIBC)
 
 # Phase 28 Session G.3 — gsh shell (full rewrite, TUI-first, parallel
 # to gash).  Phase 29 Session F links libtui for the chrome rendering
@@ -534,16 +649,16 @@ httptest: httptest.o $(LIBNET) $(LIBC)
 # Phase 22 Stage E U21a: dnstest uses libhttp http_get + libnet_dns_resolve.
 # Phase 22 closeout (G1.5): adds libtls so any future https://... probe in
 # dnstest resolves cleanly without the -EPROTO weak-symbol path.
-dnstest: dnstest.o $(LIBHTTP) $(LIBTLS) $(LIBNET) $(LIBC)
-	@echo "Linking user program: $@ (with libhttp + libtls + libnet + libc)"
-	@$(LD) $(LDFLAGS) -o $@ dnstest.o $(LIBHTTP) --whole-archive $(LIBTLS) --no-whole-archive $(LIBNET) $(LIBC)
+dnstest: dnstest.o $(LIBHTTP) $(TLS_DEPS) $(LIBNET) $(LIBC)
+	@echo "Linking user program: $@ (with libhttp + libtls/BearSSL + libnet + libc)"
+	@$(LD) $(LDFLAGS) -o $@ dnstest.o $(LIBHTTP) $(TLS_LINK) $(LIBNET) $(LIBC)
 
 # Phase 22 Stage E U21b: aitest uses libhttp http_post against Gemini
 # (HTTPS).  Phase 22 closeout (G1.5): libtls now linked via --whole-archive
 # so the weak-symbol fallback in libhttp resolves to the shim's real impl.
-aitest: aitest.o $(LIBHTTP) $(LIBTLS) $(LIBNET) $(LIBC)
-	@echo "Linking user program: $@ (with libhttp + libtls + libnet + libc)"
-	@$(LD) $(LDFLAGS) -o $@ aitest.o $(LIBHTTP) --whole-archive $(LIBTLS) --no-whole-archive $(LIBNET) $(LIBC)
+aitest: aitest.o $(LIBHTTP) $(TLS_DEPS) $(LIBNET) $(LIBC)
+	@echo "Linking user program: $@ (with libhttp + libtls/BearSSL + libnet + libc)"
+	@$(LD) $(LDFLAGS) -o $@ aitest.o $(LIBHTTP) $(TLS_LINK) $(LIBNET) $(LIBC)
 
 # Build FD table test (Phase 10a, no libc needed)
 fdtest: fdtest.o
@@ -745,3 +860,10 @@ wasmd/wasmd_worker.o: wasmd/wasmd_worker.c
 clean:
 	@echo "Cleaning user programs..."
 	@rm -f *.o $(PROGRAMS) $(LIBTAP) tests/*.o $(TAP_TESTS)
+	@# Phase 29 FU29.B: BearSSL objects + archive + generated trust anchors.
+	@rm -rf ../vendor/bearssl/obj
+	@rm -f $(LIBBEARSSL) libtls/libtls.o libtls/trust_anchors.o $(LIBTLS_NEW)
+	@# Keep libtls/trust_anchors.c (regenerated on demand from trust.pem); it
+	@# is cheap to rebuild and removing it forces a Python dependency at the
+	@# next build.  Uncomment to scrub it as well:
+	@# rm -f libtls/trust_anchors.c

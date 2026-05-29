@@ -28,16 +28,13 @@
 extern int printf(const char *fmt, ...);
 
 #ifdef WITH_BEARSSL
-// BearSSL public API forward declarations (mirrors vendor/bearssl/inc/
-// bearssl_hash.h).  Linker resolves these out of libbearssl.a.
-typedef struct {
-    uint64_t length;
-    uint32_t val[8];
-    uint8_t  buf[64];
-} br_sha256_ctx;
-extern void br_sha256_init(br_sha256_ctx *);
-extern void br_sha256_update(br_sha256_ctx *, const void *, size_t);
-extern void br_sha256_out(const br_sha256_ctx *, void *);
+// Use the real BearSSL header (NOT a hand-rolled forward declaration): in
+// bearssl_hash.h, br_sha256_update is a MACRO aliasing br_sha224_update
+// (SHA-224/256 share the compression update), and br_sha256_context has a
+// specific layout.  Declaring them by hand would (a) request a non-existent
+// `br_sha256_update` symbol and (b) guess the struct wrong.  The build adds
+// -Ivendor/bearssl/inc for this test.
+#include "bearssl_hash.h"
 #endif
 
 void _start(void) {
@@ -62,7 +59,7 @@ void _start(void) {
 
     // 1. SHA-256("abc")
     {
-        br_sha256_ctx c;
+        br_sha256_context c;
         uint8_t d[32];
         br_sha256_init(&c);
         br_sha256_update(&c, "abc", 3);
@@ -78,7 +75,7 @@ void _start(void) {
 
     // 2. SHA-256("")
     {
-        br_sha256_ctx c;
+        br_sha256_context c;
         uint8_t d[32];
         br_sha256_init(&c);
         br_sha256_out(&c, d);
