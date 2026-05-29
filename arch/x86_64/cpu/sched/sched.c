@@ -530,7 +530,19 @@ int sched_create_task(void (*entry_point)(void)) {
     return id;
 }
 
-int sched_create_user_process(uint64_t rip, uint64_t cr3) {
+// FU29.I.spawn_argv_smp_race: argv-aware internal.  The child's argv strings +
+// pointer array are written onto its top user-stack page BEFORE the task is
+// made runnable, and regs.{rdi,rsi,rsp} are seeded INSIDE the same sched_lock
+// section that flips state=READY — BEFORE sched_enqueue_ready.  The old
+// sched_spawn_process_argv seeded those registers AFTER the task was already
+// enqueued, so on 4-CPU SMP a peer CPU could dispatch the child (via timer or
+// work-steal) with rdi==0 → _start(argc=0, ...).  When argc==0 this is
+// byte-for-byte identical to the historical plain path (the argv blocks are
+// skipped), so every non-argv caller (SYS_EXEC, init/ahcid/daemon spawns) is
+// unaffected.
+static int sched_create_user_process_argv_internal(uint64_t rip, uint64_t cr3,
+        int argc, const char *argv_data, const uint16_t *argv_lens,
+        uint32_t total_bytes) {
     spinlock_acquire(&sched_lock);
     int id;
     uint64_t flags;
@@ -757,8 +769,56 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     // Safe to print here - not in interrupt context
     framebuffer_draw_string("User process created successfully!", 700, 120, COLOR_GREEN, 0x00101828);
 
+    // FU29.I.spawn_argv_smp_race: write argv onto the child's top user-stack
+    // page and compute the argv pointer + adjusted RSP NOW (the user stack is
+    // mapped, cr3 is known, and we do NOT yet hold sched_lock — matches the
+    // framebuffer_draw_string above which is also pre-lock).  The register
+    // seed itself happens below, inside the sched_lock section, atomically
+    // with state=READY.  Layout mirrors the historical sched_spawn_process_argv
+    // doc block: strings at the top of the page, argv[] array below them,
+    // new RSP below the array (SysV %16==8 invariant).
+    uint64_t argv_user_va = 0;
+    uint64_t new_rsp_user = 0;
+    if (argc > 0 && argv_data && argv_lens) {
+        uint32_t array_bytes = (uint32_t)((argc + 1) * 8);
+        uint64_t ust_top     = 0x7FFFFFFFF000ULL;
+        uint64_t top_page_va = ust_top - 0x1000ULL;
+        uint64_t top_phys    = vmm_get_physical_address(cr3, top_page_va);
+        if (top_phys != 0 && total_bytes + array_bytes + 24 <= 4096) {
+            top_phys &= ~0xFFFULL;
+            uint8_t *page_kv = (uint8_t *)(top_phys + g_hhdm_offset);
+            uint32_t strings_end_off   = 0x1000;
+            uint32_t strings_start_off = strings_end_off - total_bytes;
+            uint32_t array_end_off     = strings_start_off & ~7u;
+            uint32_t array_start_off   = array_end_off - array_bytes;
+            uint32_t rsp_off_aligned   = array_start_off & ~15u;
+            uint32_t new_rsp_off       = (rsp_off_aligned >= 8) ? (rsp_off_aligned - 8) : 0;
+            if (new_rsp_off != 0) {
+                uint64_t argv_ptrs[17];
+                uint32_t data_cursor = 0;
+                for (int i = 0; i < argc; i++) {
+                    uint16_t alen = argv_lens[i];
+                    for (uint16_t b = 0; b < alen; b++) {
+                        page_kv[strings_start_off + data_cursor + b] =
+                            (uint8_t)argv_data[data_cursor + b];
+                    }
+                    page_kv[strings_start_off + data_cursor + alen] = 0;
+                    argv_ptrs[i] = top_page_va + strings_start_off + data_cursor;
+                    data_cursor += (uint32_t)alen + 1;
+                }
+                argv_ptrs[argc] = 0;  // NULL sentinel
+                for (int i = 0; i <= argc; i++) {
+                    uint64_t *slot = (uint64_t *)(page_kv + array_start_off + (uint32_t)i * 8);
+                    *slot = argv_ptrs[i];
+                }
+                argv_user_va = top_page_va + array_start_off;
+                new_rsp_user = top_page_va + new_rsp_off;
+            }
+        }
+    }
+
     spinlock_acquire(&sched_lock);
-    
+
     memset(&(*task_ptrs[id]).regs, 0, sizeof(struct interrupt_frame));
     (*task_ptrs[id]).regs.rip = rip;
     (*task_ptrs[id]).regs.rflags = 0x202;
@@ -774,6 +834,17 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     (*task_ptrs[id]).regs.rsp = user_stack_top - 8;
     (*task_ptrs[id]).regs.cs = 0x20 | 3;
     (*task_ptrs[id]).regs.ss = 0x18 | 3;
+
+    // FU29.I.spawn_argv_smp_race: seed argv registers HERE — inside the same
+    // sched_lock section that flips state=READY below, BEFORE the task is
+    // enqueued — so a peer CPU can never observe a runnable task with stale
+    // (argc==0) registers.  argc==0 leaves the memset's rdi/rsi=0 and the
+    // rsp set above untouched (historical behaviour).
+    if (argc > 0 && new_rsp_user != 0) {
+        (*task_ptrs[id]).regs.rdi = (uint64_t)argc;
+        (*task_ptrs[id]).regs.rsi = argv_user_va;
+        (*task_ptrs[id]).regs.rsp = new_rsp_user;
+    }
 
     // Phase 7c: Initialize heap management fields
     // Heap starts at 4GB (0x100000000) in user space
@@ -791,6 +862,13 @@ int sched_create_user_process(uint64_t rip, uint64_t cr3) {
     sched_enqueue_ready(task_ptrs[id]);
 
     return id;
+}
+
+// Public entry — historical signature.  Forwards to the argv-aware internal
+// with argc==0, which short-circuits every argv block, so this path is
+// byte-for-byte identical to the pre-FU29.I implementation.
+int sched_create_user_process(uint64_t rip, uint64_t cr3) {
+    return sched_create_user_process_argv_internal(rip, cr3, 0, NULL, NULL, 0);
 }
 
 void wake_waiting_parent(int child_id) {
@@ -1121,6 +1199,30 @@ void sched_reap_zombie(int task_id) {
     klog(KLOG_INFO, SUBSYS_SCHED, "[REAP] task_id=%d entering",
          task_id);
 
+    // Phase 29 FD-leak-on-exit fix: close the dying task's open VFS FILE
+    // descriptors so their GLOBAL open_file_table[64] slots are released.
+    // Reap already frees kstack / address space / cap handles / VMOs / txn /
+    // wasm / audit subscribers / rawnet — but it NEVER closed the global file
+    // slots, so any process that opened a file and exited without close()
+    // leaked one of the 64 shared slots.  After enough leaks across a long
+    // run, vfs_open() returned -1 for EVERY process, which silently broke
+    // every spawn/sentinel test at high gate positions (create-then-open and
+    // cross-process-sentinel-read failures — the gsh_completion write-short,
+    // the spawn_argv child's open, and the spawn_handles_inherit fork bomb).
+    // vfs_close is refcount-aware so dup'd fds are handled correctly.
+    {
+        extern int vfs_close(int fd);
+        task_t *dying_fd = task_ptrs[task_id];
+        for (int f = 0; f < PROC_MAX_FDS; f++) {
+            if (dying_fd->fd_table[f].type == FD_TYPE_FILE &&
+                dying_fd->fd_table[f].ref >= 0) {
+                (void)vfs_close((int)dying_fd->fd_table[f].ref);
+                dying_fd->fd_table[f].type = FD_TYPE_UNUSED;
+                dying_fd->fd_table[f].ref  = -1;
+            }
+        }
+    }
+
     // Free kernel stack
     uint64_t kstack_base = (*task_ptrs[task_id]).kernel_stack_top - KERNEL_STACK_SIZE;
     uint64_t kstack_phys = kstack_base - g_hhdm_offset;
@@ -1349,84 +1451,58 @@ int sched_spawn_process_argv(const char *path, int parent_id,
         return -7;   // -E2BIG
     }
 
-    int pid = sched_spawn_process(path, parent_id);
+    // FU29.I.spawn_argv_smp_race: seed argv INSIDE the atomic create (before
+    // the child is enqueued) instead of post-spawn.  We replicate
+    // sched_spawn_process's initrd_lookup + elf_load here, call the argv-aware
+    // create (which writes the argv stack + seeds rdi/rsi/rsp under the same
+    // sched_lock that flips state=READY), then apply the same
+    // parent/pledge/fd-inherit overrides so argv children keep stdio + pledge.
+    if (!path) {
+        klog(KLOG_ERROR, SUBSYS_SCHED, "[SPAWN_ARGV] ERROR: NULL path");
+        return -1;
+    }
+    size_t file_size;
+    void *file_data = initrd_lookup(path, &file_size);
+    if (!file_data) {
+        klog(KLOG_ERROR, SUBSYS_SCHED, "[SPAWN_ARGV] ERROR: File not found: %s", path);
+        return -1;
+    }
+    uint64_t entry_point, cr3;
+    if (!elf_load(file_data, &entry_point, &cr3)) {
+        klog(KLOG_ERROR, SUBSYS_SCHED, "[SPAWN_ARGV] ERROR: ELF load failed: %s", path);
+        return -1;
+    }
+
+    int pid = sched_create_user_process_argv_internal(entry_point, cr3, argc,
+                                                      argv_data, argv_lens,
+                                                      total_bytes);
     if (pid < 0) {
+        klog(KLOG_ERROR, SUBSYS_SCHED, "[SPAWN_ARGV] ERROR: Process creation failed");
         return pid;
     }
 
-    /* Fast path: argc==0 means "no argv to seed". */
-    if (argc == 0) {
-        return pid;
-    }
-
-    /* Resolve the child's top user-stack page through its CR3 + HHDM. */
-    task_t *child = task_ptrs[pid];
-    if (!child) {
-        return pid;
-    }
-
-    uint64_t user_stack_top = 0x7FFFFFFFF000ULL;
-    uint64_t top_page_vaddr = user_stack_top - 0x1000ULL;
-    uint64_t top_page_phys  = vmm_get_physical_address(child->cr3, top_page_vaddr);
-    if (top_page_phys == 0) {
-        /* Stack page somehow not mapped — keep the child but skip argv. */
-        return pid;
-    }
-    top_page_phys &= ~0xFFFULL;
-    uint8_t *page_kv = (uint8_t *)(top_page_phys + g_hhdm_offset);
-
-    /* All offsets below are PAGE-LOCAL (0..4095).  Strings sit at the
-     * top of the page (highest user-virtual addresses), array sits below
-     * the strings (8-byte aligned), and new RSP sits below the array,
-     * 16-byte aligned + 8 (SysV invariant). */
-    uint32_t strings_end_off   = 0x1000;
-    uint32_t strings_start_off = strings_end_off - total_bytes;
-    /* Round DOWN to 8 so array stays aligned. */
-    uint32_t array_end_off     = strings_start_off & ~7u;
-    uint32_t array_start_off   = array_end_off - array_bytes;
-    /* New RSP: round array_start_off DOWN to 16, then subtract 8 so the
-     * post-`call` SysV invariant (RSP%16==8 at function entry) holds.
-     * In our case there's no `call` — we ENTER _start directly via iretq
-     * — but GCC's `_start` prologue assumes the same alignment so we
-     * keep the invariant matching sched_create_user_process's setup. */
-    uint32_t rsp_off_aligned   = array_start_off & ~15u;
-    uint32_t new_rsp_off       = (rsp_off_aligned >= 8) ? (rsp_off_aligned - 8) : 0;
-    if (new_rsp_off == 0) {
-        /* Should have been caught by the size guard above. */
-        return pid;
-    }
-
-    /* Write the argv strings. argv_data is packed NUL-terminated strings:
-     * "alpha\0beta\0gamma\0".  Copy verbatim into the page. */
-    uint64_t base_top_page_vaddr = top_page_vaddr;
-    uint64_t argv_user_ptrs[17];  /* up to 16 + NULL sentinel */
-    uint32_t data_cursor = 0;
-    for (int i = 0; i < argc; i++) {
-        uint16_t len = argv_lens[i];
-        for (uint16_t b = 0; b < len; b++) {
-            page_kv[strings_start_off + data_cursor + b] =
-                (uint8_t)argv_data[data_cursor + b];
-        }
-        page_kv[strings_start_off + data_cursor + len] = 0;
-        argv_user_ptrs[i] = base_top_page_vaddr + strings_start_off + data_cursor;
-        data_cursor += (uint32_t)len + 1;
-    }
-    argv_user_ptrs[argc] = 0;  /* NULL sentinel */
-
-    /* Write the argv[] array. */
-    for (int i = 0; i <= argc; i++) {
-        uint64_t *slot = (uint64_t *)(page_kv + array_start_off + (uint32_t)i * 8);
-        *slot = argv_user_ptrs[i];
-    }
-
-    /* Seed child registers. */
-    uint64_t argv_user_va = base_top_page_vaddr + array_start_off;
-    uint64_t new_rsp_user = base_top_page_vaddr + new_rsp_off;
-
+    /* Override parent linkage + inherit pledge/stdio — mirrors
+     * sched_spawn_process.  These fields are NOT iretq registers; the child's
+     * argc/argv already live in rdi/rsi/rsp, seeded atomically with
+     * state=READY inside the create above, so the SMP argc==0 race is closed
+     * regardless of when these run. */
     spinlock_acquire(&sched_lock);
-    child->regs.rdi = (uint64_t)argc;
-    child->regs.rsi = argv_user_va;
-    child->regs.rsp = new_rsp_user;
+    (*task_ptrs[pid]).parent_id = parent_id;
+    (*task_ptrs[pid]).pgid = parent_id;
+    copy_process_name((*task_ptrs[pid]).name, path, sizeof((*task_ptrs[pid]).name));
+    if (parent_id >= 0 && parent_id < MAX_TASKS && task_ptrs[parent_id]) {
+        (*task_ptrs[pid]).pledge_mask = (*task_ptrs[parent_id]).pledge_mask;
+    }
+    if (parent_id >= 0 && parent_id < MAX_TASKS && task_ptrs[parent_id]) {
+        for (int f = 0; f < 3; f++) {
+            uint8_t ptype = (*task_ptrs[parent_id]).fd_table[f].type;
+            if (ptype == FD_TYPE_UNUSED) continue;
+            (*task_ptrs[pid]).fd_table[f] = (*task_ptrs[parent_id]).fd_table[f];
+            if (ptype == FD_TYPE_PIPE_READ || ptype == FD_TYPE_PIPE_WRITE) {
+                pipe_ref_inc((*task_ptrs[pid]).fd_table[f].ref, ptype);
+            }
+        }
+    }
     spinlock_release(&sched_lock);
 
     return pid;
