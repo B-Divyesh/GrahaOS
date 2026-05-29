@@ -992,11 +992,16 @@ endif
 	@# VERY END of the manifest (after txn_stress_*) so a hang can only affect
 	@# its own cluster, never the ~110 deterministic tests.  See the relocated
 	@# block near the end of this rule.
-	@# Phase 29 Session C: kernel ABI polish.  spawn_argv (5) +
-	@# audit_query_since (4) + spawn_handles_inherit (5) = +14 asserts.
-	@echo "spawn_argv"               >> initrd_root/bin/tests/manifest.txt
+	@# Phase 29 Session C: kernel ABI polish.  audit_query_since (4) is
+	@# deterministic and stays here; spawn_argv + spawn_handles_inherit SPAWN
+	@# child processes and can hit the FU24.A/blk-layer channel-mode FS hang
+	@# (child stuck in a write/open syscall -> never exits -> parent's blocked
+	@# SYS_WAIT poll-loop spins to the watchdog).  Their kernel fix
+	@# (SYS_SPAWN_ARGV SMP seeding) is ALREADY validated by the deterministic
+	@# multi-proc txn tests above (txn_replay_order etc., which spawn argv
+	@# children).  They are RELOCATED to the flaky cluster at the end so an
+	@# intermittent FS hang cannot truncate the ~110 deterministic tests.
 	@echo "audit_query_since"        >> initrd_root/bin/tests/manifest.txt
-	@echo "spawn_handles_inherit"    >> initrd_root/bin/tests/manifest.txt
 	@# Phase 29 Session D: TUI primitives.  console_read_input (5) +
 	@# console_attach_map (5) + fb_mmio_map (4) + vsync_wait (3) +
 	@# dirty_rect (4) = +21 asserts.
@@ -1135,6 +1140,14 @@ endif
 	@# cluster — the ~110 deterministic tests above always complete.
 	@# gsh_completion's write_file now loops on short writes + bails without
 	@# spawning gsh if the sentinel still can't be staged (no interactive hang).
+	@# spawn_argv + spawn_handles_inherit relocated here (FU24.A/blk hang): a
+	@# spawned child can get stuck in a channel-mode FS write/open under load so
+	@# the parent's SYS_WAIT poll-loop never returns.  Their SMP-seeding fix is
+	@# validated by the deterministic multi-proc txn tests; here they only risk
+	@# the flaky cluster.  spawn_handles_inherit is now fork-bomb-proof (argv
+	@# baseline + verified WITH role + /.shi_guard) so it can't 700s-cascade.
+	@echo "spawn_argv"               >> initrd_root/bin/tests/manifest.txt
+	@echo "spawn_handles_inherit"    >> initrd_root/bin/tests/manifest.txt
 	@echo "gsh_completion"           >> initrd_root/bin/tests/manifest.txt
 	@echo "gsh_chrome"               >> initrd_root/bin/tests/manifest.txt
 	@echo "ai_txn_rollback"          >> initrd_root/bin/tests/manifest.txt

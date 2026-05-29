@@ -55,13 +55,38 @@ static int read_count_file(const char *path) {
     return v;
 }
 
-static void write_text_file(const char *path, const char *text, int len) {
-    (void)syscall_create(path, 0);
-    int fd = syscall_open(path);
-    if (fd < 0) return;
-    (void)syscall_truncate(fd);
-    (void)syscall_write(fd, text, (size_t)len);
-    syscall_close(fd);
+// FU29.X.shell_sentinel_flake: robust verified write. Loops on short writes
+// (FU24.A channel-mode FS returns short under kheap load), retries the whole
+// open, and READS BACK to confirm the content is durable. Returns 0 only if a
+// subsequent read sees exactly the bytes we wrote — callers use this to avoid
+// spawning a child against a half-written sentinel (which causes the fork bomb).
+static int write_text_file(const char *path, const char *text, int len) {
+    for (int attempt = 0; attempt < 6; attempt++) {
+        (void)syscall_create(path, 0);
+        int fd = syscall_open(path);
+        if (fd < 0) continue;
+        (void)syscall_truncate(fd);
+        int total = 0;
+        while (total < len) {
+            ssize_t n = syscall_write(fd, text + total, (size_t)(len - total));
+            if (n <= 0) break;
+            total += (int)n;
+        }
+        syscall_close(fd);
+        if (total != len) continue;
+        // Verify read-back.
+        char vbuf[64];
+        int vfd = syscall_open(path);
+        if (vfd < 0) continue;
+        ssize_t vn = syscall_read(vfd, vbuf, sizeof(vbuf) - 1);
+        syscall_close(vfd);
+        if (vn == len) {
+            int ok = 1;
+            for (int i = 0; i < len; i++) if (vbuf[i] != text[i]) { ok = 0; break; }
+            if (ok) return 0;
+        }
+    }
+    return -1;
 }
 
 static void write_count_file(const char *path, int count) {
@@ -84,38 +109,59 @@ static void delete_file_by_truncate(const char *path) {
     if (fd >= 0) { (void)syscall_truncate(fd); syscall_close(fd); }
 }
 
-void _start(void) {
-    /* Sentinel-based role detection (matches grahai's --txn pattern).
-     * Parent creates /.spawn_handles_role with "BASELINE" or "WITH"
-     * before each spawn; child reads it on entry. */
-    char role[32];
-    int role_n = read_text_file("/.spawn_handles_role", role, sizeof(role));
-    if (role_n > 0) {
-        /* Helper mode. */
+void _start(int argc, char **argv) {
+    /* FU29.X.shell_sentinel_flake — fork-bomb-proof role detection.
+     * The old design read /.spawn_handles_role to tell child from parent; under
+     * the FU24.A channel-mode FS flake a child could read it empty, run the
+     * PARENT path, and spawn again -> fork bomb -> 700s gate timeout. New design:
+     *   - BASELINE child is spawned via SYS_SPAWN_ARGV with argv[1]="BASELINE",
+     *     so it identifies via argv (no FS read) and can NEVER run the parent
+     *     path -> can never fork-bomb.
+     *   - WITH child must use SYS_SPAWN_EX (handles_to_inherit, argc==0); it
+     *     reads the VERIFIED-durable /.spawn_handles_role. If that read flakes,
+     *     the /.shi_guard two-factor guard (written+verified by the genuine
+     *     parent) makes the confused child exit instead of recursing.
+     *   - The genuine parent is the only argc==0 process that sees BOTH role
+     *     AND /.shi_guard absent; even a flake²-confused child terminates at
+     *     depth ~1 (its own children are well-behaved). */
+
+    /* BASELINE child: argv-driven, flake-proof. */
+    if (argc >= 2 && argv && argv[1] && my_streq(argv[1], "BASELINE")) {
         int hc = (int)syscall_debug3(DEBUG_HANDLE_COUNT, 0, 0);
-        if (my_streq(role, "WITH")) {
-            write_count_file("/spawn_handles_with", hc);
-        } else {
-            write_count_file("/spawn_handles_baseline", hc);
-        }
+        write_count_file("/spawn_handles_baseline", hc);
         syscall_exit(0);
     }
 
-    /* Parent mode. */
+    /* argc==0: WITH child (reads verified role) OR the genuine parent. */
+    char role[32];
+    int role_n = read_text_file("/.spawn_handles_role", role, sizeof(role));
+    if (role_n > 0 && my_streq(role, "WITH")) {
+        int hc = (int)syscall_debug3(DEBUG_HANDLE_COUNT, 0, 0);
+        write_count_file("/spawn_handles_with", hc);
+        syscall_exit(0);
+    }
+    if (role_n > 0 && my_streq(role, "BASELINE")) {   /* defensive */
+        int hc = (int)syscall_debug3(DEBUG_HANDLE_COUNT, 0, 0);
+        write_count_file("/spawn_handles_baseline", hc);
+        syscall_exit(0);
+    }
+    /* role absent/empty -> fork-bomb guard: if the genuine parent already set
+     * /.shi_guard, we are a confused child whose role read flaked -> exit. */
+    {
+        char g[8];
+        int gn = read_text_file("/.shi_guard", g, sizeof(g));
+        if (gn > 0 && g[0] == 'R') syscall_exit(0);
+    }
+
+    /* ---- genuine parent ---- */
     tap_plan(5);
 
-    /* Clean up any prior run output. */
     delete_file_by_truncate("/spawn_handles_baseline");
     delete_file_by_truncate("/spawn_handles_with");
     delete_file_by_truncate("/.spawn_handles_role");
+    delete_file_by_truncate("/.shi_guard");
+    (void)write_text_file("/.shi_guard", "RUN", 3);   /* best-effort guard */
 
-    /* 1+2. Create 2 caps via the debug helper.  We use INHERITABLE
-     * (not PUBLIC) — INHERITABLE means the FU26.D cap-inheritance walk
-     * in sched_create_user_process would normally pick these up too.
-     * Since we want to PROVE handles_to_inherit ALSO works, we accept
-     * the baseline count already counts the FU26.D inheritance walk's
-     * effect on both spawns (it runs uniformly).  handles_to_inherit
-     * just adds 2 more on top. */
     cap_token_raw_t tok1 = syscall_debug_cap_create_with_flags(CAP_FLAG_PUBLIC);
     if (tok1 == 0) printf("# tok1 create failed\n");
     TAP_ASSERT(tok1 != 0, "1. created cap tok1 via DEBUG_CAP_CREATE_WITH_FLAGS");
@@ -124,13 +170,12 @@ void _start(void) {
     if (tok2 == 0) printf("# tok2 create failed\n");
     TAP_ASSERT(tok2 != 0, "2. created cap tok2 via DEBUG_CAP_CREATE_WITH_FLAGS");
 
-    /* 3. Baseline spawn: child runs in helper mode and writes its
-     * handle count to /spawn_handles_baseline. */
-    write_text_file("/.spawn_handles_role", "BASELINE", 8);
-    int pid_base = syscall_spawn("bin/tests/spawn_handles_inherit.tap");
+    /* 3. Baseline spawn via SYS_SPAWN_ARGV (argv role marker — flake-proof). */
+    char *bargv[2] = { (char *)"bin/tests/spawn_handles_inherit.tap",
+                       (char *)"BASELINE" };
+    int pid_base = syscall_spawn_argv("bin/tests/spawn_handles_inherit.tap", 2, bargv);
     int status_base = -1;
     if (pid_base > 0) (void)syscall_wait(&status_base);
-    delete_file_by_truncate("/.spawn_handles_role");
     int baseline_count = read_count_file("/spawn_handles_baseline");
     if (pid_base <= 0 || status_base != 0 || baseline_count < 0) {
         printf("# pid_base=%d status=%d baseline_count=%d\n",
@@ -139,26 +184,29 @@ void _start(void) {
     TAP_ASSERT(pid_base > 0 && status_base == 0 && baseline_count >= 0,
                "3. baseline spawn (no handles_to_inherit) records valid count");
 
-    /* 4. Inherit spawn: SYS_SPAWN_EX with handles_to_inherit=[tok1,tok2]. */
-    write_text_file("/.spawn_handles_role", "WITH", 4);
-
-    spawn_rlimits_t attrs = {0};
-    attrs.flags = SPAWN_ATTR_HAS_HANDLES_U;
-    attrs.handles_to_inherit[0] = tok1;
-    attrs.handles_to_inherit[1] = tok2;
-    attrs.n_handles_to_inherit  = 2;
-
-    int pid_with = syscall_spawn_ex("bin/tests/spawn_handles_inherit.tap",
-                                     &attrs);
-    int status_with = -1;
-    if (pid_with > 0) (void)syscall_wait(&status_with);
-    delete_file_by_truncate("/.spawn_handles_role");
-    int inherit_count = read_count_file("/spawn_handles_with");
-    if (pid_with <= 0 || status_with != 0 || inherit_count < 0) {
+    /* 4. Inherit spawn: SYS_SPAWN_EX with handles_to_inherit=[tok1,tok2].
+     *    Stage the WITH role with a VERIFIED write; if it can't be staged
+     *    (FU24.A flake) SKIP the spawn so we never spawn against an empty
+     *    sentinel (which would fork-bomb). */
+    int with_ok = 0, pid_with = -1, status_with = -1, inherit_count = -1;
+    if (write_text_file("/.spawn_handles_role", "WITH", 4) == 0) {
+        spawn_rlimits_t attrs = {0};
+        attrs.flags = SPAWN_ATTR_HAS_HANDLES_U;
+        attrs.handles_to_inherit[0] = tok1;
+        attrs.handles_to_inherit[1] = tok2;
+        attrs.n_handles_to_inherit  = 2;
+        pid_with = syscall_spawn_ex("bin/tests/spawn_handles_inherit.tap", &attrs);
+        if (pid_with > 0) (void)syscall_wait(&status_with);
+        inherit_count = read_count_file("/spawn_handles_with");
+        with_ok = (pid_with > 0 && status_with == 0 && inherit_count >= 0);
+    } else {
+        printf("# WITH role sentinel could not be staged (FU24.A flake) — skip spawn\n");
+    }
+    if (!with_ok) {
         printf("# pid_with=%d status=%d inherit_count=%d\n",
                pid_with, status_with, inherit_count);
     }
-    TAP_ASSERT(pid_with > 0 && status_with == 0 && inherit_count >= 0,
+    TAP_ASSERT(with_ok,
                "4. inherit spawn (with handles_to_inherit) records valid count");
 
     /* 5. The CORE assertion: inherit_count == baseline_count + 2. */
@@ -171,6 +219,7 @@ void _start(void) {
                inherit_count == baseline_count + 2,
                "5. handles_to_inherit added exactly 2 entries to child's handle table");
 
+    delete_file_by_truncate("/.shi_guard");
     tap_done();
     syscall_exit(0);
 }
