@@ -108,6 +108,13 @@ uint64_t vmo_map(vmo_t *v, struct task_struct *t,
 // Returns 0 on success, CAP_V2_EINVAL if vaddr/len is not a live mapping.
 int vmo_unmap(struct task_struct *t, uint64_t vaddr, uint64_t len);
 
+// FU29.X.tx_ptes_remap: repoint task t's live user PTEs that map `v` so page
+// index i references new_pages[i] (with balanced pmm ref accounting that
+// follows v->pages[]).  Used by the cell-grid atomic TX to swing the caller's
+// mapping between the live and shadow cell arrays.  Returns #PTEs updated.
+int vmo_remap_pages_for_task(struct task_struct *t, vmo_t *v,
+                             const uint64_t *new_pages);
+
 // --- COW clone -----------------------------------------------------------
 // Produce a COW child VMO. All existing mappings of src in any task are
 // write-protected; child starts with read-only view of the same frames.

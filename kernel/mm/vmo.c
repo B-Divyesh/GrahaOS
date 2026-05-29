@@ -382,6 +382,56 @@ int vmo_unmap(task_t *t, uint64_t vaddr, uint64_t len) {
     return 0;
 }
 
+// --- vmo_remap_pages_for_task --------------------------------------------
+// FU29.X.tx_ptes_remap: repoint task `t`'s already-installed user PTEs that
+// map VMO `v` so page index i references new_pages[i] instead of whatever the
+// PTE currently maps.  Used by the cell-grid atomic TX (cell_tx.c) to swing
+// the caller's live mapping between the live cell array and the shadow array
+// on BEGIN / ABORT.  Without it, userspace writes after BEGIN_TX land in the
+// original frames (stale view) and the page-frees on COMMIT/ABORT would leave
+// the user PTEs pointing at the wrong/freed frame.
+//
+// Ref accounting: each moved PTE takes a ref on the frame it lands on and
+// drops one on the frame it leaves, so the per-page ref always follows
+// v->pages[] — which is exactly what vmo_unmap()/vmo destroy walk and unref.
+// new_pages must hold v->npages entries.  Returns #PTEs updated, <0 on error.
+// Pages with no present PTE are skipped; the console cell-VMO is eager
+// (VMO_ZEROED), so every mapped page is present and gets remapped.  invlpg is
+// local-only — TX syscalls run in the owner's own CPU context (owner==caller
+// is enforced in cell_tx.c), matching the cow_fault/vmo_pf_dispatch model.
+#define VMO_PTE_PHYS_MASK 0x000FFFFFFFFFF000ULL
+int vmo_remap_pages_for_task(task_t *t, vmo_t *v, const uint64_t *new_pages) {
+    if (!t || !vmo_check(v) || !new_pages) return CAP_V2_EINVAL;
+    if (t->id < 0 || t->id >= VMO_MAX_TASKS) return CAP_V2_EINVAL;
+    if (v->flags & VMO_MMIO) return 0;   // MMIO frames are not pmm-tracked
+
+    spinlock_acquire(&g_vmo_map_lock);
+    int updated = 0;
+    for (int s = 0; s < VMO_MAPPINGS_PER_TASK; s++) {
+        vmo_mapping_t *m = &g_vmo_task_maps[t->id][s];
+        if (m->vaddr == 0 || m->vmo != v) continue;
+        uint64_t start_page = m->offset / 4096;
+        for (uint32_t p = 0; p < m->len_pages; p++) {
+            uint64_t idx = start_page + p;
+            if (idx >= v->npages) break;
+            uint64_t va      = m->vaddr + (uint64_t)p * 4096;
+            uint64_t old_pte = vmm_get_pte(t->cr3, va);
+            if (!(old_pte & 1ULL)) continue;             // not present
+            uint64_t old_phys = old_pte & VMO_PTE_PHYS_MASK;
+            uint64_t new_phys = new_pages[idx];
+            if (new_phys == 0 || new_phys == old_phys) continue;
+            uint64_t flags = old_pte & ~VMO_PTE_PHYS_MASK; // keep P/RW/US/NX
+            vmm_unmap_page_by_cr3(t->cr3, va);
+            pmm_page_ref((void *)new_phys);
+            if (old_phys) pmm_page_unref((void *)old_phys);
+            vmm_map_page_by_cr3(t->cr3, va, new_phys, flags);
+            updated++;
+        }
+    }
+    spinlock_release(&g_vmo_map_lock);
+    return updated;
+}
+
 // --- vmo_clone_cow -------------------------------------------------------
 vmo_t *vmo_clone_cow(vmo_t *src, int32_t owner_pid) {
     if (!vmo_check(src)) return NULL;

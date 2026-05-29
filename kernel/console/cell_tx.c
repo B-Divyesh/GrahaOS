@@ -11,6 +11,7 @@
 #include "../mm/vmo.h"
 #include "../audit.h"
 #include "../../arch/x86_64/mm/pmm.h"
+#include "../../arch/x86_64/cpu/sched/sched.h"  // sched_get_task (FU29.X.tx_ptes_remap)
 
 #include <string.h>
 #include <stdint.h>
@@ -135,6 +136,17 @@ int console_tx_begin(int32_t caller_pid, uint32_t console_id) {
     }
     spinlock_release(&c->cell_vmo->lock);
 
+    // FU29.X.tx_ptes_remap: repoint the owner's already-installed user PTEs to
+    // the shadow frames so writes through an existing mapping land in the
+    // shadow set (not the original/live frames).  Ref accounting follows
+    // cell_vmo->pages[] (now == shadow).  No-op if the cell-VMO isn't mapped
+    // into the owner (e.g. the DEBUG-only gate path), so behaviour there is
+    // byte-for-byte unchanged.
+    task_t *owner = sched_get_task(caller_pid);
+    if (owner) {
+        (void)vmo_remap_pages_for_task(owner, c->cell_vmo, shadow);
+    }
+
     tx->state       = TX_STATE_ACTIVE;
     tx->owner_pid   = caller_pid;
     tx->console_id  = console_id;
@@ -198,6 +210,13 @@ int console_tx_abort(int32_t caller_pid, uint32_t tx_handle) {
             c->cell_vmo->pages[i] = tx->saved_pages[i];
         }
         spinlock_release(&c->cell_vmo->lock);
+        // FU29.X.tx_ptes_remap: repoint the owner's PTEs back to the restored
+        // (saved) frames BEFORE freeing the shadow frames below — otherwise
+        // the user PTEs would dangle at freed shadow pages.
+        task_t *owner = sched_get_task(caller_pid);
+        if (owner) {
+            (void)vmo_remap_pages_for_task(owner, c->cell_vmo, tx->saved_pages);
+        }
         cells_dropped = (tx->npages * 4096u) / 16u;
     }
     // Free shadow pages.
