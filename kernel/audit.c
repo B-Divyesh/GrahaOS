@@ -205,13 +205,16 @@ int audit_subscribe(int32_t pid, uint64_t filter_mask) {
         return -1;  // -EAGAIN at syscall layer
     }
     audit_subscriber_t *s = &g_audit_subscribers[slot];
-    s->in_use = true;
+    // FU29.X.pcpu_audit: fully initialise the slot BEFORE publishing in_use,
+    // so a concurrent audit_broadcast on another CPU (which reads in_use with
+    // ACQUIRE) never observes in_use==true with stale head/tail/lock.
     s->pid = pid;
     s->filter_mask = filter_mask;
     s->dropped_count = 0;
     s->head = 0;
     s->tail = 0;
     spinlock_init(&s->lock, "audit_sub");
+    __atomic_store_n(&s->in_use, true, __ATOMIC_RELEASE);   // publish last
     spinlock_release(&g_audit_subscribers_lock);
     klog(KLOG_INFO, SUBSYS_AUDIT,
          "audit: subscriber %d attached (pid=%d filter=0x%lx)",
@@ -224,7 +227,7 @@ void audit_unsubscribe(int slot_idx) {
     spinlock_acquire(&g_audit_subscribers_lock);
     audit_subscriber_t *s = &g_audit_subscribers[slot_idx];
     if (s->in_use) {
-        s->in_use = false;
+        __atomic_store_n(&s->in_use, false, __ATOMIC_RELEASE);  // FU29.X.pcpu_audit
         s->pid = -1;
         s->filter_mask = 0;
         s->head = s->tail = 0;
@@ -237,7 +240,8 @@ void audit_unsubscribe_all_for_pid(int32_t pid) {
     spinlock_acquire(&g_audit_subscribers_lock);
     for (uint32_t i = 0; i < AUDIT_SUB_MAX; i++) {
         if (g_audit_subscribers[i].in_use && g_audit_subscribers[i].pid == pid) {
-            g_audit_subscribers[i].in_use = false;
+            __atomic_store_n(&g_audit_subscribers[i].in_use, false,
+                             __ATOMIC_RELEASE);  // FU29.X.pcpu_audit
             g_audit_subscribers[i].pid = -1;
             g_audit_subscribers[i].head = 0;
             g_audit_subscribers[i].tail = 0;
@@ -266,6 +270,12 @@ int audit_stream_read(int slot_idx, int32_t caller_pid,
     return (int)take;
 }
 
+// FU29.X.pcpu_audit: producer must never block.  The critical section is a
+// single ring write (~200 ns); a multi-µs wait already means pathological
+// contention, so we surrender after this tiny budget and drop+count (exactly
+// the lossy-ring semantics the full-ring branch below already implements).
+#define AUDIT_BROADCAST_TRYLOCK_NS  2000ull   // 2 µs
+
 void audit_broadcast(const audit_entry_t *entry) {
     if (!entry) return;
     uint16_t ev = entry->event_type;
@@ -273,22 +283,23 @@ void audit_broadcast(const audit_entry_t *entry) {
     for (uint32_t i = 0; i < AUDIT_SUB_MAX; i++) {
         audit_subscriber_t *s = &g_audit_subscribers[i];
         // Lock-free hint: if not in_use, skip without taking the lock.
-        if (!s->in_use) continue;
+        if (!__atomic_load_n(&s->in_use, __ATOMIC_ACQUIRE)) continue;
         if (bit && !(s->filter_mask & bit)) continue;
-        // Phase 25 T1/T2 lesson: this lock is OUTSIDE the audit_queue
-        // primary lock so contention here can't backpressure the audit
-        // emitter. Per-subscriber lock is short-held (~200 ns) — only a
-        // bounded ring write — so spinlock_acquire is safe. (try_acquire
-        // would shave the contention drop, but spinlock_t doesn't expose
-        // it; FU27.X.lockless_audit_ring revisits if measurement justifies.)
-        spinlock_acquire(&s->lock);
-        if (!s->in_use) {
+        // FU29.X.pcpu_audit: audit_enqueue is MPSC (any CPU broadcasts) and is
+        // even re-entered from the spinlock-panic audit writer.  A BLOCKING
+        // acquire could spin to the 5 s budget and panic-in-panic.  Use the
+        // bounded non-panicking timeout variant; on contention drop + count.
+        if (!spinlock_acquire_with_timeout(&s->lock, AUDIT_BROADCAST_TRYLOCK_NS)) {
+            __atomic_fetch_add(&s->dropped_count, 1, __ATOMIC_RELAXED);
+            continue;
+        }
+        if (!__atomic_load_n(&s->in_use, __ATOMIC_ACQUIRE)) {
             spinlock_release(&s->lock);
             continue;
         }
         if (s->head - s->tail >= AUDIT_SUB_RING_DEPTH) {
             // Full ring → drop oldest.
-            s->dropped_count++;
+            __atomic_fetch_add(&s->dropped_count, 1, __ATOMIC_RELAXED);
             s->tail++;
         }
         s->ring[s->head % AUDIT_SUB_RING_DEPTH] = *entry;

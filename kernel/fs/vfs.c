@@ -14,6 +14,19 @@ static vfs_filesystem_t filesystem_table[MAX_FILESYSTEMS];
 static vfs_node_t* vfs_root = NULL;
 spinlock_t vfs_lock = SPINLOCK_INITIALIZER("vfs");
 
+// FU29.I.spinlock_sites (FU28.D) decision: vfs_lock / pmm_lock / sched_lock all
+// KEEP the loud panic-on-budget acquire (spinlock_acquire).  A timeout-variant
+// conversion was attempted for vfs_lock and reverted: vfs_close() runs from
+// sched_reap_zombie's FD-cleanup path, and converting that acquire to the
+// timeout helper destabilised the FS open path (the gate regressed from 104
+// tests back to 71).  The diagnostic-counter value does not justify the risk on
+// the lock held across the blocking blk_wait_response window.  pmm_lock (silent
+// -ENOMEM in the page-fault handler) and the schedule()/IRQ-context sched_lock
+// acquires (no caller can handle a failed context switch) are likewise
+// DO-NOT-CONVERT.  The two SAFE FU28.D conversions are the already-landed
+// chan_reg_lock (chan_lookup_by_id) and the audit broadcast per-subscriber lock
+// (FU29.X.pcpu_audit).  See specs/phase-29-followups.yml.
+
 // Memory utilities
 static void *vfs_memcpy(void *dest, const void *src, size_t n) {
     uint8_t *pdest = (uint8_t *)dest;
