@@ -983,9 +983,15 @@ endif
 	@echo "cpu_affinity"             >> initrd_root/bin/tests/manifest.txt
 	@echo "spinlock_timeout"         >> initrd_root/bin/tests/manifest.txt
 	@echo "rate_quota"               >> initrd_root/bin/tests/manifest.txt
-	@echo "gsh_completion"           >> initrd_root/bin/tests/manifest.txt
-	@echo "gsh_chrome"               >> initrd_root/bin/tests/manifest.txt
-	@echo "ai_txn_rollback"          >> initrd_root/bin/tests/manifest.txt
+	@# Phase 29 FU24.B/FU25.A.4 gate-integrity fix: the shell-spawn tests
+	@# (gsh_completion, gsh_chrome, ai_txn_rollback, gash_txn_*, grahai_txn_*)
+	@# spawn an interactive shell and syscall_wait for it.  When the sentinel
+	@# write flakes the shell can fall through to interactive mode and block
+	@# forever; ktest cannot time out a blocked wait, so a hang there SILENTLY
+	@# TRUNCATES every test listed after it.  They are now CLUSTERED AT THE
+	@# VERY END of the manifest (after txn_stress_*) so a hang can only affect
+	@# its own cluster, never the ~110 deterministic tests.  See the relocated
+	@# block near the end of this rule.
 	@# Phase 29 Session C: kernel ABI polish.  spawn_argv (5) +
 	@# audit_query_since (4) + spawn_handles_inherit (5) = +14 asserts.
 	@echo "spawn_argv"               >> initrd_root/bin/tests/manifest.txt
@@ -1001,7 +1007,7 @@ endif
 	@echo "dirty_rect"               >> initrd_root/bin/tests/manifest.txt
 	@# Phase 29 Session E: sprite animation + cell-grid atomic TX + mouse
 	@# + full Unicode font sweep.  sprite_anim (5) + cell_grid_atomic (6)
-	@# + mouse_basic (4) + font_full_sweep (4) = +19 asserts.
+	@# + mouse_basic (4) + font_full_sweep (7, FU29.X.font_cjk: +3) = +22 asserts.
 	@echo "sprite_anim"              >> initrd_root/bin/tests/manifest.txt
 	@echo "cell_grid_atomic"         >> initrd_root/bin/tests/manifest.txt
 	@echo "mouse_basic"              >> initrd_root/bin/tests/manifest.txt
@@ -1013,8 +1019,8 @@ endif
 	@# via F1-pattern sched_block_on_channel in SYS_WAIT polling + pipe_read.
 	@# Each test asserts 4: sentinel staged, gash spawn OK, exit 0, AUDIT_TXN_*
 	@# emitted. Total +8 assertions; gate 992 → 1000.
-	@echo "gash_txn_commit" >> initrd_root/bin/tests/manifest.txt
-	@echo "gash_txn_abort" >> initrd_root/bin/tests/manifest.txt
+	@# (Relocated to the shell-spawn cluster at the end — see FU24.B/FU25.A.4
+	@# gate-integrity note above.)
 	@# Pre-Phase-28 sweep B.3 (FU25.A.3): substrate landed (kernel + user
 	@# wrappers + gash setup_redirects pin call) but the gate-resident
 	@# verification depends on grahafs_v2 mount which is currently v1
@@ -1028,8 +1034,8 @@ endif
 	@# grahai_txn_commit asserts AUDIT_TXN_COMMIT (42) emitted on plan
 	@# success; grahai_txn_abort asserts AUDIT_TXN_ABORT (43) emitted on
 	@# --abort sentinel. 4 asserts each → +8 gate.
-	@echo "grahai_txn_commit" >> initrd_root/bin/tests/manifest.txt
-	@echo "grahai_txn_abort" >> initrd_root/bin/tests/manifest.txt
+	@# (Relocated to the shell-spawn cluster at the end — see FU24.B/FU25.A.4
+	@# gate-integrity note above.)
 	@# Phase 15a: capability objects v2.
 	@echo "captest_v2" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 15b: pledge classes + audit log.
@@ -1116,6 +1122,22 @@ endif
 	@echo "txn_stress_basic" >> initrd_root/bin/tests/manifest.txt
 	@echo "txn_stress_nested" >> initrd_root/bin/tests/manifest.txt
 	@echo "txn_stress_state_machine" >> initrd_root/bin/tests/manifest.txt
+	@# Phase 29 FU24.B/FU25.A.4 gate-integrity: shell-spawn cluster, LAST.
+	@# These tests spawn bin/gsh / bin/gash / bin/grahai and syscall_wait for
+	@# the child.  If a child falls through to interactive mode (e.g. on a
+	@# flaky sentinel write) it blocks forever, and because ktest cannot time
+	@# out a blocked wait, a hang here would truncate the suite.  By listing
+	@# them LAST (after every deterministic test), a hang can only affect this
+	@# cluster — the ~110 deterministic tests above always complete.
+	@# gsh_completion's write_file now loops on short writes + bails without
+	@# spawning gsh if the sentinel still can't be staged (no interactive hang).
+	@echo "gsh_completion"           >> initrd_root/bin/tests/manifest.txt
+	@echo "gsh_chrome"               >> initrd_root/bin/tests/manifest.txt
+	@echo "ai_txn_rollback"          >> initrd_root/bin/tests/manifest.txt
+	@echo "gash_txn_commit"          >> initrd_root/bin/tests/manifest.txt
+	@echo "gash_txn_abort"           >> initrd_root/bin/tests/manifest.txt
+	@echo "grahai_txn_commit"        >> initrd_root/bin/tests/manifest.txt
+	@echo "grahai_txn_abort"         >> initrd_root/bin/tests/manifest.txt
 	@# Phase 23 Step 4: blk_stress_random_read NOT yet in gate — assertion 1
 	@# (/etc/gcp.json opens) trips at the late position the test would land
 	@# in, even though gcp_manifest opens the same file successfully ~14 s

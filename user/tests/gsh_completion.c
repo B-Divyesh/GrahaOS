@@ -17,18 +17,30 @@ extern int printf(const char *fmt, ...);
 #define OUT_PATH      "/gsh_complete_out"
 
 static int write_file(const char *path, const char *content, int len) {
-    // FU24.A class flake mitigation: retry up to 3× on partial write.
-    // Channel-mode FS in TCG occasionally returns short writes when
-    // kheap is under load; the kernel handles it correctly, but the
-    // user-side ssize_t == len check is over-strict.
-    for (int attempt = 0; attempt < 3; attempt++) {
+    // FU24.A class flake fix: a single syscall_write can return a SHORT
+    // count when channel-mode FS is under kheap load in TCG.  The old code
+    // treated a short write as total failure and retried from scratch
+    // (re-truncating), so it could loop forever returning -1.  The correct
+    // POSIX-shaped handling is to LOOP on the residual, advancing the
+    // buffer, and only retry the whole open on a hard error.  This makes
+    // the sentinel write reliable and stops the gate-truncating hang
+    // (FU24.B/FU25.A.4): a failed sentinel made gsh fall through to
+    // interactive mode and block forever, silently dropping every test
+    // after this one.
+    for (int attempt = 0; attempt < 5; attempt++) {
         syscall_create(path, 0);
         int fd = syscall_open(path);
         if (fd < 0) continue;
         (void)syscall_truncate(fd);
-        ssize_t n = syscall_write(fd, content, (size_t)len);
+        ssize_t total = 0;
+        while (total < len) {
+            ssize_t n = syscall_write(fd, content + total,
+                                      (size_t)(len - total));
+            if (n <= 0) break;       // hard error → reopen + retry
+            total += n;
+        }
         syscall_close(fd);
-        if (n == len) return 0;
+        if (total == len) return 0;
     }
     return -1;
 }
@@ -71,6 +83,24 @@ void _start(void) {
     const char script[] = "cap-l\t\nSYS_STREAM_C\t\n";
     int wr = write_file(SENTINEL_PATH, script, (int)sizeof(script) - 1);
     TAP_ASSERT(wr == 0, "1. sentinel /.gsh-script staged");
+
+    if (wr != 0) {
+        // Sentinel write genuinely failed.  Do NOT spawn gsh: an empty or
+        // truncated /.gsh-script makes gsh fall through to interactive mode
+        // and block on console input forever, which hangs syscall_wait
+        // below and (since ktest cannot time out a blocked wait) HANGS THE
+        // WHOLE GATE, silently dropping every test after this one.  Emit
+        // the remaining asserts as failures and exit cleanly so the suite
+        // keeps running.
+        printf("# gsh_completion: sentinel write failed — skipping gsh spawn "
+               "to avoid hanging the gate\n");
+        TAP_ASSERT(0, "2. spawn bin/gsh (skipped — sentinel write failed)");
+        TAP_ASSERT(0, "3. gsh exits cleanly (skipped)");
+        TAP_ASSERT(0, "4. completion 'cap-list' (skipped)");
+        TAP_ASSERT(0, "5. completion 'SYS_STREAM_CREATE' (skipped)");
+        tap_done();
+        syscall_exit(0);
+    }
 
     int pid = syscall_spawn("bin/gsh");
     if (pid <= 0) printf("# spawn bin/gsh rc=%d\n", pid);
