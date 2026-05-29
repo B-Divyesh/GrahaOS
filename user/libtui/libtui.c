@@ -30,6 +30,12 @@ typedef struct {
     tui_cell_u_t *mapped_cells;    // NULL → fall back to DEBUG path
     uint64_t cell_vmo_token_raw;
     uint64_t input_chan_token_raw;
+    // FU29.X.partial_render_clip — accumulated dirty bbox (inclusive cell
+    // coords) for mapped-VMO writes, flushed as ONE DEBUG_CONSOLE_MARK_DIRTY
+    // in tui_present.  This keeps the write fast path at zero syscalls
+    // (Session D's win) while still letting synthetic_render clip.
+    uint32_t dirty_min_row, dirty_min_col, dirty_max_row, dirty_max_col;
+    uint8_t  dirty_any;
 } libtui_console_state_t;
 
 #define LIBTUI_MAX_CONSOLES 8u
@@ -153,6 +159,22 @@ int tui_attach(uint32_t console_id) {
     return 0;
 }
 
+// FU29.X.partial_render_clip — expand a console's accumulated dirty bbox to
+// include cell (row,col).  Userspace-only (no syscall); flushed in tui_present.
+static inline void libtui_dirty_cell(libtui_console_state_t *cs,
+                                     uint32_t row, uint32_t col) {
+    if (!cs->dirty_any) {
+        cs->dirty_min_row = cs->dirty_max_row = row;
+        cs->dirty_min_col = cs->dirty_max_col = col;
+        cs->dirty_any = 1;
+        return;
+    }
+    if (row < cs->dirty_min_row) cs->dirty_min_row = row;
+    if (row > cs->dirty_max_row) cs->dirty_max_row = row;
+    if (col < cs->dirty_min_col) cs->dirty_min_col = col;
+    if (col > cs->dirty_max_col) cs->dirty_max_col = col;
+}
+
 int tui_write_cell(uint32_t console_id, uint32_t row, uint32_t col,
                    uint32_t codepoint, uint8_t fg, uint8_t bg, uint16_t attrs) {
     if (console_id >= LIBTUI_MAX_CONSOLES) {
@@ -169,6 +191,7 @@ int tui_write_cell(uint32_t console_id, uint32_t row, uint32_t col,
         p->bg_color  = bg;
         p->attrs     = attrs;
         for (int i = 0; i < 8; i++) p->padding[i] = 0;
+        libtui_dirty_cell(cs, row, col);
         return 0;
     }
     // Fallback — single-syscall DEBUG path.
@@ -192,6 +215,12 @@ int tui_clear(uint32_t console_id, uint8_t fg, uint8_t bg) {
                 for (int i = 0; i < 8; i++) p->padding[i] = 0;
             }
         }
+        // Whole frame changed.
+        cs->dirty_min_row = 0;
+        cs->dirty_min_col = 0;
+        cs->dirty_max_row = cs->height_cells ? cs->height_cells - 1u : 0u;
+        cs->dirty_max_col = cs->width_cells ? cs->width_cells - 1u : 0u;
+        cs->dirty_any = 1;
         return 0;
     }
     // Fallback — DEBUG-write loop.
@@ -305,6 +334,22 @@ int tui_set_cursor(uint32_t console_id, uint32_t row, uint32_t col) {
 }
 
 int tui_present(uint32_t console_id) {
+    // FU29.X.partial_render_clip — flush the accumulated dirty bbox from
+    // mapped-VMO writes into the kernel ring (ONE syscall per present, not
+    // per cell) so synthetic_render clips to exactly what changed.  Writes
+    // through the DEBUG path already mark dirty kernel-side, so this only
+    // covers the mapped fast path.
+    if (console_id < LIBTUI_MAX_CONSOLES) {
+        libtui_console_state_t *cs = &g_state.consoles[console_id];
+        if (cs->dirty_any) {
+            uint16_t x = (uint16_t)cs->dirty_min_col;
+            uint16_t y = (uint16_t)cs->dirty_min_row;
+            uint16_t w = (uint16_t)(cs->dirty_max_col - cs->dirty_min_col + 1u);
+            uint16_t h = (uint16_t)(cs->dirty_max_row - cs->dirty_min_row + 1u);
+            (void)syscall_console_mark_dirty_cells(console_id, x, y, w, h);
+            cs->dirty_any = 0;
+        }
+    }
     // Session D: when the cell-VMO is mapped, the kernel still owns the
     // pixel composite — we just need to trigger it.  syscall_console_ack_render
     // would be appropriate when fbd is alive; for now keep the existing

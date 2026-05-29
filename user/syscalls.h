@@ -350,6 +350,7 @@ typedef struct {
 #define DEBUG_SPINLOCK_TIMEOUT_COUNT        96
 #define DEBUG_SYSCALL_RATE_SET              97
 #define DEBUG_SYSCALL_RATE_EXCEEDED         98
+#define DEBUG_CONSOLE_MARK_DIRTY            99
 #define DEBUG_FB_READ_PIXEL    61
 #define DEBUG_SET_WALL       51
 
@@ -1194,6 +1195,27 @@ static inline long syscall_debug_console_synthetic_render(uint32_t console_id) {
         : "a"(SYS_DEBUG),
           "D"((uint64_t)DEBUG_CONSOLE_SYNTHETIC_RENDER),
           "S"((uint64_t)console_id)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+// Phase 29 FU29.X.partial_render_clip — feed the kernel dirty-rect ring from a
+// userspace (mapped-VMO) writer so synthetic_render can clip to the changed
+// region.  x/y/w/h are in cell coords.  Pack: x:16 | y:16 | w:16 | h:16.
+static inline long syscall_console_mark_dirty_cells(uint32_t console_id,
+                                                    uint16_t x, uint16_t y,
+                                                    uint16_t w, uint16_t h) {
+    uint64_t packed = (uint64_t)x |
+                      ((uint64_t)y << 16) |
+                      ((uint64_t)w << 32) |
+                      ((uint64_t)h << 48);
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(SYS_DEBUG),
+          "D"((uint64_t)DEBUG_CONSOLE_MARK_DIRTY),
+          "S"((uint64_t)console_id),
+          "d"(packed)
         : "rcx", "r11", "memory");
     return ret;
 }

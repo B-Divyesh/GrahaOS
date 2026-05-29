@@ -162,6 +162,73 @@ static const uint8_t font_8x16[95][16] = {
     [43] = {0x00,0x00,0x66,0x6C,0x78,0x70,0x78,0x6C,0x66,0x66,0x66,0x00,0x00,0x00,0x00,0x00},
 };
 
+// Phase 29 FU29.X.font_cjk — bounded Latin-1 Supplement (U+00A0..U+00FF).
+// Flat offset-keyed table (index = codepoint - 0xA0). Only a representative
+// subset of high-frequency Western-European glyphs is hand-authored
+// (public-domain, no GPL font import — same policy as Session E); the rest
+// are intentional blanks. This is BOUNDED on purpose: 96*16 = 1536 bytes of
+// .rodata, NOT a multi-megabyte full-Unicode/CJK import. Codepoints with no
+// glyph anywhere fall back to the visible "missing glyph" (tofu) box below so
+// dropped text is auditable (Design Principle 4) rather than silently blank.
+static const uint8_t font_latin1[96][16] = {
+    // U+00A0 NBSP (index 0) — intentional blank.
+    [0x00] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    // U+00A3 £ pound
+    [0x03] = {0,0,0x1C,0x36,0x30,0x30,0x7C,0x30,0x30,0x30,0xFE,0,0,0,0,0},
+    // U+00A7 § section
+    [0x07] = {0,0x3C,0x66,0x70,0x3C,0x66,0x66,0x3C,0x0E,0x66,0x3C,0,0,0,0,0},
+    // U+00A9 © copyright
+    [0x09] = {0,0x3C,0x42,0x99,0xA5,0xA1,0xA5,0x99,0x42,0x3C,0,0,0,0,0,0},
+    // U+00AE ® registered
+    [0x0E] = {0,0x3C,0x42,0x9D,0xA5,0x9D,0xA9,0x91,0x42,0x3C,0,0,0,0,0,0},
+    // U+00B0 ° degree
+    [0x10] = {0,0,0x38,0x44,0x44,0x38,0,0,0,0,0,0,0,0,0,0},
+    // U+00B1 ± plus-minus
+    [0x11] = {0,0,0,0x18,0x18,0x7E,0x18,0x18,0,0x7E,0,0,0,0,0,0},
+    // U+00B5 µ micro
+    [0x15] = {0,0,0,0,0,0x66,0x66,0x66,0x66,0x66,0x7C,0x60,0x60,0,0,0},
+    // U+00B7 · middle dot
+    [0x17] = {0,0,0,0,0,0,0,0x18,0x18,0,0,0,0,0,0,0},
+    // U+00C9 É E-acute
+    [0x29] = {0x0C,0x18,0x7E,0x60,0x60,0x7C,0x60,0x60,0x60,0x7E,0,0,0,0,0,0},
+    // U+00D1 Ñ N-tilde
+    [0x31] = {0x32,0x4C,0,0x66,0x76,0x7E,0x7E,0x6E,0x66,0x66,0,0,0,0,0,0},
+    // U+00D6 Ö O-diaeresis
+    [0x36] = {0x66,0,0x3C,0x66,0x66,0x66,0x66,0x66,0x66,0x3C,0,0,0,0,0,0},
+    // U+00DC Ü U-diaeresis
+    [0x3C] = {0x66,0,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x3C,0,0,0,0,0,0},
+    // U+00DF ß sharp-s
+    [0x3F] = {0,0,0x3C,0x66,0x66,0x6C,0x66,0x66,0x66,0x6C,0x60,0,0,0,0,0},
+    // U+00E0 à a-grave
+    [0x40] = {0,0x18,0x0C,0,0,0x3C,0x06,0x3E,0x66,0x66,0x3E,0,0,0,0,0},
+    // U+00E1 á a-acute
+    [0x41] = {0,0x0C,0x18,0,0,0x3C,0x06,0x3E,0x66,0x66,0x3E,0,0,0,0,0},
+    // U+00E4 ä a-diaeresis
+    [0x44] = {0,0x66,0,0,0,0x3C,0x06,0x3E,0x66,0x66,0x3E,0,0,0,0,0},
+    // U+00E7 ç c-cedilla
+    [0x47] = {0,0,0,0,0,0x3C,0x66,0x60,0x60,0x66,0x3C,0x18,0x0C,0x38,0,0},
+    // U+00E8 è e-grave
+    [0x48] = {0,0x18,0x0C,0,0,0x3C,0x66,0x7E,0x60,0x66,0x3C,0,0,0,0,0},
+    // U+00E9 é e-acute
+    [0x49] = {0,0x0C,0x18,0,0,0x3C,0x66,0x7E,0x60,0x66,0x3C,0,0,0,0,0},
+    // U+00EA ê e-circumflex
+    [0x4A] = {0,0x18,0x24,0,0,0x3C,0x66,0x7E,0x60,0x66,0x3C,0,0,0,0,0},
+    // U+00F1 ñ n-tilde
+    [0x51] = {0,0x32,0x4C,0,0,0x7C,0x66,0x66,0x66,0x66,0x66,0,0,0,0,0},
+    // U+00F6 ö o-diaeresis
+    [0x56] = {0,0x66,0,0,0,0x3C,0x66,0x66,0x66,0x66,0x3C,0,0,0,0,0},
+    // U+00FC ü u-diaeresis
+    [0x5C] = {0,0x66,0,0,0,0x66,0x66,0x66,0x66,0x66,0x3E,0,0,0,0,0},
+};
+
+// Phase 29 FU29.X.font_cjk — deterministic "missing glyph" (.notdef / tofu).
+// A hollow box, visually distinct from both a blank cell and every real glyph,
+// rendered for any printable codepoint we don't ship a glyph for. Makes dropped
+// text auditable instead of a silent blank (Design Principle 4).
+static const uint8_t glyph_missing[16] = {
+    0,0,0x7E,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x7E,0,0,0,0
+};
+
 // Phase 27 Stage A5 — Unicode box-drawing glyphs (U+2500..U+2518 minimal
 // subset for libtui windows). Full CP437 sweep is FU27.X.font_full. Each
 // glyph is 16 bytes (8x16 1bpp); bit 7 (0x80) is leftmost pixel.
@@ -651,6 +718,10 @@ void framebuffer_force_draw_cell(uint32_t pixel_x, uint32_t pixel_y,
     const uint8_t *glyph = NULL;
     if (codepoint >= 32 && codepoint <= 126) {
         glyph = font_8x16[codepoint - 32];
+    } else if (codepoint >= 0xA0 && codepoint <= 0xFF) {
+        // Phase 29 FU29.X.font_cjk — Latin-1 Supplement (always non-NULL
+        // within range; unauthored slots are intentional blanks).
+        glyph = font_latin1[codepoint - 0xA0];
     } else if (codepoint >= 0x2190 && codepoint <= 0x21FF) {
         // Arrows.
         glyph = find_box_glyph(codepoint);
@@ -668,6 +739,17 @@ void framebuffer_force_draw_cell(uint32_t pixel_x, uint32_t pixel_y,
     } else if (codepoint >= 0x2600 && codepoint <= 0x27BF) {
         // Misc symbols + dingbats (smileys, suits, music).
         glyph = find_box_glyph(codepoint);
+    }
+    // Phase 29 FU29.X.font_cjk — visible tofu fallback for any printable
+    // codepoint we have no glyph for (e.g. unmapped CJK, or an in-range box
+    // codepoint absent from the table). Exclude: control ranges (<0x20 and
+    // C1 0x80..0x9F), space, and the sprite PUA (0xE100..0xE7FF, dispatched
+    // upstream in console_render_synthetic_frame — guarded here as
+    // belt-and-suspenders; framebuffer.c can't see TUI_SPRITE_BASE/END).
+    if (!glyph && codepoint >= 0x20 && codepoint != ' ' &&
+        !(codepoint >= 0x80 && codepoint <= 0x9F) &&
+        !(codepoint >= 0xE100u && codepoint <= 0xE7FFu)) {
+        glyph = glyph_missing;
     }
     if (glyph) {
         for (int row = 0; row < 16; row++) {

@@ -604,24 +604,36 @@ int console_render_synthetic_frame(uint32_t console_id) {
     const uint32_t H = c->height_cells;
     sprite_table_t *st = (sprite_table_t *)c->sprite_table;
 
-    // Phase 29 Session D: drain dirty-rect ring → compute bounding-box clip.
-    // Bookkeeping ONLY: synthetic_render still walks the full cell grid by
-    // default because libtui (and the test substrate) may write cells via
-    // mapped-VMO memcpy without marking them dirty.  The dirty-rect ring is
-    // an *upper bound* of what's known dirty; the test gate counts how
-    // often it was non-empty (partial) vs empty (full) for instrumentation
-    // purposes.  Real partial-render skip optimisation will land in
-    // FU29.X.partial_render_clip once mapped-VMO writers also mark dirty.
+    // Phase 29 FU29.X.partial_render_clip: drain dirty-rect ring → compute
+    // bounding-box clip and APPLY it to the cell-walk bounds. Three cases
+    // (matching console_drain_dirty_ring's contract):
+    //   - overflow (partial==false)        → full redraw of the whole grid.
+    //   - empty ring (partial, drw/drh==0) → nothing dirty; skip the cell pass
+    //                                        (zero loop iterations).
+    //   - non-empty (partial, drw/drh>0)   → clip to the coalesced union bbox.
+    // The framebuffer is never cleared, so cells outside the clip retain their
+    // prior pixels (correct). All cell writers (DEBUG_CONSOLE_WRITE_CELL and
+    // the libtui mapped-VMO path) mark dirty, so the union is a correct upper
+    // bound of what changed.
     uint16_t drx = 0, dry = 0, drw = 0, drh = 0;
     bool partial = console_drain_dirty_ring(c, &drx, &dry, &drw, &drh);
-    (void)drx; (void)dry; (void)drw; (void)drh;
     if (partial) {
         __atomic_fetch_add(&g_dirty_rect_renders_partial, 1, __ATOMIC_RELAXED);
     } else {
         __atomic_fetch_add(&g_dirty_rect_renders_full, 1, __ATOMIC_RELAXED);
     }
-    uint32_t row_lo = 0, row_hi = H;
-    uint32_t col_lo = 0, col_hi = W;
+    uint32_t row_lo, row_hi, col_lo, col_hi;
+    if (!partial) {                      // overflow → full redraw
+        row_lo = 0; row_hi = H; col_lo = 0; col_hi = W;
+    } else if (drw == 0 || drh == 0) {   // empty ring → nothing dirty
+        row_lo = row_hi = col_lo = col_hi = 0;
+    } else {                             // partial → clip to union bbox
+        col_lo = drx;          row_lo = dry;
+        col_hi = (uint32_t)drx + drw;
+        row_hi = (uint32_t)dry + drh;
+        if (col_hi > W) col_hi = W;
+        if (row_hi > H) row_hi = H;
+    }
 
     for (uint32_t row = row_lo; row < row_hi; row++) {
         for (uint32_t col = col_lo; col < col_hi; col++) {

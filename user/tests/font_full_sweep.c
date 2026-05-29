@@ -2,7 +2,7 @@
 //
 // Phase 29 Session E gate test — extended Unicode font coverage.
 //
-// 4 asserts:
+// 7 asserts:
 //   1. Render Block Element U+2588 (full block) at (8, 16); pixel at center
 //      is foreground color (non-zero).
 //   2. Same for Block Element U+2580 (upper half) — pixel in upper half
@@ -10,6 +10,10 @@
 //   3. Same for Geometric Shape U+25A0 (filled square) — center pixel is fg.
 //   4. Same for Arrow U+2192 (right arrow) — at least one pixel of the
 //      arrow body is fg.
+//   5. (FU29.X.font_cjk) Latin-1 U+00E9 (é) renders fg in the 'e' body bar.
+//   6. (FU29.X.font_cjk) Latin-1 U+00B0 (°) renders fg in the degree circle.
+//   7. (FU29.X.font_cjk) Unmapped CJK U+4E2D renders the visible tofu box
+//      (NOT a silent blank) — a pixel on the box's top edge is fg.
 //
 // We use DEBUG_CONSOLE_WRITE_CELL to populate cells, then
 // DEBUG_CONSOLE_SYNTHETIC_RENDER to trigger the render, then
@@ -47,7 +51,7 @@ static int render_and_check(uint32_t codepoint,
 }
 
 void _start(void) {
-    tap_plan(4);
+    tap_plan(7);
 
     (void)syscall_pledge(PLEDGE_SYS_CONTROL | PLEDGE_SYS_QUERY |
                          PLEDGE_IPC_SEND | PLEDGE_IPC_RECV |
@@ -69,6 +73,20 @@ void _start(void) {
     // (the bitmap puts the arrow's horizontal line at rows 5-10 col 0-6).
     int ok4 = render_and_check(0x2192, 4, 7, 1);
     TAP_ASSERT(ok4, "4. U+2192 right arrow renders fg pixel in body");
+
+    // Test 5: U+00E9 (é) — Latin-1 path; 'e' middle bar (row 7 = 0x7E) at
+    // pixel (4, 7) should be fg.
+    int ok5 = render_and_check(0x00E9, 4, 7, 1);
+    TAP_ASSERT(ok5, "5. U+00E9 (e-acute) renders fg via Latin-1 table");
+
+    // Test 6: U+00B0 (°) — degree circle (row 2 = 0x38) at pixel (3, 2) is fg.
+    int ok6 = render_and_check(0x00B0, 3, 2, 1);
+    TAP_ASSERT(ok6, "6. U+00B0 (degree) renders fg via Latin-1 table");
+
+    // Test 7: U+4E2D — an unshipped CJK codepoint must render the visible tofu
+    // box (top edge row 2 = 0x7E) at pixel (4, 2), NOT a silent blank.
+    int ok7 = render_and_check(0x4E2D, 4, 2, 1);
+    TAP_ASSERT(ok7, "7. U+4E2D (unmapped) renders tofu box, not blank");
 
     tap_done();
     syscall_exit(0);

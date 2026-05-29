@@ -2019,6 +2019,22 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 frame->rax = (uint64_t)(long)rc;
                 break;
             }
+            // Phase 29 FU29.X.partial_render_clip — libtui mapped-VMO writers
+            // mark dirty here so synthetic_render's clip includes them.
+            case DEBUG_CONSOLE_MARK_DIRTY: {
+                extern void console_mark_dirty(uint32_t console_id,
+                                               uint16_t x, uint16_t y,
+                                               uint16_t w, uint16_t h);
+                uint32_t cid = (uint32_t)frame->rsi;
+                uint64_t packed = frame->rdx;
+                uint16_t x = (uint16_t)(packed & 0xFFFFu);
+                uint16_t y = (uint16_t)((packed >> 16) & 0xFFFFu);
+                uint16_t w = (uint16_t)((packed >> 32) & 0xFFFFu);
+                uint16_t h = (uint16_t)((packed >> 48) & 0xFFFFu);
+                console_mark_dirty(cid, x, y, w, h);
+                frame->rax = 0;
+                break;
+            }
             // Phase 27 Block C (Stage C1): test-only PLAN_* audit emission.
             case DEBUG_AUDIT_EMIT_PLAN: {
                 uint16_t ev = (uint16_t)frame->rsi;

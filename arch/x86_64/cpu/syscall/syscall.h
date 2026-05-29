@@ -638,6 +638,12 @@
 #define DEBUG_SYSCALL_RATE_SET              97
 // Read caller's syscall_rate_exceeded_count diagnostic.
 #define DEBUG_SYSCALL_RATE_EXCEEDED         98
+// Phase 29 FU29.X.partial_render_clip — let libtui's mapped-VMO writers feed
+// the kernel dirty-rect ring so synthetic_render can clip.  RSI=console_id,
+// RDX=packed(x | y<<16 | w<<32 | h<<48) in cell coords.  DEBUG-only (not in
+// gcp.json → manifest blob/hash unchanged); consistent with libtui already
+// driving DEBUG_CONSOLE_SYNTHETIC_RENDER in its present path.
+#define DEBUG_CONSOLE_MARK_DIRTY            99
 
 void syscall_init(void);
 void syscall_dispatcher(struct syscall_frame *frame);
