@@ -619,10 +619,26 @@ ssize_t grahafs_write(vfs_node_t* node, uint64_t offset, size_t size, void* buff
         block_offset = 0;
     }
     
-    // Update inode size if extended
+    // Update inode size if extended.
+    //
+    // FU24.A / Design Principle 4 (failure is auditable, not silent): do NOT
+    // ignore the inode flush.  If write_inode fails (transient pmm pressure on
+    // its scratch buffer, or a channel-mode transport error under load), the
+    // data block is on disk but the on-disk inode SIZE stays stale — so a
+    // subsequent open/read sees an empty/short file while THIS write falsely
+    // reported full success (returns bytes_written).  That is exactly the
+    // "shell reads an empty sentinel despite a successful write" symptom
+    // (FU29.X.shell_sentinel_flake).  Report the failure (-1) so the caller's
+    // reopen-retry loop re-attempts and the size is durably persisted, rather
+    // than losing the size update silently.  The reopen happens with all FS
+    // locks released, so transient pmm pressure clears between attempts.
     if (offset + bytes_written > inode.size) {
         inode.size = offset + bytes_written;
-        write_inode(node->inode, &inode);
+        if (write_inode(node->inode, &inode) != 0) {
+            pmm_free_page(temp_buffer_phys);
+            grahafs_lock_release_busy();
+            return -1;
+        }
     }
 
     /* Phase 23 Step 3.C: skip the per-write flush.  In channel-mode each

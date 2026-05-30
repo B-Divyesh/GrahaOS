@@ -33,6 +33,14 @@ void _start(void) {
 
     int pid = syscall_spawn("bin/grahai");
     TAP_ASSERT(pid > 0, "2. spawn bin/grahai returns valid PID");
+    if (pid <= 0) {
+        // Spawn failed — do NOT call syscall_wait (it would block waiting for
+        // a child that was never created).  Graceful-fail and exit.
+        TAP_ASSERT(0, "3. grahai exited 0 (skipped — spawn failed)");
+        TAP_ASSERT(0, "4. AUDIT_TXN_COMMIT (skipped)");
+        tap_done();
+        syscall_exit(0);
+    }
 
     int status = -1;
     int wpid = syscall_wait(&status);

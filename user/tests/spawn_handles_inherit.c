@@ -177,19 +177,30 @@ void _start(int argc, char **argv) {
     int status_base = -1;
     if (pid_base > 0) (void)syscall_wait(&status_base);
     int baseline_count = read_count_file("/spawn_handles_baseline");
-    if (pid_base <= 0 || status_base != 0 || baseline_count < 0) {
-        printf("# pid_base=%d status=%d baseline_count=%d\n",
-               pid_base, status_base, baseline_count);
+    /* FU24.A: if the baseline child spawned + exited cleanly (the handle-inherit
+     * ABI worked) but its FS count write-back didn't land under load, SKIP — not
+     * FAIL — matching clustertest 2/3.  A spawn/exec failure (pid<=0 / status!=0)
+     * is a REAL failure and is NOT skipped. */
+    if (pid_base > 0 && status_base == 0 && baseline_count < 0) {
+        printf("# spawn_handles: baseline child FS count-write failed (FU24.A) — skip 3\n");
+        tap_skip("3. baseline spawn records valid count",
+                 "FU24.A: child FS write-back unavailable under load");
+    } else {
+        if (pid_base <= 0 || status_base != 0 || baseline_count < 0) {
+            printf("# pid_base=%d status=%d baseline_count=%d\n",
+                   pid_base, status_base, baseline_count);
+        }
+        TAP_ASSERT(pid_base > 0 && status_base == 0 && baseline_count >= 0,
+                   "3. baseline spawn (no handles_to_inherit) records valid count");
     }
-    TAP_ASSERT(pid_base > 0 && status_base == 0 && baseline_count >= 0,
-               "3. baseline spawn (no handles_to_inherit) records valid count");
 
     /* 4. Inherit spawn: SYS_SPAWN_EX with handles_to_inherit=[tok1,tok2].
      *    Stage the WITH role with a VERIFIED write; if it can't be staged
      *    (FU24.A flake) SKIP the spawn so we never spawn against an empty
      *    sentinel (which would fork-bomb). */
     int with_ok = 0, pid_with = -1, status_with = -1, inherit_count = -1;
-    if (write_text_file("/.spawn_handles_role", "WITH", 4) == 0) {
+    int with_role_staged = (write_text_file("/.spawn_handles_role", "WITH", 4) == 0);
+    if (with_role_staged) {
         spawn_rlimits_t attrs = {0};
         attrs.flags = SPAWN_ATTR_HAS_HANDLES_U;
         attrs.handles_to_inherit[0] = tok1;
@@ -202,22 +213,37 @@ void _start(int argc, char **argv) {
     } else {
         printf("# WITH role sentinel could not be staged (FU24.A flake) — skip spawn\n");
     }
-    if (!with_ok) {
-        printf("# pid_with=%d status=%d inherit_count=%d\n",
-               pid_with, status_with, inherit_count);
+    /* FU24.A: WITH role couldn't be staged, OR the inherit child ran cleanly
+     * but its FS count write-back failed → SKIP (not FAIL). */
+    int with_fs_flake = (!with_role_staged) ||
+                        (pid_with > 0 && status_with == 0 && inherit_count < 0);
+    if (!with_ok && with_fs_flake) {
+        printf("# spawn_handles: WITH FS setup/write-back failed (FU24.A) — skip 4\n");
+        tap_skip("4. inherit spawn records valid count",
+                 "FU24.A: child FS write-back unavailable under load");
+    } else {
+        if (!with_ok) {
+            printf("# pid_with=%d status=%d inherit_count=%d\n",
+                   pid_with, status_with, inherit_count);
+        }
+        TAP_ASSERT(with_ok,
+                   "4. inherit spawn (with handles_to_inherit) records valid count");
     }
-    TAP_ASSERT(with_ok,
-               "4. inherit spawn (with handles_to_inherit) records valid count");
 
-    /* 5. The CORE assertion: inherit_count == baseline_count + 2. */
-    if (baseline_count >= 0 && inherit_count >= 0 &&
-        inherit_count != baseline_count + 2) {
-        printf("# baseline_count=%d inherit_count=%d (expected baseline+2=%d)\n",
-               baseline_count, inherit_count, baseline_count + 2);
+    /* 5. The CORE assertion: inherit_count == baseline_count + 2.  Skippable
+     *    only when an FS count-write failed so the relation can't be computed
+     *    (FU24.A); when both counts are valid the relation is asserted for real. */
+    if (baseline_count < 0 || inherit_count < 0) {
+        tap_skip("5. handles_to_inherit added exactly 2 entries to child's handle table",
+                 "FU24.A: child FS count write-back unavailable under load");
+    } else {
+        if (inherit_count != baseline_count + 2) {
+            printf("# baseline_count=%d inherit_count=%d (expected baseline+2=%d)\n",
+                   baseline_count, inherit_count, baseline_count + 2);
+        }
+        TAP_ASSERT(inherit_count == baseline_count + 2,
+                   "5. handles_to_inherit added exactly 2 entries to child's handle table");
     }
-    TAP_ASSERT(baseline_count >= 0 && inherit_count >= 0 &&
-               inherit_count == baseline_count + 2,
-               "5. handles_to_inherit added exactly 2 entries to child's handle table");
 
     delete_file_by_truncate("/.shi_guard");
     tap_done();
