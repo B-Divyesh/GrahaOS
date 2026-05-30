@@ -132,6 +132,25 @@ static inline bool is_user_pointer(const void *ptr, size_t size) {
     return true;
 }
 
+// FU24.B robustness/DoS guard: is_user_pointer only proves the [ptr,ptr+size)
+// range is in the canonical user half — it does NOT prove the pages are
+// PRESENT.  A raw kernel byte-copy of a user struct that straddles an unmapped
+// page (classically a caller stack-local abutting the unmapped stack-guard
+// page at 0x7FFFFFFFF000) then takes a PAGE FAULT *in the kernel*, killing the
+// caller mid-syscall (==OOPS==).  Any process could trigger this on purpose.
+// user_range_mapped walks every page in the range in the caller's cr3 and
+// returns false if any is absent, so the syscall can return -EFAULT cleanly.
+static bool user_range_mapped(uint64_t cr3, const void *ptr, size_t size) {
+    if (size == 0) return true;
+    uint64_t start = (uint64_t)ptr;
+    uint64_t last  = start + size - 1;                 // inclusive last byte
+    for (uint64_t page = start & ~0xFFFULL;
+         page <= (last & ~0xFFFULL); page += 0x1000ULL) {
+        if (vmm_get_physical_address(cr3, page) == 0) return false;
+    }
+    return true;
+}
+
 // Phase 15b: pledge guard helper. Called at the top of every sensitive
 // syscall handler. If the calling task lacks the named class in its
 // pledge_mask, writes an AUDIT_CAP_VIOLATION entry, stamps -EPLEDGE on
@@ -3518,6 +3537,18 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             const void *attrs_user = (const void *)frame->rsi;
             if (attrs_user) {
                 if (!is_user_pointer(attrs_user, sizeof(attrs_snap))) {
+                    frame->rax = (uint64_t)(int64_t)-14;  // -EFAULT
+                    break;
+                }
+                // FU24.B: harden against a straddling/partially-unmapped attrs
+                // pointer (e.g. a caller stack-local abutting the stack-guard
+                // page).  Without this the byte-copy below page-faults IN THE
+                // KERNEL.  Verify every page is present first; return -EFAULT
+                // instead of crashing the caller.
+                task_t *attrs_caller = sched_get_current_task();
+                if (!attrs_caller ||
+                    !user_range_mapped(attrs_caller->cr3, attrs_user,
+                                       sizeof(attrs_snap))) {
                     frame->rax = (uint64_t)(int64_t)-14;  // -EFAULT
                     break;
                 }

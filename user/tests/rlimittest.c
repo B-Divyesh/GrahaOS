@@ -66,8 +66,19 @@ void _start(void) {
         syscall_wait(&wst);
     }
 
-    // b) SPAWN_EX with override sets child's mem_limit
-    spawn_rlimits_t attrs = {0};
+    // b) SPAWN_EX with override sets child's mem_limit.
+    //
+    // FU24.B root cause (this was the real "rlimittest INCOMPLETE" — NOT a
+    // mallocbomb hang): a STACK-LOCAL attrs here landed at the very top of
+    // this _start frame, so the 168-byte spawn_rlimits_t straddled the
+    // unmapped user-stack guard page at 0x7FFFFFFFF000.  The kernel's
+    // SYS_SPAWN_EX attrs byte-copy then read across that boundary and the
+    // KERNEL itself page-faulted (==OOPS== pid=rlimittest), killing this test
+    // mid-run -> END marker missing -> gate INCOMPLETE.  Placing attrs in BSS
+    // (static, a stable low mapped address) keeps the copy entirely inside
+    // mapped pages.  The kernel side is ALSO hardened to return -EFAULT rather
+    // than fault on any straddling/unmapped attrs pointer (syscall.c).
+    static spawn_rlimits_t attrs;
     attrs.flags = SPAWN_ATTR_HAS_RLIMIT_U;
     attrs.rlimit_mem_pages = 64;
     attrs.rlimit_cpu_ns    = 1000000000ULL;  // 1 s budget
