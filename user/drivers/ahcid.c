@@ -685,6 +685,72 @@ static uint32_t ring_slot_for_req_id(const blk_spsc_slot_t *ring,
     return 0xFFFFFFFFu;
 }
 
+/* Harvest every completed (PxCI-bit-clear) in_use slot on port `st`.
+ * For each: publish the completion (SPSC ring done=1 + flag a coalesced
+ * doorbell, or the legacy 24-byte resp chan_send) and free the slot
+ * (in_use=0). A clear PxCI bit is the HBA-authoritative "command complete"
+ * signal, so this is correct whether the harvest is triggered by an IRQ
+ * (handle_irq) OR by the main-loop poll (poll_complete_slots) — in-flight
+ * commands keep their CI bit set and are skipped. doorbell_pending[cli]
+ * is OR'd so the caller can emit one coalesced doorbell per client. Does
+ * NOT touch PxIS (that is the IRQ-acknowledge path's responsibility). */
+static void harvest_port_completed(ahcid_port_state_t *st,
+                                   uint8_t *doorbell_pending) {
+    ahcid_port_mmio_t *p = st->mmio;
+    uint32_t ci = p->ci;
+    for (uint32_t s = 0; s < g_ahcid.ncs; s++) {
+        if (!st->slot[s].in_use) continue;
+        if (ci & (1u << s)) continue;  /* still in-flight */
+
+        /* W5 Phase 2: prefer ring path if client connected with one.
+         * Avoids the 24-byte blk_resp_msg_t chan_send on the hot path;
+         * doorbell is coalesced by the caller. */
+        blk_spsc_slot_t *ring = (blk_spsc_slot_t *)st->slot[s].spsc_ring;
+        uint32_t ring_idx = st->slot[s].ring_slot_idx;
+        if (ring && ring_idx == 0xFFFFFFFFu) {
+            ring_idx = ring_slot_for_req_id(ring, st->slot[s].req_id);
+        }
+        if (ring && ring_idx < BLK_SPSC_RING_SLOTS) {
+            blk_spsc_slot_t *rs = &ring[ring_idx];
+            rs->status = BLK_E_OK;
+            rs->bytes  = st->slot[s].bytes;
+            asm volatile("mfence" ::: "memory");
+            __atomic_store_n(&rs->done, 1u, __ATOMIC_RELEASE);
+            if (st->slot[s].cli_idx < AHCID_MAX_CLIENTS) {
+                doorbell_pending[st->slot[s].cli_idx] = 1u;
+            }
+        } else {
+            /* Legacy: full 24-byte resp via chan_send. */
+            blk_resp_msg_t resp = {0};
+            resp.req_id            = st->slot[s].req_id;
+            resp.status            = BLK_E_OK;
+            resp.bytes_transferred = st->slot[s].bytes;
+            resp.timestamp_tsc     = rdtsc_now();
+            cap_token_u_t tok = {.raw = (uint64_t)st->slot[s].resp_chan};
+            (void)send_payload(tok, fnv1a64(BLK_SERVICE_TYPE),
+                               &resp, sizeof(resp));
+        }
+
+        st->slot[s].in_use    = 0;
+        st->slot[s].spsc_ring = NULL;  /* defensive */
+        g_ahcid.requests_total++;
+    }
+}
+
+/* Emit one coalesced 1-byte doorbell per client that had ≥1 completion.
+ * The kt task scans the whole ring on every doorbell, so coalescing (and
+ * even a redundant doorbell across handle_irq + poll_complete_slots) is
+ * safe — kt picks up all done=1 slots. */
+static void emit_coalesced_doorbells(const uint8_t *doorbell_pending) {
+    for (uint32_t c = 0; c < AHCID_MAX_CLIENTS; c++) {
+        if (!doorbell_pending[c]) continue;
+        if (!g_ahcid.clients[c].in_use) continue;
+        uint8_t db = 0;
+        cap_token_u_t tok = {.raw = (uint64_t)g_ahcid.clients[c].client_chan_write};
+        (void)send_payload(tok, fnv1a64(BLK_SERVICE_TYPE), &db, 1);
+    }
+}
+
 static void handle_irq(void) {
     g_ahcid.irq_count++;
     uint32_t hba_is = g_ahcid.hba->is;
@@ -711,58 +777,37 @@ static void handle_irq(void) {
         }
         // Walk slots; for each slot with in_use=1 and CI bit cleared,
         // command completed → send response.
-        uint32_t ci = p->ci;
-        for (uint32_t s = 0; s < g_ahcid.ncs; s++) {
-            if (!st->slot[s].in_use) continue;
-            if (ci & (1u << s)) continue;  /* still in-flight */
-
-            /* W5 Phase 2: prefer ring path if client connected with one.
-             * Avoids the 24-byte blk_resp_msg_t chan_send on the hot path;
-             * doorbell is coalesced below. */
-            blk_spsc_slot_t *ring = (blk_spsc_slot_t *)st->slot[s].spsc_ring;
-            uint32_t ring_idx = st->slot[s].ring_slot_idx;
-            if (ring && ring_idx == 0xFFFFFFFFu) {
-                ring_idx = ring_slot_for_req_id(ring, st->slot[s].req_id);
-            }
-            if (ring && ring_idx < BLK_SPSC_RING_SLOTS) {
-                blk_spsc_slot_t *rs = &ring[ring_idx];
-                rs->status = BLK_E_OK;
-                rs->bytes  = st->slot[s].bytes;
-                asm volatile("mfence" ::: "memory");
-                __atomic_store_n(&rs->done, 1u, __ATOMIC_RELEASE);
-                if (st->slot[s].cli_idx < AHCID_MAX_CLIENTS) {
-                    doorbell_pending[st->slot[s].cli_idx] = 1u;
-                }
-            } else {
-                /* Legacy: full 24-byte resp via chan_send. */
-                blk_resp_msg_t resp = {0};
-                resp.req_id            = st->slot[s].req_id;
-                resp.status            = BLK_E_OK;
-                resp.bytes_transferred = st->slot[s].bytes;
-                resp.timestamp_tsc     = rdtsc_now();
-                cap_token_u_t tok = {.raw = (uint64_t)st->slot[s].resp_chan};
-                (void)send_payload(tok, fnv1a64(BLK_SERVICE_TYPE),
-                                   &resp, sizeof(resp));
-            }
-
-            st->slot[s].in_use    = 0;
-            st->slot[s].spsc_ring = NULL;  /* defensive */
-            g_ahcid.requests_total++;
-        }
+        harvest_port_completed(st, doorbell_pending);
         p->is = port_is;  /* clear */
     }
     g_ahcid.hba->is = hba_is;  /* clear */
 
-    /* W5 Phase 2: emit one 1-byte doorbell per client that had at least
-     * one SPSC completion. The kt task scans the ring on every doorbell,
-     * so coalescing is safe — kt will pick up all done=1 slots. */
-    for (uint32_t c = 0; c < AHCID_MAX_CLIENTS; c++) {
-        if (!doorbell_pending[c]) continue;
-        if (!g_ahcid.clients[c].in_use) continue;
-        uint8_t db = 0;
-        cap_token_u_t tok = {.raw = (uint64_t)g_ahcid.clients[c].client_chan_write};
-        (void)send_payload(tok, fnv1a64(BLK_SERVICE_TYPE), &db, 1);
+    emit_coalesced_doorbells(doorbell_pending);
+}
+
+/* FU24.A/B (#660) fix: poll-harvest completions INDEPENDENT of IRQ delivery.
+ *
+ * handle_irq only runs when drv_irq_wait returns an IRQ message, and it
+ * snapshots PxCI then unconditionally clears PxIS — so a completion that
+ * lands in the snapshot→clear window, or an AHCI IRQ that is lost/coalesced
+ * away under load, leaves an in_use slot whose command actually FINISHED.
+ * The kernel waiter for that slot then sits until its 5 s blk_wait_response
+ * deadline; under the spawn/txn-cluster burst this compounds into many
+ * sequential 5 s per-op grinds that push the gate past its watchdog
+ * (root cause of #660 — confirmed: spawn_argv's child-spawns were spaced
+ * exactly 5 s/15 s apart = blk timeouts firing). Scanning PxCI every
+ * main-loop iteration reaps any completed-but-unsignaled slot promptly, so
+ * completion delivery never depends on IRQ delivery. Idempotent with
+ * handle_irq (a slot it already reaped has in_use=0 and is skipped). */
+static void poll_complete_slots(void) {
+    uint8_t doorbell_pending[AHCID_MAX_CLIENTS];
+    memset(doorbell_pending, 0, sizeof(doorbell_pending));
+    for (uint32_t i = 0; i < AHCID_MAX_PORTS; i++) {
+        ahcid_port_state_t *st = &g_ahcid.ports[i];
+        if (!st->present) continue;
+        harvest_port_completed(st, doorbell_pending);
     }
+    emit_coalesced_doorbells(doorbell_pending);
 }
 
 // Phase 24a W3: dispatch a single blk_req_msg_t op. Returns 0 if the
@@ -1030,6 +1075,15 @@ void ahcid_main_loop(void) {
         if (n > 0) {
             for (long i = 0; i < n; i++) handle_irq();
         }
+
+        // 3b. FU24.A/B (#660): unconditionally poll-harvest completed HBA
+        //     slots every iteration, independent of whether an IRQ arrived.
+        //     Closes the lost/missed-IRQ window in handle_irq that otherwise
+        //     strands a finished command until the kernel's 5 s timeout,
+        //     compounding into the per-op grind that tips the gate past its
+        //     watchdog. Cheap: one PxCI MMIO read per present port + a scan
+        //     that early-outs on !in_use slots.
+        poll_complete_slots();
 
         // 4. With SPSC active and no IRQs, emit `pause` instructions so
         //    we don't burn 100% CPU for nothing while still resuming the
