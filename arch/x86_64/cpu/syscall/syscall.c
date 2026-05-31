@@ -1337,7 +1337,9 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             for (size_t i = 0; i < sizeof(grahafs_ai_metadata_t); i++)
                 kdst[i] = usrc[i];
 
-            int aim_rc = grahafs_set_ai_metadata(ino, &kmeta);
+            int aim_rc = grahafs_v2_is_mounted()
+                       ? grahafs_v2_set_ai_metadata(ino, &kmeta)
+                       : grahafs_set_ai_metadata(ino, &kmeta);
             frame->rax = (uint64_t)(long)aim_rc;
             if (aim_rc >= 0) {
                 task_t *aic = sched_get_current_task();
@@ -1371,7 +1373,9 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             vfs_destroy_node(node);
 
             grahafs_ai_metadata_t kmeta;
-            int ret = grahafs_get_ai_metadata(ino, &kmeta);
+            int ret = grahafs_v2_is_mounted()
+                    ? grahafs_v2_get_ai_metadata(ino, &kmeta)
+                    : grahafs_get_ai_metadata(ino, &kmeta);
             if (ret == 0) {
                 // Copy result to user space
                 uint8_t *udst = (uint8_t *)frame->rsi;
@@ -1403,7 +1407,9 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             if (max <= 0 || max > 16) max = 16;
 
             grahafs_search_results_t kresults;
-            int ret = grahafs_search_by_tag(ktag, &kresults, max);
+            int ret = grahafs_v2_is_mounted()
+                    ? grahafs_v2_search_by_tag(ktag, &kresults, max)
+                    : grahafs_search_by_tag(ktag, &kresults, max);
 
             if (ret >= 0) {
                 // Copy results to user space
@@ -1702,7 +1708,9 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 break;
             }
             grahafs_search_results_t kresults;
-            int sim_ret = grahafs_find_similar(sim_node->inode, sim_threshold, &kresults, 16);
+            int sim_ret = grahafs_v2_is_mounted()
+                        ? grahafs_v2_find_similar(sim_node->inode, sim_threshold, &kresults, 16)
+                        : grahafs_find_similar(sim_node->inode, sim_threshold, &kresults, 16);
             if (sim_ret >= 0) {
                 // Copy results to user-space
                 uint8_t *dst = (uint8_t *)sim_results;

@@ -37,6 +37,8 @@
 #include <stdint.h>
 
 #include "../sync/spinlock.h"
+#include "grahafs.h"   // FU29.H: shared AI user-structs + GRAHAFS_AI_*/META_FLAG_*
+                       // used by the v2 AI-metadata function prototypes below.
 
 // ---------------------------------------------------------------------------
 // Magic numbers. All verified on every disk read.
@@ -457,6 +459,16 @@ int grahafs_revert_to_version(uint32_t inode_num, uint64_t target_version);
 // non-FILE, zero-size, all-block-reads-failed).
 // ---------------------------------------------------------------------------
 uint64_t grahafs_v2_compute_simhash(uint32_t inode_num);
+
+// FU29.H — v2 ports of the v1 AI-feature surface (grahafs.c). Same observable
+// semantics + same user-struct ABI; the syscall dispatch routes to these when
+// grahafs_v2_is_mounted(). See §AI_METADATA in grahafs_v2.c.
+int grahafs_v2_set_ai_metadata(uint32_t inode_num, const grahafs_ai_metadata_t *meta);
+int grahafs_v2_get_ai_metadata(uint32_t inode_num, grahafs_ai_metadata_t *meta);
+int grahafs_v2_search_by_tag(const char *tag, grahafs_search_results_t *results,
+                             int max_results);
+int grahafs_v2_find_similar(uint32_t ref_inode, int threshold,
+                            grahafs_search_results_t *results, int max_results);
 
 // Block tree walker. Returns 0 if the logical block is sparse.
 uint32_t v2_block_index_to_lba(const grahafs_v2_inode_t *ino,

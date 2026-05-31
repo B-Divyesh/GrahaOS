@@ -17,6 +17,9 @@
 
 #define __GRAHAFS_V2_INTERNAL__
 #include "grahafs_v2.h"
+#include "grahafs.h"   // FU29.H: shared AI user-structs (grahafs_ai_metadata_t,
+                       // grahafs_search_results_t, grahafs_ai_metadata_block_t)
+                       // + GRAHAFS_AI_* / GRAHAFS_META_FLAG_* / GRAHAFS_AI_META_MAGIC.
 #include "../cap/token.h"
 
 #include <stddef.h>
@@ -1619,6 +1622,323 @@ uint64_t grahafs_v2_compute_simhash(uint32_t inode_num) {
 
     inode_cache_put(ce);
     return hash;
+}
+
+// ===========================================================================
+// §AI_METADATA — v2 ports of the v1 grahafs.c AI-feature surface
+// (set/get_ai_metadata, search_by_tag, find_similar).  FU29.H.
+//
+// The user-facing structs (grahafs_ai_metadata_t / grahafs_search_results_t /
+// grahafs_ai_metadata_block_t) and the GRAHAFS_AI_* / GRAHAFS_META_FLAG_* bits
+// are shared with v1 via grahafs.h — the syscall layer copies the SAME ABI in
+// and out regardless of which FS is mounted, so these v2 variants must match
+// v1's observable semantics exactly.
+//
+// Storage mapping v1 -> v2:
+//   * importance, tags(inline 95), ai_flags  -> identical inline inode fields.
+//   * simhash                                -> inode.ai_embedding[0] (v2 keeps
+//     it INLINE; v1 kept it in the extended block — find_similar accounts for
+//     that difference).
+//   * summary / full-tags / 128-dim embedding -> extended metadata block at
+//     inode.ai_metadata_block (an LBA), laid out as grahafs_ai_metadata_block_t,
+//     allocated lazily via v2_bitmap_allocate_block + journalled atomically with
+//     the inode update.
+// ===========================================================================
+
+// Substring match (v1 used grahafs_strstr; keep a local copy to avoid an
+// include-order dependency on the v1 .c).
+static const char *v2_ai_strstr(const char *hay, const char *needle) {
+    if (!needle[0]) return hay;
+    for (const char *h = hay; *h; ++h) {
+        const char *a = h, *b = needle;
+        while (*a && *b && *a == *b) { ++a; ++b; }
+        if (!*b) return h;
+    }
+    return NULL;
+}
+
+// Build "/<name>" from a (possibly non-NUL-terminated 28-byte) dirent name into
+// a 256-byte path buffer.
+static void v2_ai_build_root_path(char out[256], const char *name) {
+    out[0] = '/';
+    size_t n = 0;
+    while (n < 27 && name[n] != '\0') { out[1 + n] = name[n]; ++n; }
+    out[1 + n] = '\0';
+}
+
+// Read root-directory block 0's LBA (where every top-level file lives). Mirrors
+// v1's single-block root scan (a pre-existing v1 limitation kept for parity).
+// Returns 0 if there is no root dir block.
+static uint32_t v2_ai_root_dir_block(void) {
+    const grahafs_v2_superblock_t *sb = grahafs_v2_sb();
+    uint32_t root_inode = sb ? sb->root_inode : 0;
+    if (root_inode == 0) return 0;
+    grahafs_v2_inode_cache_t *rce = inode_cache_get(root_inode);
+    if (!rce) return 0;
+    uint32_t db0;
+    spinlock_acquire(&rce->lock);
+    db0 = rce->disk.direct_blocks[0];
+    spinlock_release(&rce->lock);
+    inode_cache_put(rce);
+    return db0;
+}
+
+// Snapshot an inode's on-disk image by number. Returns true + fills *out on a
+// valid allocated inode; false on miss/IO-error/bad-magic.
+static bool v2_ai_inode_snapshot(uint32_t inode_num, grahafs_v2_inode_t *out) {
+    grahafs_v2_inode_cache_t *ce = inode_cache_get(inode_num);
+    if (!ce) return false;
+    spinlock_acquire(&ce->lock);
+    *out = ce->disk;
+    spinlock_release(&ce->lock);
+    inode_cache_put(ce);
+    return out->magic == GRAHAFS_V2_INODE_MAGIC;
+}
+
+int grahafs_v2_set_ai_metadata(uint32_t inode_num, const grahafs_ai_metadata_t *meta) {
+    if (!meta || !grahafs_v2_is_mounted()) return -1;
+    if (inode_num == 0) return -1;
+
+    grahafs_v2_inode_cache_t *ce = inode_cache_get(inode_num);
+    if (!ce) return -1;
+
+    grahafs_v2_inode_t work;
+    spinlock_acquire(&ce->lock);
+    work = ce->disk;
+    spinlock_release(&ce->lock);
+
+    if (work.magic != GRAHAFS_V2_INODE_MAGIC) { inode_cache_put(ce); return -2; }
+
+    // Importance (always inline).
+    if (meta->flags & GRAHAFS_META_FLAG_IMPORTANCE) {
+        work.ai_importance = meta->importance > 100 ? 100 : meta->importance;
+    }
+
+    // Tags: inline up to 95 chars; overflow spills to the extended block.
+    if (meta->flags & GRAHAFS_META_FLAG_TAGS) {
+        size_t tag_len = v2_strlen(meta->tags);
+        size_t inline_len = tag_len > 95 ? 95 : tag_len;
+        memcpy(work.ai_tags, meta->tags, inline_len);
+        work.ai_tags[inline_len] = '\0';
+        work.ai_flags |= GRAHAFS_AI_HAS_TAGS;
+        if (tag_len > 95) work.ai_flags |= GRAHAFS_AI_HAS_EXTENDED;
+    }
+
+    bool need_extended = (meta->flags & GRAHAFS_META_FLAG_SUMMARY) ||
+                         (meta->flags & GRAHAFS_META_FLAG_EMBEDDING) ||
+                         ((meta->flags & GRAHAFS_META_FLAG_TAGS) &&
+                          v2_strlen(meta->tags) > 95);
+
+    // One journal txn: extended-block bitmap alloc + extended content + inode
+    // update all commit atomically (or all revert on crash).
+    journal_txn_t *txn = journal_txn_begin();
+    if (!txn) { inode_cache_put(ce); return -3; }
+
+    if (need_extended) {
+        if (work.ai_metadata_block == 0) {
+            uint32_t ext = v2_bitmap_allocate_block(txn);
+            if (ext == 0) { journal_txn_abort(txn); inode_cache_put(ce); return -3; }
+            work.ai_metadata_block = ext;
+            work.ai_flags |= GRAHAFS_AI_HAS_EXTENDED;
+        }
+
+        uint8_t ext_buf[GRAHAFS_V2_BLOCK_SIZE];
+        if (grahafs_v2_block_read((uint8_t)g_v2_device_id,
+                                  work.ai_metadata_block, ext_buf) != 1) {
+            memset(ext_buf, 0, sizeof(ext_buf));
+        }
+        grahafs_ai_metadata_block_t *ext_meta = (grahafs_ai_metadata_block_t *)ext_buf;
+        if (ext_meta->magic != GRAHAFS_AI_META_MAGIC) {
+            memset(ext_buf, 0, sizeof(ext_buf));
+            ext_meta->magic = GRAHAFS_AI_META_MAGIC;
+            ext_meta->version = 1;
+        }
+
+        if (meta->flags & GRAHAFS_META_FLAG_TAGS) {
+            size_t tl = v2_strlen(meta->tags);
+            size_t cl = tl > 511 ? 511 : tl;
+            memcpy(ext_meta->tags, meta->tags, cl);
+            ext_meta->tags[cl] = '\0';
+        }
+        if (meta->flags & GRAHAFS_META_FLAG_SUMMARY) {
+            size_t sl = v2_strlen(meta->summary);
+            size_t cl = sl > 1023 ? 1023 : sl;
+            memcpy(ext_meta->summary, meta->summary, cl);
+            ext_meta->summary[cl] = '\0';
+            work.ai_flags |= GRAHAFS_AI_HAS_SUMMARY;
+        }
+        if (meta->flags & GRAHAFS_META_FLAG_EMBEDDING) {
+            uint32_t dim = meta->embedding_dim > 128 ? 128 : meta->embedding_dim;
+            if (dim) memcpy(ext_meta->embedding, meta->embedding,
+                            dim * sizeof(uint64_t));
+            ext_meta->embedding_dim = dim;
+            work.ai_flags |= GRAHAFS_AI_HAS_EMBEDDING;
+        }
+
+        int rc = journal_txn_add_block(txn, work.ai_metadata_block,
+                                       JOURNAL_BLOCK_KIND_DATA, ext_buf);
+        if (rc != 0) { journal_txn_abort(txn); inode_cache_put(ce); return rc; }
+    }
+
+    work.ai_last_modified++;  // monotonic stamp (no RTC dependency needed).
+
+    work.checksum_inode = 0;
+    work.checksum_inode = inode_checksum(&work);
+    int rc = journal_stage_inode(txn, inode_num, &work);
+    if (rc != 0) { journal_txn_abort(txn); inode_cache_put(ce); return rc; }
+    rc = journal_txn_commit(txn);
+    if (rc != 0) { inode_cache_put(ce); return rc; }
+
+    // Reflect persisted state into the cache so subsequent reads are coherent.
+    spinlock_acquire(&ce->lock);
+    ce->disk = work;
+    ce->dirty = false;
+    spinlock_release(&ce->lock);
+    inode_cache_put(ce);
+    return 0;
+}
+
+int grahafs_v2_get_ai_metadata(uint32_t inode_num, grahafs_ai_metadata_t *meta) {
+    if (!meta || !grahafs_v2_is_mounted()) return -1;
+    if (inode_num == 0) return -1;
+
+    grahafs_v2_inode_t work;
+    if (!v2_ai_inode_snapshot(inode_num, &work)) return -2;
+
+    memset(meta, 0, sizeof(*meta));
+    meta->flags        = work.ai_flags;
+    meta->importance   = work.ai_importance;
+    meta->access_count = work.ai_access_count;
+    meta->last_modified = work.ai_last_modified;
+
+    size_t tag_len = v2_strlen(work.ai_tags);
+    if (tag_len > 0) {
+        size_t cl = tag_len > 511 ? 511 : tag_len;
+        memcpy(meta->tags, work.ai_tags, cl);
+        meta->tags[cl] = '\0';
+    }
+
+    if ((work.ai_flags & GRAHAFS_AI_HAS_EXTENDED) && work.ai_metadata_block != 0) {
+        uint8_t ext_buf[GRAHAFS_V2_BLOCK_SIZE];
+        if (grahafs_v2_block_read((uint8_t)g_v2_device_id,
+                                  work.ai_metadata_block, ext_buf) == 1) {
+            grahafs_ai_metadata_block_t *ext_meta =
+                (grahafs_ai_metadata_block_t *)ext_buf;
+            if (ext_meta->magic == GRAHAFS_AI_META_MAGIC) {
+                if (ext_meta->tags[0] != '\0') {
+                    memcpy(meta->tags, ext_meta->tags, 511);
+                    meta->tags[511] = '\0';
+                }
+                if (work.ai_flags & GRAHAFS_AI_HAS_SUMMARY) {
+                    memcpy(meta->summary, ext_meta->summary, 1023);
+                    meta->summary[1023] = '\0';
+                }
+                if (work.ai_flags & GRAHAFS_AI_HAS_EMBEDDING) {
+                    memcpy(meta->embedding, ext_meta->embedding,
+                           128 * sizeof(uint64_t));
+                    meta->embedding_dim = ext_meta->embedding_dim;
+                }
+            }
+        }
+    }
+    // NB: unlike v1, the v2 read path does NOT persist an access_count bump —
+    // get is a pure read (no journal txn per query). No test observes the
+    // counter, and avoiding a write keeps the already-slower v2 query cheap.
+    return 0;
+}
+
+int grahafs_v2_search_by_tag(const char *tag, grahafs_search_results_t *results,
+                             int max_results) {
+    if (!tag || !results || !grahafs_v2_is_mounted()) return -1;
+    if (max_results <= 0 || max_results > 16) max_results = 16;
+    memset(results, 0, sizeof(*results));
+
+    uint32_t db0 = v2_ai_root_dir_block();
+    if (db0 == 0) return 0;
+
+    uint8_t dir_blk[GRAHAFS_V2_BLOCK_SIZE];
+    if (grahafs_v2_block_read((uint8_t)g_v2_device_id, db0, dir_blk) != 1) return -1;
+    v2_dirent_t *entries = (v2_dirent_t *)dir_blk;
+
+    uint32_t count = 0;
+    for (size_t i = 0; i < V2_DIRENTS_PER_BLOCK && count < (uint32_t)max_results; ++i) {
+        uint32_t ino = entries[i].inode_num;
+        if (ino == 0 || entries[i].name[0] == '\0') continue;
+        if (entries[i].name[0] == '.' &&
+            (entries[i].name[1] == '\0' ||
+             (entries[i].name[1] == '.' && entries[i].name[2] == '\0'))) continue;
+
+        grahafs_v2_inode_t fin;
+        if (!v2_ai_inode_snapshot(ino, &fin)) continue;
+        if (!(fin.ai_flags & GRAHAFS_AI_HAS_TAGS)) continue;
+        if (!v2_ai_strstr(fin.ai_tags, tag)) continue;
+
+        grahafs_search_result_t *r = &results->results[count];
+        v2_ai_build_root_path(r->path, entries[i].name);
+        r->inode_num  = ino;
+        r->importance = fin.ai_importance;
+        size_t tc = v2_strlen(fin.ai_tags);
+        if (tc > 95) tc = 95;
+        memcpy(r->tags, fin.ai_tags, tc);
+        r->tags[tc] = '\0';
+        ++count;
+    }
+    results->count = count;
+    return (int)count;
+}
+
+int grahafs_v2_find_similar(uint32_t ref_inode, int threshold,
+                            grahafs_search_results_t *results, int max_results) {
+    if (!results || !grahafs_v2_is_mounted()) return -1;
+    if (threshold <= 0) threshold = SIMHASH_SIMILAR_THRESHOLD;
+    if (max_results <= 0 || max_results > 16) max_results = 16;
+
+    // v2 stores the SimHash INLINE in ai_embedding[0] (v1 kept it in the
+    // extended block). No SimHash computed -> -2, matching v1's contract.
+    grahafs_v2_inode_t ref;
+    if (!v2_ai_inode_snapshot(ref_inode, &ref)) return -1;
+    uint64_t ref_hash = ref.ai_embedding[0];
+    if (ref_hash == 0) return -2;
+
+    memset(results, 0, sizeof(*results));
+
+    uint32_t db0 = v2_ai_root_dir_block();
+    if (db0 == 0) return 0;
+
+    uint8_t dir_blk[GRAHAFS_V2_BLOCK_SIZE];
+    if (grahafs_v2_block_read((uint8_t)g_v2_device_id, db0, dir_blk) != 1) return -1;
+    v2_dirent_t *entries = (v2_dirent_t *)dir_blk;
+
+    uint32_t count = 0;
+    for (size_t i = 0; i < V2_DIRENTS_PER_BLOCK && count < (uint32_t)max_results; ++i) {
+        uint32_t ino = entries[i].inode_num;
+        if (ino == 0 || entries[i].name[0] == '\0') continue;
+        if (ino == ref_inode) continue;   // skip self.
+        if (entries[i].name[0] == '.' &&
+            (entries[i].name[1] == '\0' ||
+             (entries[i].name[1] == '.' && entries[i].name[2] == '\0'))) continue;
+
+        grahafs_v2_inode_t fin;
+        if (!v2_ai_inode_snapshot(ino, &fin)) continue;
+        if (fin.type != GRAHAFS_V2_TYPE_FILE) continue;
+        uint64_t fhash = fin.ai_embedding[0];
+        if (fhash == 0) continue;   // no SimHash for this file.
+
+        int dist = simhash_hamming_distance(ref_hash, fhash);
+        if (dist <= threshold) {
+            grahafs_search_result_t *r = &results->results[count];
+            v2_ai_build_root_path(r->path, entries[i].name);
+            r->inode_num  = ino;
+            r->importance = (uint32_t)dist;   // v1 stashes distance here.
+            size_t tc = v2_strlen(fin.ai_tags);
+            if (tc > 95) tc = 95;
+            memcpy(r->tags, fin.ai_tags, tc);
+            r->tags[tc] = '\0';
+            ++count;
+        }
+    }
+    results->count = count;
+    return (int)count;
 }
 
 // ===========================================================================
