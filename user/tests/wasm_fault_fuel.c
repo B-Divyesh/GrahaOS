@@ -1,15 +1,21 @@
-/* user/tests/wasm_fault_fuel.c — FU27.WASM.D2_worker gate test.
+/* user/tests/wasm_fault_fuel.c — FU29.X.wasmd_subprocess gate test.
  *
- * fuel_exhaust.wasm contains a tight (loop (br 0)) with no host calls.
- * In v2 wasmd, the worker's TSC watchdog can't fire without a host call,
- * so the orchestrator's wall-clock deadline path is exercised: when the
- * .caps file's 6th byte is '1', wasmd spins briefly then SIGKILL's the
- * worker and maps the reap to WASMD_E_FUEL_EXHAUSTED.
+ * fuel_exhaust.wasm is a tight `(loop (br 0))` with NO host calls — the
+ * in-process wasm3 path can never contain it (m3_CallV never returns).  This
+ * test proves wasmd's KILLABLE worker subprocess does:
  *
- * Asserts:
- *   1. RUN_MODULE(fuel_exhaust) returns WASMD_E_FUEL_EXHAUSTED.
+ *   - RUN_MODULE_ISOLATED(fuel_exhaust) spawns bin/wasmd_worker, which runs
+ *     the module via argv-hex transport (NO filesystem → the worker holds no
+ *     vfs_lock).  wasmd's wall-clock deadline fires, SIGKILLs the worker
+ *     (orphan-free, pure-userspace loop), reaps it, and returns
+ *     WASMD_E_FUEL_EXHAUSTED.
+ *   - wasmd SURVIVES (the runaway never touched the daemon).
+ *   - A subsequent in-process hello.wasm still works → no daemon corruption.
+ *
+ * Asserts (3):
+ *   1. RUN_MODULE_ISOLATED(fuel_exhaust) returns WASMD_E_FUEL_EXHAUSTED.
  *   2. wasmd survives (hello.wasm OK afterwards).
- *   3. hello stdout still contains "hello" — no cross-talk.
+ *   3. hello stdout still contains "hello" — no cross-talk / corruption.
  */
 
 #include "../libtap.h"
@@ -43,26 +49,15 @@ static long read_fixture(const char *path, uint8_t *buf, uint32_t cap) {
     return n;
 }
 
-static int write_caps_file(const char *bits) {
-    (void)syscall_create("/tmp/wasmd_pending.caps", 0644);
-    int fd = syscall_open("/tmp/wasmd_pending.caps");
-    if (fd < 0) return -1;
-    size_t n = 0;
-    while (bits[n]) n++;
-    long w = syscall_write(fd, bits, n);
-    (void)syscall_close(fd);
-    return (w == (long)n) ? 0 : -1;
-}
-
-static int run_module(libnet_client_ctx_t *cli,
-                      const uint8_t *mod_bytes, uint32_t mod_len,
-                      int32_t *out_status,
-                      uint8_t *stdout_buf, uint32_t stdout_cap,
-                      uint32_t *out_stdout_len) {
+static int run_module_op(libnet_client_ctx_t *cli, uint32_t op,
+                         const uint8_t *mod_bytes, uint32_t mod_len,
+                         int32_t *out_status,
+                         uint8_t *stdout_buf, uint32_t stdout_cap,
+                         uint32_t *out_stdout_len) {
     chan_msg_user_t req;
     memset(&req, 0, sizeof(req));
     req.header.type_hash = wasmd_type_hash();
-    *(uint32_t *)(req.inline_payload + 0) = WASMD_OP_RUN_MODULE;
+    *(uint32_t *)(req.inline_payload + 0) = op;
     *(uint32_t *)(req.inline_payload + 4) = mod_len;
     memcpy(req.inline_payload + WASMD_BYTES_OFFSET, mod_bytes, (size_t)mod_len);
     req.header.inline_len = (uint16_t)(WASMD_BYTES_OFFSET + mod_len);
@@ -72,7 +67,8 @@ static int run_module(libnet_client_ctx_t *cli,
 
     chan_msg_user_t resp;
     memset(&resp, 0, sizeof(resp));
-    /* fuel_exhaust path takes ~200ms in wasmd; allow generous 10s window. */
+    /* The isolated path runs a ~400ms deadline + ~100ms grace + reap in
+     * wasmd; allow a generous 10s recv window. */
     long rr = syscall_chan_recv(cli->rd_resp, &resp, /*timeout_ns=*/10000000000ULL);
     if (rr < 0) return (int)rr;
 
@@ -113,9 +109,6 @@ void _start(void) {
         syscall_exit(2);
     }
 
-    /* Tell wasmd to kill this worker after a short deadline. */
-    (void)write_caps_file("111111");  /* 6th byte '1' = expect_kill */
-
     spin_ms(10);
 
     libnet_client_ctx_t cli;
@@ -131,26 +124,26 @@ void _start(void) {
         syscall_exit(1);
     }
 
-    /* Phase 1: fuel_exhaust -> WASMD_E_FUEL_EXHAUSTED. */
+    /* Phase 1: fuel_exhaust via the ISOLATED (killable worker) path. */
     int32_t  status1 = 0;
     uint8_t  out1[64];
     uint32_t out1len = 0;
-    (void)run_module(&cli, f_buf, (uint32_t)f_n,
-                     &status1, out1, sizeof(out1), &out1len);
-    printf("# wasm_fault_fuel: status1=%d (expected %d)\n",
-           status1, WASMD_E_FUEL_EXHAUSTED);
-    TAP_ASSERT(status1 == WASMD_E_FUEL_EXHAUSTED,
-               "wasm_fault_fuel: fuel_exhaust -> WASMD_E_FUEL_EXHAUSTED");
+    int rc1 = run_module_op(&cli, WASMD_OP_RUN_MODULE_ISOLATED,
+                            f_buf, (uint32_t)f_n,
+                            &status1, out1, sizeof(out1), &out1len);
+    printf("# wasm_fault_fuel: rc1=%d status1=%d (expected %d)\n",
+           rc1, status1, WASMD_E_FUEL_EXHAUSTED);
+    TAP_ASSERT(rc1 == 0 && status1 == WASMD_E_FUEL_EXHAUSTED,
+               "wasm_fault_fuel: fuel_exhaust -> WASMD_E_FUEL_EXHAUSTED "
+               "(worker spawned, killed at deadline, reaped)");
 
-    /* Reset caps to all-allowed + expect_kill=0 (6 bytes). */
-    (void)write_caps_file("111110");
-
-    /* Phase 2: hello.wasm — daemon survives. */
+    /* Phase 2: hello.wasm in-process — daemon survived the worker kill. */
     int32_t  status2 = 0;
     uint8_t  out2[128];
     uint32_t out2len = 0;
-    int rc2 = run_module(&cli, hello_buf, (uint32_t)hello_n,
-                         &status2, out2, sizeof(out2), &out2len);
+    int rc2 = run_module_op(&cli, WASMD_OP_RUN_MODULE,
+                            hello_buf, (uint32_t)hello_n,
+                            &status2, out2, sizeof(out2), &out2len);
     TAP_ASSERT(rc2 == 0 && status2 == WASMD_OK,
                "wasm_fault_fuel: hello OK after fuel-kill (daemon survived)");
 

@@ -59,6 +59,14 @@ static inline uint64_t wasmd_run_response_hash(void){ return wasmd_fnv1a_hash64(
 #define WASMD_OP_RUN_RESPONSE       0x10000002u
 #define WASMD_OP_KILL_INSTANCE      0x10000003u
 #define WASMD_OP_INSPECT_INSTANCE   0x10000004u
+/* FU29.X.wasmd_subprocess: run the module in a KILLABLE worker subprocess
+ * (bin/wasmd_worker) instead of in-process.  Module bytes are hex-encoded
+ * into the worker's argv (NO filesystem transport — the worker never holds
+ * the global vfs_lock, so wasmd's deadline SIGKILL of a runaway worker lands
+ * while the worker is in a pure-userspace wasm loop = orphan-free, per the
+ * kernel kill-safety analysis).  Used for runaway / fuel-exhaust modules that
+ * the in-process path fundamentally cannot contain (m3_CallV never returns). */
+#define WASMD_OP_RUN_MODULE_ISOLATED 0x10000005u
 
 /* RUN_MODULE message layout in inline_payload:
  *   [0..3]   uint32_t op = WASMD_OP_RUN_MODULE

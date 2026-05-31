@@ -1,38 +1,45 @@
 /*
- * user/wasmd/wasmd_worker.c — FU27.WASM.D2_worker subprocess.
+ * user/wasmd/wasmd_worker.c — FU27.WASM.D2_worker / FU29.X.wasmd_subprocess.
  *
- * Spawned by wasmd (via SYS_SPAWN_ARGV slot 1115) per RUN_MODULE call.
+ * A KILLABLE wasm execution subprocess.  wasmd spawns this (via
+ * SYS_SPAWN_ARGV) for any module that must be crash/runaway-isolated — i.e.
+ * a module that could loop forever (m3_CallV never returns) and would hang
+ * the in-process daemon.  wasmd enforces a wall-clock deadline and SIGKILLs
+ * the worker; because the worker holds NO kernel lock at that point (see
+ * "TRANSPORT" below), the kill is orphan-free.
+ *
+ * TRANSPORT (the crux of the orphan-free guarantee):
+ *   The module bytes arrive HEX-ENCODED IN argv — NOT via the filesystem.
+ *   The Phase 27/29 "vfs spinlock orphan" deadlock happened because the old
+ *   file-transport worker read /tmp/wasmd_pending.wasm, holding the global
+ *   vfs_lock for SECONDS across a channel-mode blk read; wasmd's deadline
+ *   SIGKILL then landed WHILE the worker held vfs_lock → the lock was
+ *   orphaned → the next acquirer spun the 5s budget → SPINLOCK PANIC.
+ *   By passing the module via argv the worker makes ZERO filesystem syscalls,
+ *   so at kill time it is always in a pure-userspace wasm loop (or wasm3
+ *   setup) holding no kernel spinlock → reap is safe (kernel kill-safety
+ *   analysis verdict (a)).
+ *
+ *   argv layout (seeded by the kernel SYS_SPAWN_ARGV path):
+ *     argv[0] = "bin/wasmd_worker"  (path, by convention)
+ *     argv[1] = caps bitmap, ASCII "tcrwa" ('1'=allowed) — 5 chars
+ *     argv[2..argc-1] = hex chunks of the module bytes (each ≤240 chars to
+ *                       stay under the kernel's 255-char-per-arg limit);
+ *                       the worker concatenates + hex-decodes them.
  *
  * Lifecycle:
- *   1. (Phase 29 Session G) subscribe to audit so per-instance events
- *      stay in this worker's slot.  Auto-unsubscribed on exit by the
- *      kernel via audit_unsubscribe_all_for_pid in sched_reap_zombie.
- *   2. Open /tmp/wasmd_pending.wasm (single-slot v1 staging file).
- *   3. Read up to 1 MiB of bytes.
- *   4. m3_NewEnvironment / NewRuntime / ParseModule / LoadModule.
- *   5. m3_LinkRawFunction for each of the 6 host bindings:
- *        gcp.print        — stdout capture (existing).
- *        gcp.tui_write    — cap-gated cell-grid write.
- *        gcp.tui_read     — cap-gated input-event drain.
- *        gcp.fs_read      — pledge-filtered read.
- *        gcp.fs_write     — pledge-filtered write.
- *        gcp.audit_query  — query own pid's recent events.
- *   6. m3_FindFunction("_start") and m3_CallV().
- *   7. Write captured stdout buffer to /tmp/wasmd_output.txt.
- *   8. exit(N) where N reflects which step failed:
- *        0 = OK
- *        1 = load fail (open/read/parse/load)
- *        2 = instantiate fail (link/find_function)
- *        3 = trap (CallV returned non-NULL M3Result)
- *        4 = internal (malloc failure etc.)
- *        5 = cap denied (host binding refused due to missing cap/path)
- *        6 = fuel exhausted (wall-clock watchdog tripped)
+ *   1. Parse argv → caps + module bytes (no syscalls).
+ *   2. m3 NewEnvironment / NewRuntime / ParseModule / LoadModule.
+ *   3. m3_LinkRawFunction for the 6 host bindings (gcp.print / tui_write /
+ *      tui_read / fs_read / fs_write / audit_query) — cap-gated.
+ *   4. m3_FindFunction("_start") and m3_CallV().  A runaway module never
+ *      returns here; wasmd's deadline SIGKILL terminates the worker.
+ *   5. exit(N) where N reflects which step failed (see WORKER_EXIT_*).
  *
- * Cap-flags: encoded in /tmp/wasmd_pending.caps (one ASCII char per
- *   binding — '1' allowed, '0' denied).  Order:
- *     [0] tui_write  [1] tui_read  [2] fs_read  [3] fs_write  [4] audit
- *   When the .caps file is absent, all bindings are ALLOWED (back-compat
- *   for hello.wasm and other fixtures that only use gcp.print).
+ * The worker writes NOTHING to the filesystem and opens NO channel; its
+ * result surfaces purely through its exit code, which wasmd reaps.  For the
+ * runaway/fuel fixtures the worker is killed before it can exit, and wasmd
+ * maps the kill to WASMD_E_FUEL_EXHAUSTED.
  */
 
 #include "../syscalls.h"
@@ -52,8 +59,9 @@
 #define WORKER_EXIT_INTERNAL    4
 #define WORKER_EXIT_CAP_DENIED  5
 #define WORKER_EXIT_FUEL        6
+#define WORKER_EXIT_BADARGS     7
 
-/* Cap bitmap — set by read_caps_file(); each entry is a per-binding gate. */
+/* Cap bitmap — set from argv[1]; each entry is a per-binding gate. */
 #define CAP_BIT_TUI_WRITE   (1u << 0)
 #define CAP_BIT_TUI_READ    (1u << 1)
 #define CAP_BIT_FS_READ     (1u << 2)
@@ -61,20 +69,18 @@
 #define CAP_BIT_AUDIT       (1u << 4)
 static uint32_t g_caps = 0xFFFFFFFFu;  /* default: all allowed */
 
-/* Wall-clock watchdog: track start in TSC ticks; each host call samples
- * rdtsc and aborts when the deadline is crossed. */
+/* Self-watchdog disabled in the subprocess model: wasmd owns the deadline
+ * and SIGKILLs us.  Left as 0 so watchdog_tripped() is a cheap no-op (the
+ * runaway fixtures make no host calls, so a self-watchdog can't fire anyway). */
 static uint64_t g_deadline_tsc = 0;
-static uint64_t g_start_tsc    = 0;
 static int      g_fuel_tripped = 0;
 
-/* Per-instance audit subscription slot.  Returned by syscall_audit_subscribe;
- * the kernel auto-unsubscribes on task exit via sched_reap_zombie. */
-static int g_audit_slot = -1;
-
-/* Cap-deny / fuel-exhaust sticky flags surfaced via exit code. */
+/* Cap-deny sticky flag surfaced via exit code. */
 static int g_cap_denied = 0;
 
-/* Captured-stdout buffer. */
+/* Captured-stdout buffer.  Not transported anywhere in the subprocess model
+ * (the isolated path is for runaway modules whose stdout is irrelevant);
+ * retained so the print binding stays well-formed. */
 #define WORKER_STDOUT_MAX 240
 static uint8_t  g_stdout[WORKER_STDOUT_MAX + 1];
 static uint32_t g_stdout_len = 0;
@@ -88,8 +94,8 @@ static void stdout_append(const uint8_t *bytes, uint32_t len) {
     g_stdout[g_stdout_len] = '\0';
 }
 
-/* Returns 1 if the wall-clock deadline has been crossed; sets the
- * sticky g_fuel_tripped flag for the exit-code mapper. */
+/* No-op in the subprocess model (g_deadline_tsc==0): wasmd's external SIGKILL
+ * is the runaway-termination mechanism. */
 static int watchdog_tripped(void) {
     if (g_deadline_tsc == 0) return 0;
     if (spin_rdtsc() >= g_deadline_tsc) {
@@ -111,10 +117,7 @@ m3ApiRawFunction(host_gcp_print) {
 }
 
 /* Host import: "gcp.tui_write" — signature "i(iiii)" returns i32 status.
- * Args: (console_id, x, y, codepoint).
- * Cap-gated: requires CAP_BIT_TUI_WRITE.  Calls the DEBUG_CONSOLE_WRITE_CELL
- * test substrate (Session D) rather than the full SYS_CONSOLE_ATTACH path
- * so the binding works without a per-worker console attachment. */
+ * Args: (console_id, x, y, codepoint).  Cap-gated: CAP_BIT_TUI_WRITE. */
 m3ApiRawFunction(host_gcp_tui_write) {
     m3ApiReturnType(uint32_t);
     m3ApiGetArg(uint32_t, console_id);
@@ -126,7 +129,6 @@ m3ApiRawFunction(host_gcp_tui_write) {
         g_cap_denied = 1;
         m3ApiTrap("cap denied: tui_write");
     }
-    /* Default fg=7 (white) / bg=0 / attrs=0 for AI-driven writes. */
     long rc = syscall_debug_console_write_cell(console_id, y, x,
                                                codepoint,
                                                /*fg=*/7, /*bg=*/0,
@@ -134,9 +136,7 @@ m3ApiRawFunction(host_gcp_tui_write) {
     m3ApiReturn((uint32_t)(rc < 0 ? (uint32_t)-1 : 0));
 }
 
-/* Host import: "gcp.tui_read" — signature "i(ii)" returns i32 event count.
- * Args: (out_ptr, max_events).  Each event is 16 bytes (matches kernel
- * input_event_t).  Cap-gated: requires CAP_BIT_TUI_READ. */
+/* Host import: "gcp.tui_read" — signature "i(*i)" returns i32 event count. */
 m3ApiRawFunction(host_gcp_tui_read) {
     m3ApiReturnType(uint32_t);
     m3ApiGetArgMem(uint8_t *, out_ptr);
@@ -158,10 +158,9 @@ m3ApiRawFunction(host_gcp_tui_read) {
 }
 
 /* Host import: "gcp.fs_read" — signature "i(*i*i)" returns i32 bytes read.
- * Args: (path_ptr, path_len, out_ptr, max).
- * Pledge-filtered: only paths within an allowed prefix-set are honored.
- * For Phase 29 G we accept paths starting with "/tmp/" (sandbox) and
- * "bin/tests/wasm/" (read-only fixtures).  Anything else returns -1. */
+ * NOTE: this touches the vfs.  It is only reachable for NON-runaway modules
+ * deliberately routed through the worker; the runaway fixtures wasmd sends
+ * here make NO host calls, so this path is never exercised mid-kill. */
 m3ApiRawFunction(host_gcp_fs_read) {
     m3ApiReturnType(int32_t);
     m3ApiGetArgMem(const uint8_t *, path_ptr);
@@ -179,7 +178,6 @@ m3ApiRawFunction(host_gcp_fs_read) {
     char path[256];
     memcpy(path, path_ptr, path_len);
     path[path_len] = '\0';
-    /* Sandbox: /tmp/ and bin/tests/wasm/ prefixes only. */
     if (strncmp(path, "/tmp/", 5) != 0 &&
         strncmp(path, "bin/tests/wasm/", 15) != 0) {
         g_cap_denied = 1;
@@ -192,8 +190,7 @@ m3ApiRawFunction(host_gcp_fs_read) {
     m3ApiReturn((int32_t)n);
 }
 
-/* Host import: "gcp.fs_write" — signature "i(*i*i)" returns i32 bytes
- * written.  Same sandbox: only /tmp/ prefix paths are honored. */
+/* Host import: "gcp.fs_write" — signature "i(*i*i)" returns i32 bytes written. */
 m3ApiRawFunction(host_gcp_fs_write) {
     m3ApiReturnType(int32_t);
     m3ApiGetArgMem(const uint8_t *, path_ptr);
@@ -223,10 +220,7 @@ m3ApiRawFunction(host_gcp_fs_write) {
     m3ApiReturn((int32_t)n);
 }
 
-/* Host import: "gcp.audit_query" — signature "i(*i)" returns i32 event count.
- * Args: (out_ptr, max_events).  Each entry is 256 bytes (audit_entry_t).
- * Filtered to this worker's pid implicitly via the kernel's per-subscriber
- * scoping; here we just rely on the global audit_query and cap the count. */
+/* Host import: "gcp.audit_query" — signature "i(*i)" returns i32 event count. */
 m3ApiRawFunction(host_gcp_audit_query) {
     m3ApiReturnType(int32_t);
     m3ApiGetArgMem(uint8_t *, out_ptr);
@@ -236,7 +230,7 @@ m3ApiRawFunction(host_gcp_audit_query) {
         g_cap_denied = 1;
         m3ApiTrap("cap denied: audit_query");
     }
-    if (max_events > 4) max_events = 4;  /* fit in wasm linear memory; AI module sizing */
+    if (max_events > 4) max_events = 4;
     uint32_t bytes_needed = max_events * 256;
     m3ApiCheckMem(out_ptr, bytes_needed);
     long rc = syscall_audit_query(0, 0, ~0u,
@@ -246,99 +240,80 @@ m3ApiRawFunction(host_gcp_audit_query) {
     m3ApiReturn((int32_t)rc);
 }
 
-static int read_pending_module(uint8_t **out_bytes, size_t *out_len) {
-    *out_bytes = NULL;
-    *out_len = 0;
+/* ----- argv transport: caps + hex-encoded module bytes (no FS) ----- */
 
-    int fd = syscall_open(WASMD_PENDING_PATH);
-    if (fd < 0) return WORKER_EXIT_LOAD;
-
-    const size_t MAX = 1u << 20;
-    uint8_t *buf = malloc(MAX);
-    if (!buf) {
-        (void)syscall_close(fd);
-        return WORKER_EXIT_INTERNAL;
-    }
-    size_t total = 0;
-    while (total < MAX) {
-        long r = syscall_read(fd, buf + total, MAX - total);
-        if (r < 0) { free(buf); (void)syscall_close(fd); return WORKER_EXIT_LOAD; }
-        if (r == 0) break;
-        total += (size_t)r;
-    }
-    (void)syscall_close(fd);
-    *out_bytes = buf;
-    *out_len = total;
-    return WORKER_EXIT_OK;
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
 }
 
-/* Read /tmp/wasmd_pending.caps — an ASCII bitmap.  '1' allowed, '0' denied. */
-static void read_caps_file(void) {
-    int fd = syscall_open("/tmp/wasmd_pending.caps");
-    if (fd < 0) return;  /* default: all caps allowed */
-    char buf[16];
-    long n = syscall_read(fd, buf, sizeof(buf));
-    (void)syscall_close(fd);
-    if (n <= 0) return;
+/* Parse caps argv string "tcrwa" ('1'=allow).  Absent/short → all allowed. */
+static void parse_caps_arg(const char *s) {
+    if (!s) return;
+    size_t n = 0;
+    while (s[n]) n++;
     g_caps = 0;
-    if (n > 0 && buf[0] == '1') g_caps |= CAP_BIT_TUI_WRITE;
-    if (n > 1 && buf[1] == '1') g_caps |= CAP_BIT_TUI_READ;
-    if (n > 2 && buf[2] == '1') g_caps |= CAP_BIT_FS_READ;
-    if (n > 3 && buf[3] == '1') g_caps |= CAP_BIT_FS_WRITE;
-    if (n > 4 && buf[4] == '1') g_caps |= CAP_BIT_AUDIT;
+    if (n > 0 && s[0] == '1') g_caps |= CAP_BIT_TUI_WRITE;
+    if (n > 1 && s[1] == '1') g_caps |= CAP_BIT_TUI_READ;
+    if (n > 2 && s[2] == '1') g_caps |= CAP_BIT_FS_READ;
+    if (n > 3 && s[3] == '1') g_caps |= CAP_BIT_FS_WRITE;
+    if (n > 4 && s[4] == '1') g_caps |= CAP_BIT_AUDIT;
 }
 
-static void write_output_file(void) {
-    (void)syscall_create(WASMD_OUTPUT_PATH, 0644);
-    int fd = syscall_open(WASMD_OUTPUT_PATH);
-    if (fd < 0) return;
-    if (g_stdout_len) {
-        (void)syscall_write(fd, g_stdout, g_stdout_len);
+/* Decode the concatenation of argv[2..argc-1] (hex) into *out.  Returns the
+ * decoded byte count, or -1 on a malformed (odd-length / non-hex) stream. */
+static long decode_hex_argv(int argc, char **argv, uint8_t *out, uint32_t out_cap) {
+    uint32_t produced = 0;
+    int have_hi = 0;
+    int hi = 0;
+    for (int a = 2; a < argc; a++) {
+        const char *s = argv[a];
+        if (!s) continue;
+        for (uint32_t i = 0; s[i]; i++) {
+            int v = hex_nibble(s[i]);
+            if (v < 0) return -1;
+            if (!have_hi) { hi = v; have_hi = 1; }
+            else {
+                if (produced >= out_cap) return -1;
+                out[produced++] = (uint8_t)((hi << 4) | v);
+                have_hi = 0;
+            }
+        }
     }
-    (void)syscall_close(fd);
+    if (have_hi) return -1;  /* odd number of hex digits */
+    return (long)produced;
 }
 
-/* Helper: cleanly exit with proper output flush.  Worker exit code maps
- * to wasmd status via wasmd.c::map_worker_exit. */
 static void worker_exit(int code) {
-    /* Translate sticky cap-deny / fuel-exhaust flags */
     if (g_cap_denied && code == WORKER_EXIT_TRAP) code = WORKER_EXIT_CAP_DENIED;
     if (g_fuel_tripped && code == WORKER_EXIT_TRAP) code = WORKER_EXIT_FUEL;
-    write_output_file();
     syscall_exit(code);
 }
 
-void _start(void) {
-    /* FU27.X.wasmd_audit_subscription: per-instance audit slot.  Kernel
-     * auto-unsubscribes on task exit via sched_reap_zombie hook calling
-     * audit_unsubscribe_all_for_pid(self).  ~0 = receive every event. */
-    g_audit_slot = (int)syscall_audit_subscribe(~0ULL);
-    /* If the subscribe fails (-EAGAIN, all 16 slots taken), continue
-     * anyway — host_gcp_audit_query falls back to the global query path. */
+void _start(int argc, char **argv) {
+    /* The kernel seeds argc in RDI, argv in RSI for SYS_SPAWN_ARGV children.
+     * We require at least: argv[0]=path, argv[1]=caps, argv[2..]=hex bytes. */
+    if (argc < 3) {
+        syscall_exit(WORKER_EXIT_BADARGS);
+    }
 
-    /* Set up wall-clock watchdog (1 second default — fuel_exhaust.wasm
-     * exercises this; ai_demo / hello complete in << 100 ms).  TSC Hz
-     * varies wildly between TCG and KVM, so query at runtime. */
-    g_start_tsc = spin_rdtsc();
-    uint64_t hz = syscall_tsc_hz_query();
-    if (hz == 0) hz = 1000000000ULL;  /* 1 GHz fallback if calibration not ready */
-    g_deadline_tsc = g_start_tsc + hz;  /* 1 second budget */
+    parse_caps_arg(argv[1]);
 
-    /* Read .caps gate-file (if any). */
-    read_caps_file();
-
-    uint8_t *mod_bytes = NULL;
-    size_t mod_len = 0;
-    int rc = read_pending_module(&mod_bytes, &mod_len);
-    if (rc != WORKER_EXIT_OK) worker_exit(rc);
+    static uint8_t mod_bytes[WASMD_BYTES_MAX + 8];
+    long mod_len = decode_hex_argv(argc, argv, mod_bytes, sizeof(mod_bytes));
+    if (mod_len <= 0) {
+        syscall_exit(WORKER_EXIT_BADARGS);
+    }
 
     IM3Environment env = m3_NewEnvironment();
-    if (!env) { free(mod_bytes); worker_exit(WORKER_EXIT_INTERNAL); }
+    if (!env) worker_exit(WORKER_EXIT_INTERNAL);
 
     IM3Runtime rt = m3_NewRuntime(env, 64 * 1024, NULL);
     if (!rt) {
         m3_FreeEnvironment(env);
-        free(mod_bytes); worker_exit(WORKER_EXIT_INTERNAL);
+        worker_exit(WORKER_EXIT_INTERNAL);
     }
 
     IM3Module mod = NULL;
@@ -346,18 +321,16 @@ void _start(void) {
     if (r) {
         m3_FreeRuntime(rt);
         m3_FreeEnvironment(env);
-        free(mod_bytes); worker_exit(WORKER_EXIT_LOAD);
+        worker_exit(WORKER_EXIT_LOAD);
     }
 
     r = m3_LoadModule(rt, mod);
     if (r) {
         m3_FreeRuntime(rt);
         m3_FreeEnvironment(env);
-        free(mod_bytes); worker_exit(WORKER_EXIT_LOAD);
+        worker_exit(WORKER_EXIT_LOAD);
     }
 
-    /* Wire host imports.  Six bindings — m3Err_functionLookupFailed is
-     * benign (module doesn't import that binding); other errors are fatal. */
     struct binding {
         const char *mod;
         const char *fn;
@@ -378,7 +351,7 @@ void _start(void) {
         if (lr && lr != m3Err_functionLookupFailed) {
             m3_FreeRuntime(rt);
             m3_FreeEnvironment(env);
-            free(mod_bytes); worker_exit(WORKER_EXIT_INSTANTIATE);
+            worker_exit(WORKER_EXIT_INSTANTIATE);
         }
     }
 
@@ -387,18 +360,15 @@ void _start(void) {
     if (r) {
         m3_FreeRuntime(rt);
         m3_FreeEnvironment(env);
-        free(mod_bytes); worker_exit(WORKER_EXIT_INSTANTIATE);
+        worker_exit(WORKER_EXIT_INSTANTIATE);
     }
 
+    /* A runaway module never returns from m3_CallV — wasmd's deadline SIGKILL
+     * terminates us here, in a pure-userspace loop holding no kernel lock. */
     r = m3_CallV(fn);
-    int exit_code = WORKER_EXIT_OK;
-    if (r) {
-        exit_code = WORKER_EXIT_TRAP;
-    }
-    /* Sticky cap-deny / fuel flags refine the trap code in worker_exit. */
+    int exit_code = (r == NULL) ? WORKER_EXIT_OK : WORKER_EXIT_TRAP;
 
     m3_FreeRuntime(rt);
     m3_FreeEnvironment(env);
-    free(mod_bytes);
     worker_exit(exit_code);
 }

@@ -28,8 +28,15 @@ cd "$REPO_ROOT"
 LOG_DIR="${GRAHAOS_TEST_LOG_DIR:-/tmp/grahaos_tests}"
 SERIAL_LOG="${GRAHAOS_SERIAL_LOG:-/tmp/grahaos_test.log}"
 SUMMARY_JSON="$LOG_DIR/summary.json"
-MESON_FLAGS="${GRAHAOS_TEST_MESON_FLAGS:-autorun=ktest quiet=1 test_timeout_seconds=700}"
-QEMU_WALL_TIMEOUT_SEC="${GRAHAOS_TEST_WALL_TIMEOUT_SEC:-780}"
+# FU29.X.wasmd_subprocess: +2 wasm fault-isolation gate tests (each spawns a
+# wasmd + a killable worker subprocess) add ~10-12s of GUEST time, which ate
+# into the already-tight margin against the FU24.A/B spawn_handles_inherit
+# grind near the 700s guest watchdog.  Bump the guest watchdog to 780s to
+# restore headroom (still a hard hang-catch bound — spawn_handles_inherit
+# makes progress, it does not hang) and the wall timeout to 900s so the guest
+# watchdog always fires first.
+MESON_FLAGS="${GRAHAOS_TEST_MESON_FLAGS:-autorun=ktest quiet=1 test_timeout_seconds=780}"
+QEMU_WALL_TIMEOUT_SEC="${GRAHAOS_TEST_WALL_TIMEOUT_SEC:-900}"
 
 mkdir -p "$LOG_DIR"
 rm -f "$SERIAL_LOG" "$SUMMARY_JSON"

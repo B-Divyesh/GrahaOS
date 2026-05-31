@@ -60,6 +60,11 @@ TAP_TESTS := tests/libtap_selftest tests/sentinel_pass \
              tests/wasm_fault_trap \
              tests/wasm_load_reject \
              tests/wasm_concurrent_serial \
+             tests/wasm_sandbox_path_narrow \
+             tests/wasm_lacks_cap \
+             tests/wasm_ai_bindings \
+             tests/wasm_fault_sigkill \
+             tests/wasm_fault_fuel \
              tests/vsnprintftest \
              tests/console_init \
              tests/keyboard_alt \

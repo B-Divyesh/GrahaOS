@@ -314,6 +314,136 @@ static int32_t run_module(const uint8_t *mod_bytes, size_t mod_len) {
     return status;
 }
 
+/* ---- FU29.X.wasmd_subprocess: killable worker-subprocess isolation ---- */
+
+/* Worker exit codes — keep in sync with wasmd_worker.c::WORKER_EXIT_*. */
+#define WORKER_EXIT_OK          0
+#define WORKER_EXIT_LOAD        1
+#define WORKER_EXIT_INSTANTIATE 2
+#define WORKER_EXIT_TRAP        3
+#define WORKER_EXIT_INTERNAL    4
+#define WORKER_EXIT_CAP_DENIED  5
+#define WORKER_EXIT_FUEL        6
+#define WORKER_EXIT_BADARGS     7
+
+/* Hex-encode n bytes into out (needs 2n+1 chars incl. NUL). */
+static void hex_encode(const uint8_t *in, uint32_t n, char *out) {
+    static const char hx[] = "0123456789abcdef";
+    for (uint32_t i = 0; i < n; i++) {
+        out[2 * i]     = hx[(in[i] >> 4) & 0xF];
+        out[2 * i + 1] = hx[in[i] & 0xF];
+    }
+    out[2 * n] = '\0';
+}
+
+static int32_t map_worker_exit(int status) {
+    if (status >= 128) return WASMD_E_FUEL_EXHAUSTED;  /* 128+signal = killed */
+    switch (status) {
+        case WORKER_EXIT_OK:          return WASMD_OK;
+        case WORKER_EXIT_LOAD:        return WASMD_E_LOAD_FAILED;
+        case WORKER_EXIT_INSTANTIATE: return WASMD_E_INSTANTIATE_FAILED;
+        case WORKER_EXIT_TRAP:        return WASMD_E_TRAP;
+        case WORKER_EXIT_CAP_DENIED:  return WASMD_E_CAP_DENIED;
+        case WORKER_EXIT_FUEL:        return WASMD_E_FUEL_EXHAUSTED;
+        default:                      return WASMD_E_INTERNAL;
+    }
+}
+
+/* Run a (potentially runaway) module in a KILLABLE worker subprocess.
+ * Module bytes flow via argv-hex (NO filesystem — the worker never holds the
+ * global vfs_lock, so the deadline SIGKILL below lands while the worker is in
+ * a pure-userspace wasm loop = orphan-free, per the kernel kill-safety
+ * verdict).  Returns WASMD_E_FUEL_EXHAUSTED when the worker had to be killed
+ * (the runaway case the in-process path cannot contain). */
+static int32_t run_module_isolated(const uint8_t *mod_bytes, uint32_t mod_len) {
+    if (mod_len == 0 || mod_len > WASMD_BYTES_MAX) return WASMD_E_INTERNAL;
+
+    static char hexbuf[2 * WASMD_BYTES_MAX + 1];
+    hex_encode(mod_bytes, mod_len, hexbuf);
+    uint32_t hexlen = mod_len * 2;
+
+    /* Chunk hex into ≤240-char argv strings (kernel limit is 255 chars/arg,
+     * 3072 bytes + 16 args total — 248 module bytes => 496 hex => 3 chunks). */
+    static char chunk[3][256];
+    char *argv[8];
+    int argc = 0;
+    argv[argc++] = (char *)"bin/wasmd_worker";
+    argv[argc++] = (char *)"111111";   /* caps all-allowed; runaway = no host calls */
+    uint32_t off = 0;
+    int ci = 0;
+    while (off < hexlen && ci < 3) {
+        uint32_t take = hexlen - off;
+        if (take > 240) take = 240;
+        memcpy(chunk[ci], hexbuf + off, take);
+        chunk[ci][take] = '\0';
+        argv[argc++] = chunk[ci];
+        off += take;
+        ci++;
+    }
+    if (off < hexlen) return WASMD_E_INTERNAL;  /* module too large for argv */
+
+    int pid = syscall_spawn_argv("bin/wasmd_worker", argc, argv);
+    if (pid <= 0) {
+        WASMD_LOG("isolated: spawn_argv failed rc=%d", pid);
+        return WASMD_E_WORKER_SPAWN;
+    }
+    WASMD_LOG("isolated: spawned worker pid=%d mod_len=%u", pid, mod_len);
+
+    uint64_t hz = syscall_tsc_hz_query();
+    if (hz == 0) hz = 1000000000ULL;
+
+    /* Deadline (~250 ms): a tiny module reaches its wasm loop well within
+     * this; a runaway module never exits.  Safety is independent of the
+     * value (the worker holds no kernel lock regardless) — kept modest
+     * because under SMP the worker's pegged-CPU loop inflates the guest
+     * clock (the test watchdog's unit) ~4x, so every spun ms is budget. */
+    uint64_t deadline = spin_rdtsc() + (hz / 4);
+    while (spin_rdtsc() < deadline) {
+        for (volatile int s = 0; s < 50000; s++) { }
+    }
+
+    /* SIGKILL the (runaway) worker.  Orphan-free: it is in a pure-userspace
+     * wasm loop, holding no kernel spinlock. */
+    (void)syscall_kill(pid, 2 /*SIGKILL*/);
+
+    /* GRACE (~50 ms ≫ the 10 ms timer tick): let the worker's CPU take a
+     * tick so schedule() deschedules the now-ZOMBIE worker and loads a
+     * different CR3 BEFORE we reap.  sched_reap_zombie frees the worker's
+     * kernel stack + address space; reaping a task still 'current' on another
+     * CPU would be a use-after-free. */
+    uint64_t grace = spin_rdtsc() + (hz / 20);
+    while (spin_rdtsc() < grace) {
+        for (volatile int s = 0; s < 50000; s++) { }
+    }
+
+    int status = 0;
+    int wpid = syscall_wait(&status);
+    WASMD_LOG("isolated: reaped worker wpid=%d status=%d", wpid, status);
+
+    return map_worker_exit(status);
+}
+
+static void handle_run_module_isolated(const chan_msg_user_t *req,
+                                       chan_msg_user_t *resp) {
+    wasmd_response_header_t *rh = (wasmd_response_header_t *)resp->inline_payload;
+    rh->op = WASMD_OP_RUN_RESPONSE;
+    rh->reserved = 0;
+    rh->stdout_len = 0;
+
+    uint32_t wasm_len = *(const uint32_t *)(req->inline_payload + 4);
+    if (wasm_len == 0 || wasm_len > WASMD_BYTES_MAX) {
+        rh->status = WASMD_E_INTERNAL;
+        return;
+    }
+    uint32_t expected_inline = WASMD_BYTES_OFFSET + wasm_len;
+    if (req->header.inline_len < expected_inline) {
+        rh->status = WASMD_E_INTERNAL;
+        return;
+    }
+    const uint8_t *mod_bytes = req->inline_payload + WASMD_BYTES_OFFSET;
+    rh->status = run_module_isolated(mod_bytes, wasm_len);
+}
+
 static void handle_run_module(const chan_msg_user_t *req, chan_msg_user_t *resp) {
     wasmd_response_header_t *rh = (wasmd_response_header_t *)resp->inline_payload;
     rh->op = WASMD_OP_RUN_RESPONSE;
@@ -385,6 +515,8 @@ void _start(void) {
             uint32_t op = *(const uint32_t *)req.inline_payload;
             if (op == WASMD_OP_RUN_MODULE) {
                 handle_run_module(&req, &resp);
+            } else if (op == WASMD_OP_RUN_MODULE_ISOLATED) {
+                handle_run_module_isolated(&req, &resp);
             } else {
                 wasmd_response_header_t *rh =
                     (wasmd_response_header_t *)resp.inline_payload;

@@ -780,7 +780,10 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@#   fs_read            — open client-supplied .wasm file
 	@#   fs_write           — stage at /tmp/wasmd_pending.wasm + read worker output
 	@#   compute,time       — wasm3 runs in worker (worker has narrowed pledge)
-	@echo "daemon=bin/wasmd:ipc_send,ipc_recv,sys_control,sys_query,fs_read,fs_write,compute,time" >> initrd_root/etc/init.conf
+	@# FU29.X.wasmd_subprocess: + spawn (SYS_SPAWN_ARGV the killable
+	@#   wasmd_worker for runaway-module isolation; sys_control already
+	@#   present covers the deadline SIGKILL).
+	@echo "daemon=bin/wasmd:ipc_send,ipc_recv,sys_control,sys_query,fs_read,fs_write,compute,time,spawn" >> initrd_root/etc/init.conf
 ifdef TEST_HARNESS
 	@# G6.4 — echod loopback echo daemon for tcp_stress_1000 harness.
 	@# Production boot does NOT carry this; only `make TEST_HARNESS=1 ...`.
@@ -908,13 +911,18 @@ endif
 	@echo "wasm_concurrent_serial" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 29 Session G: 3 gates exercising the new in-process host
 	@# bindings (gcp.tui_write / fs_read / fs_write / audit_query) +
-	@# path-prefix sandbox + cap-deny via missing imports.  Two more
-	@# planned gates (wasm_fault_sigkill, wasm_fault_fuel) require
-	@# true subprocess isolation (FU27.WASM.D2_worker) and are deferred
-	@# pending the vfs_lock contention fix that v2 wasmd ran into.
+	@# path-prefix sandbox + cap-deny via missing imports.
 	@echo "wasm_sandbox_path_narrow" >> initrd_root/bin/tests/manifest.txt
 	@echo "wasm_lacks_cap" >> initrd_root/bin/tests/manifest.txt
 	@echo "wasm_ai_bindings" >> initrd_root/bin/tests/manifest.txt
+	@# FU29.X.wasmd_subprocess: true crash/runaway isolation via a KILLABLE
+	@# bin/wasmd_worker subprocess.  The module flows to the worker hex-encoded
+	@# in argv (NO filesystem → the worker holds no vfs_lock), so wasmd's
+	@# deadline SIGKILL of a runaway worker lands in a pure-userspace wasm loop
+	@# = orphan-free (kernel kill-safety verdict).  These two fixtures are
+	@# infinite loops the in-process wasm3 path fundamentally cannot contain.
+	@echo "wasm_fault_fuel" >> initrd_root/bin/tests/manifest.txt
+	@echo "wasm_fault_sigkill" >> initrd_root/bin/tests/manifest.txt
 	@# Phase 26 closeout (FU26.C): kernel vsnprintf width/flags parser test.
 	@# Verifies %04x / %5d / %-10s / etc. produce correct output and that
 	@# the unknown-spec default branch no longer slips va_args (FU26.A trap).
