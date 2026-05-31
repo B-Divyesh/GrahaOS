@@ -28,6 +28,14 @@ grahafs_v2_journal_state_t g_v2_journal;
 static int       g_journal_device_id = -1;
 static uint64_t  g_journal_sb_block_lba = 0;  // Where sb lives (always 0).
 
+// FU29.H perf (#665): persist the sb (journal head/tail/last_txn_id) LAZILY —
+// every JOURNAL_SB_PERSIST_INTERVAL commits — rather than on every commit. See
+// the call site in journal_txn_commit for the crash-safety argument (FLUSH #3
+// already makes home durable; head/tail are invariant at base; last_txn_id
+// reuse after a crash is benign under single-txn-in-flight replay).
+#define JOURNAL_SB_PERSIST_INTERVAL 64u
+static uint32_t  g_v2_journal_commits_since_sb = 0;
+
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
@@ -86,6 +94,7 @@ int journal_subsystem_init(int device_id,
     spinlock_init(&g_v2_journal.append_lock, "v2_journal");
     g_journal_device_id = device_id;
     g_journal_sb_block_lba = 0;
+    g_v2_journal_commits_since_sb = 0;
 
     klog(KLOG_INFO, SUBSYS_FS,
          "journal_init: base=%llu size=%u head=%llu tail=%llu next_txn=%llu",
@@ -370,16 +379,24 @@ int journal_txn_commit(journal_txn_t *txn) {
         }
     }
 
-    // --- (2) Barrier BEFORE commit — orders device writeback ---
-    if (journal_barrier(g_journal_device_id) != 0) {
-        klog(KLOG_ERROR, SUBSYS_FS,
-             "journal_commit: pre-commit barrier failed txn=%llu",
-             (unsigned long long)txn->txn_id);
-        journal_txn_abort(txn);
-        return -5;
-    }
-
-    // --- (3) Build commit block (CRC over begin+payloads) ---
+    // --- (2+3) Build commit block (CRC over begin+payloads), write it
+    //           directly after the payloads, then ONE durability barrier.
+    //
+    // FU29.H perf (#665): the original protocol used FLUSH #1 (order journal
+    // data before the commit marker) AND FLUSH #2 (commit marker durable) —
+    // two device FLUSHes, the dominant per-commit cost. The pre-commit barrier
+    // is REDUNDANT given the commit block's CRC over begin+payloads: on replay
+    // (journal_replay) a torn or device-reordered journal write — commit marker
+    // durable but a payload not — fails the CRC recompute (replay re-reads the
+    // journal copies at refs[i].journal_lba and folds the same CRC) and the txn
+    // is DISCARDED, the exact outcome the pre-commit ordering guaranteed. So a
+    // single barrier after [begin + payloads + commit] makes the whole txn
+    // atomically durable-or-discarded. This is the standard checksummed-commit
+    // optimization (cf. ext4 journal_async_commit) and removes one FLUSH from
+    // every v2 mutation. The post-checkpoint barrier (#3 below) is NOT
+    // removable: reset-to-base journal reuse would otherwise let the next
+    // commit overwrite this txn's journal copy before its home writes are
+    // durable (adversarially confirmed data-loss otherwise).
     uint32_t crc = crc32_init();
     crc = crc32_update(crc, &begin, GRAHAFS_V2_BLOCK_SIZE);
     for (uint32_t i = 0; i < txn->ref_count; ++i) {
@@ -399,10 +416,12 @@ int journal_txn_commit(journal_txn_t *txn) {
         return -5;
     }
 
-    // --- (4) Barrier AFTER commit — ensures commit block is durable ---
+    // --- (4) Single journal-durability barrier (replaces the old pre+post
+    //         pair): [begin + payloads + commit] all durable as a unit; CRC is
+    //         the torn/reorder backstop on replay. ---
     if (journal_barrier(g_journal_device_id) != 0) {
         klog(KLOG_ERROR, SUBSYS_FS,
-             "journal_commit: post-commit barrier failed txn=%llu",
+             "journal_commit: journal barrier failed txn=%llu",
              (unsigned long long)txn->txn_id);
         journal_txn_abort(txn);
         return -5;
@@ -432,7 +451,20 @@ int journal_txn_commit(journal_txn_t *txn) {
     // --- (7) Advance journal head/tail (MVP: reset to base after commit) ---
     g_v2_journal.head_block = base;
     g_v2_journal.tail_block = base;
-    (void)persist_journal_head_to_sb();
+    // FU29.H perf (#665): persist the sb LAZILY (every JOURNAL_SB_PERSIST_INTERVAL
+    // commits) instead of on every commit, removing one sb READ + one sb WRITE
+    // from the common path. Safe because: (a) FLUSH #3 above has already made
+    // THIS txn's home writes durable, so the on-disk journal copy is never
+    // needed again; (b) head/tail always reset to base, so the sb's
+    // journal_head/tail fields are invariant (already base on disk after the
+    // first persist, and replay clamps a sub-base head to base regardless);
+    // (c) the only field that drifts is last_txn_id, and txn_id reuse after a
+    // crash is benign — single-txn-in-flight replay validates by begin/commit
+    // magic + CRC, never by absolute id ordering.
+    if (++g_v2_journal_commits_since_sb >= JOURNAL_SB_PERSIST_INTERVAL) {
+        g_v2_journal_commits_since_sb = 0;
+        (void)persist_journal_head_to_sb();
+    }
 
     // --- (8) Done — free payloads, release append_lock via abort() ---
     klog(KLOG_DEBUG, SUBSYS_FS,
