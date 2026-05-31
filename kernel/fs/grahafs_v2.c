@@ -661,6 +661,32 @@ static int journal_stage_inode(journal_txn_t *txn, uint32_t inode_num,
         (inode_num * GRAHAFS_V2_INODE_SIZE) / GRAHAFS_V2_BLOCK_SIZE;
     uint32_t off = (inode_num * GRAHAFS_V2_INODE_SIZE) % GRAHAFS_V2_BLOCK_SIZE;
 
+    // FU29.H / FU25.D — same-inode-table-block coalescing.
+    //
+    // INODE_SIZE=512, BLOCK_SIZE=4096 → 8 inodes share each inode-table
+    // block. A single create stages TWO inodes that usually land in the same
+    // block: the new file's inode AND the parent directory's inode (e.g.
+    // root=1 and the first file=2 both map to inode-table block 0).
+    // journal_txn_commit's inline checkpoint writes refs to their target LBA
+    // in insertion order, so two refs with the SAME target LBA are
+    // last-writer-wins. If we re-read the block FRESH FROM DISK for the
+    // second inode, that read predates the first inode's not-yet-checkpointed
+    // edit, so the later ref carries a stale block that clobbers the first
+    // inode back to magic=0 on disk → finddir()/open() of the just-created
+    // file then reads inode magic=0 and returns fd<0.
+    //
+    // Fix: if this inode-table block is ALREADY staged in the current txn,
+    // overlay the inode onto the PENDING payload in place so both inodes
+    // coexist in the single ref that gets checkpointed. This lives entirely
+    // in the v2 journal path (v1 grahafs.c has no journal references), so it
+    // cannot regress v1.
+    for (uint32_t i = 0; i < txn->ref_count; ++i) {
+        if (txn->refs[i].lba_target == lba && txn->payloads[i]) {
+            memcpy(txn->payloads[i] + off, disk_copy, GRAHAFS_V2_INODE_SIZE);
+            return 0;
+        }
+    }
+
     uint8_t blk[GRAHAFS_V2_BLOCK_SIZE];
     if (grahafs_block_read((uint8_t)g_v2_device_id, lba, 1, blk) != 1) return -5;
     memcpy(blk + off, disk_copy, GRAHAFS_V2_INODE_SIZE);
