@@ -74,9 +74,9 @@ static uint32_t inode_checksum(const grahafs_v2_inode_t *ino) {
 // if the on-disk inode's magic/CRC is bad.
 grahafs_v2_inode_cache_t *inode_cache_get(uint32_t inode_num) {
     if (!g_v2_mounted) return NULL;
-    spinlock_acquire(&g_inode_cache_lock);
 
-    // Scan for existing entry.
+    // (1) Fast path: cache hit under the lock — NO I/O.
+    spinlock_acquire(&g_inode_cache_lock);
     for (uint32_t i = 0; i < INODE_CACHE_SLOTS; ++i) {
         grahafs_v2_inode_cache_t *e = &g_inode_cache[i];
         if (e->magic == GRAHAFS_V2_INODE_CACHE_MAGIC &&
@@ -86,8 +86,64 @@ grahafs_v2_inode_cache_t *inode_cache_get(uint32_t inode_num) {
             return e;
         }
     }
+    spinlock_release(&g_inode_cache_lock);
 
-    // Allocate a free slot.
+    // (2) Miss: read the inode's block OUTSIDE the cache lock.  FU29.H / L3
+    // lock-drop-around-I/O: holding g_inode_cache_lock across the (now 4 KiB)
+    // channel-mode block read deadlocks under cluster load — a stalled read
+    // keeps the lock held past the 5 s spinlock budget and trips
+    // SCHED_SPINLOCK_PANIC(lock=v2_inode_cache).  Read into a local, validate,
+    // then install under the lock.  Buffer is heap-allocated (this runs in a
+    // tight loop during mount cluster-rebuild; on-stack 4 KiB overflows).
+    uint64_t lba; uint32_t off;
+    inode_locate(inode_num, &lba, &off);
+    uint8_t *block = kmalloc(GRAHAFS_V2_BLOCK_SIZE, SUBSYS_FS);
+    if (!block) {
+        klog(KLOG_ERROR, SUBSYS_FS, "inode_cache_get: kmalloc failed inode=%u", inode_num);
+        return NULL;
+    }
+    if (grahafs_v2_block_read((uint8_t)g_v2_device_id, lba, block) != 1) {
+        kfree(block);
+        klog(KLOG_ERROR, SUBSYS_FS, "inode_cache_get: read failed inode=%u", inode_num);
+        return NULL;
+    }
+    grahafs_v2_inode_t disk;
+    memcpy(&disk, block + off, GRAHAFS_V2_INODE_SIZE);
+    kfree(block);
+
+    if (disk.magic != GRAHAFS_V2_INODE_MAGIC) {
+        /* magic==0 means the slot is unallocated — expected during table
+         * scans on a fresh-formatted disk. Only log actual corruption. */
+        if (disk.magic != 0u) {
+            klog(KLOG_WARN, SUBSYS_FS,
+                 "inode_cache_get: inode=%u bad magic=0x%08x", inode_num, disk.magic);
+        }
+        return NULL;
+    }
+    uint32_t expected = disk.checksum_inode;
+    disk.checksum_inode = 0;
+    uint32_t got = inode_checksum(&disk);
+    disk.checksum_inode = expected;
+    if (got != expected) {
+        klog(KLOG_WARN, SUBSYS_FS,
+             "inode_cache_get: inode=%u CRC mismatch got=0x%08x exp=0x%08x",
+             inode_num, got, expected);
+        return NULL;
+    }
+
+    // (3) Install under the lock, re-scanning for a concurrent loader so two
+    // racing misses on the same inode don't create duplicate (incoherent)
+    // slots — the loser adopts the winner's entry.
+    spinlock_acquire(&g_inode_cache_lock);
+    for (uint32_t i = 0; i < INODE_CACHE_SLOTS; ++i) {
+        grahafs_v2_inode_cache_t *e = &g_inode_cache[i];
+        if (e->magic == GRAHAFS_V2_INODE_CACHE_MAGIC &&
+            e->inode_num == inode_num) {
+            e->pinned_readers++;
+            spinlock_release(&g_inode_cache_lock);
+            return e;
+        }
+    }
     grahafs_v2_inode_cache_t *slot = NULL;
     for (uint32_t i = 0; i < INODE_CACHE_SLOTS; ++i) {
         if (g_inode_cache[i].magic != GRAHAFS_V2_INODE_CACHE_MAGIC) {
@@ -101,54 +157,7 @@ grahafs_v2_inode_cache_t *inode_cache_get(uint32_t inode_num) {
              "inode_cache_get: cache full (MVP bound=%u)", INODE_CACHE_SLOTS);
         return NULL;
     }
-
-    // Read the block containing the inode. Buffer is heap-allocated rather
-    // than on-stack because this function is called in a tight loop during
-    // mount (cluster rebuild walks every inode, up to 16K iterations) and
-    // its callers have other 4 KiB stack buffers — keeping this on-stack
-    // overflowed the kernel stack on v2 mount.
-    uint64_t lba; uint32_t off;
-    inode_locate(inode_num, &lba, &off);
-    uint8_t *block = kmalloc(GRAHAFS_V2_BLOCK_SIZE, SUBSYS_FS);
-    if (!block) {
-        spinlock_release(&g_inode_cache_lock);
-        klog(KLOG_ERROR, SUBSYS_FS, "inode_cache_get: kmalloc failed inode=%u", inode_num);
-        return NULL;
-    }
-    if (grahafs_block_read((uint8_t)g_v2_device_id, lba, 1, block) != 1) {
-        kfree(block);
-        spinlock_release(&g_inode_cache_lock);
-        klog(KLOG_ERROR, SUBSYS_FS, "inode_cache_get: read failed inode=%u", inode_num);
-        return NULL;
-    }
-    memcpy(&slot->disk, block + off, GRAHAFS_V2_INODE_SIZE);
-    kfree(block);
-
-    if (slot->disk.magic != GRAHAFS_V2_INODE_MAGIC) {
-        spinlock_release(&g_inode_cache_lock);
-        /* magic==0 means the slot is unallocated — expected during table
-         * scans on a fresh-formatted disk. Suppress the noise; only log
-         * actual corruption (non-zero magic that doesn't match). */
-        if (slot->disk.magic != 0u) {
-            klog(KLOG_WARN, SUBSYS_FS,
-                 "inode_cache_get: inode=%u bad magic=0x%08x",
-                 inode_num, slot->disk.magic);
-        }
-        return NULL;
-    }
-
-    uint32_t expected = slot->disk.checksum_inode;
-    slot->disk.checksum_inode = 0;
-    uint32_t got = inode_checksum(&slot->disk);
-    slot->disk.checksum_inode = expected;
-    if (got != expected) {
-        klog(KLOG_WARN, SUBSYS_FS,
-             "inode_cache_get: inode=%u CRC mismatch got=0x%08x exp=0x%08x",
-             inode_num, got, expected);
-        spinlock_release(&g_inode_cache_lock);
-        return NULL;
-    }
-
+    slot->disk                      = disk;
     slot->magic                     = GRAHAFS_V2_INODE_CACHE_MAGIC;
     slot->inode_num                 = inode_num;
     slot->dirty                     = false;
@@ -177,7 +186,7 @@ int inode_cache_flush_dirty(grahafs_v2_inode_cache_t *e) {
     uint64_t lba; uint32_t off;
     inode_locate(e->inode_num, &lba, &off);
     uint8_t block[GRAHAFS_V2_BLOCK_SIZE];
-    if (grahafs_block_read((uint8_t)g_v2_device_id, lba, 1, block) != 1) return -5;
+    if (grahafs_v2_block_read((uint8_t)g_v2_device_id, lba, block) != 1) return -5;
 
     e->disk.checksum_inode = 0;
     e->disk.checksum_inode = inode_checksum(&e->disk);
@@ -207,7 +216,7 @@ int inode_cache_flush_dirty(grahafs_v2_inode_cache_t *e) {
 static uint32_t v2_indirect_lookup(uint32_t indirect_lba, uint32_t inner_idx) {
     if (indirect_lba == 0) return 0;
     uint8_t block[GRAHAFS_V2_BLOCK_SIZE];
-    if (grahafs_block_read((uint8_t)g_v2_device_id, indirect_lba, 1, block) != 1) return 0;
+    if (grahafs_v2_block_read((uint8_t)g_v2_device_id, indirect_lba, block) != 1) return 0;
     uint32_t *slots = (uint32_t *)block;
     return slots[inner_idx];
 }
@@ -238,7 +247,7 @@ uint32_t v2_block_index_to_lba(const grahafs_v2_inode_t *ino, uint32_t logical_b
 // ===========================================================================
 int grahafs_v2_mount(int device_id) {
     uint8_t sb_block[GRAHAFS_V2_BLOCK_SIZE];
-    if (grahafs_block_read((uint8_t)device_id, 0, 1, sb_block) != 1) {
+    if (grahafs_v2_block_read((uint8_t)device_id, 0, sb_block) != 1) {
         return -5;
     }
     grahafs_v2_superblock_t *sb = (grahafs_v2_superblock_t *)sb_block;
@@ -300,8 +309,7 @@ int grahafs_v2_mount(int device_id) {
             GRAHAFS_V2_INODES_PER_BLOCK;
         for (uint32_t blk = 0; blk < blocks_to_scan; ++blk) {
             uint64_t lba = (uint64_t)g_v2_sb.inode_table_start_block + blk;
-            if (grahafs_block_read((uint8_t)g_v2_device_id, lba, 1,
-                                   ino_block) != 1) {
+            if (grahafs_v2_block_read((uint8_t)g_v2_device_id, lba, ino_block) != 1) {
                 klog(KLOG_WARN, SUBSYS_FS,
                      "grahafs_v2_mount: cluster rebuild read failed lba=%lu",
                      (unsigned long)lba);
@@ -397,7 +405,7 @@ static uint32_t v2_bitmap_allocate_block(journal_txn_t *txn) {
         uint64_t lba; uint32_t bit;
         if (bitmap_block_lba(i, &lba, &bit) != 0) continue;
         if (!cached_valid || cached_lba != lba) {
-            if (grahafs_block_read((uint8_t)g_v2_device_id, lba, 1, buf) != 1) return 0;
+            if (grahafs_v2_block_read((uint8_t)g_v2_device_id, lba, buf) != 1) return 0;
             cached_lba = lba;
             cached_valid = true;
         }
@@ -418,7 +426,7 @@ static uint32_t v2_bitmap_allocate_block(journal_txn_t *txn) {
                     return 0;
                 }
             } else {
-                if (grahafs_block_write((uint8_t)g_v2_device_id, lba, 1, buf) != 1) {
+                if (grahafs_v2_block_write((uint8_t)g_v2_device_id, lba, buf) != 1) {
                     bitmap_mark(buf, bit, false);
                     return 0;
                 }
@@ -438,9 +446,9 @@ static int v2_bitmap_free_block(uint32_t block_num) {
     uint64_t lba; uint32_t bit;
     if (bitmap_block_lba(block_num, &lba, &bit) != 0) return -22;
     uint8_t buf[GRAHAFS_V2_BLOCK_SIZE];
-    if (grahafs_block_read((uint8_t)g_v2_device_id, lba, 1, buf) != 1) return -5;
+    if (grahafs_v2_block_read((uint8_t)g_v2_device_id, lba, buf) != 1) return -5;
     bitmap_mark(buf, bit, false);
-    if (grahafs_block_write((uint8_t)g_v2_device_id, lba, 1, buf) != 1) return -5;
+    if (grahafs_v2_block_write((uint8_t)g_v2_device_id, lba, buf) != 1) return -5;
     spinlock_acquire(&g_v2_sb_lock);
     g_v2_sb.free_blocks++;
     spinlock_release(&g_v2_sb_lock);
@@ -455,7 +463,7 @@ static uint32_t v2_allocate_inode(void) {
         uint64_t lba = g_v2_sb.inode_table_start_block +
             (i * GRAHAFS_V2_INODE_SIZE) / GRAHAFS_V2_BLOCK_SIZE;
         uint32_t off = (i * GRAHAFS_V2_INODE_SIZE) % GRAHAFS_V2_BLOCK_SIZE;
-        if (grahafs_block_read((uint8_t)g_v2_device_id, lba, 1, buf) != 1) continue;
+        if (grahafs_v2_block_read((uint8_t)g_v2_device_id, lba, buf) != 1) continue;
         grahafs_v2_inode_t *ino = (grahafs_v2_inode_t *)(buf + off);
         if (ino->magic == 0 && ino->type == 0) {
             spinlock_acquire(&g_v2_sb_lock);
@@ -476,7 +484,7 @@ static int v2_write_superblock(void) {
     sb->checksum_sb = 0;
     sb->checksum_sb = crc32_buf(sb,
         offsetof(grahafs_v2_superblock_t, checksum_sb));
-    if (grahafs_block_write((uint8_t)g_v2_device_id, 0, 1, sb_block) != 1) return -5;
+    if (grahafs_v2_block_write((uint8_t)g_v2_device_id, 0, sb_block) != 1) return -5;
     return 0;
 }
 
@@ -515,7 +523,7 @@ ssize_t grahafs_v2_read(struct vfs_node *node, uint64_t offset, size_t size, voi
             memset((uint8_t *)buffer + bytes_read, 0, chunk);
         } else {
             uint8_t blk[GRAHAFS_V2_BLOCK_SIZE];
-            if (grahafs_block_read((uint8_t)g_v2_device_id, lba, 1, blk) != 1) {
+            if (grahafs_v2_block_read((uint8_t)g_v2_device_id, lba, blk) != 1) {
                 klog(KLOG_ERROR, SUBSYS_FS,
                      "grahafs_v2_read: grahafs_block_read lba=%u failed", lba);
                 return (ssize_t)bytes_read > 0 ? (ssize_t)bytes_read : -5;
@@ -580,7 +588,7 @@ static uint32_t v2_block_index_to_lba_alloc(grahafs_v2_inode_t *ino,
         }
         // Read indirect page (it may be freshly zeroed), patch slot, re-stage.
         uint8_t ipage[GRAHAFS_V2_BLOCK_SIZE];
-        if (grahafs_block_read((uint8_t)g_v2_device_id, ino->indirect_block, 1, ipage) != 1) return 0;
+        if (grahafs_v2_block_read((uint8_t)g_v2_device_id, ino->indirect_block, ipage) != 1) return 0;
         uint32_t *slots = (uint32_t *)ipage;
         if (slots[adj] == 0) {
             uint32_t b = v2_bitmap_allocate_block(txn);
@@ -612,7 +620,7 @@ static uint32_t v2_block_index_to_lba_alloc(grahafs_v2_inode_t *ino,
         uint32_t outer = adj / GRAHAFS_V2_INDIRECT_PTRS;
         uint32_t inner = adj % GRAHAFS_V2_INDIRECT_PTRS;
         uint8_t outer_page[GRAHAFS_V2_BLOCK_SIZE];
-        if (grahafs_block_read((uint8_t)g_v2_device_id, ino->double_indirect, 1, outer_page) != 1)
+        if (grahafs_v2_block_read((uint8_t)g_v2_device_id, ino->double_indirect, outer_page) != 1)
             return 0;
         uint32_t *outer_slots = (uint32_t *)outer_page;
         if (outer_slots[outer] == 0) {
@@ -629,7 +637,7 @@ static uint32_t v2_block_index_to_lba_alloc(grahafs_v2_inode_t *ino,
         }
         uint32_t mid_lba = outer_slots[outer];
         uint8_t mid_page[GRAHAFS_V2_BLOCK_SIZE];
-        if (grahafs_block_read((uint8_t)g_v2_device_id, mid_lba, 1, mid_page) != 1) return 0;
+        if (grahafs_v2_block_read((uint8_t)g_v2_device_id, mid_lba, mid_page) != 1) return 0;
         uint32_t *mid_slots = (uint32_t *)mid_page;
         if (mid_slots[inner] == 0) {
             uint32_t b = v2_bitmap_allocate_block(txn);
@@ -688,7 +696,7 @@ static int journal_stage_inode(journal_txn_t *txn, uint32_t inode_num,
     }
 
     uint8_t blk[GRAHAFS_V2_BLOCK_SIZE];
-    if (grahafs_block_read((uint8_t)g_v2_device_id, lba, 1, blk) != 1) return -5;
+    if (grahafs_v2_block_read((uint8_t)g_v2_device_id, lba, blk) != 1) return -5;
     memcpy(blk + off, disk_copy, GRAHAFS_V2_INODE_SIZE);
     return journal_txn_add_block(txn, lba, JOURNAL_BLOCK_KIND_METADATA, blk);
 }
@@ -727,7 +735,7 @@ ssize_t grahafs_v2_write(struct vfs_node *node, uint64_t offset, size_t size, vo
         uint8_t blk[GRAHAFS_V2_BLOCK_SIZE];
         if (block_offset != 0 || chunk != GRAHAFS_V2_BLOCK_SIZE) {
             // Partial block — must RMW.
-            if (grahafs_block_read((uint8_t)g_v2_device_id, lba, 1, blk) != 1) {
+            if (grahafs_v2_block_read((uint8_t)g_v2_device_id, lba, blk) != 1) {
                 journal_txn_abort(txn); inode_cache_put(ce); return -5;
             }
         } else {
@@ -818,7 +826,7 @@ static int v2_dir_add_entry(uint32_t parent_inode, const char *name,
     }
 
     uint8_t blk[GRAHAFS_V2_BLOCK_SIZE];
-    if (grahafs_block_read((uint8_t)g_v2_device_id, dir.direct_blocks[0], 1, blk) != 1) {
+    if (grahafs_v2_block_read((uint8_t)g_v2_device_id, dir.direct_blocks[0], blk) != 1) {
         inode_cache_put(ce); return -5;
     }
     v2_dirent_t *entries = (v2_dirent_t *)blk;
@@ -857,7 +865,7 @@ static int v2_dir_remove_entry(uint32_t parent_inode, const char *name,
         inode_cache_put(ce); return -2;  // -ENOENT.
     }
     uint8_t blk[GRAHAFS_V2_BLOCK_SIZE];
-    if (grahafs_block_read((uint8_t)g_v2_device_id, dir.direct_blocks[0], 1, blk) != 1) {
+    if (grahafs_v2_block_read((uint8_t)g_v2_device_id, dir.direct_blocks[0], blk) != 1) {
         inode_cache_put(ce); return -5;
     }
     v2_dirent_t *entries = (v2_dirent_t *)blk;
@@ -908,7 +916,7 @@ struct vfs_node *grahafs_v2_finddir(struct vfs_node *node, const char *name) {
         return NULL;
 
     uint8_t blk[GRAHAFS_V2_BLOCK_SIZE];
-    if (grahafs_block_read((uint8_t)g_v2_device_id, dir.direct_blocks[0], 1, blk) != 1) return NULL;
+    if (grahafs_v2_block_read((uint8_t)g_v2_device_id, dir.direct_blocks[0], blk) != 1) return NULL;
     v2_dirent_t *entries = (v2_dirent_t *)blk;
     for (size_t i = 0; i < V2_DIRENTS_PER_BLOCK; ++i) {
         if (entries[i].inode_num == 0) continue;
@@ -941,7 +949,7 @@ struct vfs_node *grahafs_v2_readdir(struct vfs_node *node, uint32_t index) {
         return NULL;
 
     uint8_t blk[GRAHAFS_V2_BLOCK_SIZE];
-    if (grahafs_block_read((uint8_t)g_v2_device_id, dir.direct_blocks[0], 1, blk) != 1) return NULL;
+    if (grahafs_v2_block_read((uint8_t)g_v2_device_id, dir.direct_blocks[0], blk) != 1) return NULL;
     v2_dirent_t *entries = (v2_dirent_t *)blk;
     uint32_t cur = 0;
     for (size_t i = 0; i < V2_DIRENTS_PER_BLOCK; ++i) {
@@ -1080,7 +1088,7 @@ int grahafs_v2_truncate_inode(uint32_t inode_num) {
     if (work.indirect_block) {
         uint32_t indirect_lba = work.indirect_block;
         uint8_t indir_buf[GRAHAFS_V2_BLOCK_SIZE];
-        if (grahafs_block_read((uint8_t)g_v2_device_id, indirect_lba, 1, indir_buf) == 1) {
+        if (grahafs_v2_block_read((uint8_t)g_v2_device_id, indirect_lba, indir_buf) == 1) {
             uint32_t *ptrs = (uint32_t *)indir_buf;
             for (uint32_t i = 0; i < GRAHAFS_V2_INDIRECT_PTRS; ++i) {
                 if (ptrs[i]) (void)v2_bitmap_free_block(ptrs[i]);
@@ -1093,12 +1101,12 @@ int grahafs_v2_truncate_inode(uint32_t inode_num) {
     if (work.double_indirect) {
         uint32_t dindir_lba = work.double_indirect;
         uint8_t dindir_buf[GRAHAFS_V2_BLOCK_SIZE];
-        if (grahafs_block_read((uint8_t)g_v2_device_id, dindir_lba, 1, dindir_buf) == 1) {
+        if (grahafs_v2_block_read((uint8_t)g_v2_device_id, dindir_lba, dindir_buf) == 1) {
             uint32_t *l1 = (uint32_t *)dindir_buf;
             for (uint32_t a = 0; a < GRAHAFS_V2_INDIRECT_PTRS; ++a) {
                 if (!l1[a]) continue;
                 uint8_t l2_buf[GRAHAFS_V2_BLOCK_SIZE];
-                if (grahafs_block_read((uint8_t)g_v2_device_id, l1[a], 1, l2_buf) == 1) {
+                if (grahafs_v2_block_read((uint8_t)g_v2_device_id, l1[a], l2_buf) == 1) {
                     uint32_t *l2 = (uint32_t *)l2_buf;
                     for (uint32_t b = 0; b < GRAHAFS_V2_INDIRECT_PTRS; ++b) {
                         if (l2[b]) (void)v2_bitmap_free_block(l2[b]);
@@ -1405,7 +1413,7 @@ void grahafs_v2_close(struct vfs_node *node) {
         uint32_t lba = v2_block_index_to_lba(&work, i);
         if (lba == 0) continue;
         uint8_t blk[GRAHAFS_V2_BLOCK_SIZE];
-        if (grahafs_block_read((uint8_t)g_v2_device_id, lba, 1, blk) != 1) break;
+        if (grahafs_v2_block_read((uint8_t)g_v2_device_id, lba, blk) != 1) break;
         uint32_t copy = GRAHAFS_V2_BLOCK_SIZE;
         if (sampled + copy > bytes_to_sample) copy = (uint32_t)(bytes_to_sample - sampled);
         if (sampled + copy > sizeof(sample_buf)) copy = (uint32_t)(sizeof(sample_buf) - sampled);
@@ -1532,7 +1540,7 @@ uint64_t grahafs_v2_compute_simhash(uint32_t inode_num) {
         uint32_t lba = v2_block_index_to_lba(&work, i);
         if (lba == 0) continue;
         uint8_t blk[GRAHAFS_V2_BLOCK_SIZE];
-        if (grahafs_block_read((uint8_t)dev_id, lba, 1, blk) != 1) break;
+        if (grahafs_v2_block_read((uint8_t)dev_id, lba, blk) != 1) break;
         uint32_t copy = GRAHAFS_V2_BLOCK_SIZE;
         if ((uint64_t)sampled + copy > bytes_to_sample) {
             copy = (uint32_t)(bytes_to_sample - sampled);
@@ -1561,7 +1569,7 @@ uint64_t grahafs_v2_compute_simhash(uint32_t inode_num) {
                 spinlock_release(&root_ce->lock);
                 if (root_db0 != 0) {
                     uint8_t dir_blk[GRAHAFS_V2_BLOCK_SIZE];
-                    if (grahafs_block_read((uint8_t)dev_id, root_db0, 1, dir_blk) == 1) {
+                    if (grahafs_v2_block_read((uint8_t)dev_id, root_db0, dir_blk) == 1) {
                         v2_dirent_t *entries = (v2_dirent_t *)dir_blk;
                         for (size_t i = 0; i < V2_DIRENTS_PER_BLOCK; i++) {
                             if (entries[i].inode_num == inode_num) {

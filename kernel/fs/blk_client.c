@@ -698,6 +698,21 @@ int grahafs_block_write(uint8_t dev, uint64_t lba, uint32_t count, const void *k
     return blk_chan_write(dev, lba, count, kbuf);
 }
 
+// FU29.H — v2 4096-byte logical-block I/O: scale block→sector (×8) and
+// transfer a full 8-sector (4 KiB) block, matching v1's grahafs.c convention.
+// Returns 1 on full success (==1 contract), <0 on error.
+int grahafs_v2_block_read(uint8_t dev, uint64_t block, void *buf4096) {
+    if (!buf4096) return -22;
+    int rc = grahafs_block_read(dev, block * 8u, 8u, buf4096);
+    return (rc == 8) ? 1 : (rc < 0 ? rc : -5);
+}
+
+int grahafs_v2_block_write(uint8_t dev, uint64_t block, const void *buf4096) {
+    if (!buf4096) return -22;
+    int rc = grahafs_block_write(dev, block * 8u, 8u, buf4096);
+    return (rc == 8) ? 1 : (rc < 0 ? rc : -5);
+}
+
 int grahafs_block_flush(uint8_t dev) {
     if (blk_fs_state() == BLK_FS_READ_ONLY_ERROR) return -30;
     blk_client_state_t st = blk_resolve_dispatch_state();

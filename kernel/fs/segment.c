@@ -88,8 +88,7 @@ static void segment_build_header(uint32_t seg_idx,
 static int segment_persist_header(uint64_t first_block,
                                   const grahafs_v2_segment_header_t *hdr) {
     seg_io_acquire();
-    int rc = grahafs_block_write((uint8_t)g_segment_device_id,
-                                 first_block, 1, hdr);
+    int rc = grahafs_v2_block_write((uint8_t)g_segment_device_id, first_block, hdr);
     seg_io_release();
     if (rc != 1) {
         klog(KLOG_ERROR, SUBSYS_FS,
@@ -116,7 +115,7 @@ static int segment_write_header(uint32_t seg_idx) {
 static int segment_read_header(uint32_t seg_idx) {
     grahafs_v2_segment_t *s = &g_segments[seg_idx];
     uint8_t buf[GRAHAFS_V2_BLOCK_SIZE];
-    if (grahafs_block_read((uint8_t)g_segment_device_id, s->first_block, 1, buf) != 1) {
+    if (grahafs_v2_block_read((uint8_t)g_segment_device_id, s->first_block, buf) != 1) {
         return -5;
     }
     grahafs_v2_segment_header_t *hdr = (grahafs_v2_segment_header_t *)buf;
@@ -178,7 +177,7 @@ int segment_subsystem_init(int device_id,
     //    [0..7]  : first_block (u64)
     //    [8..15] : reserved
     uint8_t tbl[GRAHAFS_V2_BLOCK_SIZE];
-    if (grahafs_block_read((uint8_t)device_id, segment_table_lba, 1, tbl) != 1) {
+    if (grahafs_v2_block_read((uint8_t)device_id, segment_table_lba, tbl) != 1) {
         klog(KLOG_ERROR, SUBSYS_FS,
              "segment_subsystem_init: failed to read segment table at lba=%llu",
              (unsigned long long)segment_table_lba);

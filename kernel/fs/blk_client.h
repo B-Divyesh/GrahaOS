@@ -95,6 +95,17 @@ int grahafs_block_read(uint8_t dev, uint64_t lba, uint32_t count, void *kbuf);
 int grahafs_block_write(uint8_t dev, uint64_t lba, uint32_t count, const void *kbuf);
 int grahafs_block_flush(uint8_t dev);
 
+// FU29.H — GrahaFS v2 logical-block I/O.  v2 uses 4096-byte logical blocks but
+// the block layer / ahcid is 512-byte-sector granular (fis->lba is a sector;
+// dbc = count*512).  These helpers scale a 4096-byte BLOCK index to its
+// 8-sector run (block*8) and transfer a full 4 KiB block (count=8) — exactly
+// the convention v1's grahafs.c uses (block_num * 8u, count 8u).  Without this,
+// v2 read block N at sector N (byte N*512) instead of byte N*4096, so its
+// inode table overlapped the on-disk bitmap (garbage 0xffffffff reads).
+// Return 1 on full success (preserving callers' "== 1" contract), else <0.
+int grahafs_v2_block_read(uint8_t dev, uint64_t block, void *buf4096);
+int grahafs_v2_block_write(uint8_t dev, uint64_t block, const void *buf4096);
+
 // Phase 24a W3: batched read. Submits up to BLK_BATCH_MAX (= 6) reads in
 // one chan_send. Each kbufs[i] receives counts[i]*512 bytes from lbas[i].
 // Returns the number of successfully-completed reads (0..n) on the

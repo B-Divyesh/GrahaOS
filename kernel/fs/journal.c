@@ -32,14 +32,16 @@ static uint64_t  g_journal_sb_block_lba = 0;  // Where sb lives (always 0).
 // Helpers.
 // ---------------------------------------------------------------------------
 static int ahci_write_block(int dev, uint64_t lba, const void *buf) {
-    /* Phase 23 cutover: route through blk_client wrapper. Wrapper returns
-     * count on success (1 here), 0 or negative on error. */
-    int rc = grahafs_block_write((uint8_t)dev, lba, 1, buf);
+    /* Phase 23 cutover: route through blk_client wrapper.  FU29.H: v2 uses
+     * 4096-byte logical blocks, so go through the scaled v2 helper (block*8,
+     * 8 sectors) — `lba` here is a 4096-byte block index (journal/main-area
+     * block), NOT a 512-byte sector.  Helper returns 1 on full success. */
+    int rc = grahafs_v2_block_write((uint8_t)dev, lba, buf);
     return rc == 1 ? 0 : -5;
 }
 
 static int ahci_read_block(int dev, uint64_t lba, void *buf) {
-    int rc = grahafs_block_read((uint8_t)dev, lba, 1, buf);
+    int rc = grahafs_v2_block_read((uint8_t)dev, lba, buf);
     return rc == 1 ? 0 : -5;
 }
 
