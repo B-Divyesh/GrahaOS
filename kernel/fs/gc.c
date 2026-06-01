@@ -47,6 +47,14 @@ uint64_t g_gc_max_age_ns = 0;
 
 void gc_set_max_age_ns(uint64_t ns) { g_gc_max_age_ns = ns; }
 
+// FU29.H read-path perf (#666): in count-only mode the periodic gc full-scan is
+// pure I/O waste (version_count is capped at MAX on write, so the >MAX prune
+// condition is unreachable) — it re-read ~150 inode-table blocks every 30 s and
+// dominated v2 block reads. Run only a low-frequency safety-net scan in that
+// mode. Age-based mode scans every wakeup.
+#define GC_COUNT_MODE_SCAN_EVERY 16u   /* ~8 min @ 30 s/wakeup */
+static uint32_t g_gc_count_mode_skip = 0;
+
 extern int64_t rtc_now_seconds(void);
 
 // FU29.H: scaled v2 block read (block*8, 8 sectors = 4 KiB) + device id.
@@ -201,6 +209,18 @@ static void gc_periodic_task(void) {
         uint64_t t0 = g_timer_ticks;
         while (g_timer_ticks - t0 < 3000) asm volatile("hlt");  // 30s @ 100 Hz.
         if (!grahafs_v2_is_mounted()) continue;
+        // FU29.H read-path perf (#666): skip the wasteful full-scan in count-
+        // only mode (g_gc_max_age_ns==0, the default) except for an occasional
+        // safety-net pass. version_count is capped at GRAHAFS_V2_MAX_VERSIONS at
+        // every write (grahafs_v2.c:1450,2103), so the ">MAX" prune condition is
+        // unreachable and a periodic scan can never prune — it just re-reads the
+        // inode table (~88% of all v2 block reads pre-fix). Age-based mode
+        // (set only by tests) scans every wakeup; manual syscall_fs_gc_now()
+        // always scans (fstest_v2 G1.1), so explicit GC is never throttled.
+        if (g_gc_max_age_ns == 0) {
+            if (++g_gc_count_mode_skip < GC_COUNT_MODE_SCAN_EVERY) continue;
+            g_gc_count_mode_skip = 0;
+        }
         gc_stats_t s;
         (void)gc_scan_all(&s);
         g_gc_passes++;

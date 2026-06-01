@@ -310,6 +310,19 @@ int grahafs_v2_mount(int device_id) {
         uint32_t blocks_to_scan =
             (g_v2_sb.inode_count_max + GRAHAFS_V2_INODES_PER_BLOCK - 1) /
             GRAHAFS_V2_INODES_PER_BLOCK;
+        // FU29.H read-path perf (#666): early-exit after a run of consecutive
+        // all-free inode-table blocks. This scan runs at MOUNT, on the boot
+        // CRITICAL PATH (before init/tests spawn), and previously read all
+        // ~2048 inode-table blocks unconditionally — dominating v2 boot time
+        // even though v2 allocates inodes LOWEST-FIRST, so every allocated
+        // inode clusters at the low end. Once we see CLUSTER_REBUILD_EMPTY_RUN
+        // consecutive blocks with no allocated inode we are past every live
+        // inode; stop. (Mirrors gc_scan_all's bound, commit 98f2020. Best-effort
+        // — a pathologically-sparse high inode would be missed for the in-memory
+        // cluster hint only; on-disk state is unaffected and clustertest's files
+        // are dense/low.)
+        const uint32_t CLUSTER_REBUILD_EMPTY_RUN = 128u;  /* 1024 inodes margin */
+        uint32_t empty_run = 0;
         for (uint32_t blk = 0; blk < blocks_to_scan; ++blk) {
             uint64_t lba = (uint64_t)g_v2_sb.inode_table_start_block + blk;
             if (grahafs_v2_block_read((uint8_t)g_v2_device_id, lba, ino_block) != 1) {
@@ -318,6 +331,7 @@ int grahafs_v2_mount(int device_id) {
                      (unsigned long)lba);
                 break;
             }
+            bool any_alloc = false;
             for (uint32_t i = 0; i < GRAHAFS_V2_INODES_PER_BLOCK; ++i) {
                 uint32_t ino = blk * GRAHAFS_V2_INODES_PER_BLOCK + i;
                 if (ino < 2u) continue;
@@ -326,6 +340,7 @@ int grahafs_v2_mount(int device_id) {
                     (grahafs_v2_inode_t *)
                         (ino_block + i * GRAHAFS_V2_INODE_SIZE);
                 if (disk->magic != GRAHAFS_V2_INODE_MAGIC) continue;
+                any_alloc = true;
                 uint64_t sh = disk->ai_embedding[0];
                 uint32_t cid = ((uint32_t)disk->ai_reserved[0])       |
                                ((uint32_t)disk->ai_reserved[1] << 8)  |
@@ -337,6 +352,8 @@ int grahafs_v2_mount(int device_id) {
                 hint[27] = 0;
                 cluster_rebuild_add(ino, cid, sh, hint);
             }
+            if (any_alloc) empty_run = 0;
+            else if (++empty_run >= CLUSTER_REBUILD_EMPTY_RUN) break;
         }
         kfree(ino_block);
     }
