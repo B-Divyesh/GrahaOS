@@ -1192,10 +1192,38 @@ void sched_orphan_children(int parent_id) {
     }
 }
 
-void sched_reap_zombie(int task_id) {
-    if (task_id < 0 || task_id >= next_task_id || task_id >= MAX_TASKS) return;
-    if (!task_ptrs[task_id]) return;  // Already reaped / never allocated.
-    if ((*task_ptrs[task_id]).state != TASK_STATE_ZOMBIE) return;
+// FU29.H roadmap#4 — exit-race UAF guard. A task that called SYS_EXIT sets
+// state=ZOMBIE (atomic release) but KEEPS RUNNING on its own kernel stack +
+// CR3 until its CPU's next schedule() (next timer tick) deschedules it; until
+// then it is still runq.current on that CPU. If the parent's SYS_WAIT reaps it
+// (frees kstack / address space / task_t) on another CPU in that window, the
+// still-running CPU faults on freed memory (the "post-wake, returning" then
+// page-fault-at-rip=0 symptom). This predicate lets the reap path DEFER until
+// the task is no longer current on ANY CPU. Lock-free is safe: runq.current is
+// written only by its owning CPU in schedule(); the reaper's read is a benign
+// one-way-latch observation — a ZOMBIE is never re-enqueued, so once it stops
+// being current it NEVER becomes current again (monotone not-current).
+static bool task_is_current_on_any_cpu(task_t *t) {
+    if (!t) return false;
+    for (uint32_t i = 0; i < g_cpu_count; ++i) {
+        if (__atomic_load_n(&g_cpu_locals[i].runq.current, __ATOMIC_ACQUIRE) == t)
+            return true;
+    }
+    return false;
+}
+
+int sched_reap_zombie(int task_id) {
+    if (task_id < 0 || task_id >= next_task_id || task_id >= MAX_TASKS) return 0;
+    if (!task_ptrs[task_id]) return 0;  // Already reaped / never allocated.
+    if ((*task_ptrs[task_id]).state != TASK_STATE_ZOMBIE) return 0;
+    // FU29.H roadmap#4: DEFER while the zombie is still runq.current on some
+    // CPU — freeing now is a use-after-free. SYS_WAIT retries after a tick;
+    // the one-way latch self-clears within <=1 timer tick (10 ms). This is the
+    // ONLY change to the reap path and it does NOT touch schedule()'s hot
+    // dispatch path (unlike the reverted Phase-23 T1-T7 IPC/dispatch variants).
+    if (task_is_current_on_any_cpu(task_ptrs[task_id])) {
+        return -11;  // -EAGAIN
+    }
     klog(KLOG_INFO, SUBSYS_SCHED, "[REAP] task_id=%d entering",
          task_id);
 
@@ -1296,6 +1324,7 @@ void sched_reap_zombie(int task_id) {
     kmem_cache_free(task_cache, task_ptrs[task_id]);
     task_ptrs[task_id] = NULL;
     klog(KLOG_INFO, SUBSYS_SCHED, "[REAP] task_id=%d done", task_id);
+    return 0;
 }
 
 // Get task by ID including zombies (needed for wait/reap operations)

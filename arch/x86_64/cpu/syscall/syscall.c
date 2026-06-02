@@ -1086,7 +1086,21 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                     }
                     *status_ptr = exit_status;
                 }
-                sched_reap_zombie(child_pid);
+                // FU29.H roadmap#4 exit-race fix: sched_reap_zombie returns
+                // -EAGAIN (-11) if the child zombie is still runq.current on
+                // another CPU (it iretq'd back to userspace as a zombie and
+                // hasn't reached its next timer tick). Freeing then would UAF
+                // its kstack/CR3. Retry after a tick — the one-way latch
+                // self-clears within <=1 tick. exit_status was already captured
+                // above, so the retry is status-safe. Same unbounded yield
+                // pattern as the ZOMBIE poll loop above (terminates because
+                // every live CPU reschedules every timer tick).
+                while (sched_reap_zombie(child_pid) == -11) {
+                    (void)sched_block_on_channel(
+                        current, CHAN_WAIT_READ,
+                        10ULL * 1000 * 1000,  /* 10 ms = 1 tick */
+                        (struct task_struct **)&current->wait_for_child_head);
+                }
                 frame->rax = child_pid;
                 framebuffer_draw_string("wait(): Found and reaped zombie child", 400, 640, COLOR_GREEN, 0x00101828);
             } else {

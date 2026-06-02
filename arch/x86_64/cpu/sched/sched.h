@@ -428,10 +428,13 @@ int sched_check_children(int parent_id, int *status);
 void sched_orphan_children(int parent_id);
 
 /**
- * @brief Reap a zombie task and free its resources
+ * @brief Reap a zombie task and free its resources.
  * @param task_id Task ID to reap
+ * @return 0 on reap / nothing-to-do; -11 (-EAGAIN) if DEFERRED because the
+ *         zombie is still runq.current on some CPU (FU29.H roadmap#4 exit-race
+ *         guard). The caller must retry after a timer tick.
  */
-void sched_reap_zombie(int task_id);
+int sched_reap_zombie(int task_id);
 
 /**
  * @brief Wake up parent waiting for a child
