@@ -30,12 +30,20 @@ static bool g_fb_active = true;
 // boot (pre-fbd) draws normally.
 static volatile bool g_fbd_alive = false;
 static volatile bool g_panic_in_progress = false;
+// FU29.H TUI: set once the INTERACTIVE kernel console takes over the display
+// (boot->shell transition, non-ktest only). Like g_fbd_alive, it routes every
+// direct kernel framebuffer_draw_* debug draw (ELF loader, SYS_WAIT/spawn/exit
+// diagnostics, boot progress) to a no-op so they don't trample the shell's TUI.
+// The console's own rendering uses framebuffer_force_draw_* (bypass-immune), and
+// the panic path still wins via g_panic_in_progress.
+static volatile bool g_console_owns_display = false;
 
 static inline bool fb_should_bypass(void) {
-    // Bypass = "fbd is in charge AND we are not in a panic". Reads are
-    // intentionally relaxed (no acquire) — racing with set_fbd_alive is
-    // fine; worst case we draw one extra/missed frame at the handshake.
-    return g_fbd_alive && !g_panic_in_progress;
+    // Bypass = "fbd OR the interactive kernel console is in charge AND we are
+    // not in a panic". Reads are intentionally relaxed (no acquire) — racing
+    // with the setters is fine; worst case we draw one extra/missed frame at
+    // the handshake.
+    return (g_fbd_alive || g_console_owns_display) && !g_panic_in_progress;
 }
 // --- Simple 8x16 Bitmap Font ---
 // Basic ASCII characters (32-126)
@@ -668,6 +676,12 @@ bool framebuffer_get_fbd_alive(void) {
 
 void framebuffer_set_panic_in_progress(bool in_progress) {
     g_panic_in_progress = in_progress;
+}
+
+// FU29.H TUI: the interactive kernel console claims the display. After this,
+// direct kernel framebuffer_draw_* debug draws bypass (panic still overrides).
+void framebuffer_set_console_owns_display(bool owns) {
+    g_console_owns_display = owns;
 }
 
 uint32_t framebuffer_get_pitch(void) {

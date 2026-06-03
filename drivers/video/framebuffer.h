@@ -133,6 +133,8 @@ uint32_t framebuffer_read_pixel(uint32_t x, uint32_t y);
 void     framebuffer_set_fbd_alive(bool alive);
 bool     framebuffer_get_fbd_alive(void);
 void     framebuffer_set_panic_in_progress(bool in_progress);
+// FU29.H TUI: interactive kernel console claims the display (debug draws bypass).
+void     framebuffer_set_console_owns_display(bool owns);
 uint32_t framebuffer_get_pitch(void);
 void     framebuffer_force_draw_cell(uint32_t pixel_x, uint32_t pixel_y,
                                      uint32_t codepoint,

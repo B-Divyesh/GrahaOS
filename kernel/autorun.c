@@ -81,6 +81,25 @@ void autorun_register_init_pid(int pid) {
     if (autorun_is_active()) {
         watchdog_arm(g_timer_ticks, g_cmdline_flags.test_timeout_seconds);
     }
+
+    // FU29.H TUI: in INTERACTIVE mode (not the headless ktest gate), the kernel
+    // console owns the display from here on. Wipe the boot-progress / debug
+    // cruft now, and route subsequent direct kernel framebuffer_draw_* debug
+    // draws (ELF loader, SYS_WAIT/spawn diagnostics, daemon respawns) to no-ops
+    // so they don't trample the shell's TUI. The console's own rendering uses
+    // framebuffer_force_draw_* (bypass-immune); the panic path still overrides
+    // via g_panic_in_progress. Gated to non-ktest so `make test` is identical.
+    {
+        const char *ar = g_cmdline_flags.autorun;
+        bool is_ktest = ar && ar[0] == 'k' && ar[1] == 't' && ar[2] == 'e' &&
+                        ar[3] == 's' && ar[4] == 't' && ar[5] == '\0';
+        if (!is_ktest) {
+            extern void framebuffer_clear(uint32_t color);
+            extern void framebuffer_set_console_owns_display(bool owns);
+            framebuffer_clear(0x00101828u);   // dark-navy console backdrop
+            framebuffer_set_console_owns_display(true);
+        }
+    }
 }
 
 int autorun_get_init_pid(void) {
