@@ -38,12 +38,19 @@ static volatile bool g_panic_in_progress = false;
 // the panic path still wins via g_panic_in_progress.
 static volatile bool g_console_owns_display = false;
 
+// For DEBUG / diagnostic draws (framebuffer_draw_string, _hex, the lock/oops
+// overlays): bypass when fbd OR the interactive kernel console owns the display.
 static inline bool fb_should_bypass(void) {
-    // Bypass = "fbd OR the interactive kernel console is in charge AND we are
-    // not in a panic". Reads are intentionally relaxed (no acquire) — racing
-    // with the setters is fine; worst case we draw one extra/missed frame at
-    // the handshake.
     return (g_fbd_alive || g_console_owns_display) && !g_panic_in_progress;
+}
+
+// For the kernel TEXT CONSOLE's own I/O (framebuffer_draw_char / draw_rect /
+// clear — the SYS_PUTC shell output): bypass ONLY when fbd owns the screen.
+// When the kernel console owns the display (g_console_owns_display) this IS the
+// console, so it must KEEP rendering — gating it on g_console_owns_display would
+// hide the shell's own text. (Reads relaxed; racing the setter is benign.)
+static inline bool fb_should_bypass_io(void) {
+    return g_fbd_alive && !g_panic_in_progress;
 }
 // --- Simple 8x16 Bitmap Font ---
 // Basic ASCII characters (32-126)
@@ -858,7 +865,7 @@ void framebuffer_draw_pixel(uint32_t x, uint32_t y, uint32_t color) {
 
 void framebuffer_draw_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t color) {
     if (!g_fb_active) return;
-    if (fb_should_bypass()) return;
+    if (fb_should_bypass_io()) return;   // text-console backspace erase: only fbd bypasses
     if (x >= fb_width || y >= fb_height || width == 0 || height == 0) {
         return;
     }
@@ -906,7 +913,7 @@ void framebuffer_draw_rect_outline(uint32_t x, uint32_t y, uint32_t width, uint3
 
 void framebuffer_draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color) {
     if (!g_fb_active) return;
-    if (fb_should_bypass()) return;
+    if (fb_should_bypass_io()) return;   // text-console I/O: only fbd bypasses
     spinlock_acquire(&fb_lock);
     _draw_char_unsafe(c, x, y, fg_color);
     spinlock_release(&fb_lock);
@@ -966,7 +973,7 @@ void framebuffer_draw_hex(uint64_t value, int x, int y, uint32_t fg_color, uint3
 // Clear function with interrupt safety
 void framebuffer_clear(uint32_t color) {
     if (!g_fb_active) return;
-    if (fb_should_bypass()) return;
+    if (fb_should_bypass_io()) return;   // text-console scroll-clear: only fbd bypasses
     if (in_interrupt_context()) {
         // Clear without lock
         for (uint32_t i = 0; i < fb_width * fb_height; i++) {

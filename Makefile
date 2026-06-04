@@ -749,12 +749,14 @@ initrd.tar: userland etc/motd.txt etc/plan.json etc/gcp.json etc/gcp.wit
 	@echo "# /etc/init.conf — Phase 22 init supervisor configuration" > initrd_root/etc/init.conf
 	@echo "# daemon=<binary>:<pledge_csv>  (CSV is advisory until Phase 24)" >> initrd_root/etc/init.conf
 	@echo "# autorun=<binary>" >> initrd_root/etc/init.conf
-	@# Phase 23 Stage-2 cutover: ahcid spawns FIRST.  The kernel-side
-	@# blk_client kt task polls /sys/blk/service after boot; ahcid must be
-	@# alive for the kt task to transition to BLK_CLIENT_READY (channel
-	@# mode).  Kernel-direct AHCI remains as the boot-time fallback so
-	@# the synchronous grahafs_v2_mount in kmain still works pre-cutover.
-	@echo "daemon=bin/ahcid:storage_server,sys_control,sys_query,ipc_send,ipc_recv,compute" >> initrd_root/etc/init.conf
+	@# FU29.X: /bin/ahcid is spawned KERNEL-CONTEXT by the blk_client kt task
+	@# (blk_client.c:1018, in BOTH ktest and interactive) so it can publish
+	@# /sys/blk/service and mount the FS BEFORE init runs.  Listing it here too
+	@# made init double-spawn a second ahcid which hit drv_register -16 (the
+	@# device is already owned) and crash-looped.  So it is intentionally NOT an
+	@# init daemon; the userdrv framework handles respawn-on-death.
+	@echo "# bin/ahcid: spawned kernel-context by the blk_client kt task; do NOT" >> initrd_root/etc/init.conf
+	@echo "#            list as an init daemon (double-spawn -> drv_register -16)." >> initrd_root/etc/init.conf
 	@echo "daemon=bin/e1000d:net_server,sys_control,sys_query,ipc_send,ipc_recv" >> initrd_root/etc/init.conf
 	@echo "daemon=bin/netd:net_server,net_client,ipc_send,ipc_recv,sys_query,fs_read,compute,time" >> initrd_root/etc/init.conf
 	@# Phase 27 Block A (Stage A4): fbd userspace framebuffer compositor.

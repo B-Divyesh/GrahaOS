@@ -137,7 +137,7 @@ static void gsh_draw_chrome(void) {
                               GSH_CHROME_ROWS, GSH_CHROME_COLS, 15, 0);
 
     // Title bar — row 1, fg=bright white on default bg.
-    const char *title = "gsh @ Phase 29 — GrahaOS Shell";
+    const char *title = "gsh @ Phase 29 - GrahaOS Shell";
     tui_print_str(1, 2, 15, 0, title);
 
     // Footer placeholder ("cwd:") at row 23 col 2 — refreshed later.
