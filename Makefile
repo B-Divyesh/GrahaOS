@@ -1255,8 +1255,7 @@ run: grahaos.iso format-disk-if-needed
 	     -drive file=disk.img,format=raw,if=none,id=mydisk \
 	     -device ich9-ahci,id=ahci \
 	     -device ide-hd,drive=mydisk,bus=ahci.0 \
-	     -netdev user,id=net0,hostfwd=tcp::8080-:80 -device e1000,netdev=net0 \
-	     -d int,cpu_reset -D qemu.log
+	     -netdev user,id=net0,hostfwd=tcp::8080-:80 -device e1000,netdev=net0
 
 # 'terminal' = serial-only (gash on host terminal). Was 'run' pre-Phase-28
 # sweep; preserved here for users who prefer text-only iteration.
@@ -1270,8 +1269,7 @@ terminal: grahaos.iso format-disk-if-needed
 	     -drive file=disk.img,format=raw,if=none,id=mydisk \
 	     -device ich9-ahci,id=ahci \
 	     -device ide-hd,drive=mydisk,bus=ahci.0 \
-	     -netdev user,id=net0,hostfwd=tcp::8080-:80 -device e1000,netdev=net0 \
-	     -d int,cpu_reset -D qemu.log
+	     -netdev user,id=net0,hostfwd=tcp::8080-:80 -device e1000,netdev=net0
 
 # Phase 27 closeout: explicit "boot the gate live, no TAP parsing" target.
 # Patches limine.conf with autorun=ktest + watchdog 500s, rebuilds the ISO,

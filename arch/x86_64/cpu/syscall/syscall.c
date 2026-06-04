@@ -112,13 +112,6 @@ extern void *memcpy(void *dest, const void *src, size_t n);
 // Terminal cursor position for SYS_PUTC
 static uint32_t term_x = 0;
 static uint32_t term_y = 0;
-// FU29.X TUI: reserved top margin (pixels) for the interactive shell's cell-grid
-// chrome (the cap-sidebar). The kernel text console renders BELOW term_top and,
-// on overflow, clears only [term_top, height) so the chrome above is preserved.
-// Stays 0 in ktest (the setter is called only on the interactive takeover) =>
-// whole-screen clear, byte-identical to the previous behaviour.
-static uint32_t term_top = 0;
-void console_text_set_top(uint32_t y_px) { term_top = y_px; term_x = 0; term_y = y_px; }
 
 // Enhanced debug variables that assembly can write to
 volatile uint64_t syscall_entry_reached = 0;
@@ -325,10 +318,9 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                     term_y += 16;
                 }
                 if (term_y >= framebuffer_get_height() - 20) {
-                    framebuffer_draw_rect(0, term_top, framebuffer_get_width(),
-                                          framebuffer_get_height() - term_top, 0x00101828);
+                    framebuffer_clear(0x00101828);
                     term_x = 0;
-                    term_y = term_top;
+                    term_y = 0;
                 }
             } else if (fd1_type == FD_TYPE_FILE) {
                 // Redirected to file: write single char
@@ -495,10 +487,9 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                         term_y += 16;
                     }
                     if (term_y >= framebuffer_get_height() - 20) {
-                        framebuffer_draw_rect(0, term_top, framebuffer_get_width(),
-                                              framebuffer_get_height() - term_top, 0x00101828);
+                        framebuffer_clear(0x00101828);
                         term_x = 0;
-                        term_y = term_top;
+                        term_y = 0;
                     }
                 }
                 frame->rax = count;
@@ -570,48 +561,93 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 break;
             }
             
-            // Open the directory
+            // Resolve the directory on the disk filesystem.  This may be NULL
+            // for pure-initrd paths (e.g. /bin) — the disk grahafs root is
+            // typically empty; the runnable binaries live in the initrd, which
+            // is otherwise only an open-fallback.  We therefore merge initrd
+            // entries into readdir for "/" and for paths absent from disk, so
+            // `ls /` shows bin/etc and `ls /bin` lists the programs.
             vfs_node_t* dir = vfs_path_to_node(pathname_kernel);
-            if (!dir) {
-                frame->rax = -1;
-                break;
-            }
-            
-            if (dir->type != VFS_DIRECTORY) {
+
+            // Exists on disk but isn't a directory -> ENOTDIR.
+            if (dir && dir->type != VFS_DIRECTORY) {
                 vfs_destroy_node(dir);
-                frame->rax = -2; // Not a directory
+                frame->rax = -2;
                 break;
             }
-            
-            // Read the directory entry at index
-            vfs_node_t* entry = NULL;
-            if (dir->readdir) {
-                entry = dir->readdir(dir, index);
-            }
-            
-            if (!entry) {
+            int is_disk_dir = (dir && dir->readdir);
+
+            // Disk entry at this index, if the disk dir has one.
+            vfs_node_t* entry = is_disk_dir ? dir->readdir(dir, index) : NULL;
+            if (entry) {
+                if (dirent_buffer) {
+                    if (!is_user_pointer(dirent_buffer, 32)) {
+                        vfs_destroy_node(entry);
+                        vfs_destroy_node(dir);
+                        frame->rax = -1;
+                        break;
+                    }
+                    uint32_t type = entry->type;
+                    memcpy(dirent_buffer, &type, 4);
+                    memcpy((uint8_t*)dirent_buffer + 4, entry->name, 28);
+                }
+                vfs_destroy_node(entry);
                 vfs_destroy_node(dir);
-                frame->rax = 0; // No more entries
+                frame->rax = 1;
                 break;
             }
-            
-            // Copy entry info to user buffer
-            // Simple format: 4 bytes type, 28 bytes name
-            if (dirent_buffer) {
-                if (!is_user_pointer(dirent_buffer, 32)) {
-                    vfs_destroy_node(entry);
-                    vfs_destroy_node(dir);
-                    frame->rax = -1;
+
+            // Past the disk entries.  Consult the initrd for the root and for
+            // paths not present on disk; other disk directories end here.
+            int path_is_root = (pathname_kernel[0] == '/' && pathname_kernel[1] == '\0');
+            if (path_is_root || dir == NULL) {
+                uint32_t disk_count = 0;
+                if (is_disk_dir) {
+                    vfs_node_t* e;
+                    while ((e = dir->readdir(dir, disk_count)) != NULL) {
+                        vfs_destroy_node(e);
+                        disk_count++;
+                    }
+                }
+                char iname[28]; uint32_t is_dir = 0;
+                if (index >= disk_count &&
+                    initrd_readdir(pathname_kernel, index - disk_count,
+                                   iname, sizeof(iname), &is_dir) == 0) {
+                    if (dirent_buffer) {
+                        if (!is_user_pointer(dirent_buffer, 32)) {
+                            if (dir) vfs_destroy_node(dir);
+                            frame->rax = -1;
+                            break;
+                        }
+                        uint32_t type = is_dir ? VFS_DIRECTORY : VFS_FILE;
+                        memcpy(dirent_buffer, &type, 4);
+                        uint8_t *nm = (uint8_t*)dirent_buffer + 4;
+                        for (int k = 0; k < 28; k++) nm[k] = 0;
+                        for (int k = 0; k < 27 && iname[k]; k++) nm[k] = (uint8_t)iname[k];
+                    }
+                    if (dir) vfs_destroy_node(dir);
+                    frame->rax = 1;
                     break;
                 }
-                uint32_t type = entry->type;
-                memcpy(dirent_buffer, &type, 4);
-                memcpy((uint8_t*)dirent_buffer + 4, entry->name, 28);
+                // Neither disk nor initrd knows this path -> ENOENT; else end.
+                // On end-of-entries, zero the dirent so callers that stop on an
+                // empty name[] (rather than rc<=0) break promptly — avoids a
+                // pathological 256-iteration readdir loop that re-hits the disk.
+                int ec = (!dir && disk_count == 0 && index == 0) ? -1 : 0;
+                if (ec == 0 && dirent_buffer && is_user_pointer(dirent_buffer, 32)) {
+                    for (int k = 0; k < 32; k++) ((uint8_t*)dirent_buffer)[k] = 0;
+                }
+                frame->rax = ec;
+                if (dir) vfs_destroy_node(dir);
+                break;
             }
-            
-            vfs_destroy_node(entry);
+
+            // Disk directory, past its entries — write a zeroed end sentinel.
+            if (dirent_buffer && is_user_pointer(dirent_buffer, 32)) {
+                for (int k = 0; k < 32; k++) ((uint8_t*)dirent_buffer)[k] = 0;
+            }
             vfs_destroy_node(dir);
-            frame->rax = 1; // Success
+            frame->rax = 0;
             break;
         }
 

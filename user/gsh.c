@@ -603,21 +603,29 @@ static void cmd_pwd(void) {
 
 static void cmd_ls(int argc, char **argv) {
     const char *path = (argc >= 2) ? argv[1] : g_cwd;
-    // syscall_readdir signature: int syscall_readdir(const char *path,
-    // int index, grahafs_dirent_t *out) — index iterates; -ENOENT
-    // ends.  We don't include kernel headers here; use the raw syscall
-    // and a stack buffer.
-    // The dirent layout (from kernel/fs/grahafs.h) is name[256] + ino:u32
-    // + type:u32 — 264 bytes.  But we just emit names so we copy out
-    // up to the first NUL.
-    uint8_t dirent[264];
-    for (int i = 0; i < 256; i++) {
-        long rc = syscall_readdir(path, i, (void *)dirent);
-        if (rc < 0) break;
-        // dirent[0..255] is the name.
-        if (dirent[0] == '\0') break;
-        print((const char *)dirent);
+    // The kernel SYS_READDIR ABI fills a `user_dirent_t` (syscalls.h):
+    //   { uint32_t type; char name[28]; }  — name is at offset 4, NOT 0.
+    // (An earlier version read a raw byte buffer at offset 0, so it read
+    // the `type` u32 as the name and printed nothing.)  Mirror gash's
+    // working loop: rc>0 = entry, rc==0 = end, rc<0 = error; skip empty
+    // slots and continue.
+    user_dirent_t dirent;
+    uint32_t index = 0;
+    while (1) {
+        int rc = syscall_readdir(path, index, &dirent);
+        if (rc <= 0) {
+            if (rc < 0 && index == 0) {
+                print("ls: cannot access ");
+                print(path);
+                print("\n");
+            }
+            break;
+        }
+        if (dirent.name[0] == '\0') { index++; continue; }
+        print(dirent.name);
+        if (dirent.type == 2) print("/");   // VFS_DIRECTORY
         print("\n");
+        index++;
     }
 }
 
@@ -921,6 +929,41 @@ static int try_run_script_sentinel(void) {
     return 1;  // unreachable
 }
 
+// Interactive startup banner — printed to the full-screen text console (NOT
+// the cell grid).  Shows the title, the live capability list (queried once),
+// pid, and the help hint.  Interactive mode deliberately skips the cell-grid
+// chrome (see _start); this banner gives the same information without the
+// black-corner / output-wipe problems of the 80x24 cell box.
+static void gsh_print_banner(void) {
+    print("\n");
+    print("==============================================================================\n");
+    print(" gsh - GrahaOS Shell (Phase 29)    pid ");
+    print_int(syscall_getpid());
+    print("\n");
+    long rc = syscall_get_system_state(STATE_CAT_CAPABILITIES,
+                                       &g_cap_list, sizeof(g_cap_list));
+    if (rc >= 0 && g_cap_list.count > 0) {
+        print(" caps:");
+        int col = 6;
+        for (uint32_t i = 0; i < g_cap_list.count && i < STATE_MAX_CAPS; i++) {
+            state_cap_entry_t *e = &g_cap_list.caps[i];
+            if (e->deleted) continue;
+            int nlen = 0; while (e->name[nlen]) nlen++;
+            if (col + nlen + 1 > 76) { print("\n      "); col = 6; }
+            print(" ");
+            print(e->name);
+            col += nlen + 1;
+        }
+        print("\n");
+    }
+    print("==============================================================================\n");
+    print("Type `help` or `?<word>`.  Manifest: ");
+    print_int(g_manifest_bytes);
+    print(" bytes, ");
+    print_int(g_term_count);
+    print(" terms.\n\n");
+}
+
 // =========================================================================
 //   Main loop
 // =========================================================================
@@ -934,14 +977,27 @@ void _start(int argc, char **argv) {
     seed_builtins();
     load_manifest();
 
-    // Phase 29 Session F — attempt TUI attach.  When this succeeds gsh
-    // routes its chrome (frame, title, footer, sidebar) through the
-    // mapped cell-VMO.  Failure is silent and harmless: the existing
-    // syscall_putc path stays in effect.  We do this BEFORE the script-
-    // mode branch so the chrome appears under both interactive AND
-    // script-mode (the latter is how gsh_chrome.tap reads cells back).
+    // The cell-grid chrome (gsh_draw_chrome + cap-sidebar) is an 80x24 box
+    // that the headless gate reads back via gsh_chrome.tap in SCRIPT mode.
+    // In INTERACTIVE mode it left ~3/4 of a 160x50 screen black, and every
+    // chrome present overflows the 16-deep dirty ring -> a whole-grid redraw
+    // from the cell-VMO that WIPES command output (which lives only in
+    // framebuffer pixels).  So draw the cell chrome ONLY when a /.gsh-script
+    // sentinel is present (the gate); interactive boots get a clean
+    // full-screen text console + the inline banner below.
+    int script_mode = 0;
+    {
+        int sfd = syscall_open(GSH_SCRIPT_SENTINEL);
+        if (sfd >= 0) {
+            char probe;
+            ssize_t pr = syscall_read(sfd, &probe, 1);
+            syscall_close(sfd);
+            if (pr > 0) script_mode = 1;
+        }
+    }
+
     (void)tui_init();
-    if (tui_attach(GSH_CHROME_CONSOLE_ID) == 0) {
+    if (script_mode && tui_attach(GSH_CHROME_CONSOLE_ID) == 0) {
         g_tui_active = 1;
         gsh_draw_chrome();
         gsh_refresh_cap_sidebar();
@@ -953,13 +1009,7 @@ void _start(int argc, char **argv) {
         // unreachable — script_run exits.
     }
 
-    print("\n");
-    print("gsh — GrahaOS Shell (Phase 29). Type `help` or `?<word>`.\n");
-    print("Manifest: ");
-    print_int(g_manifest_bytes);
-    print(" bytes, ");
-    print_int(g_term_count);
-    print(" completion terms.\n");
+    gsh_print_banner();
 
     char line[HISTORY_LINE_MAX];
     for (;;) {
