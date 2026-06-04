@@ -112,6 +112,13 @@ extern void *memcpy(void *dest, const void *src, size_t n);
 // Terminal cursor position for SYS_PUTC
 static uint32_t term_x = 0;
 static uint32_t term_y = 0;
+// FU29.X TUI: reserved top margin (pixels) for the interactive shell's cell-grid
+// chrome (the cap-sidebar). The kernel text console renders BELOW term_top and,
+// on overflow, clears only [term_top, height) so the chrome above is preserved.
+// Stays 0 in ktest (the setter is called only on the interactive takeover) =>
+// whole-screen clear, byte-identical to the previous behaviour.
+static uint32_t term_top = 0;
+void console_text_set_top(uint32_t y_px) { term_top = y_px; term_x = 0; term_y = y_px; }
 
 // Enhanced debug variables that assembly can write to
 volatile uint64_t syscall_entry_reached = 0;
@@ -318,9 +325,10 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                     term_y += 16;
                 }
                 if (term_y >= framebuffer_get_height() - 20) {
-                    framebuffer_clear(0x00101828);
+                    framebuffer_draw_rect(0, term_top, framebuffer_get_width(),
+                                          framebuffer_get_height() - term_top, 0x00101828);
                     term_x = 0;
-                    term_y = 0;
+                    term_y = term_top;
                 }
             } else if (fd1_type == FD_TYPE_FILE) {
                 // Redirected to file: write single char
@@ -487,9 +495,10 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                         term_y += 16;
                     }
                     if (term_y >= framebuffer_get_height() - 20) {
-                        framebuffer_clear(0x00101828);
+                        framebuffer_draw_rect(0, term_top, framebuffer_get_width(),
+                                              framebuffer_get_height() - term_top, 0x00101828);
                         term_x = 0;
-                        term_y = 0;
+                        term_y = term_top;
                     }
                 }
                 frame->rax = count;

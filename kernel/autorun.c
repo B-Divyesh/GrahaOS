@@ -96,8 +96,13 @@ void autorun_register_init_pid(int pid) {
         if (!is_ktest) {
             extern void framebuffer_clear(uint32_t color);
             extern void framebuffer_set_console_owns_display(bool owns);
+            extern void console_text_set_top(uint32_t y_px);
             framebuffer_clear(0x00101828u);   // dark-navy console backdrop
             framebuffer_set_console_owns_display(true);
+            // Reserve the top 24 text rows (= gsh's 80x24 cell-grid chrome at
+            // 16 px/row) so the kernel text console scrolls BELOW the persistent
+            // cap-sidebar instead of clearing the whole screen over it.
+            console_text_set_top(24u * 16u);
         }
     }
 }
