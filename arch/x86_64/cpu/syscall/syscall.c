@@ -561,15 +561,47 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 break;
             }
             
-            // Resolve the directory on the disk filesystem.  This may be NULL
-            // for pure-initrd paths (e.g. /bin) — the disk grahafs root is
-            // typically empty; the runnable binaries live in the initrd, which
-            // is otherwise only an open-fallback.  We therefore merge initrd
-            // entries into readdir for "/" and for paths absent from disk, so
-            // `ls /` shows bin/etc and `ls /bin` lists the programs.
-            vfs_node_t* dir = vfs_path_to_node(pathname_kernel);
+            // The initrd is memory-resident; the disk grahafs is reached via a
+            // channel round-trip to ahcid (slow, ~tens of ms each). So for
+            // NON-ROOT paths, enumerate the initrd FIRST — `ls /bin` (an
+            // initrd-only dir) then lists every program with zero disk I/O,
+            // instead of one disk round-trip per entry (which made it crawl).
+            // Only paths the initrd doesn't own fall through to the disk. The
+            // root ("/") still merges the disk root with the initrd top level.
+            int path_is_root = (pathname_kernel[0] == '/' && pathname_kernel[1] == '\0');
 
-            // Exists on disk but isn't a directory -> ENOTDIR.
+            if (!path_is_root) {
+                char iname[28]; uint32_t is_dir = 0;
+                int irc = initrd_readdir(pathname_kernel, index,
+                                         iname, sizeof(iname), &is_dir);
+                if (irc == 0) {
+                    if (dirent_buffer && is_user_pointer(dirent_buffer, 32)) {
+                        uint32_t type = is_dir ? VFS_DIRECTORY : VFS_FILE;
+                        memcpy(dirent_buffer, &type, 4);
+                        uint8_t *nm = (uint8_t*)dirent_buffer + 4;
+                        for (int k = 0; k < 28; k++) nm[k] = 0;
+                        for (int k = 0; k < 27 && iname[k]; k++) nm[k] = (uint8_t)iname[k];
+                    }
+                    frame->rax = 1;
+                    break;
+                }
+                // No initrd entry at this index. If index>0 and the path IS an
+                // initrd dir (has a child 0), we're just past its end -> 0.
+                if (index > 0) {
+                    char probe[28];
+                    if (initrd_readdir(pathname_kernel, 0, probe, sizeof(probe), NULL) == 0) {
+                        if (dirent_buffer && is_user_pointer(dirent_buffer, 32)) {
+                            for (int k = 0; k < 32; k++) ((uint8_t*)dirent_buffer)[k] = 0;
+                        }
+                        frame->rax = 0;
+                        break;
+                    }
+                }
+                // Not an initrd path — resolve against the disk below.
+            }
+
+            // Disk resolution: the root (merged with initrd) or a disk dir.
+            vfs_node_t* dir = vfs_path_to_node(pathname_kernel);
             if (dir && dir->type != VFS_DIRECTORY) {
                 vfs_destroy_node(dir);
                 frame->rax = -2;
@@ -577,16 +609,9 @@ void syscall_dispatcher(struct syscall_frame *frame) {
             }
             int is_disk_dir = (dir && dir->readdir);
 
-            // Disk entry at this index, if the disk dir has one.
             vfs_node_t* entry = is_disk_dir ? dir->readdir(dir, index) : NULL;
             if (entry) {
-                if (dirent_buffer) {
-                    if (!is_user_pointer(dirent_buffer, 32)) {
-                        vfs_destroy_node(entry);
-                        vfs_destroy_node(dir);
-                        frame->rax = -1;
-                        break;
-                    }
+                if (dirent_buffer && is_user_pointer(dirent_buffer, 32)) {
                     uint32_t type = entry->type;
                     memcpy(dirent_buffer, &type, 4);
                     memcpy((uint8_t*)dirent_buffer + 4, entry->name, 28);
@@ -597,12 +622,10 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 break;
             }
 
-            // Past the disk entries.  Consult the initrd for the root and for
-            // paths not present on disk; other disk directories end here.
-            int path_is_root = (pathname_kernel[0] == '/' && pathname_kernel[1] == '\0');
-            if (path_is_root || dir == NULL) {
+            // Root: after the disk root's entries, append the initrd top level.
+            if (path_is_root) {
                 uint32_t disk_count = 0;
-                if (is_disk_dir) {
+                if (is_disk_dir && index > 0) {
                     vfs_node_t* e;
                     while ((e = dir->readdir(dir, disk_count)) != NULL) {
                         vfs_destroy_node(e);
@@ -611,14 +634,9 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                 }
                 char iname[28]; uint32_t is_dir = 0;
                 if (index >= disk_count &&
-                    initrd_readdir(pathname_kernel, index - disk_count,
+                    initrd_readdir("/", index - disk_count,
                                    iname, sizeof(iname), &is_dir) == 0) {
-                    if (dirent_buffer) {
-                        if (!is_user_pointer(dirent_buffer, 32)) {
-                            if (dir) vfs_destroy_node(dir);
-                            frame->rax = -1;
-                            break;
-                        }
+                    if (dirent_buffer && is_user_pointer(dirent_buffer, 32)) {
                         uint32_t type = is_dir ? VFS_DIRECTORY : VFS_FILE;
                         memcpy(dirent_buffer, &type, 4);
                         uint8_t *nm = (uint8_t*)dirent_buffer + 4;
@@ -629,20 +647,20 @@ void syscall_dispatcher(struct syscall_frame *frame) {
                     frame->rax = 1;
                     break;
                 }
-                // Neither disk nor initrd knows this path -> ENOENT; else end.
-                // On end-of-entries, zero the dirent so callers that stop on an
-                // empty name[] (rather than rc<=0) break promptly — avoids a
-                // pathological 256-iteration readdir loop that re-hits the disk.
-                int ec = (!dir && disk_count == 0 && index == 0) ? -1 : 0;
-                if (ec == 0 && dirent_buffer && is_user_pointer(dirent_buffer, 32)) {
+                // End of the root listing — zeroed end sentinel.
+                if (dirent_buffer && is_user_pointer(dirent_buffer, 32)) {
                     for (int k = 0; k < 32; k++) ((uint8_t*)dirent_buffer)[k] = 0;
                 }
-                frame->rax = ec;
                 if (dir) vfs_destroy_node(dir);
+                frame->rax = 0;
                 break;
             }
 
-            // Disk directory, past its entries — write a zeroed end sentinel.
+            // Non-root: a real disk dir past its entries, or a missing path.
+            if (!dir) {
+                frame->rax = -1;   // ENOENT (not on disk and not in the initrd)
+                break;
+            }
             if (dirent_buffer && is_user_pointer(dirent_buffer, 32)) {
                 for (int k = 0; k < 32; k++) ((uint8_t*)dirent_buffer)[k] = 0;
             }
